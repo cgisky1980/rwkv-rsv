@@ -700,6 +700,7 @@ dependencies = [
  "fastrand",
  "half",
  "itertools",
+ "libloading",
  "log",
  "memmap2",
  "rayon",

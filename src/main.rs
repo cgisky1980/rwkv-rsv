@@ -743,9 +743,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ===== GPU 对比验证 =====
-    let backend = backend::VulkanBackend::new()?;
-    log::info!("vulkan runtime created");
-    let mut gpu_model = gpu_model::GpuModel::from_safetensors(Box::new(backend), &model_path)?;
+    let backend_kind = backend::detect_backend();
+    log::info!(
+        "backend auto-selected: {backend_kind:?} (cuda hw available: {})",
+        backend::cuda_available()
+    );
+    let backend = backend::create_backend(backend_kind)?;
+    let mut gpu_model = gpu_model::GpuModel::from_safetensors(backend, &model_path)?;
     log::info!("gpu model loaded");
 
     // ===== state_tune 演示：cargo run --release -- statetune =====

@@ -15,6 +15,7 @@ clap = { version = "4.5", features = ["derive"] }
 fastrand = "2.3"
 half = { version = "2.7", features = ["bytemuck"] }
 itertools = "0.14"
+libloading = "0.8"
 log = "0.4"
 memmap2 = "0.9"
 rayon = { version = "1.12", optional = true }

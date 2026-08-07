@@ -2484,9 +2484,10 @@ impl ModelBuilder {
     }
 
     /// 构建模型并绑定一个零初始化的 `State`，得到 `Bundle`。
+    /// 后端自动选择（`detect_backend()`）：CUDA 算子就绪前默认为 Vulkan。
     pub fn build(self) -> R<Bundle> {
-        let backend = crate::backend::VulkanBackend::new()?;
-        let mut model = GpuModel::from_safetensors(Box::new(backend), &self.path)?;
+        let backend = crate::backend::create_backend(crate::backend::detect_backend())?;
+        let mut model = GpuModel::from_safetensors(backend, &self.path)?;
         let state = model.create_state()?;
         Ok(Bundle { model, state })
     }

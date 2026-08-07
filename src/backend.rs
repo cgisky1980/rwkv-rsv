@@ -687,18 +687,32 @@ pub trait ComputeBackend {
     fn argmax_into_host(&mut self, logits: TensorId, token: TensorId, n: usize) -> R<()>;
 }
 
-/// 探测可用后端：CUDA 可用优先，否则 Vulkan。
+/// CUDA 算子实现是否就绪。
+/// 当前 `CudaBackend` 为骨架（张量管理可用、算子未实现），故暂为 `false`；
+/// 待按 Albatross 补齐 decode 核心算子后翻转为 `true`，`detect_backend()` 即优先选择 CUDA。
+pub const CUDA_READY: bool = false;
+
+/// 探测可用后端：CUDA 可用**且算子已就绪**优先，否则 Vulkan。
+/// 返回的是「能真正跑通模型」的后端，避免骨架阶段选中 CUDA 后运行报错。
 pub fn detect_backend() -> BackendKind {
-    if cuda_available() {
+    if CUDA_READY && cuda_available() {
         BackendKind::Cuda
     } else {
         BackendKind::Vulkan
     }
 }
 
-/// CUDA 可用性检查（占位：当前无 CUDA 运行时，恒为 false）。
-fn cuda_available() -> bool {
-    false
+/// CUDA 硬件可用性（真实探测，不依赖算子实现）：驱动可加载 + `cuInit` 成功 + ≥1 设备。
+pub fn cuda_available() -> bool {
+    crate::backend_cuda::cuda_available()
+}
+
+/// 按 `BackendKind` 构造对应后端实例。
+pub fn create_backend(kind: BackendKind) -> R<Box<dyn ComputeBackend>> {
+    match kind {
+        BackendKind::Vulkan => Ok(Box::new(VulkanBackend::new()?)),
+        BackendKind::Cuda => Ok(Box::new(crate::backend_cuda::CudaBackend::new()?)),
+    }
 }
 
 /// Vulkan 后端：封装现有 `Runtime`。
