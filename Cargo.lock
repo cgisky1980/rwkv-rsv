@@ -659,6 +659,8 @@ dependencies = [
  "memmap2",
  "rust-embed",
  "safetensors",
+ "serde",
+ "serde_json",
  "simplelog",
  "thiserror",
  "vulkanalia",

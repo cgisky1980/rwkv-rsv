@@ -1,9 +1,6 @@
 use std::error::Error;
 
-mod gpu_model;
-mod model;
-mod runtime;
-mod vulkan;
+use rwkv_rsv::{gpu_model, model, runtime};
 
 fn topk_indices(logits: &[f32]) -> Vec<usize> {
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
@@ -750,6 +747,58 @@ fn main() -> Result<(), Box<dyn Error>> {
     log::info!("vulkan runtime created");
     let mut gpu_model = gpu_model::GpuModel::from_safetensors(rt, &model_path)?;
     log::info!("gpu model loaded");
+
+    // ===== state_tune 演示：cargo run --release -- statetune =====
+    // 验证 web-rwkv 风格 State 的「前进 → back 取态 → load 回灌」闭环：
+    //   1) 用外部 State 前向推理，得到训练目标 token 的 logits；
+    //   2) state_back 整态下载到 CPU（布局与 state_load 一致）；
+    //   3) 模拟 state tuning：对取出的态做轻量扰动（tuning 方向性调整）；
+    //   4) state_load 回灌 GPU，再次前向，验证 logits 随 tuned 态变化（target token 概率应有差异）。
+    // 该闭环即 ai00-server 会话持久化 / state tuning 文件存取所依赖的序列化原语。
+    if std::env::args().any(|a| a == "statetune") {
+        let tunes = std::env::var("TUNE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3usize);
+        log::info!("== statetune: 前进→back→load 闭环演示 (tuning {tunes} 次) ==");
+
+        // 一个真实 prompt 作为训练目标序列
+        let train_tokens: Vec<u32> = vec![304, 25740, 109];
+        let mut state = gpu_model.create_state()?;
+        let logits_base = gpu_model.forward_with_state(&mut state, &train_tokens)?;
+        let base_top = topk_indices(&logits_base)[..5].to_vec();
+        log::info!("base (未 tuning) top5: {base_top:?}");
+
+        for i in 1..=tunes {
+            // 1) 取态
+            let st = gpu_model.state_back(&state)?;
+            log::info!("  round {i}: state_back {} f32", st.len());
+
+            // 2) tuning：对态做确定性扰动（放大一个小量的方向，模拟 state tuning 调整）
+            let mut tuned = st.clone();
+            let amp = 0.01f32 * i as f32;
+            for v in tuned.iter_mut().step_by(37) {
+                *v *= 1.0 + amp;
+            }
+
+            // 3) 回灌
+            gpu_model.state_load(&state, &tuned)?;
+
+            // 4) 用 tuned 态继续前向（在 train_tokens 后追加同 token，观察状态变化）
+            let logits_t = gpu_model.forward_with_state(&mut state, &[train_tokens[0]])?;
+            let t_top = topk_indices(&logits_t)[..5].to_vec();
+            log::info!(
+                "  round {i}: tuned 态前向 top5: {t_top:?}  (与 base 之差 {:.6})",
+                logits_t
+                    .iter()
+                    .zip(&logits_base)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |m, v| m.max(v))
+            );
+        }
+        log::info!("== statetune 演示完成 ==");
+        return Ok(());
+    }
 
     // ===== 显存累积测试：cargo run --release -- memtest =====
     // 连续自回归生成 GEN_TOKENS（默认 1000）个 token，周期性采样显存，检查是否累积上升并统计速度。

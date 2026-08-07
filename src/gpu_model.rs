@@ -43,6 +43,60 @@ pub struct ModelConfig {
     pub g_mid_pad: usize,
 }
 
+impl ModelConfig {
+    /// 派生 web-rwkv 风格的公开模型元信息（供服务端读取/展示）。
+    pub fn info(&self) -> ModelInfo {
+        ModelInfo {
+            version: ModelVersion::V7,
+            num_layer: self.n_layer,
+            num_emb: self.n_embd,
+            // 对齐 web-rwkv：num_hidden 用于 buffer 计算（num_emb × num_hidden = 每层 att 线性投影权重大小），RWKV-7 为 C×C
+            num_hidden: self.n_embd,
+            num_vocab: self.vocab,
+            num_head: self.n_head,
+            head_size: self.head_size,
+            ffn_hidden: self.ffn_hidden,
+            w_mid: self.w_mid,
+            a_mid: self.a_mid,
+            v_mid: self.v_mid,
+            g_mid: self.g_mid,
+        }
+    }
+}
+
+/// 模型架构版本（对标 `web-rwkv::ModelVersion`）。rwkv-rsv 专用于 RWKV-7。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelVersion {
+    V7,
+}
+
+/// web-rwkv 风格的公开模型元信息（对标 `web-rwkv::ModelInfo`）。
+/// 服务端（ai00-server）据此获取模型规模、初始化 State、展示模型信息，无需访问内部 `ModelConfig`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// 模型架构版本
+    pub version: ModelVersion,
+    /// 层数
+    pub num_layer: usize,
+    /// 嵌入维度 C
+    pub num_emb: usize,
+    /// 隐藏维度（=num_emb，用于 buffer 尺寸计算）
+    pub num_hidden: usize,
+    /// vocab 大小
+    pub num_vocab: usize,
+    /// 头数
+    pub num_head: usize,
+    /// 每头维度 N
+    pub head_size: usize,
+    /// FFN hidden 维度
+    pub ffn_hidden: usize,
+    /// 低秩中间维度（w/a/v/g）
+    pub w_mid: usize,
+    pub a_mid: usize,
+    pub v_mid: usize,
+    pub g_mid: usize,
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     rt: Runtime,
@@ -58,11 +112,10 @@ pub struct GpuModel {
     bufs: WorkBuffers,
     // 序列并行工作缓冲区（forward_seq 时按需创建/复用）
     seq_bufs: Option<SeqBuffers>,
-    // 每层 RNN 状态（GPU 端维护）
-    state: Vec<GpuState>,
-    // v_first 跨层共享，每个 token 重置（fp16，与 v 缓冲同精度）
-    v_first: GpuTensor16,
-    v_first_set: bool,
+    // 内部推理状态（web-rwkv 风格 `State`）。
+    // 拆分为外部传入式 `forward_with_state`/`forward_seq_with_state`（主 API），
+    // 旧 `forward`/`forward_seq`/`forward_argmax` 等便捷封装复用此内部态。
+    state: Option<State>,
     // 标量缓冲区: -1/sqrt(e)，用于 w = exp(w_sig * scale)
     scale_w: GpuTensor,
 }
@@ -347,14 +400,8 @@ impl GpuModel {
         // 工作缓冲区
         let bufs = WorkBuffers::new(&rt, n_embd, vocab, &config)?;
 
-        // 状态
-        let mut state = Vec::with_capacity(n_layer);
-        for _ in 0..n_layer {
-            state.push(GpuState::new(&rt, n_embd, n_head, head_size)?);
-        }
-
-        // v_first 跨层共享
-        let mut v_first = rt.create_tensor_f16(n_embd)?;
+        // 内部推理状态（可序列化 `State`：每层 RNN 状态 + v_first）
+        let state = State::new(&rt, n_embd, n_head, head_size, n_layer)?;
 
         // scale_w: -1/sqrt(e)
         let mut scale_w = rt.create_tensor(1)?;
@@ -365,7 +412,6 @@ impl GpuModel {
         rt.drop_host(&mut ln_out_w_t);
         rt.drop_host(&mut ln_out_b_t);
         rt.drop_host_f16(&mut head_w16_t);
-        rt.drop_host_f16(&mut v_first);
         rt.drop_host(&mut scale_w);
 
         Ok(Self {
@@ -379,9 +425,7 @@ impl GpuModel {
             layers,
             bufs,
             seq_bufs: None,
-            state,
-            v_first,
-            v_first_set: false,
+            state: Some(state),
             scale_w,
         })
     }
@@ -391,17 +435,64 @@ impl GpuModel {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let n = self.config.head_size;
-        for s in &self.state {
-            s.reset(&self.rt, c, h, n)?;
-        }
-        self.v_first_set = false;
+        self.state.as_ref().unwrap().reset(&self.rt, c, h, n)?;
         Ok(())
     }
 
-    /// 前向推理：返回最后一个 token 的 logits [vocab]
+    /// 创建零初始化的推理状态（web-rwkv 风格，供 `forward_with_state` 使用）。
+    /// `State` 是会话持久化与 state tuning 的第一等公民：`state_back` 取态 → 存盘 →
+    /// `state_load` 回灌。
+    pub fn create_state(&self) -> R<State> {
+        State::new(
+            &self.rt,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+            self.config.n_layer,
+        )
+    }
+
+    /// 公开模型元信息（web-rwkv 风格 `ModelInfo`），供服务端读取模型规模。
+    pub fn info(&self) -> ModelInfo {
+        self.config.info()
+    }
+
+    /// 把 `State` 整态下载到 CPU 为连续 `Vec<f32>`（布局与 `state_load` 一一对应）。
+    pub fn state_back(&self, state: &State) -> R<Vec<f32>> {
+        state.back(
+            &self.rt,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
+    /// 从 CPU `Vec<f32>` 回灌 `State`（与 `state_back` 布局对应）。
+    pub fn state_load(&self, state: &State, data: &[f32]) -> R<()> {
+        state.load(
+            &self.rt,
+            data,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
+    /// 前向推理：返回最后一个 token 的 logits [vocab]。
+    /// 便捷封装：复用内部状态（等价于 `forward_with_state(&mut self.state, tokens)`）。
     pub fn forward(&mut self, tokens: &[u32]) -> R<Vec<f32>> {
+        let mut state = self.state.take().unwrap();
+        let out = self.forward_with_state(&mut state, tokens);
+        self.state = Some(state);
+        out
+    }
+
+    /// 前向推理（web-rwkv 风格）：接受外部 `State`，返回最后一个 token 的 logits [vocab]。
+    /// `State` 由调用方持有/保存，`forward_with_state` 在其上累积 RNN 状态，
+    /// 支撑会话持久化与 state tuning（`State::back` → 存盘 → `State::load`）。
+    pub fn forward_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<Vec<f32>> {
         for &token in tokens {
-            self.forward_token(token, false)?;
+            self.forward_token(token, false, state)?;
         }
         let logits = self.rt.download(&self.bufs.logits)?;
         Ok(logits)
@@ -411,8 +502,16 @@ impl GpuModel {
     /// 对标 albatross 的 torch.argmax：只把 4 字节的 token 索引回传，省去每 token 下载
     /// 65536 个 f32 logits（256KB）与 CPU 遍历。
     pub fn forward_argmax(&mut self, tokens: &[u32]) -> R<u32> {
+        let mut state = self.state.take().unwrap();
+        let out = self.forward_argmax_with_state(&mut state, tokens);
+        self.state = Some(state);
+        out
+    }
+
+    /// forward_argmax 的 state 显式版本（供内部封装复用）。
+    fn forward_argmax_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<u32> {
         for &token in tokens {
-            self.forward_token(token, true)?;
+            self.forward_token(token, true, state)?;
         }
         let t = self.rt.download(&self.bufs.token_argmax)?;
         // shader 向 f32 缓冲写入 uint，回读时按位解释为 u32
@@ -426,6 +525,19 @@ impl GpuModel {
     /// 每轮 argmax 的 token 用 record_token 追加到序列缓冲，结束后一次性下载验证。
     /// 返回生成的 n 个 token 索引（按位解释为 u32）。
     pub fn forward_argmax_selfloop(&mut self, seed: u32, n: usize) -> R<Vec<u32>> {
+        let mut state = self.state.take().unwrap();
+        let out = self.forward_argmax_selfloop_with_state(&mut state, seed, n);
+        self.state = Some(state);
+        out
+    }
+
+    /// self-loop 的 state 显式版本（供内部封装复用）。
+    fn forward_argmax_selfloop_with_state(
+        &mut self,
+        state: &mut State,
+        seed: u32,
+        n: usize,
+    ) -> R<Vec<u32>> {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let ns = self.config.head_size;
@@ -445,7 +557,7 @@ impl GpuModel {
 
         for _ in 0..n {
             // RNN 状态跨 token 保持，仅每个 token 重置 v_first
-            self.v_first_set = false;
+            state.v_first_set = false;
 
             // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
             self.rt.gather_row_device_f16(
@@ -456,7 +568,7 @@ impl GpuModel {
             )?;
 
             for i in 0..self.config.n_layer {
-                self.forward_layer(i, c, h, ns)?;
+                self.forward_layer(i, c, h, ns, state)?;
             }
 
             // ln_out + head
@@ -503,14 +615,14 @@ impl GpuModel {
     /// 单 token 前向：把该 token 的 logits 写入 bufs.logits（含 batch 记录与提交）。
     /// `do_argmax` 为真时，在提交前把 logits 的 GPU argmax 索引写入 bufs.token_argmax
     /// （与本次前向同批记录，避免额外一次 submit）。
-    fn forward_token(&mut self, token: u32, do_argmax: bool) -> R<()> {
+    fn forward_token(&mut self, token: u32, do_argmax: bool, state: &mut State) -> R<()> {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let n = self.config.head_size;
         let vocab = self.config.vocab;
 
         // 每个 token 重置 v_first
-        self.v_first_set = false;
+        state.v_first_set = false;
 
         // 开启批处理记录：整层 forward 的所有 kernel + 拷贝一次性记录
         self.rt.begin_batch()?;
@@ -528,7 +640,7 @@ impl GpuModel {
         )?;
 
         for i in 0..self.config.n_layer {
-            self.forward_layer(i, c, h, n)?;
+            self.forward_layer(i, c, h, n, state)?;
             if let Ok(sl) = std::env::var("SNAP_LAYER")
                 && sl.parse::<usize>().unwrap() == i
             {
@@ -572,7 +684,14 @@ impl GpuModel {
     }
 
     /// 单层前向：time mixing + channel mixing
-    fn forward_layer(&mut self, i: usize, c: usize, h: usize, n: usize) -> R<()> {
+    fn forward_layer(
+        &mut self,
+        i: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+        state: &mut State,
+    ) -> R<()> {
         // decode 走 any4 GEMV，无需 fp16 副本；prefill 已逐层释放临时 fp16，decode 不再持有。
         let (wm, am, vm, gm, fh) = (
             self.config.w_mid,
@@ -604,7 +723,7 @@ impl GpuModel {
         // 深度融合：ln1 = layer_norm(x) + 6 次 lerp(xr/xw/xk/xv/xa/xg) + state.tmix_x 写回
         self.rt.norm_lerp6(
             &self.bufs.x,
-            &mut self.state[i].tmix_x,
+            &mut state.layers[i].tmix_x,
             &self.layers[i].ln1_w,
             &self.layers[i].ln1_b,
             &self.layers[i].x_r,
@@ -744,9 +863,9 @@ impl GpuModel {
         )?;
 
         // ===== v_first 跨层逻辑（首层把 v 快照到 v_first）=====
-        if !self.v_first_set {
-            self.rt.copy_device_f16(&self.bufs.v, &mut self.v_first)?;
-            self.v_first_set = true;
+        if !state.v_first_set {
+            self.rt.copy_device_f16(&self.bufs.v, &mut state.v_first)?;
+            state.v_first_set = true;
         }
         // ===== 低秩链第二级融合（w/a/g/v 二级投影 + 激活，1 次 dispatch）=====
         // 首层 v_first==v，v 链 lerp 因子 sigmoid*(v_first-v)=0，v 保持不变（=value 投影）
@@ -763,7 +882,7 @@ impl GpuModel {
             &self.layers[i].a0,
             &self.layers[i].v0,
             &self.scale_w,
-            &self.v_first,
+            &state.v_first,
             &mut self.bufs.w,
             &mut self.bufs.a,
             &mut self.bufs.v,
@@ -784,7 +903,7 @@ impl GpuModel {
         //   y_norm  = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k)*v
         // （省 1 次 dispatch/层，替代 fuse_ka_dplr + norm_sum_rk_rk 两次）
         self.rt.fuse_ka_dplr_norm(
-            &mut self.state[i].tmix_rnn,
+            &mut state.layers[i].tmix_rnn,
             &self.bufs.k,
             &self.layers[i].k_k,
             &self.bufs.a,
@@ -856,7 +975,7 @@ impl GpuModel {
         // xb = ln2 + ffn_x_k * (prev_c - ln2)，一次 dispatch 完成（原 4 跳）。
         self.rt.cmix_norm_lerp(
             &self.bufs.x,
-            &mut self.state[i].cmix_x,
+            &mut state.layers[i].cmix_x,
             &self.layers[i].ln2_w,
             &self.layers[i].ln2_b,
             &self.layers[i].ffn_x_k,
@@ -918,6 +1037,15 @@ impl GpuModel {
     /// 对标 albatross forward_seq：线性投影用批量 GEMM（token 并行），WKV 顺序更新用单次 launch 的
     /// dplr_seq（内部循环 T），最大程度减少逐 token 的 dispatch 开销。
     pub fn forward_seq(&mut self, tokens: &[u32]) -> R<Vec<f32>> {
+        let mut state = self.state.take().unwrap();
+        let out = self.forward_seq_with_state(&mut state, tokens);
+        self.state = Some(state);
+        out
+    }
+
+    /// 前向推理（sequence-parallel，web-rwkv 风格）：接受外部 `State`。
+    /// 把整段 T 个 token 一次贯穿各层，返回最后 token 的 logits [vocab]。
+    pub fn forward_seq_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<Vec<f32>> {
         let t = tokens.len();
         assert!(t >= 1, "forward_seq requires at least 1 token");
         let (c, n, vocab) = (self.config.n_embd, self.config.head_size, self.config.vocab);
@@ -949,7 +1077,7 @@ impl GpuModel {
             if std::env::var("GEMM_DIAG").is_ok() {
                 log::info!("[FS] layer {i} start");
             }
-            self.forward_seq_layer(i, t, c, n, sb)?;
+            self.forward_seq_layer(i, t, c, n, sb, state)?;
             if std::env::var("GEMM_DIAG").is_ok() {
                 log::info!("[FS] layer {i} done");
             }
@@ -1038,14 +1166,16 @@ impl GpuModel {
         }
         self.rt.upload(&sb.x, &x_data)?;
         let mut snaps = Vec::new();
-        // 与 forward_seq 一致：any4 GEMM 零 fp16 副本，逐层独立 batch 以便下载快照。
+        // 取出内部状态，逐层快照（与 forward_seq 一致：any4 GEMM 零 fp16 副本）
+        let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
             self.rt.begin_batch()?;
-            self.forward_seq_layer(i, t, c, n, sb)?;
+            self.forward_seq_layer(i, t, c, n, sb, &mut state)?;
             self.rt.end_batch()?;
             let xd = self.rt.download(&sb.x)?;
             snaps.push(xd[..d].to_vec());
         }
+        self.state = Some(state);
         self.seq_bufs = Some(seq_bufs);
         Ok(snaps)
     }
@@ -1066,26 +1196,40 @@ impl GpuModel {
         let token = tokens[0] as usize;
         let mut x_host = emb_ln[token * c..(token + 1) * c].to_vec();
         self.rt.upload(&self.bufs.x, &x_host)?;
-        // 与 forward 一致：逐层前向并快照
+        // 取出内部状态，与 forward 一致：逐层前向并快照
+        let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
-            self.v_first_set = false;
+            state.v_first_set = false;
             self.rt.begin_batch()?;
-            self.forward_layer(i, c, h, n)?;
+            self.forward_layer(i, c, h, n, &mut state)?;
             self.rt.end_batch()?;
             x_host = self.rt.download(&self.bufs.x)?;
             snaps.push(x_host[..d].to_vec());
         }
+        self.state = Some(state);
         Ok(snaps)
     }
 
     /// 诊断：下载 layer idx 的 tmix_rnn 状态的前 n 个元素（用于对比 seq 与 tok 路径 dplr 状态差异）。
     pub fn download_state_rnn(&mut self, idx: usize, n: usize) -> R<Vec<f32>> {
-        let s = self.rt.download(&self.state[idx].tmix_rnn)?;
+        let s = self
+            .rt
+            .download(&self.state.as_ref().unwrap().layers[idx].tmix_rnn)?;
         Ok(s[..n.min(s.len())].to_vec())
     }
 
     pub fn layers_len(&self) -> usize {
         self.layers.len()
+    }
+
+    /// 词表大小（采样/解码用）。
+    pub fn vocab_len(&self) -> usize {
+        self.config.vocab
+    }
+
+    /// 模型维度 n_embd（C）。
+    pub fn n_embd(&self) -> usize {
+        self.config.n_embd
     }
 
     /// 诊断：逐 token 路径，跑 up_to_layer 层之前的 x_norm（ln1）和 x（输入），下载前 n 个元素。
@@ -1105,12 +1249,14 @@ impl GpuModel {
         let token = tokens[0] as usize;
         let x_host = emb_ln[token * c..(token + 1) * c].to_vec();
         self.rt.upload(&self.bufs.x, &x_host)?;
+        let mut state = self.state.take().unwrap();
         for i in 0..up_to_layer {
-            self.v_first_set = false;
+            state.v_first_set = false;
             self.rt.begin_batch()?;
-            self.forward_layer(i, c, h, n_head)?;
+            self.forward_layer(i, c, h, n_head, &mut state)?;
             self.rt.end_batch()?;
         }
+        self.state = Some(state);
         // 下载输入 x（layer up_to_layer 的输入）
         let x_inp = self.rt.download(&self.bufs.x)?;
         // 计算 ln1
@@ -1156,12 +1302,14 @@ impl GpuModel {
             x_data[ti * c..(ti + 1) * c].copy_from_slice(&emb_ln[tok * c..(tok + 1) * c]);
         }
         self.rt.upload(&sb.x, &x_data)?;
-        // 跑 [0, up_to_layer) 层
+        // 取出内部状态，跑 [0, up_to_layer) 层
+        let mut state = self.state.take().unwrap();
         for i in 0..up_to_layer {
             self.rt.begin_batch()?;
-            self.forward_seq_layer(i, t, c, n_head, sb)?;
+            self.forward_seq_layer(i, t, c, n_head, sb, &mut state)?;
             self.rt.end_batch()?;
         }
+        self.state = Some(state);
         // 下载输入 x（第 0 token：sb.x[0..c]，因为 mk_pad(c) 布局 [M_PAD, C] 第 0 行偏移 = 0 * C = 0）
         let x_all = self.rt.download(&sb.x)?;
         let x_inp = x_all[..c.min(x_all.len())].to_vec();
@@ -1335,6 +1483,7 @@ impl GpuModel {
         c: usize,
         n: usize,
         sb: &mut SeqBuffers,
+        state: &mut State,
     ) -> R<()> {
         let fh = self.config.ffn_hidden;
         let (wwp, aap, vvp, ggp) = (
@@ -1378,7 +1527,7 @@ impl GpuModel {
         // token shift + time-mix：xr/xw/xk/xv/xa/xg（t=0 用旧 state，t>0 用前一 token）
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_r,
             &mut sb.xr,
             c,
@@ -1388,7 +1537,7 @@ impl GpuModel {
         )?;
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_w,
             &mut sb.xw,
             c,
@@ -1398,7 +1547,7 @@ impl GpuModel {
         )?;
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_k,
             &mut sb.xk,
             c,
@@ -1408,7 +1557,7 @@ impl GpuModel {
         )?;
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_v,
             &mut sb.xv,
             c,
@@ -1418,7 +1567,7 @@ impl GpuModel {
         )?;
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_a,
             &mut sb.xa,
             c,
@@ -1428,7 +1577,7 @@ impl GpuModel {
         )?;
         self.rt.seq_shift(
             &sb.ln1,
-            &self.state[i].tmix_x,
+            &state.layers[i].tmix_x,
             &layer.x_g,
             &mut sb.xg,
             c,
@@ -1439,7 +1588,7 @@ impl GpuModel {
 
         // state[i].tmix_x = ln1[T-1]（须在 seq_shift 之后，避免覆盖 t=0 读取的旧 state）
         self.rt
-            .copy_token(&sb.ln1, &mut self.state[i].tmix_x, c, c, t - 1)?;
+            .copy_token(&sb.ln1, &mut state.layers[i].tmix_x, c, c, t - 1)?;
 
         // r/k/v = token 并行 GEMM。
         // 方案A（默认）：any4 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
@@ -1652,7 +1801,7 @@ impl GpuModel {
 
         // DPLR：单次 launch 处理整段 T（内部循环），S 跨 token 传递
         self.rt.dplr_seq(
-            &mut self.state[i].tmix_rnn,
+            &mut state.layers[i].tmix_rnn,
             &sb.r,
             &sb.w,
             &sb.k_mod,
@@ -1783,7 +1932,7 @@ impl GpuModel {
         // xb = token shift（t=0 用旧 cmix_x state，t>0 用前一轮 ln2）
         self.rt.seq_shift(
             &sb.ln2,
-            &self.state[i].cmix_x,
+            &state.layers[i].cmix_x,
             &layer.ffn_x_k,
             &mut sb.xb,
             c,
@@ -1793,7 +1942,7 @@ impl GpuModel {
         )?;
         // state[i].cmix_x = ln2[T-1]（须在 seq_shift 之后）
         self.rt
-            .copy_token(&sb.ln2, &mut self.state[i].cmix_x, c, c, t - 1)?;
+            .copy_token(&sb.ln2, &mut state.layers[i].cmix_x, c, c, t - 1)?;
 
         // FFN = token 并行 GEMM；any4 默认走方案A（dequant→scratch→TC GEMM）
         if std::env::var("GEMM_DIAG").is_ok() {
@@ -2245,6 +2394,221 @@ impl GpuState {
         rt.upload(&self.tmix_x, &vec![0.0; c])?;
         rt.upload(&self.tmix_rnn, &vec![0.0; h * n * n])?;
         rt.upload(&self.cmix_x, &vec![0.0; c])?;
+        Ok(())
+    }
+}
+
+/// web-rwkv 风格的模型加载器（对标 `web-rwkv::ModelBuilder`）。
+/// 封装「创建 Runtime + 从 safetensors 加载模型 + 绑定 State」，
+/// 供服务端（ai00-server）以最小配置加载模型并得到 `Bundle`。
+#[derive(Debug, Clone)]
+pub struct ModelBuilder {
+    path: String,
+}
+
+impl ModelBuilder {
+    /// 指定模型文件路径（safetensors `.st`，按文件名自动路由 fp16/int8/any4）。
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// 构建模型并绑定一个零初始化的 `State`，得到 `Bundle`。
+    pub fn build(self) -> R<Bundle> {
+        let rt = Runtime::new()?;
+        let model = GpuModel::from_safetensors(rt, &self.path)?;
+        let state = model.create_state()?;
+        Ok(Bundle { model, state })
+    }
+}
+
+/// web-rwkv 风格的模型+状态聚合（对标 `web-rwkv::Bundle`）。
+/// 服务端持有单个 Bundle 即可完成一次会话的完整推理：`infer` 推进文本、
+/// `state_back`/`state_load` 存取会话态、`info` 读取模型规模。
+pub struct Bundle {
+    /// 模型（权重已上传 GPU）
+    pub model: GpuModel,
+    /// 会话推理状态（可 `state_back`/`state_load` 持久化）
+    pub state: State,
+}
+
+impl Bundle {
+    /// 用给定模型创建一个 Bundle（内部为模型新建零初始态）。
+    pub fn new(model: GpuModel) -> R<Self> {
+        let state = model.create_state()?;
+        Ok(Self { model, state })
+    }
+
+    /// 公开展示模型元信息。
+    pub fn info(&self) -> ModelInfo {
+        self.model.info()
+    }
+
+    /// 前向推理：推进整段 tokens，返回最后 token 的 logits [vocab]。
+    /// 在内部 `state` 上累积 RNN 状态（等价 `model.forward_with_state(&mut state, tokens)`）。
+    pub fn infer_tokens(&mut self, tokens: &[u32]) -> R<Vec<f32>> {
+        self.model.forward_with_state(&mut self.state, tokens)
+    }
+
+    /// 前向推理（sequence-parallel）：把整段 tokens 一次贯穿各层。
+    pub fn infer_seq(&mut self, tokens: &[u32]) -> R<Vec<f32>> {
+        self.model.forward_seq_with_state(&mut self.state, tokens)
+    }
+
+    /// 把当前会话态整态下载到 CPU（存盘/state tuning 用）。
+    pub fn state_back(&self) -> R<Vec<f32>> {
+        self.model.state_back(&self.state)
+    }
+
+    /// 从 CPU 数据回灌会话态（与 `state_back` 布局对应）。
+    pub fn state_load(&self, data: &[f32]) -> R<()> {
+        self.model.state_load(&self.state, data)
+    }
+
+    /// 清零会话态（回到首次推理前）。
+    pub fn reset(&mut self) -> R<()> {
+        self.model.reset_state()
+    }
+
+    /// 分块增量推理（对标 web-rwkv 的 chunked `infer`）。
+    /// 把长 token 序列按 `chunk_size` 切成块，逐块推进内部 `state`，返回 logits。
+    /// 长 prompt 不再一次性 prefill（避免单块超大缓冲/显存峰值），块间 RNN 状态自然累积。
+    /// 注意：块大小变化会重建 seq 缓冲（clear_cache），服务端应尽量用固定块大小。
+    ///
+    /// 输出模式：
+    /// - `RnnOption::Last`：返回最后一个 token 的 logits [vocab]（自回归生成用）
+    /// - `RnnOption::Full`：返回每个 token 位置的 logits，拼接为 `Vec<f32>`（长度 num_tok × vocab）
+    pub fn infer(&mut self, input: &RnnInput) -> R<Vec<f32>> {
+        let cs = input.chunk_size.max(1);
+        let vocab = self.info().num_vocab;
+        match input.option {
+            RnnOption::Last => {
+                let mut logits = vec![0.0f32; vocab];
+                for block in input.tokens.chunks(cs) {
+                    logits = self.model.forward_seq_with_state(&mut self.state, block)?;
+                }
+                Ok(logits)
+            }
+            // Full：每个 token 单独前向，收集每位置 logits（prompt 一次性打分/state tuning 用）
+            RnnOption::Full => {
+                let mut out = Vec::with_capacity(input.tokens.len() * vocab);
+                for &tok in &input.tokens {
+                    let lg = self.model.forward_seq_with_state(&mut self.state, &[tok])?;
+                    out.extend_from_slice(&lg);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// 便捷封装：Last 输出模式的 chunked 推理（等价 `infer(&RnnInput{ tokens, chunk_size, ..})`）。
+    pub fn infer_chunked(&mut self, tokens: &[u32], chunk_size: usize) -> R<Vec<f32>> {
+        let input = RnnInput {
+            tokens: tokens.to_vec(),
+            chunk_size,
+            option: RnnOption::Last,
+        };
+        self.infer(&input)
+    }
+}
+
+/// web-rwkv 风格的推理输出模式（对标 `web-rwkv::RnnOption`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RnnOption {
+    /// 仅输出最后一个 token 的预测（自回归生成用）
+    #[default]
+    Last,
+    /// 输出所有 token 的预测（分别返回每个位置的 logits）
+    Full,
+}
+
+/// web-rwkv 风格的推理输入（对标 `web-rwkv::RnnInput`）。
+/// 携带待推理的 token 序列、分块大小与输出模式；`Bundle::infer` 据此做 chunked 增量推理。
+#[derive(Debug, Clone)]
+pub struct RnnInput {
+    /// 待前向的 token 序列
+    pub tokens: Vec<u32>,
+    /// 分块大小（长 prompt 分块，避免单次超大 prefill）
+    pub chunk_size: usize,
+    /// 输出模式（Last=只返回最后 token 的 logits；Full=返回全部每位置 logits）
+    pub option: RnnOption,
+}
+
+impl RnnInput {
+    /// 构造推理输入。`chunk_size` 默认 0（表示不强制分块，交给实现选择）。
+    pub fn new(tokens: Vec<u32>, chunk_size: usize) -> Self {
+        Self {
+            tokens,
+            chunk_size,
+            option: RnnOption::Last,
+        }
+    }
+}
+
+/// 可序列化的推理状态（对标 web-rwkv 的 `State`）。
+///
+/// 持有每层 RNN 状态（tmix_x / tmix_rnn / cmix_x）与跨层共享的 v_first，
+/// 支持 `reset`（清零）、`back`（下载到 CPU `Vec<f32>`）与 `load`（从 CPU 回灌）。
+/// 是会话保存与 state tuning 的基础：`forward` 前进文本 → `back()` 取态 → 持久化 → `load()` 回灌。
+pub struct State {
+    layers: Vec<GpuState>,
+    v_first: GpuTensor16,
+    v_first_set: bool,
+}
+
+impl State {
+    /// 创建零初始化的状态。
+    pub fn new(rt: &Runtime, c: usize, h: usize, n: usize, n_layer: usize) -> R<Self> {
+        let mut layers = Vec::with_capacity(n_layer);
+        for _ in 0..n_layer {
+            layers.push(GpuState::new(rt, c, h, n)?);
+        }
+        let v_first = rt.create_tensor_f16(c)?;
+        rt.upload_f16(&v_first, &vec![0.0; c])?;
+        Ok(Self {
+            layers,
+            v_first,
+            v_first_set: false,
+        })
+    }
+
+    /// 把整态下载到 CPU 为连续 `Vec<f32>`（布局见 `load`）。
+    pub fn back(&self, rt: &Runtime, c: usize, h: usize, n: usize) -> R<Vec<f32>> {
+        let mut out = Vec::with_capacity(self.layers.len() * (c + h * n * n + c) + c);
+        for s in &self.layers {
+            out.extend_from_slice(&rt.download(&s.tmix_x)?);
+            out.extend_from_slice(&rt.download(&s.tmix_rnn)?);
+            out.extend_from_slice(&rt.download(&s.cmix_x)?);
+        }
+        out.extend_from_slice(&rt.download_f16(&self.v_first)?);
+        Ok(out)
+    }
+
+    /// 从 CPU 数据回灌整态（与 `back` 布局一一对应）。
+    pub fn load(&self, rt: &Runtime, data: &[f32], c: usize, h: usize, n: usize) -> R<()> {
+        let per = c + h * n * n + c;
+        let expect = self.layers.len() * per + c;
+        if data.len() != expect {
+            return Err(format!("State::load 长度不符: 得 {} 期望 {expect}", data.len()).into());
+        }
+        let mut pos = 0usize;
+        for s in &self.layers {
+            rt.upload(&s.tmix_x, &data[pos..pos + c])?;
+            pos += c;
+            rt.upload(&s.tmix_rnn, &data[pos..pos + h * n * n])?;
+            pos += h * n * n;
+            rt.upload(&s.cmix_x, &data[pos..pos + c])?;
+            pos += c;
+        }
+        rt.upload_f16(&self.v_first, &data[pos..pos + c])?;
+        Ok(())
+    }
+
+    /// 清零全部状态（含 v_first 缓冲）。
+    pub fn reset(&self, rt: &Runtime, c: usize, h: usize, n: usize) -> R<()> {
+        for s in &self.layers {
+            s.reset(rt, c, h, n)?;
+        }
+        rt.upload_f16(&self.v_first, &vec![0.0; c])?;
         Ok(())
     }
 }

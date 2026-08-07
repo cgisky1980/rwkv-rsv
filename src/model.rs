@@ -898,8 +898,8 @@ mod any4_tests {
         assert_eq!(w[1], 2.0, "k1 (次低 nibble) 应解出 2");
         assert_eq!(w[2], 1.0, "k2 应解出 1");
         assert_eq!(w[3], 5.0, "k3 应解出 5");
-        for i in 4..k {
-            assert_eq!(w[i], 0.0, "k{i} 应解出 lut[0]=0");
+        for (i, &wi) in w.iter().enumerate().skip(4) {
+            assert_eq!(wi, 0.0, "k{i} 应解出 lut[0]=0");
         }
     }
 
@@ -1040,9 +1040,9 @@ mod any4_tests {
         let mut sorted = row.to_vec();
         sorted.sort_by(f32::total_cmp);
         let mut c = [0.0f32; NC];
-        for j in 0..NC {
+        for (j, cj) in c.iter_mut().enumerate() {
             let pos = ((j as f32 + 0.5) / NC as f32 * sorted.len() as f32) as usize;
-            c[j] = sorted[pos.min(sorted.len() - 1)];
+            *cj = sorted[pos.min(sorted.len() - 1)];
         }
         c
     }
@@ -1092,8 +1092,8 @@ mod any4_tests {
                 for &x in row {
                     let mut bi = 0;
                     let mut bd = (x - c[0]).abs();
-                    for j in 1..NC {
-                        let d = (x - c[j]).abs();
+                    for (j, cj) in c.iter().enumerate().skip(1) {
+                        let d = (x - cj).abs();
                         if d < bd {
                             bd = d;
                             bi = j;
@@ -1123,8 +1123,8 @@ mod any4_tests {
             for (i, &x) in row.iter().enumerate() {
                 let mut bi = 0;
                 let mut bd = (x - c[0]).abs();
-                for j in 1..NC {
-                    let d = (x - c[j]).abs();
+                for (j, cj) in c.iter().enumerate().skip(1) {
+                    let d = (x - cj).abs();
                     if d < bd {
                         bd = d;
                         bi = j;

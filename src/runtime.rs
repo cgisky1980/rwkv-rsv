@@ -1574,6 +1574,7 @@ impl Runtime {
 
     /// 深度融合（int8 版）：gemv_int8 r/k/v（三个 C×C 投影，int8 量化权重）
     /// + lowrank_stage1（v1/w1/a1/g1 四个 mid 投影，fp32 权重）→ 1 次 dispatch。
+    ///
     /// 与 gemv_any4_rkv_stage1 同构，差异：r/k/v 用 int8 权重（无 LUT），带宽 fp16 的 ~50%。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_int8_rkv_stage1(
@@ -3222,8 +3223,8 @@ mod tests {
 
         let got = rt.download(&c).unwrap();
         let mut max_diff = 0.0f32;
-        for idx in 0..m * n {
-            max_diff = max_diff.max((got[idx] - k as f32).abs());
+        for &g in got.iter() {
+            max_diff = max_diff.max((g - k as f32).abs());
         }
         log::info!("gemm ones K=32 max_abs_diff: {max_diff:.6}");
         for r in 0..4 {
@@ -3473,8 +3474,8 @@ mod tests {
         rt.end_batch().unwrap();
         let got = rt.download(&c).unwrap();
         let mut max_diff = 0.0f32;
-        for idx in 0..m * n {
-            max_diff = max_diff.max((got[idx] - k as f32).abs());
+        for &g in got.iter() {
+            max_diff = max_diff.max((g - k as f32).abs());
         }
         log::info!("gemm (256x2560x2560) ones max_abs_diff: {max_diff:.6}");
         assert!(max_diff < 1e-2, "gemm mismatch, max_abs_diff={max_diff}");
@@ -3497,8 +3498,8 @@ mod tests {
         rt.end_batch().unwrap();
         let got = rt.download(&c).unwrap();
         let mut max_diff = 0.0f32;
-        for idx in 0..m * n {
-            max_diff = max_diff.max((got[idx] - k as f32).abs());
+        for &g in got.iter() {
+            max_diff = max_diff.max((g - k as f32).abs());
         }
         log::info!("gemm (256x2560x10240) ones max_abs_diff: {max_diff:.6}");
         assert!(max_diff < 1e-2, "gemm mismatch, max_abs_diff={max_diff}");
@@ -3523,8 +3524,8 @@ mod tests {
         // relu²(K) = K²
         let expect = (k as f32) * (k as f32);
         let mut max_diff = 0.0f32;
-        for idx in 0..m * n {
-            max_diff = max_diff.max((got[idx] - expect).abs());
+        for &g in got.iter() {
+            max_diff = max_diff.max((g - expect).abs());
         }
         log::info!("gemm_relu2 (256x10240x2560) ones max_abs_diff: {max_diff:.6}");
         assert!(
@@ -3802,7 +3803,7 @@ mod tests {
         let a16 = rt.create_tensor_f16(m * k).unwrap();
         let b16 = rt.create_tensor_f16(n * k).unwrap();
         let mut c = rt.create_tensor(m * n).unwrap();
-        let mut x = rt.create_tensor(m * n).unwrap();
+        let x = rt.create_tensor(m * n).unwrap();
         let mut a = vec![0.0f32; m * k];
         let mut b = vec![0.0f32; n * k];
         for v in a.iter_mut() {
