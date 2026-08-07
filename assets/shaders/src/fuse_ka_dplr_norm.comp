@@ -1,0 +1,220 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合 fuse_ka + dplr + group_norm + sum_rk_rk → 1 次 dispatch（单 token 路径）。
+// 每个 workgroup 处理一个 (batch, head)。列并行：每行由 SPLIT 个线程分担 N 列，
+// BLOCK_SIZE = N * SPLIT，每 head workgroup 从 2 warps（64 线程）增至 SPLIT*2 warps，
+// 提升延迟隐藏与占用率（此前仅 40 workgroup × 2 warps，占用率极低）。
+//
+// 线程布局：t = row * SPLIT + ct（row=行，ct=列分片）。每线程处理列 k ≡ ct (mod SPLIT)。
+//   Phase 0: L2 范数 inv_norm = 1/sqrt(sum_j (k_j*k_k_j)^2)（全线程归约）
+//   Phase 1: 各线程为自身列计算 k_mod/kk_l2/b/w/r 入 shared（按列索引）
+//   Phase 2: sa[row] = sum_j S[row,j] * kk_l2[j]（列分片求部分和，再按行归约）
+//   Phase 3: S[row,j] = S[row,j]*w[j] + sa[row]*b[j] + v[row]*k_mod[j]；y[row] = sum_j S[row,j]*r[j]
+//   Phase 4: group-norm(y) → mean / inv_std（仅 ct==0，按行归约）
+//   Phase 5: s = sum_j r[j]*k_mod[j]*r_k[j]（仅 ct==0）
+//   Phase 6: y_norm[row] = (y[row]-mean)*inv_std*gamma[row]+beta[row] + s*v[row]
+// 相比 fuse_ka_dplr + norm_sum_rk_rk 两次 dispatch，省 1 次/层。
+// 注意：SPLIT 与 BLOCK_SIZE 必须匹配（BLOCK_SIZE = N*SPLIT，本模型 N=64, SPLIT=2）。
+
+layout(constant_id = 0) const uint H = 1;
+layout(constant_id = 1) const uint N = 64;
+layout(constant_id = 2) const float EPSILON = 1e-12;   // L2 范数防除零
+layout(constant_id = 3) const float GN_EPS = 1e-6;     // group-norm 方差防除零
+
+const uint SPLIT          = 2;   // 每行列分片数（SPLIT 个线程/行）
+const uint BLOCK_SIZE     = 128; // = N * SPLIT（N 必须为 64）
+
+shared float sh_a[64]; // kk_l2（按列）
+shared float sh_b[64]; // b_vec（按列）
+shared float sh_k[64]; // k_mod（按列）
+shared float sh_w[64]; // w（按列）
+shared float sh_r[64]; // r（按列）
+shared float sa[64];   // 每行 sa
+shared float yv[64];   // 每行 y
+shared float sq[128];  // L2 归约缓冲（按线程）
+shared float sqY[64];  // y 归约缓冲（按行，仅 ct==0）
+shared float sqY2[64]; // y_sq 归约缓冲（按行）
+shared float ssRed[64];// s 归约缓冲（按行）
+shared float mean;
+shared float inv_std;
+shared float s_acc;
+
+layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;   // k
+layout(buffer_reference) buffer BufKK { float data[]; }  buf_kk;  // k_k
+layout(buffer_reference) buffer BufA  { float16_t data[]; }  buf_a;   // a (fp16)
+layout(buffer_reference) buffer BufKA { float data[]; }  buf_ka;  // k_a
+layout(buffer_reference) buffer BufR  { float data[]; }  buf_r;   // r
+layout(buffer_reference) buffer BufV  { float16_t data[]; }  buf_v;   // v (fp16)
+layout(buffer_reference) buffer BufW  { float16_t data[]; }  buf_w;   // w (fp16)
+layout(buffer_reference) buffer BufKM { float data[]; }  buf_km;  // k_mod (out)
+layout(buffer_reference) buffer BufY  { float data[]; }  buf_y;   // y (out)
+layout(buffer_reference) buffer BufG  { float data[]; }  buf_g;   // gamma (ln_x_w)
+layout(buffer_reference) buffer BufB  { float data[]; }  buf_b;   // beta (ln_x_b)
+layout(buffer_reference) buffer BufRK { float data[]; }  buf_rk;  // r_k (shared [H,N])
+layout(buffer_reference) buffer BufYO { float data[]; }  buf_yo;  // y_norm (out)
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufS  buf_s;
+    BufK  buf_k;
+    BufKK buf_kk;
+    BufA  buf_a;
+    BufKA buf_ka;
+    BufR  buf_r;
+    BufV  buf_v;
+    BufW  buf_w;
+    BufKM buf_km;
+    BufY  buf_y;
+    BufG  buf_g;
+    BufB  buf_b;
+    BufRK buf_rk;
+    BufYO buf_yo;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint head  = gl_WorkGroupID.x;
+    const uint t     = gl_LocalInvocationID.x;
+    const uint row   = t / SPLIT;   // 行索引
+    const uint ct    = t % SPLIT;   // 列分片
+    if (row >= N) {
+        return;
+    }
+
+    BufS  buf_s  = params.buf_s;
+    BufK  buf_k  = params.buf_k;
+    BufKK buf_kk = params.buf_kk;
+    BufA  buf_a  = params.buf_a;
+    BufKA buf_ka = params.buf_ka;
+    BufR  buf_r  = params.buf_r;
+    BufV  buf_v  = params.buf_v;
+    BufW  buf_w  = params.buf_w;
+    BufKM buf_km = params.buf_km;
+    BufY  buf_y  = params.buf_y;
+    BufG  buf_g  = params.buf_g;
+    BufB  buf_b  = params.buf_b;
+    BufRK buf_rk = params.buf_rk;
+    BufYO buf_yo = params.buf_yo;
+
+    const uint v_base = batch * (H * N) + head * N;
+    const uint w_base = head * N;
+    const uint s_base = batch * (H * N * N) + head * (N * N);
+    const uint s_row_base = s_base + row * N;
+
+    // Phase 0: L2 范数（每线程算自身行的 kk，冗余跨 ct，仅用于归约；inv_norm 全 head 共享）
+    float k_i  = buf_k.data[v_base + row];
+    float kk_i = k_i * buf_kk.data[w_base + row];
+    float a_i  = float(buf_a.data[v_base + row]);
+    sq[t] = kk_i * kk_i;
+    barrier();
+    for (uint step = BLOCK_SIZE >> 1; step > 0; step >>= 1) {
+        if (t < step) {
+            sq[t] += sq[t + step];
+        }
+        barrier();
+    }
+    float inv_norm = 1.0 / max(sqrt(sq[0]), EPSILON);
+
+    // Phase 1: 各线程为自身列填充按列 shared 数组（k ≡ ct (mod SPLIT)）
+    [[unroll]]
+    for (uint k = ct; k < N; k += SPLIT) {
+        float kc  = buf_k.data[v_base + k];
+        float kkc = kc * buf_kk.data[w_base + k];
+        float ac  = float(buf_a.data[v_base + k]);
+        float kl2 = kkc * inv_norm;
+        sh_a[k] = kl2;
+        sh_b[k] = -kl2 * ac;
+        sh_k[k] = kc * (1.0 + buf_ka.data[w_base + k] * (ac - 1.0));
+        sh_w[k] = float(buf_w.data[v_base + k]);
+        sh_r[k] = buf_r.data[v_base + k];
+    }
+    barrier();
+    // 写 k_mod 输出（每行一次，ct==0；sh_k[row] 已在 barrier 后对所有列有效）
+    if (ct == 0) {
+        buf_km.data[v_base + row] = sh_k[row];
+    }
+    barrier();
+
+    // Phase 2: sa[row] = sum_j S[row,j] * sh_a[j]（列分片部分和 → 按行归约）
+    float sa_part = 0.0;
+    [[unroll]]
+    for (uint k = ct; k < N; k += SPLIT) {
+        sa_part = fma(buf_s.data[s_row_base + k], sh_a[k], sa_part);
+    }
+    sq[t] = sa_part;
+    barrier();
+    if (ct == 0) {
+        float acc = 0.0;
+        [[unroll]]
+        for (uint c = 0; c < SPLIT; ++c) {
+            acc += sq[row * SPLIT + c];
+        }
+        sa[row] = acc;
+    }
+    barrier();
+    float sa_val = sa[row];
+    float v_i    = float(buf_v.data[v_base + row]);
+
+    // Phase 3: 更新 S[row, 自身列]，并求 y[row] 的部分和
+    float y_part = 0.0;
+    [[unroll]]
+    for (uint k = ct; k < N; k += SPLIT) {
+        float s_ij   = buf_s.data[s_row_base + k];
+        float new_s  = s_ij * sh_w[k] + sa_val * sh_b[k] + v_i * sh_k[k];
+        buf_s.data[s_row_base + k] = new_s;
+        y_part = fma(new_s, sh_r[k], y_part);
+    }
+    sq[t] = y_part;
+    barrier();
+    if (ct == 0) {
+        float acc = 0.0;
+        [[unroll]]
+        for (uint c = 0; c < SPLIT; ++c) {
+            acc += sq[row * SPLIT + c];
+        }
+        yv[row] = acc;
+    }
+    barrier();
+
+    // Phase 4 + 5: group-norm(y) 与 s 归约（仅 ct==0，每行一个线程，按行索引）
+    if (ct == 0) {
+        float y_i = yv[row];
+        sqY[row]   = y_i;
+        sqY2[row]  = y_i * y_i;
+        ssRed[row] = sh_r[row] * sh_k[row] * buf_rk.data[w_base + row];
+    }
+    barrier();
+    for (uint step = N >> 1; step > 0; step >>= 1) {
+        if (ct == 0 && row < step) {
+            sqY[row]   += sqY[row + step];
+            sqY2[row]  += sqY2[row + step];
+            ssRed[row] += ssRed[row + step];
+        }
+        barrier();
+    }
+    if (ct == 0 && row == 0) {
+        float ssum   = sqY[0];
+        float ssq    = sqY2[0];
+        mean     = ssum / float(N);
+        float variance = ssq / float(N) - mean * mean;
+        inv_std  = inversesqrt(variance + GN_EPS);
+        s_acc    = ssRed[0];
+    }
+    barrier();
+
+    // Phase 6: y_norm[row] = (y[row]-mean)*inv_std*gamma[row]+beta[row] + s*v[row]
+    if (ct == 0) {
+        float normalized = (yv[row] - mean) * inv_std * buf_g.data[w_base + row] + buf_b.data[w_base + row];
+        buf_yo.data[v_base + row] = normalized + s_acc * v_i;
+    }
+}
