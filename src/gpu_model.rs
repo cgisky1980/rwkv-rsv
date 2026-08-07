@@ -338,10 +338,13 @@ impl GpuModel {
         let a_mid = mid_of(&st.tensor("blocks.0.att.a1")?);
         let v_mid = mid_of(&st.tensor("blocks.0.att.v1")?);
         let g_mid = mid_of(&st.tensor("blocks.0.att.g1")?);
-        // 原 fp16 键可能被 any4 量化键替换，此时从 any4_idx [M, K/2] 推导 M
+        // 原 fp16 键可能被 any4/int8 量化键替换，此时从量化张量推导 M（any4_idx [M,K/2] / int8_idx [M,K]）
         let ffn_hidden = match st.tensor("blocks.0.ffn.key.weight") {
             Ok(t) => t.shape()[0],
-            Err(_) => st.tensor("blocks.0.ffn.key.weight.any4_idx")?.shape()[0],
+            Err(_) => st
+                .tensor("blocks.0.ffn.key.weight.any4_idx")
+                .or_else(|_| st.tensor("blocks.0.ffn.key.weight.int8_idx"))?
+                .shape()[0],
         };
 
         let config = ModelConfig {
@@ -439,6 +442,17 @@ impl GpuModel {
         Ok(())
     }
 
+    /// 重置一个**外部** `State`（例如 `Bundle` 持有的会话状态）为零。
+    /// 与 `reset_state`（重置模型内部 `Option<State>`）不同，此方法作用于调用方传入的状态，
+    /// 供 `Bundle::reset` 使用——否则 reset 会重置到模型内部态而遗漏会话态，导致跨次状态残留。
+    pub fn reset_state_of(&self, state: &State) -> R<()> {
+        let c = self.config.n_embd;
+        let h = self.config.n_head;
+        let n = self.config.head_size;
+        state.reset(&self.rt, c, h, n)?;
+        Ok(())
+    }
+
     /// 创建零初始化的推理状态（web-rwkv 风格，供 `forward_with_state` 使用）。
     /// `State` 是会话持久化与 state tuning 的第一等公民：`state_back` 取态 → 存盘 →
     /// `state_load` 回灌。
@@ -492,7 +506,7 @@ impl GpuModel {
     /// 支撑会话持久化与 state tuning（`State::back` → 存盘 → `State::load`）。
     pub fn forward_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<Vec<f32>> {
         for &token in tokens {
-            self.forward_token(token, false, state)?;
+            self.forward_token(token, false, None, &[], state)?;
         }
         let logits = self.rt.download(&self.bufs.logits)?;
         Ok(logits)
@@ -511,11 +525,140 @@ impl GpuModel {
     /// forward_argmax 的 state 显式版本（供内部封装复用）。
     fn forward_argmax_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<u32> {
         for &token in tokens {
-            self.forward_token(token, true, state)?;
+            self.forward_token(token, true, None, &[], state)?;
         }
         let t = self.rt.download(&self.bufs.token_argmax)?;
         // shader 向 f32 缓冲写入 uint，回读时按位解释为 u32
         Ok(t[0].to_bits())
+    }
+
+    /// 前向推理 + GPU 采样：推进整段 tokens，返回最后一个 token 的采样索引（全 GPU）。
+    /// 在 logits 上做 penalty/temperature/top-k/top-p 过滤后按概率采样，只回传 4 字节索引。
+    /// 采样参数由 `SamplerParams` 携带；`seed` 由调用方控制（每 token 生成应递增）。
+    /// `history` 为已生成 token（惩罚计数用，空则跳过惩罚）。
+    fn forward_sample_with_state(
+        &mut self,
+        state: &mut State,
+        tokens: &[u32],
+        sp: &SamplerParams,
+        history: &[u32],
+    ) -> R<u32> {
+        for &token in tokens {
+            self.forward_token(token, false, Some(sp), history, state)?;
+        }
+        let t = self.rt.download(&self.bufs.token_argmax)?;
+        Ok(t[0].to_bits())
+    }
+
+    /// GPU self-loop 批量采样生成：在**单次 submit** 内连续采样 n 个 token。
+    /// 与 argmax 版 self-loop 同构，但每轮用带参数（temperature/top-k/top-p）的采样替换
+    /// argmax；采样临时缓冲（temp/mask/sampler）预建一次存活到 batch 提交后，每轮
+    /// 用 `store_sampler_host` 更新 seed 后复用。返回生成的 n 个 token 索引。
+    fn forward_sample_selfloop_with_state(
+        &mut self,
+        state: &mut State,
+        seed: u32,
+        n: usize,
+        sp: &SamplerParams,
+    ) -> R<Vec<u32>> {
+        let c = self.config.n_embd;
+        let h = self.config.n_head;
+        let ns = self.config.head_size;
+        let vocab = self.config.vocab;
+
+        // 采样临时缓冲（存活到 end_batch 后）：temp/mask 为 vocab 长工作区，sampler 存参数，
+        // counter 为 vocab 长 u32 直方图（惩罚计数用）
+        let temp = self.rt.create_tensor(vocab)?;
+        let mask = self.rt.create_tensor(vocab)?;
+        let counter = self.rt.create_tensor_u32(vocab)?;
+        let sampler = self.rt.create_tensor(8)?;
+        // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
+        let token_seq = self.rt.create_tensor(n)?;
+        let mut seq_cnt = self.rt.create_tensor(1)?;
+        self.rt.upload(&token_seq, &vec![0.0; n])?;
+        self.rt.upload(&seq_cnt, &[0.0; 1])?;
+
+        // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
+        self.rt.begin_batch()?;
+
+        // 首个 token 由 CPU 写入 host-visible 缓冲
+        self.rt.store_token_host(&self.bufs.current_token, seed)?;
+
+        for round in 0..n {
+            // RNN 状态跨 token 保持，仅每个 token 重置 v_first
+            state.v_first_set = false;
+
+            // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
+            self.rt.gather_row_device_f16(
+                &self.emb_ln,
+                &mut self.bufs.x,
+                &self.bufs.current_token,
+                c,
+            )?;
+
+            for i in 0..self.config.n_layer {
+                self.forward_layer(i, c, h, ns, state)?;
+            }
+
+            // ln_out + head
+            self.rt.norm(
+                &self.bufs.x,
+                &self.ln_out_w,
+                &self.ln_out_b,
+                &mut self.bufs.x_norm,
+                c,
+                1,
+                LN_EPS,
+                1,
+            )?;
+            self.rt.gemv_f16(
+                &self.head_w16,
+                &self.bufs.x_norm,
+                &mut self.bufs.logits,
+                vocab,
+                c,
+                1,
+            )?;
+
+            // 每轮更新 seed 与惩罚历史长度（hist_len = 已生成 round 个 token），GPU 采样直接写回
+            // host-visible current_token（下一轮 gather 自动跟随）
+            self.rt.store_sampler_host(
+                &sampler,
+                sp.temperature,
+                sp.top_k,
+                sp.top_p,
+                seed + round as u32,
+                sp.repetition_penalty,
+                sp.frequency_penalty,
+                sp.presence_penalty,
+                round as u32,
+            )?;
+            let tok_host = self
+                .bufs
+                .current_token
+                .host
+                .as_ref()
+                .ok_or("forward_sample_selfloop: current_token host dropped")?;
+            self.rt.sample_into_host_seeded(
+                &self.bufs.logits,
+                tok_host,
+                vocab,
+                &temp,
+                &mask,
+                &counter,
+                &sampler,
+                &token_seq, // 前 round 个已生成 token 作为惩罚历史
+            )?;
+            // 把本轮 token 追加到序列缓冲（供一次性下载验证）
+            self.rt.record_token(tok_host, &token_seq, &mut seq_cnt)?;
+        }
+
+        // 一次性提交整段 self-loop
+        self.rt.end_batch()?;
+
+        // 下载序列缓冲，按位解释为 u32
+        let t = self.rt.download(&token_seq)?;
+        Ok(t[..n].iter().map(|x| x.to_bits()).collect())
     }
 
     /// GPU self-loop 批量生成：在**单次 submit** 内连续采样 n 个 token。
@@ -613,9 +756,18 @@ impl GpuModel {
     }
 
     /// 单 token 前向：把该 token 的 logits 写入 bufs.logits（含 batch 记录与提交）。
-    /// `do_argmax` 为真时，在提交前把 logits 的 GPU argmax 索引写入 bufs.token_argmax
-    /// （与本次前向同批记录，避免额外一次 submit）。
-    fn forward_token(&mut self, token: u32, do_argmax: bool, state: &mut State) -> R<()> {
+    /// `do_argmax` 为真时，在提交前把 logits 的 GPU argmax 索引写入 bufs.token_argmax；
+    /// `sampler` 为 Some 时用带参数（temperature/top-k/top-p/penalty）的 GPU 采样写回同一缓冲；
+    /// `history` 为已生成 token（惩罚计数用，采样时透传，非采样调用传空）。
+    /// （均与本次前向同批记录，避免额外一次 submit；二选一，两者都提供时 sampler 优先。）
+    fn forward_token(
+        &mut self,
+        token: u32,
+        do_argmax: bool,
+        sampler: Option<&SamplerParams>,
+        history: &[u32],
+        state: &mut State,
+    ) -> R<()> {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let n = self.config.head_size;
@@ -672,8 +824,22 @@ impl GpuModel {
             c,
             1,
         )?;
-        // 需要采样时，GPU 端 argmax 归约（与本次前向同批）
-        if do_argmax {
+        // 需要采样时，GPU 端 argmax / 带参数采样归约（与本次前向同批）
+        if let Some(sp) = sampler {
+            self.rt.sample(
+                &self.bufs.logits,
+                &mut self.bufs.token_argmax,
+                vocab,
+                sp.temperature,
+                sp.top_k,
+                sp.top_p,
+                sp.seed,
+                sp.repetition_penalty,
+                sp.frequency_penalty,
+                sp.presence_penalty,
+                history,
+            )?;
+        } else if do_argmax {
             self.rt
                 .argmax(&self.bufs.logits, &mut self.bufs.token_argmax, vocab)?;
         }
@@ -2466,7 +2632,10 @@ impl Bundle {
 
     /// 清零会话态（回到首次推理前）。
     pub fn reset(&mut self) -> R<()> {
-        self.model.reset_state()
+        // 注意：必须重置 Bundle 自身的 `self.state`（infer_tokens/infer 实际使用的会话态），
+        // 而非模型内部态。此前错误地调用 `model.reset_state()`，只重置了模型内部 `Option<State>`，
+        // 导致会话态残留、同样的输入多次前向结果不一致（伪“GPU 非确定性”）。
+        self.model.reset_state_of(&self.state)
     }
 
     /// 分块增量推理（对标 web-rwkv 的 chunked `infer`）。
@@ -2509,6 +2678,43 @@ impl Bundle {
         };
         self.infer(&input)
     }
+
+    /// GPU 采样：推进整段 tokens，返回最后一个 token 的 argmax 索引（全 GPU，不下载 logits）。
+    /// 对标 albatross 的 torch.argmax：只回传 4 字节索引，省去每 token 下载 65536 个 f32。
+    pub fn infer_argmax(&mut self, tokens: &[u32]) -> R<u32> {
+        self.model
+            .forward_argmax_with_state(&mut self.state, tokens)
+    }
+
+    /// GPU self-loop 批量生成：在**单次 submit** 内连续采样 n 个 token。
+    /// 首个 token 由 CPU 写入（seed），随后每轮 argmax 结果直接写回同一 host 缓冲，
+    /// 全程无 CPU 回读/回传 token、无每 token 一次 submit+wait，消除 CPU⟷GPU 交换开销。
+    /// 返回生成的 n 个 token 索引。
+    pub fn infer_argmax_selfloop(&mut self, seed: u32, n: usize) -> R<Vec<u32>> {
+        self.model
+            .forward_argmax_selfloop_with_state(&mut self.state, seed, n)
+    }
+
+    /// GPU 采样：推进整段 tokens，返回最后一个 token 的采样索引（penalty/temperature/top-k/top-p）。
+    /// 全 GPU 过滤+采样，只回传 4 字节索引；`sp.seed` 由调用方控制（每生成递增）。
+    /// `history` 为已生成 token（惩罚计数用，空则跳过惩罚）。
+    pub fn infer_sample(&mut self, tokens: &[u32], sp: &SamplerParams, history: &[u32]) -> R<u32> {
+        self.model
+            .forward_sample_with_state(&mut self.state, tokens, sp, history)
+    }
+
+    /// GPU self-loop 批量采样生成：在**单次 submit** 内连续采样 n 个 token。
+    /// 每轮用带参数（temperature/top-k/top-p）的采样替换 argmax，seed 随轮次递增。
+    /// 返回生成的 n 个 token 索引。
+    pub fn infer_sample_selfloop(
+        &mut self,
+        seed: u32,
+        n: usize,
+        sp: &SamplerParams,
+    ) -> R<Vec<u32>> {
+        self.model
+            .forward_sample_selfloop_with_state(&mut self.state, seed, n, sp)
+    }
 }
 
 /// web-rwkv 风格的推理输出模式（对标 `web-rwkv::RnnOption`）。
@@ -2540,6 +2746,43 @@ impl RnnInput {
             tokens,
             chunk_size,
             option: RnnOption::Last,
+        }
+    }
+}
+
+/// GPU 采样参数（penalty / temperature / top-k / top-p）。
+/// 传给 `Bundle::infer_sample*`，在 GPU 上对 logits 过滤后按概率采样。
+/// 惩罚公式与 OpenAI / vLLM / llama.cpp 主流一致（作用于 softmax 前的 logits）：
+///   repetition_penalty（缩放，1.0=禁用）、frequency_penalty（次数偏移，0.0=禁用）、
+///   presence_penalty（存在偏移，0.0=禁用）。
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerParams {
+    /// 温度 >0；logits 除以 temperature 后做 softmax。0 或负视为 1（不缩放）。
+    pub temperature: f32,
+    /// top-k：仅保留概率/ logits 前 top_k 个候选。0 表示禁用。
+    pub top_k: u32,
+    /// top-p：按概率从高到低累积，达到 top_p 后截断。1.0（或 >=1）表示禁用。
+    pub top_p: f32,
+    /// 采样随机种子；每生成一个 token 应递增以保证多样性。
+    pub seed: u32,
+    /// repetition_penalty：对历史中出现的 token，logit>0 时 /=rp，logit<0 时 *=rp。1.0 表示禁用。
+    pub repetition_penalty: f32,
+    /// frequency_penalty：logit 减去 fp × 出现次数。0.0 表示禁用。
+    pub frequency_penalty: f32,
+    /// presence_penalty：出现过的 token 一律 logit 减去 pp。0.0 表示禁用。
+    pub presence_penalty: f32,
+}
+
+impl Default for SamplerParams {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
     }
 }

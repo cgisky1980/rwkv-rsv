@@ -201,6 +201,31 @@ Key env vars (see [src/main.rs](src/main.rs)):
 | `PROF_GPU` / `PROF_HOST` | GPU / host-side profiling |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | Override cross-hardware adaptation |
 
+#### 9.1 Examples (web-rwkv style)
+
+Self-contained runnable programs under `examples/`:
+
+```bash
+# Model info: load model, print ModelInfo, probe forward
+cargo run --release --example model_info
+# Autoregressive generation: prefill + GPU self-loop (argmax deterministic / sample)
+cargo run --release --example generate          # env: NTOKENS, TEMP, TOPK, TOPP, GEN_MODE, VOCAB_JSON
+# Throughput benchmark: infer_seq / infer_tokens / argmax_selfloop / sample_selfloop
+cargo run --release --example benchmark
+# State serialization: forward→state_back→save→state_load→state_back lossless round-trip
+cargo run --release --example state_persist     # env: OUT=state.bin
+```
+
+#### 9.2 Library API (web-rwkv style) & GPU Sampling
+
+`rwkv-rsv` also exports a **library** tailored for server integration (e.g. an `ai00-server`), mirroring [web-rwkv](https://github.com/cryscan/web-rwkv)'s abstractions:
+
+- **`ModelBuilder` + `Bundle`**: load a model and bind a zero-initialized `State`; `infer_tokens` / `infer_seq` / `infer` advance it and return logits.
+- **`State`**: first-class session state — `state_back()` downloads it to a CPU `Vec<f32>`, `state_load()` restores it, `reset()` clears it. Serialization is bit-exact (round-trip `max_diff == 0`).
+- **GPU sampling (`SamplerParams`)**: `infer_sample` / `infer_sample_selfloop` filter logits entirely on GPU — `temperature`, `top-k`, `top-p` plus OpenAI-compatible `repetition_penalty`, `frequency_penalty`, `presence_penalty` — and return only the sampled token index (no per-token logits download).
+
+> Determinism note: GPU forward is deterministic given an identical `State`. The former "non-determinism" was a `Bundle::reset()` bug that reset the model-internal state instead of the session state; `reset()` now correctly clears the working session state.
+
 ### 10. Quantization Toolchain
 
 Offline quantizer (Python, run via `uv`):

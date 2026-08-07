@@ -6,7 +6,7 @@ edition = "2024"
 # vendored Vulkan 库的可选 feature（未启用，仅为消除 unexpected_cfgs 警告）
 [features]
 serde = []
-rayon = []
+rayon = ["dep:rayon"]
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
@@ -17,6 +17,7 @@ half = { version = "2.7", features = ["bytemuck"] }
 itertools = "0.14"
 log = "0.4"
 memmap2 = "0.9"
+rayon = { version = "1.12", optional = true }
 rust-embed = { version = "8", features = ["include-exclude"] }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }

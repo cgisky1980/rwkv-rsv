@@ -341,6 +341,9 @@ fn main() {
         "argmax" => "src/argmax.comp" => {
             TYPE => [none("")],
         },
+        "sample" => "src/sample.comp" => {
+            TYPE => [none("")],
+        },
         "gather_row" => "src/gather_row.comp" => {
             TYPE => [none("")],
         },

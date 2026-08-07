@@ -1236,6 +1236,140 @@ impl Runtime {
         Ok(())
     }
 
+    /// GPU 采样：penalty(repetition/frequency/presence) + temperature + top-k + top-p 过滤后按概率采样，
+    /// 写入 token（len 1 f32 位模式存 uint）。
+    /// 相比下载 65536 个 logits 到 CPU 采样，只在 GPU 完成并回传 4 字节索引。
+    /// `history` 为已生成的 token（用于惩罚计数），空则跳过惩罚阶段。
+    /// 自建采样临时缓冲（temp/mask/counter/sampler/hist），单次调用（非 self-loop）使用；
+    /// 自回归每 token 一次独立 begin/end batch，临时缓冲可安全随调用释放。
+    #[allow(clippy::too_many_arguments)] // sampler 标量参数直接透传 shader，保持扁平
+    pub fn sample(
+        &mut self,
+        logits: &GpuTensor,
+        token: &mut GpuTensor,
+        n: usize,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u32,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        history: &[u32],
+    ) -> R<()> {
+        let temp = self.create_tensor(n)?;
+        let mask = self.create_tensor(n)?;
+        let counter = self.create_tensor_u32(n)?;
+        let sampler = self.create_tensor(8)?;
+        self.store_sampler_host(
+            &sampler,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            history.len() as u32,
+        )?;
+        // 历史 token 缓冲（hist_len=0 时 shader 跳过直方图，缓冲仅需合法地址）
+        let hist = self.create_tensor_u32(history.len().max(1))?;
+        if !history.is_empty() {
+            self.upload_u32(&hist, history)?;
+        }
+        self.record_sample(
+            logits,
+            token.device.address,
+            &token.device.buffer,
+            &temp,
+            &mask,
+            &counter,
+            &sampler,
+            hist.device.address,
+            &hist.device.buffer,
+            n,
+        )
+    }
+
+    /// GPU 采样（self-loop 批量版）：采样结果直接写回 host-visible 缓冲（token_host）。
+    /// 复用调用方预建的 temp/mask/counter/sampler 缓冲（存活到 batch 提交后），供单 batch 内
+    /// 连续多轮采样使用；sampler 的 seed 与 hist_len 由调用方每轮用 `store_sampler_host` 更新。
+    /// `hist` 为历史 token 缓冲（self-loop 中即累积的 token_seq）。
+    #[allow(clippy::too_many_arguments)] // 各缓冲引用扁平透传 record_sample，保持结构清晰
+    pub fn sample_into_host_seeded(
+        &mut self,
+        logits: &GpuTensor,
+        token_host: &Tensor<f32>,
+        n: usize,
+        temp: &GpuTensor,
+        mask: &GpuTensor,
+        counter: &GpuTensorU32,
+        sampler: &GpuTensor,
+        hist: &GpuTensor,
+    ) -> R<()> {
+        self.record_sample(
+            logits,
+            token_host.address,
+            &token_host.buffer,
+            temp,
+            mask,
+            counter,
+            sampler,
+            hist.device.address,
+            &hist.device.buffer,
+            n,
+        )
+    }
+
+    /// 记录一次采样 kernel（共享实现）。
+    #[allow(clippy::too_many_arguments)] // 各缓冲地址 + 长度，扁平透传 shader
+    fn record_sample(
+        &mut self,
+        logits: &GpuTensor,
+        token_addr: u64,
+        token_buf: &vk::Buffer,
+        temp: &GpuTensor,
+        mask: &GpuTensor,
+        counter: &GpuTensorU32,
+        sampler: &GpuTensor,
+        hist_addr: u64,
+        hist_buf: &vk::Buffer,
+        n: usize,
+    ) -> R<()> {
+        // sampler 由 CPU 直写 host-visible 缓冲，需 HOST_WRITE→SHADER_READ 屏障
+        self.host_write_to_shader_barrier(&sampler.device.buffer)?;
+        let spec = [n as u32];
+        let params = [
+            logits.device.address,
+            token_addr,
+            temp.device.address,
+            mask.device.address,
+            counter.device.address,
+            hist_addr,
+            sampler.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/sample.spv",
+            &spec,
+            &params,
+            (1, 1, 1),
+            &[
+                logits.device.buffer,
+                sampler.device.buffer,
+                *hist_buf,
+                temp.device.buffer,
+                mask.device.buffer,
+            ],
+            &[
+                *token_buf,
+                temp.device.buffer,
+                mask.device.buffer,
+                counter.device.buffer,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 把 host-visible 缓冲 in_tok[0]（token 索引，字节存 uint）追加到序列缓冲 out_seq[cnt]，
     /// 并将 cnt 自增。供 GPU self-loop 记录每轮生成的 token，便于一次性下载验证。
     /// spec 恒空（不重建 pipeline）。dispatch (1,1,1)。
@@ -1264,6 +1398,46 @@ impl Runtime {
     pub fn store_token_host(&self, tok: &GpuTensor, token: u32) -> R<()> {
         let host = tok.host.as_ref().ok_or("store_token_host: host dropped")?;
         host.copy_from(&[f32::from_bits(token)], 0)?;
+        Ok(())
+    }
+
+    /// 把采样参数写入 host-visible 缓冲（sampler）。CPU 侧 memcpy，无 kernel、无 spec constant；
+    /// 采样 shader 直接从 device address 读取。8 元素：
+    ///   [0]=temperature 位模式, [1]=top_k, [2]=top_p 位模式, [3]=seed,
+    ///   [4]=repetition_penalty 位模式, [5]=frequency_penalty 位模式, [6]=presence_penalty 位模式,
+    ///   [7]=hist_len。
+    /// 打包约定：shader 对 [0,2,4,5,6] 用 `uintBitsToFloat` 读回 f32，故直接写入 f32 值；
+    /// 对 [1,3,7] 用原生 uint 读，故用 `f32::from_bits` 保持原始 u32 位模式。
+    #[allow(clippy::too_many_arguments)] // sampler 标量参数直接透传 shader，保持扁平
+    pub fn store_sampler_host(
+        &self,
+        sampler: &GpuTensor,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u32,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        hist_len: u32,
+    ) -> R<()> {
+        let host = sampler
+            .host
+            .as_ref()
+            .ok_or("store_sampler_host: host dropped")?;
+        host.copy_from(
+            &[
+                temperature,
+                f32::from_bits(top_k),
+                top_p,
+                f32::from_bits(seed),
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                f32::from_bits(hist_len),
+            ],
+            0,
+        )?;
         Ok(())
     }
 

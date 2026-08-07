@@ -201,6 +201,31 @@ cargo run --release
 | `PROF_GPU` / `PROF_HOST` | GPU / 主机端性能剖析 |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | 覆盖跨硬件自适应参数 |
 
+#### 9.1 示例程序（web-rwkv 风格）
+
+自包含可运行示例，位于 `examples/`：
+
+```bash
+# 模型信息：加载模型、打印 ModelInfo、probe 前向
+cargo run --release --example model_info
+# 自回归生成：prefill + GPU self-loop（argmax 确定性 / sample 采样）
+cargo run --release --example generate          # env: NTOKENS, TEMP, TOPK, TOPP, GEN_MODE, VOCAB_JSON
+# 吞吐基准：infer_seq / infer_tokens / argmax_selfloop / sample_selfloop
+cargo run --release --example benchmark
+# State 序列化：前进→state_back→存盘→state_load→state_back 无损闭环
+cargo run --release --example state_persist     # env: OUT=state.bin
+```
+
+#### 9.2 库 API（web-rwkv 风格）与 GPU 采样
+
+`rwkv-rsv` 同时以 **library** 形式导出，便于服务端（如 `ai00-server`）集成，对标 [web-rwkv](https://github.com/cryscan/web-rwkv) 的抽象：
+
+- **`ModelBuilder` + `Bundle`**：加载模型并绑定零初始化 `State`；`infer_tokens` / `infer_seq` / `infer` 推进会话并返回 logits。
+- **`State`**：一等公民的会话状态——`state_back()` 下载为 CPU `Vec<f32>`，`state_load()` 回灌，`reset()` 清零。序列化逐位无损（往返 `max_diff == 0`）。
+- **GPU 采样（`SamplerParams`）**：`infer_sample` / `infer_sample_selfloop` 全 GPU 端过滤 logits——`temperature`、`top-k`、`top-p`，以及兼容 OpenAI 的 `repetition_penalty` / `frequency_penalty` / `presence_penalty`——只回传采样 token 索引（不再逐 token 下载 logits）。
+
+> 确定性说明：在相同 `State` 下 GPU 前向是确定性的。此前所谓的“非确定性”实为 `Bundle::reset()` 的 bug（重置了模型内部态而非会话态）；`reset()` 现已正确清零工作会话态。
+
 ### 10. 量化工具链
 
 离线量化器（Python，`uv` 运行）：
