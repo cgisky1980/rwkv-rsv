@@ -136,9 +136,19 @@ test/           Development scripts
 
 ## Acknowledgements / 致谢
 
-本项目在早期移除了最初参考的 Rust 推理实现——[cryscan/rosalia](https://github.com/cryscan/rosalia)（Rust + Vulkan 计算着色器的 RWKV 推理引擎）。本仓库在 Vulkan 内核、运行时结构与部分算子的初始设计上受到了它的启发，随后独立演进：新增 fp16 / any4 / int8 三路量化推理、CPU fp32 参考与离线量化工具链。
+本项目最初参考了两份 RWKV 推理实现：
 
-This project initially referenced the Rust inference implementation [cryscan/rosalia](https://github.com/cryscan/rosalia) (an RWKV inference engine in Rust with Vulkan compute shaders). The initial design of our Vulkan kernels, runtime structure, and some operators was inspired by it, and has since evolved independently — adding fp16 / any4 / int8 quantization paths, a CPU fp32 reference, and an offline quantization toolchain.
+- **信天翁 [Albatross](https://github.com/BlinkDL/Albatross)**（Apache-2.0）：RWKV-7 CUDA 高性能推理引擎。本仓库的 kernel 融合、sequence-parallel 批量提交与 argmax 采样等设计均对标/借鉴其思路。
+- **[cryscan/rosalia](https://github.com/cryscan/rosalia)**：Rust + Vulkan 计算着色器的 RWKV 推理引擎。本仓库在 Vulkan 内核、运行时结构与部分算子的初始设计上受到了它的启发。
+
+两者启发之下，本仓库随后独立演进：新增 fp16 / any4 / int8 三路量化推理、CPU fp32 参考与离线量化工具链。
+
+This project initially referenced two RWKV inference implementations:
+
+- **信天翁 [Albatross](https://github.com/BlinkDL/Albatross)** (Apache-2.0): a high-performance CUDA inference engine for RWKV-7. Our kernel-fusion, sequence-parallel batched submission, and argmax-sampling designs draw on / benchmark against its approach.
+- **[cryscan/rosalia](https://github.com/cryscan/rosalia)**: an RWKV inference engine in Rust with Vulkan compute shaders. The initial design of our Vulkan kernels, runtime structure, and some operators was inspired by it.
+
+Inspired by both, this repository has since evolved independently — adding fp16 / any4 / int8 quantization paths, a CPU fp32 reference, and an offline quantization toolchain.
 
 ## License
 
