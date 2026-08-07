@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use rwkv_rsv::{gpu_model, model, runtime};
+use rwkv_rsv::{backend, gpu_model, model, runtime};
 
 fn topk_indices(logits: &[f32]) -> Vec<usize> {
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
@@ -743,9 +743,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ===== GPU 对比验证 =====
-    let rt = runtime::Runtime::new()?;
+    let backend = backend::VulkanBackend::new()?;
     log::info!("vulkan runtime created");
-    let mut gpu_model = gpu_model::GpuModel::from_safetensors(rt, &model_path)?;
+    let mut gpu_model = gpu_model::GpuModel::from_safetensors(Box::new(backend), &model_path)?;
     log::info!("gpu model loaded");
 
     // ===== state_tune 演示：cargo run --release -- statetune =====

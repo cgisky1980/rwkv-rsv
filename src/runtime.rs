@@ -19,7 +19,7 @@ pub type R<T> = Result<T, Box<dyn Error>>;
 
 /// GPU 端张量：包含 host 可见缓冲（用于上传/下载）和 device local 缓冲（用于计算）。
 /// `host` 为 Option：权重上传完成后可调用 `drop_host` 释放 host 缓冲，节省系统内存。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GpuTensor {
     pub host: Option<Tensor<f32>>,
     pub device: Tensor<f32>,
@@ -29,7 +29,7 @@ pub struct GpuTensor {
 /// GPU 端 fp16 张量（tensor-core GEMM 用，fp32io16 模式）。
 /// 权重以 fp16 存储，激活由 fp32 经 `to_f16` 转换而来。
 /// `host` 为 Option：权重上传完成后可调用 `drop_host` 释放 host 缓冲。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GpuTensor16 {
     pub host: Option<Tensor<f16>>,
     pub device: Tensor<f16>,
@@ -37,7 +37,7 @@ pub struct GpuTensor16 {
 }
 
 /// GPU 端 u32 张量（any4 打包索引 / scale-zero 对用）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GpuTensorU32 {
     pub host: Option<Tensor<u32>>,
     pub device: Tensor<u32>,

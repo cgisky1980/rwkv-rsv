@@ -6,6 +6,7 @@
 //!
 //! 推理路径（按模型文件自动路由）：fp16 / int8 / any4（4-bit）。
 
+pub mod backend;
 pub mod gpu_model;
 pub mod model;
 pub mod runtime;

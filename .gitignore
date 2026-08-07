@@ -13,6 +13,9 @@
 # Model files (large, fetched separately)
 *.st
 
+# Test / example artifacts
+state.bin
+
 # IDE / editor config
 /.trae
 

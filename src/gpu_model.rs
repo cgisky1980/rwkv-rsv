@@ -11,7 +11,8 @@
 use half::f16;
 use safetensors::tensor::TensorView;
 
-use crate::runtime::{GpuTensor, GpuTensor16, GpuTensorAny4, GpuTensorInt8, R, Runtime};
+use crate::backend::{Any4Handle, ComputeBackend, Int8Handle, TensorDtype, TensorId};
+use crate::runtime::R;
 
 /// LayerNorm eps（与 CPU model.rs 一致）
 pub const LN_EPS: f32 = 1.0e-5;
@@ -99,14 +100,14 @@ pub struct ModelInfo {
 
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
-    rt: Runtime,
+    backend: Box<dyn ComputeBackend>,
     config: ModelConfig,
     // 预计算的 GPU 权重
-    emb_ln: GpuTensor16,  // [vocab, C] fp16 — 预计算 ln0(embed) 后的 embedding
+    emb_ln: TensorId,     // [vocab, C] fp16 — 预计算 ln0(embed) 后的 embedding
     emb_ln_cpu: Vec<f32>, // [vocab, C] CPU 缓存（f16 舍入值，与 GPU 表逐位一致），避免每次 forward_seq 下载
-    ln_out_w: GpuTensor,
-    ln_out_b: GpuTensor,
-    head_w16: GpuTensor16, // [vocab, C] fp16 变体（单 token 用 fp16 gemv）
+    ln_out_w: TensorId,
+    ln_out_b: TensorId,
+    head_w16: TensorId, // [vocab, C] fp16 变体（单 token 用 fp16 gemv）
     layers: Vec<GpuLayer>,
     // 工作缓冲区（forward 时复用，避免每 token 重新分配）
     bufs: WorkBuffers,
@@ -117,131 +118,131 @@ pub struct GpuModel {
     // 旧 `forward`/`forward_seq`/`forward_argmax` 等便捷封装复用此内部态。
     state: Option<State>,
     // 标量缓冲区: -1/sqrt(e)，用于 w = exp(w_sig * scale)
-    scale_w: GpuTensor,
+    scale_w: TensorId,
 }
 
 /// 单层权重（全部已上传到 GPU）
 pub struct GpuLayer {
-    ln1_w: GpuTensor,
-    ln1_b: GpuTensor,
-    ln2_w: GpuTensor,
-    ln2_b: GpuTensor,
-    ln_x_w: GpuTensor,
-    ln_x_b: GpuTensor,
+    ln1_w: TensorId,
+    ln1_b: TensorId,
+    ln2_w: TensorId,
+    ln2_b: TensorId,
+    ln_x_w: TensorId,
+    ln_x_b: TensorId,
     // token shift 系数 [C]
-    x_r: GpuTensor,
-    x_w: GpuTensor,
-    x_k: GpuTensor,
-    x_v: GpuTensor,
-    x_a: GpuTensor,
-    x_g: GpuTensor,
+    x_r: TensorId,
+    x_w: TensorId,
+    x_k: TensorId,
+    x_v: TensorId,
+    x_a: TensorId,
+    x_g: TensorId,
     // att biases [C]
-    w0: GpuTensor,
-    a0: GpuTensor,
-    v0: GpuTensor,
+    w0: TensorId,
+    a0: TensorId,
+    v0: TensorId,
     // 低秩权重（单 token 低秩链用 fp32；prefill 用 fp16，见 *_16）
-    w1: GpuTensor,
-    w2: GpuTensor,
-    a1: GpuTensor,
-    a2: GpuTensor,
-    v1: GpuTensor,
-    v2: GpuTensor,
-    g1: GpuTensor,
-    g2: GpuTensor,
+    w1: TensorId,
+    w2: TensorId,
+    a1: TensorId,
+    a2: TensorId,
+    v1: TensorId,
+    v2: TensorId,
+    g1: TensorId,
+    g2: TensorId,
     // element-wise 参数
-    r_k: GpuTensor,     // [H, N]
-    k_k: GpuTensor,     // [C]
-    k_a: GpuTensor,     // [C]
-    ffn_x_k: GpuTensor, // [C]
+    r_k: TensorId,     // [H, N]
+    k_k: TensorId,     // [C]
+    k_a: TensorId,     // [C]
+    ffn_x_k: TensorId, // [C]
     /// 诊断用 fp32 输出权重（仅 GEMM_DIAG 参考路径使用；其余线性权重已删 fp32 副本省显存）。
     /// 仅在设置 GEMM_DIAG 时创建，正式推理不持有，省 ~26MB/层。
-    output_w: Option<GpuTensor>, // [C, C]
+    output_w: Option<TensorId>, // [C, C]
     // any4 量化矩阵的 fp16 线性权重（prefill tensor-core GEMM 用，fp32io16 模式）——
     // 不常驻：prefill（forward_seq）前由 host 反量化临时创建，decode 前释放归还显存。
     // 非 any4 矩阵此处为 Some 常驻（直接读模型 fp16 键）；any4 矩阵为 None/临时。
-    receptance_w16: Option<GpuTensor16>, // [C, C]
-    key_w16: Option<GpuTensor16>,
-    value_w16: Option<GpuTensor16>,
-    output_w16: Option<GpuTensor16>,
-    ffn_key_w16: Option<GpuTensor16>,   // [ffn_hidden, C]
-    ffn_value_w16: Option<GpuTensor16>, // [C, ffn_hidden]
+    receptance_w16: Option<TensorId>, // [C, C]
+    key_w16: Option<TensorId>,
+    value_w16: Option<TensorId>,
+    output_w16: Option<TensorId>,
+    ffn_key_w16: Option<TensorId>,   // [ffn_hidden, C]
+    ffn_value_w16: Option<TensorId>, // [C, ffn_hidden]
     // any4 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16 路径）
-    ffn_key_a4: Option<GpuTensorAny4>,    // [ffn_hidden, C]
-    ffn_value_a4: Option<GpuTensorAny4>,  // [C, ffn_hidden]
-    att_output_a4: Option<GpuTensorAny4>, // [C, C]
-    receptance_a4: Option<GpuTensorAny4>, // [C, C]
-    key_a4: Option<GpuTensorAny4>,        // [C, C]
-    value_a4: Option<GpuTensorAny4>,      // [C, C]
+    ffn_key_a4: Option<Any4Handle>,    // [ffn_hidden, C]
+    ffn_value_a4: Option<Any4Handle>,  // [C, ffn_hidden]
+    att_output_a4: Option<Any4Handle>, // [C, C]
+    receptance_a4: Option<Any4Handle>, // [C, C]
+    key_a4: Option<Any4Handle>,        // [C, C]
+    value_a4: Option<Any4Handle>,      // [C, C]
     // int8 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16/any4 路径）
-    ffn_key_a8: Option<GpuTensorInt8>,    // [ffn_hidden, C]
-    ffn_value_a8: Option<GpuTensorInt8>,  // [C, ffn_hidden]
-    att_output_a8: Option<GpuTensorInt8>, // [C, C]
-    receptance_a8: Option<GpuTensorInt8>, // [C, C]
-    key_a8: Option<GpuTensorInt8>,        // [C, C]
-    value_a8: Option<GpuTensorInt8>,      // [C, C]
+    ffn_key_a8: Option<Int8Handle>,    // [ffn_hidden, C]
+    ffn_value_a8: Option<Int8Handle>,  // [C, ffn_hidden]
+    att_output_a8: Option<Int8Handle>, // [C, C]
+    receptance_a8: Option<Int8Handle>, // [C, C]
+    key_a8: Option<Int8Handle>,        // [C, C]
+    value_a8: Option<Int8Handle>,      // [C, C]
     // fp16 低秩权重（tensor-core GEMM 用，已补齐到 [mid_pad, C] / [C, mid_pad]）—— 仅保留 fp16
-    w1_16: GpuTensor16, // [wm_pad, C]
-    w2_16: GpuTensor16, // [C, wm_pad]
-    a1_16: GpuTensor16, // [am_pad, C]
-    a2_16: GpuTensor16, // [C, am_pad]
-    v1_16: GpuTensor16, // [vm_pad, C]
-    v2_16: GpuTensor16, // [C, vm_pad]
-    g1_16: GpuTensor16, // [gm_pad, C]
-    g2_16: GpuTensor16, // [C, gm_pad]
+    w1_16: TensorId, // [wm_pad, C]
+    w2_16: TensorId, // [C, wm_pad]
+    a1_16: TensorId, // [am_pad, C]
+    a2_16: TensorId, // [C, am_pad]
+    v1_16: TensorId, // [vm_pad, C]
+    v2_16: TensorId, // [C, vm_pad]
+    g1_16: TensorId, // [gm_pad, C]
+    g2_16: TensorId, // [C, gm_pad]
 }
 
 /// 每层 RNN 状态（GPU 端）
 pub struct GpuState {
-    tmix_x: GpuTensor,   // [C] token shift
-    tmix_rnn: GpuTensor, // [H, N, N] DPLR state
-    cmix_x: GpuTensor,   // [C] token shift
+    tmix_x: TensorId,   // [C] token shift
+    tmix_rnn: TensorId, // [H, N, N] DPLR state
+    cmix_x: TensorId,   // [C] token shift
 }
 
 /// 工作缓冲区：forward 期间复用，避免反复创建 GpuTensor
 pub struct WorkBuffers {
     // [C] 大小
-    x: GpuTensor,
-    ln1: GpuTensor,
-    xr: GpuTensor,
-    xw: GpuTensor,
-    xk: GpuTensor,
-    xv: GpuTensor,
-    xa: GpuTensor,
-    xg: GpuTensor,
-    prev_x: GpuTensor,
-    r: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor16,
-    v_full: GpuTensor,
-    gate: GpuTensor,
-    w_full: GpuTensor,
-    w_sig: GpuTensor,
-    w: GpuTensor16,
-    a_full: GpuTensor,
-    a: GpuTensor16,
-    kk_l2: GpuTensor,
-    k_mod: GpuTensor,
-    b_vec: GpuTensor,
-    y: GpuTensor,
-    y_norm: GpuTensor,
-    g: GpuTensor16,
-    y_g: GpuTensor,
-    y_out: GpuTensor,
-    ln2: GpuTensor,
-    prev_c: GpuTensor,
-    xb: GpuTensor,
-    v2: GpuTensor,
-    x_norm: GpuTensor,
-    tmp_c: GpuTensor, // 临时缓冲，用于 in-place 操作中转
+    x: TensorId,
+    ln1: TensorId,
+    xr: TensorId,
+    xw: TensorId,
+    xk: TensorId,
+    xv: TensorId,
+    xa: TensorId,
+    xg: TensorId,
+    prev_x: TensorId,
+    r: TensorId,
+    k: TensorId,
+    v: TensorId,
+    v_full: TensorId,
+    gate: TensorId,
+    w_full: TensorId,
+    w_sig: TensorId,
+    w: TensorId,
+    a_full: TensorId,
+    a: TensorId,
+    kk_l2: TensorId,
+    k_mod: TensorId,
+    b_vec: TensorId,
+    y: TensorId,
+    y_norm: TensorId,
+    g: TensorId,
+    y_g: TensorId,
+    y_out: TensorId,
+    ln2: TensorId,
+    prev_c: TensorId,
+    xb: TensorId,
+    v2: TensorId,
+    x_norm: TensorId,
+    tmp_c: TensorId, // 临时缓冲，用于 in-place 操作中转
     // 其他大小
-    v_mid: GpuTensor,         // [V_MID]
-    w_mid: GpuTensor,         // [W_MID]
-    a_mid: GpuTensor,         // [A_MID]
-    g_mid: GpuTensor,         // [G_MID]
-    r2: GpuTensor,            // [FFN_HIDDEN]
-    logits: GpuTensor,        // [vocab]
-    token_argmax: GpuTensor,  // [1] GPU argmax 采样的 token 索引（字节存 uint）
-    current_token: GpuTensor, // [1] 当前待 gather 的 token 索引（f32 位模式存 uint，供 gather_row 读取）
+    v_mid: TensorId,         // [V_MID]
+    w_mid: TensorId,         // [W_MID]
+    a_mid: TensorId,         // [A_MID]
+    g_mid: TensorId,         // [G_MID]
+    r2: TensorId,            // [FFN_HIDDEN]
+    logits: TensorId,        // [vocab]
+    token_argmax: TensorId,  // [1] GPU argmax 采样的 token 索引（字节存 uint）
+    current_token: TensorId, // [1] 当前待 gather 的 token 索引（f32 位模式存 uint，供 gather_row 读取）
 }
 
 /// 序列并行工作缓冲区（forward_seq 用）：所有激活均为 [T, C]（token 主序）
@@ -251,72 +252,72 @@ pub struct SeqBuffers {
     /// 补齐到 TILE_M=256 倍数的 token 数（GEMM 输出缓冲大小）
     m_pad: usize,
     // [T, C] 大小
-    x: GpuTensor,
-    ln1: GpuTensor,
-    xr: GpuTensor,
-    xw: GpuTensor,
-    xk: GpuTensor,
-    xv: GpuTensor,
-    xa: GpuTensor,
-    xg: GpuTensor,
+    x: TensorId,
+    ln1: TensorId,
+    xr: TensorId,
+    xw: TensorId,
+    xk: TensorId,
+    xv: TensorId,
+    xa: TensorId,
+    xg: TensorId,
     // [M_PAD, C] 大小（tensor-core GEMM 输出）
-    r: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    v_first: GpuTensor, // [M_PAD, C] 每 token 来自 layer 0 的 v（copy_device 需与 v 同尺寸）
-    v_full: GpuTensor,  // [M_PAD, C]（tensor-core GEMM 输出）
-    gate: GpuTensor,    // [T, C]
-    w_full: GpuTensor,  // [M_PAD, C]（tensor-core GEMM 输出）
-    w_sig: GpuTensor,   // [T, C]
-    w: GpuTensor,       // [T, C]
-    a_full: GpuTensor,  // [M_PAD, C]（tensor-core GEMM 输出）
-    a: GpuTensor,       // [T, C]
-    kk_l2: GpuTensor,
-    k_mod: GpuTensor,
-    b_vec: GpuTensor,
-    y: GpuTensor,
-    y_norm: GpuTensor,
-    g: GpuTensor, // [M_PAD, C]（tensor-core GEMM 输出）
-    y_g: GpuTensor,
-    y_out: GpuTensor,        // [M_PAD, C]
-    diag_out_ref: GpuTensor, // [M_PAD, C] gemv 参考输出（仅诊断用）
-    ln2: GpuTensor,
-    xb: GpuTensor,
-    v2: GpuTensor, // [M_PAD, C]
-    x_norm: GpuTensor,
-    tmp_c: GpuTensor,
+    r: TensorId,
+    k: TensorId,
+    v: TensorId,
+    v_first: TensorId, // [M_PAD, C] 每 token 来自 layer 0 的 v（copy_device 需与 v 同尺寸）
+    v_full: TensorId,  // [M_PAD, C]（tensor-core GEMM 输出）
+    gate: TensorId,    // [T, C]
+    w_full: TensorId,  // [M_PAD, C]（tensor-core GEMM 输出）
+    w_sig: TensorId,   // [T, C]
+    w: TensorId,       // [T, C]
+    a_full: TensorId,  // [M_PAD, C]（tensor-core GEMM 输出）
+    a: TensorId,       // [T, C]
+    kk_l2: TensorId,
+    k_mod: TensorId,
+    b_vec: TensorId,
+    y: TensorId,
+    y_norm: TensorId,
+    g: TensorId, // [M_PAD, C]（tensor-core GEMM 输出）
+    y_g: TensorId,
+    y_out: TensorId,        // [M_PAD, C]
+    diag_out_ref: TensorId, // [M_PAD, C] gemv 参考输出（仅诊断用）
+    ln2: TensorId,
+    xb: TensorId,
+    v2: TensorId, // [M_PAD, C]
+    x_norm: TensorId,
+    tmp_c: TensorId,
     // 低秩中间缓冲 [M_PAD, mid_pad]（tensor-core GEMM 输出，mid_pad 补齐到 64）
-    v_mid: GpuTensor,
-    w_mid: GpuTensor,
-    a_mid: GpuTensor,
-    g_mid: GpuTensor,
-    r2: GpuTensor,      // [M_PAD, fh]
-    head_in: GpuTensor, // [C] 最后 token 的 x_norm 行（head 只算末 token）
-    logits: GpuTensor,  // [vocab] 末 token logits
+    v_mid: TensorId,
+    w_mid: TensorId,
+    a_mid: TensorId,
+    g_mid: TensorId,
+    r2: TensorId,      // [M_PAD, fh]
+    head_in: TensorId, // [C] 最后 token 的 x_norm 行（head 只算末 token）
+    logits: TensorId,  // [vocab] 末 token logits
     // fp16 激活（tensor-core GEMM 输入）
-    xr16: GpuTensor16, // [M_PAD, C]
-    xk16: GpuTensor16,
-    xv16: GpuTensor16,
-    xw16: GpuTensor16, // 低秩 w/a/g 第一级投影输入
-    xa16: GpuTensor16,
-    xg16: GpuTensor16,
-    y_g16: GpuTensor16,
-    xb16: GpuTensor16,
-    r2_16: GpuTensor16, // [M_PAD, fh]
+    xr16: TensorId, // [M_PAD, C]
+    xk16: TensorId,
+    xv16: TensorId,
+    xw16: TensorId, // 低秩 w/a/g 第一级投影输入
+    xa16: TensorId,
+    xg16: TensorId,
+    y_g16: TensorId,
+    xb16: TensorId,
+    r2_16: TensorId, // [M_PAD, fh]
     // fp16 低秩中间缓冲（第二级投影的 GEMM 输入）
-    v_mid16: GpuTensor16, // [M_PAD, vm_pad]
-    w_mid16: GpuTensor16, // [M_PAD, wm_pad]
-    a_mid16: GpuTensor16, // [M_PAD, am_pad]
-    g_mid16: GpuTensor16, // [M_PAD, gm_pad]
+    v_mid16: TensorId, // [M_PAD, vm_pad]
+    w_mid16: TensorId, // [M_PAD, wm_pad]
+    a_mid16: TensorId, // [M_PAD, am_pad]
+    g_mid16: TensorId, // [M_PAD, gm_pad]
     /// any4→fp16 反量化共享 scratch（方案A prefill）：大小取 6 个 any4 矩阵最大值
     /// [ffn_hidden, C] = 26.2M 元素（52.4MB）。每矩阵 GEMM 前由 dequant 全量覆写，
     /// 顺序复用（barrier 由 record_kernel 读写序保证），替代旧逐层 3.4GB fp16 副本。
-    w_scratch: GpuTensor16,
+    w_scratch: TensorId,
 }
 
 impl GpuModel {
     /// 从 safetensors 文件加载模型并上传到 GPU
-    pub fn from_safetensors(rt: Runtime, path: &str) -> R<Self> {
+    pub fn from_safetensors(mut backend: Box<dyn ComputeBackend>, path: &str) -> R<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
@@ -376,49 +377,49 @@ impl GpuModel {
         let emb_ln = layer_norm_rows(&emb_f32, &ln0_w, &ln0_b, n_embd, vocab, LN_EPS);
         // GPU 表存 fp16（省 335MB 显存）；CPU 缓存用同一 f16 舍入值回读 f32，
         // 保证 seq（CPU 上传）与 tok（GPU gather）两条路径输入逐位一致
-        let mut emb_ln_t = rt.create_tensor_f16(vocab * n_embd)?;
-        rt.upload_f16(&emb_ln_t, &emb_ln)?;
+        let emb_ln_t = backend.create_tensor(vocab * n_embd, TensorDtype::F16)?;
+        backend.upload(emb_ln_t, &emb_ln)?;
         let emb_ln: Vec<f32> = emb_ln.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
 
         // ln_out
         let ln_out_w = tensor_to_f32(&st.tensor("ln_out.weight")?);
         let ln_out_b = tensor_to_f32(&st.tensor("ln_out.bias")?);
-        let mut ln_out_w_t = rt.create_tensor(n_embd)?;
-        rt.upload(&ln_out_w_t, &ln_out_w)?;
-        let mut ln_out_b_t = rt.create_tensor(n_embd)?;
-        rt.upload(&ln_out_b_t, &ln_out_b)?;
+        let ln_out_w_t = backend.create_tensor(n_embd, TensorDtype::F32)?;
+        backend.upload(ln_out_w_t, &ln_out_w)?;
+        let ln_out_b_t = backend.create_tensor(n_embd, TensorDtype::F32)?;
+        backend.upload(ln_out_b_t, &ln_out_b)?;
 
         // head.weight 原始 [vocab, C] = [out, in]，直接用
         // 仅保留 fp16 变体（单 token 用 fp16 gemv 减半带宽）；fp32 副本已删省显存
         let head_w = tensor_to_f32(&st.tensor("head.weight")?);
-        let mut head_w16_t = rt.create_tensor_f16(vocab * n_embd)?;
-        rt.upload_f16(&head_w16_t, &head_w)?;
+        let head_w16_t = backend.create_tensor(vocab * n_embd, TensorDtype::F16)?;
+        backend.upload(head_w16_t, &head_w)?;
 
         // 加载每一层
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
-            layers.push(GpuLayer::load(&rt, &st, i, n_embd, &config)?);
+            layers.push(GpuLayer::load(backend.as_mut(), &st, i, n_embd, &config)?);
         }
 
         // 工作缓冲区
-        let bufs = WorkBuffers::new(&rt, n_embd, vocab, &config)?;
+        let bufs = WorkBuffers::new(backend.as_mut(), n_embd, vocab, &config)?;
 
         // 内部推理状态（可序列化 `State`：每层 RNN 状态 + v_first）
-        let state = State::new(&rt, n_embd, n_head, head_size, n_layer)?;
+        let state = State::new(backend.as_mut(), n_embd, n_head, head_size, n_layer)?;
 
         // scale_w: -1/sqrt(e)
-        let mut scale_w = rt.create_tensor(1)?;
-        rt.upload(&scale_w, &[-1.0f32 / std::f32::consts::E.sqrt()])?;
+        let scale_w = backend.create_tensor(1, TensorDtype::F32)?;
+        backend.upload(scale_w, &[-1.0f32 / std::f32::consts::E.sqrt()])?;
 
         // 权重上传完成：释放模型级权重的 host（系统内存）缓冲，仅保留 device 拷贝
-        rt.drop_host_f16(&mut emb_ln_t);
-        rt.drop_host(&mut ln_out_w_t);
-        rt.drop_host(&mut ln_out_b_t);
-        rt.drop_host_f16(&mut head_w16_t);
-        rt.drop_host(&mut scale_w);
+        backend.drop_host(emb_ln_t);
+        backend.drop_host(ln_out_w_t);
+        backend.drop_host(ln_out_b_t);
+        backend.drop_host(head_w16_t);
+        backend.drop_host(scale_w);
 
         Ok(Self {
-            rt,
+            backend,
             config,
             emb_ln: emb_ln_t,
             emb_ln_cpu: emb_ln,
@@ -438,7 +439,10 @@ impl GpuModel {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let n = self.config.head_size;
-        self.state.as_ref().unwrap().reset(&self.rt, c, h, n)?;
+        self.state
+            .as_ref()
+            .unwrap()
+            .reset(&*self.backend, c, h, n)?;
         Ok(())
     }
 
@@ -449,16 +453,16 @@ impl GpuModel {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let n = self.config.head_size;
-        state.reset(&self.rt, c, h, n)?;
+        state.reset(&*self.backend, c, h, n)?;
         Ok(())
     }
 
     /// 创建零初始化的推理状态（web-rwkv 风格，供 `forward_with_state` 使用）。
     /// `State` 是会话持久化与 state tuning 的第一等公民：`state_back` 取态 → 存盘 →
     /// `state_load` 回灌。
-    pub fn create_state(&self) -> R<State> {
+    pub fn create_state(&mut self) -> R<State> {
         State::new(
-            &self.rt,
+            self.backend.as_mut(),
             self.config.n_embd,
             self.config.n_head,
             self.config.head_size,
@@ -474,7 +478,7 @@ impl GpuModel {
     /// 把 `State` 整态下载到 CPU 为连续 `Vec<f32>`（布局与 `state_load` 一一对应）。
     pub fn state_back(&self, state: &State) -> R<Vec<f32>> {
         state.back(
-            &self.rt,
+            &*self.backend,
             self.config.n_embd,
             self.config.n_head,
             self.config.head_size,
@@ -484,7 +488,7 @@ impl GpuModel {
     /// 从 CPU `Vec<f32>` 回灌 `State`（与 `state_back` 布局对应）。
     pub fn state_load(&self, state: &State, data: &[f32]) -> R<()> {
         state.load(
-            &self.rt,
+            &*self.backend,
             data,
             self.config.n_embd,
             self.config.n_head,
@@ -508,7 +512,7 @@ impl GpuModel {
         for &token in tokens {
             self.forward_token(token, false, None, &[], state)?;
         }
-        let logits = self.rt.download(&self.bufs.logits)?;
+        let logits = self.backend.download(self.bufs.logits)?;
         Ok(logits)
     }
 
@@ -527,7 +531,7 @@ impl GpuModel {
         for &token in tokens {
             self.forward_token(token, true, None, &[], state)?;
         }
-        let t = self.rt.download(&self.bufs.token_argmax)?;
+        let t = self.backend.download(self.bufs.token_argmax)?;
         // shader 向 f32 缓冲写入 uint，回读时按位解释为 u32
         Ok(t[0].to_bits())
     }
@@ -546,7 +550,7 @@ impl GpuModel {
         for &token in tokens {
             self.forward_token(token, false, Some(sp), history, state)?;
         }
-        let t = self.rt.download(&self.bufs.token_argmax)?;
+        let t = self.backend.download(self.bufs.token_argmax)?;
         Ok(t[0].to_bits())
     }
 
@@ -568,31 +572,32 @@ impl GpuModel {
 
         // 采样临时缓冲（存活到 end_batch 后）：temp/mask 为 vocab 长工作区，sampler 存参数，
         // counter 为 vocab 长 u32 直方图（惩罚计数用）
-        let temp = self.rt.create_tensor(vocab)?;
-        let mask = self.rt.create_tensor(vocab)?;
-        let counter = self.rt.create_tensor_u32(vocab)?;
-        let sampler = self.rt.create_tensor(8)?;
+        let temp = self.backend.create_tensor(vocab, TensorDtype::F32)?;
+        let mask = self.backend.create_tensor(vocab, TensorDtype::F32)?;
+        let counter = self.backend.create_tensor(vocab, TensorDtype::U32)?;
+        let sampler = self.backend.create_tensor(8, TensorDtype::F32)?;
         // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
-        let token_seq = self.rt.create_tensor(n)?;
-        let mut seq_cnt = self.rt.create_tensor(1)?;
-        self.rt.upload(&token_seq, &vec![0.0; n])?;
-        self.rt.upload(&seq_cnt, &[0.0; 1])?;
+        let token_seq = self.backend.create_tensor(n, TensorDtype::F32)?;
+        let seq_cnt = self.backend.create_tensor(1, TensorDtype::F32)?;
+        self.backend.upload(token_seq, &vec![0.0; n])?;
+        self.backend.upload(seq_cnt, &[0.0; 1])?;
 
         // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
 
         // 首个 token 由 CPU 写入 host-visible 缓冲
-        self.rt.store_token_host(&self.bufs.current_token, seed)?;
+        self.backend
+            .store_token_host(self.bufs.current_token, seed)?;
 
         for round in 0..n {
             // RNN 状态跨 token 保持，仅每个 token 重置 v_first
             state.v_first_set = false;
 
             // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
-            self.rt.gather_row_device_f16(
-                &self.emb_ln,
-                &mut self.bufs.x,
-                &self.bufs.current_token,
+            self.backend.gather_row_device_f16(
+                self.emb_ln,
+                self.bufs.x,
+                self.bufs.current_token,
                 c,
             )?;
 
@@ -601,20 +606,20 @@ impl GpuModel {
             }
 
             // ln_out + head
-            self.rt.norm(
-                &self.bufs.x,
-                &self.ln_out_w,
-                &self.ln_out_b,
-                &mut self.bufs.x_norm,
+            self.backend.norm(
+                self.bufs.x,
+                self.ln_out_w,
+                self.ln_out_b,
+                self.bufs.x_norm,
                 c,
                 1,
                 LN_EPS,
                 1,
             )?;
-            self.rt.gemv_f16(
-                &self.head_w16,
-                &self.bufs.x_norm,
-                &mut self.bufs.logits,
+            self.backend.gemv_f16(
+                self.head_w16,
+                self.bufs.x_norm,
+                self.bufs.logits,
                 vocab,
                 c,
                 1,
@@ -622,8 +627,8 @@ impl GpuModel {
 
             // 每轮更新 seed 与惩罚历史长度（hist_len = 已生成 round 个 token），GPU 采样直接写回
             // host-visible current_token（下一轮 gather 自动跟随）
-            self.rt.store_sampler_host(
-                &sampler,
+            self.backend.store_sampler_host(
+                sampler,
                 sp.temperature,
                 sp.top_k,
                 sp.top_p,
@@ -633,31 +638,26 @@ impl GpuModel {
                 sp.presence_penalty,
                 round as u32,
             )?;
-            let tok_host = self
-                .bufs
-                .current_token
-                .host
-                .as_ref()
-                .ok_or("forward_sample_selfloop: current_token host dropped")?;
-            self.rt.sample_into_host_seeded(
-                &self.bufs.logits,
-                tok_host,
+            self.backend.sample_into_host_seeded(
+                self.bufs.logits,
+                self.bufs.current_token,
                 vocab,
-                &temp,
-                &mask,
-                &counter,
-                &sampler,
-                &token_seq, // 前 round 个已生成 token 作为惩罚历史
+                temp,
+                mask,
+                counter,
+                sampler,
+                token_seq, // 前 round 个已生成 token 作为惩罚历史
             )?;
             // 把本轮 token 追加到序列缓冲（供一次性下载验证）
-            self.rt.record_token(tok_host, &token_seq, &mut seq_cnt)?;
+            self.backend
+                .record_token(self.bufs.current_token, token_seq, seq_cnt)?;
         }
 
         // 一次性提交整段 self-loop
-        self.rt.end_batch()?;
+        self.backend.end_batch()?;
 
         // 下载序列缓冲，按位解释为 u32
-        let t = self.rt.download(&token_seq)?;
+        let t = self.backend.download(token_seq)?;
         Ok(t[..n].iter().map(|x| x.to_bits()).collect())
     }
 
@@ -687,26 +687,27 @@ impl GpuModel {
         let vocab = self.config.vocab;
 
         // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
-        let token_seq = self.rt.create_tensor(n)?;
-        let mut seq_cnt = self.rt.create_tensor(1)?;
-        self.rt.upload(&token_seq, &vec![0.0; n])?;
-        self.rt.upload(&seq_cnt, &[0.0; 1])?;
+        let token_seq = self.backend.create_tensor(n, TensorDtype::F32)?;
+        let seq_cnt = self.backend.create_tensor(1, TensorDtype::F32)?;
+        self.backend.upload(token_seq, &vec![0.0; n])?;
+        self.backend.upload(seq_cnt, &[0.0; 1])?;
 
         // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
 
         // 首个 token 由 CPU 写入 host-visible 缓冲
-        self.rt.store_token_host(&self.bufs.current_token, seed)?;
+        self.backend
+            .store_token_host(self.bufs.current_token, seed)?;
 
         for _ in 0..n {
             // RNN 状态跨 token 保持，仅每个 token 重置 v_first
             state.v_first_set = false;
 
             // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
-            self.rt.gather_row_device_f16(
-                &self.emb_ln,
-                &mut self.bufs.x,
-                &self.bufs.current_token,
+            self.backend.gather_row_device_f16(
+                self.emb_ln,
+                self.bufs.x,
+                self.bufs.current_token,
                 c,
             )?;
 
@@ -715,43 +716,38 @@ impl GpuModel {
             }
 
             // ln_out + head
-            self.rt.norm(
-                &self.bufs.x,
-                &self.ln_out_w,
-                &self.ln_out_b,
-                &mut self.bufs.x_norm,
+            self.backend.norm(
+                self.bufs.x,
+                self.ln_out_w,
+                self.ln_out_b,
+                self.bufs.x_norm,
                 c,
                 1,
                 LN_EPS,
                 1,
             )?;
-            self.rt.gemv_f16(
-                &self.head_w16,
-                &self.bufs.x_norm,
-                &mut self.bufs.logits,
+            self.backend.gemv_f16(
+                self.head_w16,
+                self.bufs.x_norm,
+                self.bufs.logits,
                 vocab,
                 c,
                 1,
             )?;
 
             // GPU argmax 直接写回 host-visible current_token（self-loop 关键：下一轮 gather 自动跟随）
-            let tok_host = self
-                .bufs
-                .current_token
-                .host
-                .as_ref()
-                .ok_or("forward_argmax_selfloop: current_token host dropped")?;
-            self.rt
-                .argmax_into_host(&self.bufs.logits, tok_host, vocab)?;
+            self.backend
+                .argmax_into_host(self.bufs.logits, self.bufs.current_token, vocab)?;
             // 把本轮 token 追加到序列缓冲（供一次性下载验证）
-            self.rt.record_token(tok_host, &token_seq, &mut seq_cnt)?;
+            self.backend
+                .record_token(self.bufs.current_token, token_seq, seq_cnt)?;
         }
 
         // 一次性提交整段 self-loop
-        self.rt.end_batch()?;
+        self.backend.end_batch()?;
 
         // 下载序列缓冲，按位解释为 u32
-        let t = self.rt.download(&token_seq)?;
+        let t = self.backend.download(token_seq)?;
         Ok(t[..n].iter().map(|x| x.to_bits()).collect())
     }
 
@@ -777,58 +773,55 @@ impl GpuModel {
         state.v_first_set = false;
 
         // 开启批处理记录：整层 forward 的所有 kernel + 拷贝一次性记录
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
 
         // 参数化 embedding gather：token 索引由 CPU 直接写入 host-visible 缓冲（无 kernel、
         // 无 spec constant，避免每 token 重建 pipeline），再由 gather kernel 从 emb_ln 表
         // 按索引取行 → x。索引来自 host 缓冲，循环体不依赖具体 token 值，
         // 为 GPU self-loop（argmax 直接写索引）铺路。
-        self.rt.store_token_host(&self.bufs.current_token, token)?;
-        self.rt.gather_row_device_f16(
-            &self.emb_ln,
-            &mut self.bufs.x,
-            &self.bufs.current_token,
-            c,
-        )?;
+        self.backend
+            .store_token_host(self.bufs.current_token, token)?;
+        self.backend
+            .gather_row_device_f16(self.emb_ln, self.bufs.x, self.bufs.current_token, c)?;
 
         for i in 0..self.config.n_layer {
             self.forward_layer(i, c, h, n, state)?;
             if let Ok(sl) = std::env::var("SNAP_LAYER")
                 && sl.parse::<usize>().unwrap() == i
             {
-                self.rt.end_batch()?;
-                let xd = self.rt.download(&self.bufs.x)?;
+                self.backend.end_batch()?;
+                let xd = self.backend.download(self.bufs.x)?;
                 log::info!("[SNAP] tok  layer {i} x[0..8] = {:?}", &xd[..8]);
-                self.rt.begin_batch()?;
+                self.backend.begin_batch()?;
             }
         }
 
         // ln_out + head
         // x_norm = layer_norm(x, ln_out_w, ln_out_b)
-        self.rt.norm(
-            &self.bufs.x,
-            &self.ln_out_w,
-            &self.ln_out_b,
-            &mut self.bufs.x_norm,
+        self.backend.norm(
+            self.bufs.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            self.bufs.x_norm,
             c,
             1,
             LN_EPS,
             1,
         )?;
         // logits = x_norm @ head.T = gemv_f16(head_w16, x_norm, M=vocab, K=c)
-        self.rt.gemv_f16(
-            &self.head_w16,
-            &self.bufs.x_norm,
-            &mut self.bufs.logits,
+        self.backend.gemv_f16(
+            self.head_w16,
+            self.bufs.x_norm,
+            self.bufs.logits,
             vocab,
             c,
             1,
         )?;
         // 需要采样时，GPU 端 argmax / 带参数采样归约（与本次前向同批）
         if let Some(sp) = sampler {
-            self.rt.sample(
-                &self.bufs.logits,
-                &mut self.bufs.token_argmax,
+            self.backend.sample(
+                self.bufs.logits,
+                self.bufs.token_argmax,
                 vocab,
                 sp.temperature,
                 sp.top_k,
@@ -840,12 +833,12 @@ impl GpuModel {
                 history,
             )?;
         } else if do_argmax {
-            self.rt
-                .argmax(&self.bufs.logits, &mut self.bufs.token_argmax, vocab)?;
+            self.backend
+                .argmax(self.bufs.logits, self.bufs.token_argmax, vocab)?;
         }
 
         // 一次性提交整 token 的所有计算到 GPU
-        self.rt.end_batch()?;
+        self.backend.end_batch()?;
         Ok(())
     }
 
@@ -874,36 +867,36 @@ impl GpuModel {
         macro_rules! pf_phase {
             ($name:expr) => {
                 if pf {
-                    self.rt.end_batch()?;
+                    self.backend.end_batch()?;
                     log::info!(
                         "[P] tok t=0 layer {i} {}: {:.3}ms",
                         $name,
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
-                    self.rt.begin_batch()?;
+                    self.backend.begin_batch()?;
                     t0 = std::time::Instant::now();
                 }
             };
         }
         // ===== Time Mixing =====
         // 深度融合：ln1 = layer_norm(x) + 6 次 lerp(xr/xw/xk/xv/xa/xg) + state.tmix_x 写回
-        self.rt.norm_lerp6(
-            &self.bufs.x,
-            &mut state.layers[i].tmix_x,
-            &self.layers[i].ln1_w,
-            &self.layers[i].ln1_b,
-            &self.layers[i].x_r,
-            &self.layers[i].x_w,
-            &self.layers[i].x_k,
-            &self.layers[i].x_v,
-            &self.layers[i].x_a,
-            &self.layers[i].x_g,
-            &mut self.bufs.xr,
-            &mut self.bufs.xw,
-            &mut self.bufs.xk,
-            &mut self.bufs.xv,
-            &mut self.bufs.xa,
-            &mut self.bufs.xg,
+        self.backend.norm_lerp6(
+            self.bufs.x,
+            state.layers[i].tmix_x,
+            self.layers[i].ln1_w,
+            self.layers[i].ln1_b,
+            self.layers[i].x_r,
+            self.layers[i].x_w,
+            self.layers[i].x_k,
+            self.layers[i].x_v,
+            self.layers[i].x_a,
+            self.layers[i].x_g,
+            self.bufs.xr,
+            self.bufs.xw,
+            self.bufs.xk,
+            self.bufs.xv,
+            self.bufs.xa,
+            self.bufs.xg,
             c,
             LN_EPS,
         )?;
@@ -917,27 +910,27 @@ impl GpuModel {
             &self.layers[i].key_a8,
             &self.layers[i].value_a8,
         ) {
-            self.rt.gemv_int8_rkv_stage1(
+            self.backend.gemv_int8_rkv_stage1(
                 r_a8,
                 k_a8,
                 v_a8,
-                &self.layers[i].v1,
-                &self.layers[i].w1,
-                &self.layers[i].a1,
-                &self.layers[i].g1,
-                &self.bufs.xr,
-                &self.bufs.xk,
-                &self.bufs.xv,
-                &self.bufs.xw,
-                &self.bufs.xa,
-                &self.bufs.xg,
-                &mut self.bufs.r,
-                &mut self.bufs.k,
-                &mut self.bufs.v,
-                &mut self.bufs.v_mid,
-                &mut self.bufs.w_mid,
-                &mut self.bufs.a_mid,
-                &mut self.bufs.g_mid,
+                self.layers[i].v1,
+                self.layers[i].w1,
+                self.layers[i].a1,
+                self.layers[i].g1,
+                self.bufs.xr,
+                self.bufs.xk,
+                self.bufs.xv,
+                self.bufs.xw,
+                self.bufs.xa,
+                self.bufs.xg,
+                self.bufs.r,
+                self.bufs.k,
+                self.bufs.v,
+                self.bufs.v_mid,
+                self.bufs.w_mid,
+                self.bufs.a_mid,
+                self.bufs.g_mid,
                 c,
                 vm,
                 wm,
@@ -949,27 +942,27 @@ impl GpuModel {
             &self.layers[i].key_a4,
             &self.layers[i].value_a4,
         ) {
-            self.rt.gemv_any4_rkv_stage1(
+            self.backend.gemv_any4_rkv_stage1(
                 r_a4,
                 k_a4,
                 v_a4,
-                &self.layers[i].v1,
-                &self.layers[i].w1,
-                &self.layers[i].a1,
-                &self.layers[i].g1,
-                &self.bufs.xr,
-                &self.bufs.xk,
-                &self.bufs.xv,
-                &self.bufs.xw,
-                &self.bufs.xa,
-                &self.bufs.xg,
-                &mut self.bufs.r,
-                &mut self.bufs.k,
-                &mut self.bufs.v,
-                &mut self.bufs.v_mid,
-                &mut self.bufs.w_mid,
-                &mut self.bufs.a_mid,
-                &mut self.bufs.g_mid,
+                self.layers[i].v1,
+                self.layers[i].w1,
+                self.layers[i].a1,
+                self.layers[i].g1,
+                self.bufs.xr,
+                self.bufs.xk,
+                self.bufs.xv,
+                self.bufs.xw,
+                self.bufs.xa,
+                self.bufs.xg,
+                self.bufs.r,
+                self.bufs.k,
+                self.bufs.v,
+                self.bufs.v_mid,
+                self.bufs.w_mid,
+                self.bufs.a_mid,
+                self.bufs.g_mid,
                 c,
                 vm,
                 wm,
@@ -977,36 +970,36 @@ impl GpuModel {
                 gm,
             )?;
         } else {
-            self.rt.gemv_rkv_stage1(
-                self.layers[i]
+            self.backend.gemv_rkv_stage1(
+                *self.layers[i]
                     .receptance_w16
                     .as_ref()
                     .ok_or("receptance_w16 missing when not any4")?,
-                self.layers[i]
+                *self.layers[i]
                     .key_w16
                     .as_ref()
                     .ok_or("key_w16 missing when not any4")?,
-                self.layers[i]
+                *self.layers[i]
                     .value_w16
                     .as_ref()
                     .ok_or("value_w16 missing when not any4")?,
-                &self.layers[i].v1,
-                &self.layers[i].w1,
-                &self.layers[i].a1,
-                &self.layers[i].g1,
-                &self.bufs.xr,
-                &self.bufs.xk,
-                &self.bufs.xv,
-                &self.bufs.xw,
-                &self.bufs.xa,
-                &self.bufs.xg,
-                &mut self.bufs.r,
-                &mut self.bufs.k,
-                &mut self.bufs.v,
-                &mut self.bufs.v_mid,
-                &mut self.bufs.w_mid,
-                &mut self.bufs.a_mid,
-                &mut self.bufs.g_mid,
+                self.layers[i].v1,
+                self.layers[i].w1,
+                self.layers[i].a1,
+                self.layers[i].g1,
+                self.bufs.xr,
+                self.bufs.xk,
+                self.bufs.xv,
+                self.bufs.xw,
+                self.bufs.xa,
+                self.bufs.xg,
+                self.bufs.r,
+                self.bufs.k,
+                self.bufs.v,
+                self.bufs.v_mid,
+                self.bufs.w_mid,
+                self.bufs.a_mid,
+                self.bufs.g_mid,
                 c,
                 vm,
                 wm,
@@ -1016,43 +1009,43 @@ impl GpuModel {
         }
         pf_phase!("gemv_rkv_stage1");
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "tok",
             i,
             &[
-                ("xr", &self.bufs.xr),
-                ("xk", &self.bufs.xk),
-                ("xv", &self.bufs.xv),
-                ("r", &self.bufs.r),
-                ("k", &self.bufs.k),
+                ("xr", self.bufs.xr),
+                ("xk", self.bufs.xk),
+                ("xv", self.bufs.xv),
+                ("r", self.bufs.r),
+                ("k", self.bufs.k),
             ],
         )?;
 
         // ===== v_first 跨层逻辑（首层把 v 快照到 v_first）=====
         if !state.v_first_set {
-            self.rt.copy_device_f16(&self.bufs.v, &mut state.v_first)?;
+            self.backend.copy_device_f16(self.bufs.v, state.v_first)?;
             state.v_first_set = true;
         }
         // ===== 低秩链第二级融合（w/a/g/v 二级投影 + 激活，1 次 dispatch）=====
         // 首层 v_first==v，v 链 lerp 因子 sigmoid*(v_first-v)=0，v 保持不变（=value 投影）
-        self.rt.gemv_lowrank_chain4(
-            &self.layers[i].w2,
-            &self.layers[i].a2,
-            &self.layers[i].v2,
-            &self.layers[i].g2,
-            &self.bufs.w_mid,
-            &self.bufs.a_mid,
-            &self.bufs.v_mid,
-            &self.bufs.g_mid,
-            &self.layers[i].w0,
-            &self.layers[i].a0,
-            &self.layers[i].v0,
-            &self.scale_w,
-            &state.v_first,
-            &mut self.bufs.w,
-            &mut self.bufs.a,
-            &mut self.bufs.v,
-            &mut self.bufs.g,
+        self.backend.gemv_lowrank_chain4(
+            self.layers[i].w2,
+            self.layers[i].a2,
+            self.layers[i].v2,
+            self.layers[i].g2,
+            self.bufs.w_mid,
+            self.bufs.a_mid,
+            self.bufs.v_mid,
+            self.bufs.g_mid,
+            self.layers[i].w0,
+            self.layers[i].a0,
+            self.layers[i].v0,
+            self.scale_w,
+            state.v_first,
+            self.bufs.w,
+            self.bufs.a,
+            self.bufs.v,
+            self.bufs.g,
             c,
             wm,
             am,
@@ -1068,61 +1061,66 @@ impl GpuModel {
         //   S 更新 + y = S @ r
         //   y_norm  = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k)*v
         // （省 1 次 dispatch/层，替代 fuse_ka_dplr + norm_sum_rk_rk 两次）
-        self.rt.fuse_ka_dplr_norm(
-            &mut state.layers[i].tmix_rnn,
-            &self.bufs.k,
-            &self.layers[i].k_k,
-            &self.bufs.a,
-            &self.layers[i].k_a,
-            &self.bufs.r,
-            &self.bufs.v,
-            &self.bufs.w,
-            &self.layers[i].ln_x_w,
-            &self.layers[i].ln_x_b,
-            &self.layers[i].r_k,
-            &mut self.bufs.k_mod,
-            &mut self.bufs.y,
-            &mut self.bufs.y_norm,
+        self.backend.fuse_ka_dplr_norm(
+            state.layers[i].tmix_rnn,
+            self.bufs.k,
+            self.layers[i].k_k,
+            self.bufs.a,
+            self.layers[i].k_a,
+            self.bufs.r,
+            self.bufs.v,
+            self.bufs.w,
+            self.layers[i].ln_x_w,
+            self.layers[i].ln_x_b,
+            self.layers[i].r_k,
+            self.bufs.k_mod,
+            self.bufs.y,
+            self.bufs.y_norm,
             h,
             n,
             EPS_L2,
             GN_EPS,
         )?;
         pf_phase!("fuse_ka_dplr_norm");
-        Self::dump_tensors(&mut self.rt, "tok", i, &[("y", &self.bufs.y)])?;
-        Self::dump_tensors(&mut self.rt, "tok", i, &[("y_norm", &self.bufs.y_norm)])?;
+        Self::dump_tensors(self.backend.as_mut(), "tok", i, &[("y", self.bufs.y)])?;
+        Self::dump_tensors(
+            self.backend.as_mut(),
+            "tok",
+            i,
+            &[("y_norm", self.bufs.y_norm)],
+        )?;
 
         // x += (y_norm .* g) @ output_w（mul + 残差累加都折叠进 gemv，省 2 次 dispatch）；
         // 三路量化权重自动路由：int8 → any4 → fp16
         if let Some(a8) = &self.layers[i].att_output_a8 {
-            self.rt.gemv_int8_mul_add(
+            self.backend.gemv_int8_mul_add(
                 a8,
-                &self.bufs.y_norm,
-                &self.bufs.g,
-                &mut self.bufs.x,
+                self.bufs.y_norm,
+                self.bufs.g,
+                self.bufs.x,
                 c,
                 c,
                 1,
             )?;
         } else if let Some(a4) = &self.layers[i].att_output_a4 {
-            self.rt.gemv_any4_mul_add(
+            self.backend.gemv_any4_mul_add(
                 a4,
-                &self.bufs.y_norm,
-                &self.bufs.g,
-                &mut self.bufs.x,
+                self.bufs.y_norm,
+                self.bufs.g,
+                self.bufs.x,
                 c,
                 c,
                 1,
             )?;
         } else {
-            self.rt.gemv_f16_mul_add(
-                self.layers[i]
+            self.backend.gemv_f16_mul_add(
+                *self.layers[i]
                     .output_w16
                     .as_ref()
                     .ok_or("output_w16 missing when not any4")?,
-                &self.bufs.y_norm,
-                &self.bufs.g,
-                &mut self.bufs.x,
+                self.bufs.y_norm,
+                self.bufs.g,
+                self.bufs.x,
                 c,
                 c,
                 1,
@@ -1130,22 +1128,22 @@ impl GpuModel {
         }
         pf_phase!("gemv_f16_mul_add");
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "tok",
             i,
-            &[("y_g", &self.bufs.y_g), ("x_out", &self.bufs.x)],
+            &[("y_g", self.bufs.y_g), ("x_out", self.bufs.x)],
         )?;
 
         // ===== Channel Mixing =====
         // 深度融合：ln2 = layer_norm(x, ln2_w, ln2_b) + prev_c 读入 + state.cmix_x 写回 + lerp(xb)
         // xb = ln2 + ffn_x_k * (prev_c - ln2)，一次 dispatch 完成（原 4 跳）。
-        self.rt.cmix_norm_lerp(
-            &self.bufs.x,
-            &mut state.layers[i].cmix_x,
-            &self.layers[i].ln2_w,
-            &self.layers[i].ln2_b,
-            &self.layers[i].ffn_x_k,
-            &mut self.bufs.xb,
+        self.backend.cmix_norm_lerp(
+            self.bufs.x,
+            state.layers[i].cmix_x,
+            self.layers[i].ln2_w,
+            self.layers[i].ln2_b,
+            self.layers[i].ffn_x_k,
+            self.bufs.xb,
             c,
             LN_EPS,
         )?;
@@ -1153,19 +1151,19 @@ impl GpuModel {
 
         // r2 = relu²(xb @ ffn_key.T) — M=ffn_hidden, K=C；三路量化权重自动路由：int8 → any4 → fp16
         if let Some(a8) = &self.layers[i].ffn_key_a8 {
-            self.rt
-                .gemv_int8_relu2(a8, &self.bufs.xb, &mut self.bufs.r2, fh, c, 1)?;
+            self.backend
+                .gemv_int8_relu2(a8, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
         } else if let Some(a4) = &self.layers[i].ffn_key_a4 {
-            self.rt
-                .gemv_any4_relu2(a4, &self.bufs.xb, &mut self.bufs.r2, fh, c, 1)?;
+            self.backend
+                .gemv_any4_relu2(a4, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
         } else {
-            self.rt.gemv_f16_relu2(
-                self.layers[i]
+            self.backend.gemv_f16_relu2(
+                *self.layers[i]
                     .ffn_key_w16
                     .as_ref()
                     .ok_or("ffn_key_w16 missing when not any4")?,
-                &self.bufs.xb,
-                &mut self.bufs.r2,
+                self.bufs.xb,
+                self.bufs.r2,
                 fh,
                 c,
                 1,
@@ -1175,19 +1173,19 @@ impl GpuModel {
         // x += r2 @ ffn_value（残差累加折叠进 gemv，省 1 次 dispatch）；
         // 三路量化权重自动路由：int8 → any4 → fp16
         if let Some(a8) = &self.layers[i].ffn_value_a8 {
-            self.rt
-                .gemv_int8_add(a8, &self.bufs.r2, &mut self.bufs.x, c, fh, 1)?;
+            self.backend
+                .gemv_int8_add(a8, self.bufs.r2, self.bufs.x, c, fh, 1)?;
         } else if let Some(a4) = &self.layers[i].ffn_value_a4 {
-            self.rt
-                .gemv_any4_add(a4, &self.bufs.r2, &mut self.bufs.x, c, fh, 1)?;
+            self.backend
+                .gemv_any4_add(a4, self.bufs.r2, self.bufs.x, c, fh, 1)?;
         } else {
-            self.rt.gemv_f16_add(
-                self.layers[i]
+            self.backend.gemv_f16_add(
+                *self.layers[i]
                     .ffn_value_w16
                     .as_ref()
                     .ok_or("ffn_value_w16 missing when not any4")?,
-                &self.bufs.r2,
-                &mut self.bufs.x,
+                self.bufs.r2,
+                self.bufs.x,
                 c,
                 fh,
                 1,
@@ -1219,8 +1217,14 @@ impl GpuModel {
         // 按需创建/复用序列并行缓冲（T 变化时重建）
         if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
             // T 变化 → 新缓冲地址 + 新 spec，旧 kernel 缓存失效，清空避免耗尽 descriptor pool
-            self.rt.clear_cache();
-            self.seq_bufs = Some(SeqBuffers::new(&self.rt, t, c, vocab, &self.config)?);
+            self.backend.clear_cache();
+            self.seq_bufs = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                t,
+                c,
+                vocab,
+                &self.config,
+            )?);
         }
         // 临时取出 seq_bufs，避免 forward_seq_layer 的 &mut self 与 &mut self.seq_bufs 冲突
         let mut seq_bufs = self.seq_bufs.take().unwrap();
@@ -1233,12 +1237,12 @@ impl GpuModel {
             let tok = tok as usize;
             x_data[ti * c..(ti + 1) * c].copy_from_slice(&emb_ln[tok * c..(tok + 1) * c]);
         }
-        self.rt.upload(&sb.x, &x_data)?;
+        self.backend.upload(sb.x, &x_data)?;
 
         let seq_pf = std::env::var("SEQ_PROFILE").is_ok();
         let mut spf_t0 = std::time::Instant::now();
         // 单批处理全部层：任何层都走 any4 GEMM（零 fp16 副本），无需逐层 begin/end_batch 隔离。
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
         for i in 0..self.config.n_layer {
             if std::env::var("GEMM_DIAG").is_ok() {
                 log::info!("[FS] layer {i} start");
@@ -1252,42 +1256,42 @@ impl GpuModel {
                 spf_t0 = std::time::Instant::now();
             }
         }
-        self.rt.end_batch()?;
+        self.backend.end_batch()?;
 
         // ln_out + head（只算最后 token，避免 [T, vocab] 全量 GEMM 与 67MB 下载）
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
         // x_norm = layer_norm(x, ln_out_w, ln_out_b) over T 个 token
-        self.rt.norm(
-            &sb.x,
-            &self.ln_out_w,
-            &self.ln_out_b,
-            &mut sb.x_norm,
+        self.backend.norm(
+            sb.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            sb.x_norm,
             c,
             1,
             LN_EPS,
             t,
         )?;
         // head_in = x_norm[T-1]（末 token 行）
-        self.rt
-            .copy_token(&sb.x_norm, &mut sb.head_in, c, c, t - 1)?;
+        self.backend
+            .copy_token(sb.x_norm, sb.head_in, c, c, t - 1)?;
         // logits = head_in @ head.T，输出 [vocab]（fp16 权重减半带宽）
-        self.rt
-            .gemv_f16(&self.head_w16, &sb.head_in, &mut sb.logits, vocab, c, 1)?;
+        self.backend
+            .gemv_f16(self.head_w16, sb.head_in, sb.logits, vocab, c, 1)?;
 
-        self.rt.end_batch()?;
+        self.backend.end_batch()?;
 
         // 诊断：比较最后层 output GEMM vs gemv 参考
         if std::env::var("GEMM_DIAG").is_ok() {
-            let go = self.rt.download(&sb.y_out)?;
-            let gr = self.rt.download(&sb.diag_out_ref)?;
+            let go = self.backend.download(sb.y_out)?;
+            let gr = self.backend.download(sb.diag_out_ref)?;
             let mut md = 0.0f32;
             for (a, b) in go.iter().zip(&gr) {
                 md = md.max((a - b).abs());
             }
             log::info!("[FS] last-layer output GEMM vs gemv max_abs_diff: {md:.6}");
             // 诊断：to_f16 是否正确（y_g16 vs fp16(y_g)）
-            let yg = self.rt.download(&sb.y_g)?;
-            let yg16 = self.rt.download_f16(&sb.y_g16)?;
+            let yg = self.backend.download(sb.y_g)?;
+            let yg16 = self.backend.download(sb.y_g16)?;
             let mut md16 = 0.0f32;
             for i in 0..c {
                 let want = half::f16::from_f32(yg[i]).to_f32();
@@ -1303,7 +1307,7 @@ impl GpuModel {
         }
 
         // 返回最后 token 的 logits（先下载，再归还 seq_bufs）
-        let last_logits = self.rt.download(&sb.logits)?;
+        let last_logits = self.backend.download(sb.logits)?;
 
         // 归还 seq_bufs
         self.seq_bufs = Some(seq_bufs);
@@ -1317,10 +1321,16 @@ impl GpuModel {
         let t = tokens.len();
         let (c, n, vocab) = (self.config.n_embd, self.config.head_size, self.config.vocab);
         self.reset_state()?;
-        self.rt.clear_cache();
+        self.backend.clear_cache();
         if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
-            self.rt.clear_cache();
-            self.seq_bufs = Some(SeqBuffers::new(&self.rt, t, c, vocab, &self.config)?);
+            self.backend.clear_cache();
+            self.seq_bufs = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                t,
+                c,
+                vocab,
+                &self.config,
+            )?);
         }
         let mut seq_bufs = self.seq_bufs.take().unwrap();
         let sb = &mut seq_bufs;
@@ -1330,15 +1340,15 @@ impl GpuModel {
             let tok = tok as usize;
             x_data[ti * c..(ti + 1) * c].copy_from_slice(&emb_ln[tok * c..(tok + 1) * c]);
         }
-        self.rt.upload(&sb.x, &x_data)?;
+        self.backend.upload(sb.x, &x_data)?;
         let mut snaps = Vec::new();
         // 取出内部状态，逐层快照（与 forward_seq 一致：any4 GEMM 零 fp16 副本）
         let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
-            self.rt.begin_batch()?;
+            self.backend.begin_batch()?;
             self.forward_seq_layer(i, t, c, n, sb, &mut state)?;
-            self.rt.end_batch()?;
-            let xd = self.rt.download(&sb.x)?;
+            self.backend.end_batch()?;
+            let xd = self.backend.download(sb.x)?;
             snaps.push(xd[..d].to_vec());
         }
         self.state = Some(state);
@@ -1361,15 +1371,15 @@ impl GpuModel {
         let emb_ln = &self.emb_ln_cpu;
         let token = tokens[0] as usize;
         let mut x_host = emb_ln[token * c..(token + 1) * c].to_vec();
-        self.rt.upload(&self.bufs.x, &x_host)?;
+        self.backend.upload(self.bufs.x, &x_host)?;
         // 取出内部状态，与 forward 一致：逐层前向并快照
         let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
             state.v_first_set = false;
-            self.rt.begin_batch()?;
+            self.backend.begin_batch()?;
             self.forward_layer(i, c, h, n, &mut state)?;
-            self.rt.end_batch()?;
-            x_host = self.rt.download(&self.bufs.x)?;
+            self.backend.end_batch()?;
+            x_host = self.backend.download(self.bufs.x)?;
             snaps.push(x_host[..d].to_vec());
         }
         self.state = Some(state);
@@ -1379,8 +1389,8 @@ impl GpuModel {
     /// 诊断：下载 layer idx 的 tmix_rnn 状态的前 n 个元素（用于对比 seq 与 tok 路径 dplr 状态差异）。
     pub fn download_state_rnn(&mut self, idx: usize, n: usize) -> R<Vec<f32>> {
         let s = self
-            .rt
-            .download(&self.state.as_ref().unwrap().layers[idx].tmix_rnn)?;
+            .backend
+            .download(self.state.as_ref().unwrap().layers[idx].tmix_rnn)?;
         Ok(s[..n.min(s.len())].to_vec())
     }
 
@@ -1414,33 +1424,33 @@ impl GpuModel {
         let emb_ln = &self.emb_ln_cpu;
         let token = tokens[0] as usize;
         let x_host = emb_ln[token * c..(token + 1) * c].to_vec();
-        self.rt.upload(&self.bufs.x, &x_host)?;
+        self.backend.upload(self.bufs.x, &x_host)?;
         let mut state = self.state.take().unwrap();
         for i in 0..up_to_layer {
             state.v_first_set = false;
-            self.rt.begin_batch()?;
+            self.backend.begin_batch()?;
             self.forward_layer(i, c, h, n_head, &mut state)?;
-            self.rt.end_batch()?;
+            self.backend.end_batch()?;
         }
         self.state = Some(state);
         // 下载输入 x（layer up_to_layer 的输入）
-        let x_inp = self.rt.download(&self.bufs.x)?;
+        let x_inp = self.backend.download(self.bufs.x)?;
         // 计算 ln1
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
         let li = up_to_layer.min(self.layers.len() - 1);
         let l = &self.layers[li];
-        self.rt.norm(
-            &self.bufs.x,
-            &l.ln1_w,
-            &l.ln1_b,
-            &mut self.bufs.ln1,
+        self.backend.norm(
+            self.bufs.x,
+            l.ln1_w,
+            l.ln1_b,
+            self.bufs.ln1,
             c,
             1,
             LN_EPS,
             1,
         )?;
-        self.rt.end_batch()?;
-        let ln = self.rt.download(&self.bufs.ln1)?;
+        self.backend.end_batch()?;
+        let ln = self.backend.download(self.bufs.ln1)?;
         let nn = n.min(ln.len()).min(x_inp.len());
         Ok((x_inp[..nn].to_vec(), ln[..nn].to_vec()))
     }
@@ -1454,10 +1464,16 @@ impl GpuModel {
     ) -> R<(Vec<f32>, Vec<f32>)> {
         let t = tokens.len();
         let (c, n_head, vocab) = (self.config.n_embd, self.config.head_size, self.config.vocab);
-        self.rt.clear_cache();
+        self.backend.clear_cache();
         if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
-            self.rt.clear_cache();
-            self.seq_bufs = Some(SeqBuffers::new(&self.rt, t, c, vocab, &self.config)?);
+            self.backend.clear_cache();
+            self.seq_bufs = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                t,
+                c,
+                vocab,
+                &self.config,
+            )?);
         }
         let mut seq_bufs = self.seq_bufs.take().unwrap();
         let sb = &mut seq_bufs;
@@ -1467,44 +1483,49 @@ impl GpuModel {
             let tok = tok as usize;
             x_data[ti * c..(ti + 1) * c].copy_from_slice(&emb_ln[tok * c..(tok + 1) * c]);
         }
-        self.rt.upload(&sb.x, &x_data)?;
+        self.backend.upload(sb.x, &x_data)?;
         // 取出内部状态，跑 [0, up_to_layer) 层
         let mut state = self.state.take().unwrap();
         for i in 0..up_to_layer {
-            self.rt.begin_batch()?;
+            self.backend.begin_batch()?;
             self.forward_seq_layer(i, t, c, n_head, sb, &mut state)?;
-            self.rt.end_batch()?;
+            self.backend.end_batch()?;
         }
         self.state = Some(state);
         // 下载输入 x（第 0 token：sb.x[0..c]，因为 mk_pad(c) 布局 [M_PAD, C] 第 0 行偏移 = 0 * C = 0）
-        let x_all = self.rt.download(&sb.x)?;
+        let x_all = self.backend.download(sb.x)?;
         let x_inp = x_all[..c.min(x_all.len())].to_vec();
         // 跑 norm
-        self.rt.begin_batch()?;
+        self.backend.begin_batch()?;
         let li = up_to_layer.min(self.layers.len() - 1);
         let l = &self.layers[li];
-        self.rt
-            .norm(&sb.x, &l.ln1_w, &l.ln1_b, &mut sb.ln1, c, 1, LN_EPS, t)?;
-        self.rt.end_batch()?;
-        let xn = self.rt.download(&sb.ln1)?;
+        self.backend
+            .norm(sb.x, l.ln1_w, l.ln1_b, sb.ln1, c, 1, LN_EPS, t)?;
+        self.backend.end_batch()?;
+        let xn = self.backend.download(sb.ln1)?;
         let nn = n.min(xn.len()).min(x_inp.len());
         self.seq_bufs = Some(seq_bufs);
         Ok((x_inp[..nn].to_vec(), xn[..nn].to_vec()))
     }
 
     /// 诊断：dump 指定层的中间张量（需在批处理上下文中，吞吐低，仅调试用）。
-    fn dump_tensors(rt: &mut Runtime, tag: &str, i: usize, items: &[(&str, &GpuTensor)]) -> R<()> {
+    fn dump_tensors(
+        backend: &mut dyn ComputeBackend,
+        tag: &str,
+        i: usize,
+        items: &[(&str, TensorId)],
+    ) -> R<()> {
         let want = std::env::var("DUMP_LAYER")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
         if want == Some(i) {
-            rt.end_batch()?;
+            backend.end_batch()?;
             for (name, t) in items {
-                let d = rt.download(t)?;
+                let d = backend.download(*t)?;
                 let n = d.len().min(8);
                 log::info!("[DBG] {tag} layer {i} {name} [0..{n}] = {:?}", &d[..n]);
             }
-            rt.begin_batch()?;
+            backend.begin_batch()?;
         }
         Ok(())
     }
@@ -1513,9 +1534,9 @@ impl GpuModel {
     ///（GEMM_DIAG_VERIFY=层号 时对该层 receptance 触发，kernel 单测）。
     /// 下载 any4 idx/lut/sz 与 w_scratch，CPU 端按同一公式（含 fp16 舍入）重算并比对。
     fn verify_dequant(
-        rt: &mut Runtime,
-        a4: &GpuTensorAny4,
-        scratch: &GpuTensor16,
+        backend: &mut dyn ComputeBackend,
+        a4: &Any4Handle,
+        scratch: TensorId,
         i: usize,
         m: usize,
         k: usize,
@@ -1526,12 +1547,12 @@ impl GpuModel {
         if want != Some(i) {
             return Ok(());
         }
-        rt.end_batch()?;
-        let idx = rt.download_u32(&a4.idx, m * (k / 8))?;
-        let lut = rt.download_f16(&a4.lut)?;
-        let sz = rt.download_u32(&a4.sz, m * (k / 128))?;
-        let gpu = rt.download_f16(scratch)?;
-        rt.begin_batch()?;
+        backend.end_batch()?;
+        let idx = backend.download_u32(a4.idx)?;
+        let lut = backend.download(a4.lut)?;
+        let sz = backend.download_u32(a4.sz)?;
+        let gpu = backend.download(scratch)?;
+        backend.begin_batch()?;
         let w_ref = dequant_any4(&idx, &lut, &sz, m, k);
         let mut max_diff = 0.0f32;
         let mut bad = 0usize;
@@ -1554,7 +1575,7 @@ impl GpuModel {
     /// 诊断：用 CPU fp16 参考验证 GPU GEMM 的 r/k/v 输出（GEMM_DIAG_VERIFY=层号时触发）。
     /// 下载 xk16/xv16 与 key_w16/value_w16，计算 k[0]/v[0] 的 fp16 精确参考，与 GPU 输出对比。
     fn verify_gemm_rkv(
-        rt: &mut Runtime,
+        backend: &mut dyn ComputeBackend,
         layer: &GpuLayer,
         i: usize,
         sb: &SeqBuffers,
@@ -1566,45 +1587,21 @@ impl GpuModel {
         if want != Some(i) {
             return Ok(());
         }
-        rt.end_batch()?;
+        backend.end_batch()?;
         // any4 模型无常驻 w16（方案A 下参考为 w_scratch 反量化结果，此处直接跳过）
         let (Some(key_w16), Some(value_w16)) = (&layer.key_w16, &layer.value_w16) else {
             log::info!("[GEMMV] layer {i} skipped: any4 模型无常驻 w16 参考");
-            rt.begin_batch()?;
+            backend.begin_batch()?;
             return Ok(());
         };
-        if std::env::var("ADDR_DIAG").is_ok() {
-            log::info!(
-                "[ADDR] layer{i} key_w16 addr={:#x} len={} | value_w16 addr={:#x} len={}",
-                key_w16.device.address,
-                key_w16.len,
-                value_w16.device.address,
-                value_w16.len
-            );
-            log::info!(
-                "[ADDR] layer{i} r addr={:#x} len={} | k addr={:#x} len={} | v addr={:#x} len={}",
-                sb.r.device.address,
-                sb.r.len,
-                sb.k.device.address,
-                sb.k.len,
-                sb.v.device.address,
-                sb.v.len
-            );
-            log::info!(
-                "[ADDR] layer{i} key_w16[0..3]={:?}",
-                rt.download_f16(key_w16)
-                    .map(|d| d[..3].to_vec())
-                    .unwrap_or_default()
-            );
-        }
-        let xk16 = rt.download_f16(&sb.xk16)?;
-        let xv16 = rt.download_f16(&sb.xv16)?;
-        let xk = rt.download(&sb.xk)?;
-        let kw16 = rt.download_f16(key_w16)?;
-        let vw16 = rt.download_f16(value_w16)?;
-        let gk = rt.download(&sb.k)?;
-        let gv = rt.download(&sb.v)?;
-        rt.begin_batch()?;
+        let xk16 = backend.download(sb.xk16)?;
+        let xv16 = backend.download(sb.xv16)?;
+        let xk = backend.download(sb.xk)?;
+        let kw16 = backend.download(*key_w16)?;
+        let vw16 = backend.download(*value_w16)?;
+        let gk = backend.download(sb.k)?;
+        let gv = backend.download(sb.v)?;
+        backend.begin_batch()?;
 
         // 校验 xk16 == fp16(xk)，揭穿 GEMM 输入是否被竞态污染
         for e in 0..8 {
@@ -1665,13 +1662,13 @@ impl GpuModel {
         macro_rules! pf_phase {
             ($name:expr) => {
                 if pf {
-                    self.rt.end_batch()?;
+                    self.backend.end_batch()?;
                     log::info!(
                         "[P] t={t} layer {i} {}: {:.4}s",
                         $name,
                         t0.elapsed().as_secs_f64()
                     );
-                    self.rt.begin_batch()?;
+                    self.backend.begin_batch()?;
                     t0 = std::time::Instant::now();
                 }
             };
@@ -1679,82 +1676,26 @@ impl GpuModel {
 
         // ===== Time Mixing =====
         // ln1 = layer_norm(x, ln1_w, ln1_b) over T 个 token
-        self.rt.norm(
-            &sb.x,
-            &layer.ln1_w,
-            &layer.ln1_b,
-            &mut sb.ln1,
-            c,
-            1,
-            LN_EPS,
-            t,
-        )?;
+        self.backend
+            .norm(sb.x, layer.ln1_w, layer.ln1_b, sb.ln1, c, 1, LN_EPS, t)?;
 
         // token shift + time-mix：xr/xw/xk/xv/xa/xg（t=0 用旧 state，t>0 用前一 token）
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_r,
-            &mut sb.xr,
-            c,
-            t,
-            c,
-            c,
-        )?;
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_w,
-            &mut sb.xw,
-            c,
-            t,
-            c,
-            c,
-        )?;
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_k,
-            &mut sb.xk,
-            c,
-            t,
-            c,
-            c,
-        )?;
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_v,
-            &mut sb.xv,
-            c,
-            t,
-            c,
-            c,
-        )?;
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_a,
-            &mut sb.xa,
-            c,
-            t,
-            c,
-            c,
-        )?;
-        self.rt.seq_shift(
-            &sb.ln1,
-            &state.layers[i].tmix_x,
-            &layer.x_g,
-            &mut sb.xg,
-            c,
-            t,
-            c,
-            c,
-        )?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_r, sb.xr, c, t, c, c)?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_w, sb.xw, c, t, c, c)?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_k, sb.xk, c, t, c, c)?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_v, sb.xv, c, t, c, c)?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_a, sb.xa, c, t, c, c)?;
+        self.backend
+            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_g, sb.xg, c, t, c, c)?;
 
         // state[i].tmix_x = ln1[T-1]（须在 seq_shift 之后，避免覆盖 t=0 读取的旧 state）
-        self.rt
-            .copy_token(&sb.ln1, &mut state.layers[i].tmix_x, c, c, t - 1)?;
+        self.backend
+            .copy_token(sb.ln1, state.layers[i].tmix_x, c, c, t - 1)?;
 
         // r/k/v = token 并行 GEMM。
         // 方案A（默认）：any4 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
@@ -1768,76 +1709,46 @@ impl GpuModel {
         if let (Some(ra8), Some(ka8), Some(va8)) =
             (&layer.receptance_a8, &layer.key_a8, &layer.value_a8)
         {
-            self.rt.to_f16_triple(
-                &sb.xr,
-                &sb.xk,
-                &sb.xv,
-                &mut sb.xr16,
-                &mut sb.xk16,
-                &mut sb.xv16,
-                c,
-                t,
-                m_pad,
-                c,
-                c,
+            self.backend.to_f16_triple(
+                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
             )?;
-            self.rt.dequant_int8_to_f16(ra8, &sb.w_scratch, c, c)?;
-            self.rt
-                .gemm(&sb.xr16, &sb.w_scratch, &mut sb.r, m_pad, c, c)?;
-            self.rt.dequant_int8_to_f16(ka8, &sb.w_scratch, c, c)?;
-            self.rt
-                .gemm(&sb.xk16, &sb.w_scratch, &mut sb.k, m_pad, c, c)?;
-            self.rt.dequant_int8_to_f16(va8, &sb.w_scratch, c, c)?;
-            self.rt
-                .gemm(&sb.xv16, &sb.w_scratch, &mut sb.v, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(ra8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(ka8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(va8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
         } else if let (Some(ra4), Some(ka4), Some(va4)) =
             (&layer.receptance_a4, &layer.key_a4, &layer.value_a4)
         {
             if any4_gemm_prefill {
-                self.rt
-                    .gemm_any4(ra4, &sb.xr, None, &mut sb.r, c, c, t, false)?;
-                self.rt
-                    .gemm_any4(ka4, &sb.xk, None, &mut sb.k, c, c, t, false)?;
-                self.rt
-                    .gemm_any4(va4, &sb.xv, None, &mut sb.v, c, c, t, false)?;
+                self.backend
+                    .gemm_any4(ra4, sb.xr, None, sb.r, c, c, t, false)?;
+                self.backend
+                    .gemm_any4(ka4, sb.xk, None, sb.k, c, c, t, false)?;
+                self.backend
+                    .gemm_any4(va4, sb.xv, None, sb.v, c, c, t, false)?;
             } else {
-                self.rt.to_f16_triple(
-                    &sb.xr,
-                    &sb.xk,
-                    &sb.xv,
-                    &mut sb.xr16,
-                    &mut sb.xk16,
-                    &mut sb.xv16,
-                    c,
-                    t,
-                    m_pad,
-                    c,
-                    c,
+                self.backend.to_f16_triple(
+                    sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
                 )?;
-                self.rt.dequant_any4_to_f16(ra4, &sb.w_scratch, c, c)?;
-                Self::verify_dequant(&mut self.rt, ra4, &sb.w_scratch, i, c, c)?;
-                self.rt
-                    .gemm(&sb.xr16, &sb.w_scratch, &mut sb.r, m_pad, c, c)?;
-                self.rt.dequant_any4_to_f16(ka4, &sb.w_scratch, c, c)?;
-                self.rt
-                    .gemm(&sb.xk16, &sb.w_scratch, &mut sb.k, m_pad, c, c)?;
-                self.rt.dequant_any4_to_f16(va4, &sb.w_scratch, c, c)?;
-                self.rt
-                    .gemm(&sb.xv16, &sb.w_scratch, &mut sb.v, m_pad, c, c)?;
+                self.backend.dequant_any4_to_f16(ra4, sb.w_scratch, c, c)?;
+                Self::verify_dequant(self.backend.as_mut(), ra4, sb.w_scratch, i, c, c)?;
+                self.backend
+                    .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+                self.backend.dequant_any4_to_f16(ka4, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+                self.backend.dequant_any4_to_f16(va4, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
             }
         } else {
-            self.rt.to_f16_triple(
-                &sb.xr,
-                &sb.xk,
-                &sb.xv,
-                &mut sb.xr16,
-                &mut sb.xk16,
-                &mut sb.xv16,
-                c,
-                t,
-                m_pad,
-                c,
-                c,
+            self.backend.to_f16_triple(
+                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
             )?;
             let r16 = layer
                 .receptance_w16
@@ -1845,120 +1756,88 @@ impl GpuModel {
                 .ok_or("receptance_w16 missing")?;
             let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
             let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
-            self.rt.gemm(&sb.xr16, r16, &mut sb.r, m_pad, c, c)?;
-            self.rt.gemm(&sb.xk16, k16, &mut sb.k, m_pad, c, c)?;
-            self.rt.gemm(&sb.xv16, v16, &mut sb.v, m_pad, c, c)?;
+            self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
+            self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
+            self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
         }
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv done");
         }
         pf_phase!("shift+rkv_gemm");
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "seq",
             i,
             &[
-                ("xr", &sb.xr),
-                ("xk", &sb.xk),
-                ("xv", &sb.xv),
-                ("r", &sb.r),
-                ("k", &sb.k),
-                ("v", &sb.v),
+                ("xr", sb.xr),
+                ("xk", sb.xk),
+                ("xv", sb.xv),
+                ("r", sb.r),
+                ("k", sb.k),
+                ("v", sb.v),
             ],
         )?;
-        Self::verify_gemm_rkv(&mut self.rt, layer, i, sb, c)?;
+        Self::verify_gemm_rkv(self.backend.as_mut(), layer, i, sb, c)?;
 
         // 低秩 w/a/g 第一级投影输入转 fp16（xw/xa/xg → [M_PAD, C]）
-        self.rt.to_f16_triple(
-            &sb.xw,
-            &sb.xa,
-            &sb.xg,
-            &mut sb.xw16,
-            &mut sb.xa16,
-            &mut sb.xg16,
-            c,
-            t,
-            m_pad,
-            c,
-            c,
+        self.backend.to_f16_triple(
+            sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, t, m_pad, c, c,
         )?;
 
         // v_first 逻辑：layer 0 存 v_first = v；layer>0 交叉混合 v
         if i == 0 {
-            self.rt.copy_device(&sb.v, &mut sb.v_first)?;
+            self.backend.copy_device(sb.v, sb.v_first)?;
         } else {
             // v_mid = tensor-core GEMM(xv @ v1)：[M_PAD, vm_pad]
-            self.rt
-                .gemm(&sb.xv16, &layer.v1_16, &mut sb.v_mid, m_pad, vvp, c)?;
+            self.backend
+                .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_pad, vvp, c)?;
             // v_mid → fp16（第二级投影输入）
-            self.rt
-                .to_f16(&sb.v_mid, &mut sb.v_mid16, vvp, t, m_pad, vvp, vvp)?;
+            self.backend
+                .to_f16(sb.v_mid, sb.v_mid16, vvp, t, m_pad, vvp, vvp)?;
             // v_full = gemm_bias(v_mid @ v2 + v0)：[M_PAD, C]
-            self.rt.gemm_bias(
-                &sb.v_mid16,
-                &layer.v2_16,
-                &layer.v0,
-                &mut sb.v_full,
-                m_pad,
-                c,
-                vvp,
-            )?;
+            self.backend
+                .gemm_bias(sb.v_mid16, layer.v2_16, layer.v0, sb.v_full, m_pad, c, vvp)?;
             // gate = sigmoid(v_full)
-            self.rt
-                .elementwise_sigmoid(&sb.v_full, &mut sb.gate, c, t)?;
+            self.backend.elementwise_sigmoid(sb.v_full, sb.gate, c, t)?;
             // v = v + gate*(v_first - v)（原地，含 t=0）
-            self.rt
-                .v_first_lerp(&sb.v, &sb.gate, &sb.v_first, c, t, c)?;
+            self.backend
+                .v_first_lerp(sb.v, sb.gate, sb.v_first, c, t, c)?;
         }
 
         // w = exp(-sigmoid(w0 + tanh(xw@w1)@w2)/sqrt(e))
         // w_mid = tanh(xw @ w1)：[M_PAD, wm_pad]
-        self.rt
-            .gemm_tanh(&sb.xw16, &layer.w1_16, &mut sb.w_mid, m_pad, wwp, c)?;
-        self.rt
-            .to_f16(&sb.w_mid, &mut sb.w_mid16, wwp, t, m_pad, wwp, wwp)?;
+        self.backend
+            .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_pad, wwp, c)?;
+        self.backend
+            .to_f16(sb.w_mid, sb.w_mid16, wwp, t, m_pad, wwp, wwp)?;
         // w_full = gemm_bias(w_mid @ w2 + w0)：[M_PAD, C]
-        self.rt.gemm_bias(
-            &sb.w_mid16,
-            &layer.w2_16,
-            &layer.w0,
-            &mut sb.w_full,
-            m_pad,
-            c,
-            wwp,
-        )?;
-        self.rt
-            .elementwise_sigmoid(&sb.w_full, &mut sb.w_sig, c, t)?;
-        self.rt
-            .elementwise_scale_exp(&sb.w_sig, &self.scale_w, &mut sb.w, c, t)?;
+        self.backend
+            .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_pad, c, wwp)?;
+        self.backend
+            .elementwise_sigmoid(sb.w_full, sb.w_sig, c, t)?;
+        self.backend
+            .elementwise_scale_exp(sb.w_sig, self.scale_w, sb.w, c, t)?;
 
         // a = sigmoid(a0 + xa@a1@a2)
         // a_mid = xa @ a1：[M_PAD, am_pad]
-        self.rt
-            .gemm(&sb.xa16, &layer.a1_16, &mut sb.a_mid, m_pad, aap, c)?;
-        self.rt
-            .to_f16(&sb.a_mid, &mut sb.a_mid16, aap, t, m_pad, aap, aap)?;
+        self.backend
+            .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_pad, aap, c)?;
+        self.backend
+            .to_f16(sb.a_mid, sb.a_mid16, aap, t, m_pad, aap, aap)?;
         // a_full = gemm_bias(a_mid @ a2 + a0)：[M_PAD, C]
-        self.rt.gemm_bias(
-            &sb.a_mid16,
-            &layer.a2_16,
-            &layer.a0,
-            &mut sb.a_full,
-            m_pad,
-            c,
-            aap,
-        )?;
-        self.rt.elementwise_sigmoid(&sb.a_full, &mut sb.a, c, t)?;
+        self.backend
+            .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_pad, c, aap)?;
+        self.backend.elementwise_sigmoid(sb.a_full, sb.a, c, t)?;
 
         // 融合 k/k_a：k_mod、kk_l2、b_vec 一次 launch
-        self.rt.fuse_ka(
-            &sb.k,
-            &layer.k_k,
-            &sb.a,
-            &layer.k_a,
-            &mut sb.k_mod,
-            &mut sb.kk_l2,
-            &mut sb.b_vec,
+        self.backend.fuse_ka(
+            sb.k,
+            layer.k_k,
+            sb.a,
+            layer.k_a,
+            sb.k_mod,
+            sb.kk_l2,
+            sb.b_vec,
             self.config.n_head,
             n,
             t,
@@ -1966,15 +1845,15 @@ impl GpuModel {
         pf_phase!("lowrank+fuse_ka");
 
         // DPLR：单次 launch 处理整段 T（内部循环），S 跨 token 传递
-        self.rt.dplr_seq(
-            &mut state.layers[i].tmix_rnn,
-            &sb.r,
-            &sb.w,
-            &sb.k_mod,
-            &sb.v,
-            &sb.kk_l2,
-            &sb.b_vec,
-            &mut sb.y,
+        self.backend.dplr_seq(
+            state.layers[i].tmix_rnn,
+            sb.r,
+            sb.w,
+            sb.k_mod,
+            sb.v,
+            sb.kk_l2,
+            sb.b_vec,
+            sb.y,
             self.config.n_head,
             n,
             t,
@@ -1982,18 +1861,18 @@ impl GpuModel {
         )?;
         pf_phase!("lowrank+dplr_seq");
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "seq",
             i,
-            &[("y", &sb.y), ("y_norm", &sb.y_norm)],
+            &[("y", sb.y), ("y_norm", sb.y_norm)],
         )?;
 
         // y_norm = group_norm(y, ln_x_w, ln_x_b)
-        self.rt.norm(
-            &sb.y,
-            &layer.ln_x_w,
-            &layer.ln_x_b,
-            &mut sb.y_norm,
+        self.backend.norm(
+            sb.y,
+            layer.ln_x_w,
+            layer.ln_x_b,
+            sb.y_norm,
             n,
             self.config.n_head,
             GN_EPS,
@@ -2001,12 +1880,12 @@ impl GpuModel {
         )?;
 
         // extra: y_norm += sum(r*k_mod*r_k, head) * v
-        self.rt.sum_rk_rk(
-            &sb.r,
-            &sb.k_mod,
-            &layer.r_k,
-            &sb.v,
-            &mut sb.y_norm,
+        self.backend.sum_rk_rk(
+            sb.r,
+            sb.k_mod,
+            layer.r_k,
+            sb.v,
+            sb.y_norm,
             self.config.n_head,
             n,
             t,
@@ -2014,49 +1893,49 @@ impl GpuModel {
 
         // g = sigmoid(xg@g1)@g2（tensor-core GEMM）
         // g_mid = xg @ g1：[M_PAD, gm_pad]
-        self.rt
-            .gemm(&sb.xg16, &layer.g1_16, &mut sb.g_mid, m_pad, ggp, c)?;
+        self.backend
+            .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_pad, ggp, c)?;
         // sigmoid 原地 + 转 fp16（第二级投影输入）
-        self.rt.elementwise_sigmoid_inplace(&mut sb.g_mid, ggp, t)?;
-        self.rt
-            .to_f16(&sb.g_mid, &mut sb.g_mid16, ggp, t, m_pad, ggp, ggp)?;
+        self.backend.elementwise_sigmoid_inplace(sb.g_mid, ggp, t)?;
+        self.backend
+            .to_f16(sb.g_mid, sb.g_mid16, ggp, t, m_pad, ggp, ggp)?;
         // g = g_mid @ g2：[M_PAD, C]
-        self.rt
-            .gemm(&sb.g_mid16, &layer.g2_16, &mut sb.g, m_pad, c, ggp)?;
+        self.backend
+            .gemm(sb.g_mid16, layer.g2_16, sb.g, m_pad, c, ggp)?;
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "seq",
             i,
-            &[("w", &sb.w), ("a", &sb.a), ("v", &sb.v), ("g", &sb.g)],
+            &[("w", sb.w), ("a", sb.a), ("v", sb.v), ("g", sb.g)],
         )?;
 
         // y_g = y_norm * g
-        self.rt
-            .elementwise_mul(&sb.y_norm, &sb.g, &mut sb.y_g, c, t)?;
+        self.backend
+            .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, t)?;
 
         // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8/any4 默认走方案A（dequant→scratch→TC GEMM）
         if let Some(a8) = &layer.att_output_a8 {
-            self.rt.to_f16(&sb.y_g, &mut sb.y_g16, c, t, m_pad, c, c)?;
-            self.rt.dequant_int8_to_f16(a8, &sb.w_scratch, c, c)?;
-            self.rt
-                .gemm_add(&sb.y_g16, &sb.w_scratch, &sb.x, &mut sb.y_out, m_pad, c, c)?;
+            self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(a8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
         } else if let Some(a4) = &layer.att_output_a4 {
             if any4_gemm_prefill {
-                self.rt
-                    .gemm_any4(a4, &sb.y_g, Some(&sb.x), &mut sb.y_out, c, c, t, false)?;
+                self.backend
+                    .gemm_any4(a4, sb.y_g, Some(sb.x), sb.y_out, c, c, t, false)?;
             } else {
-                self.rt.to_f16(&sb.y_g, &mut sb.y_g16, c, t, m_pad, c, c)?;
-                self.rt.dequant_any4_to_f16(a4, &sb.w_scratch, c, c)?;
-                self.rt
-                    .gemm_add(&sb.y_g16, &sb.w_scratch, &sb.x, &mut sb.y_out, m_pad, c, c)?;
+                self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
+                self.backend.dequant_any4_to_f16(a4, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
             }
         } else {
-            self.rt.to_f16(&sb.y_g, &mut sb.y_g16, c, t, m_pad, c, c)?;
-            self.rt.gemm_add(
-                &sb.y_g16,
-                layer.output_w16.as_ref().ok_or("output_w16 missing")?,
-                &sb.x,
-                &mut sb.y_out,
+            self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
+            self.backend.gemm_add(
+                sb.y_g16,
+                *layer.output_w16.as_ref().ok_or("output_w16 missing")?,
+                sb.x,
+                sb.y_out,
                 m_pad,
                 c,
                 c,
@@ -2070,97 +1949,90 @@ impl GpuModel {
                 .output_w
                 .as_ref()
                 .ok_or("output_w missing when GEMM_DIAG")?;
-            self.rt
-                .gemv_seq(output_w, &sb.y_g, &mut sb.diag_out_ref, c, c, c, c, t)?;
+            self.backend
+                .gemv_seq(*output_w, sb.y_g, sb.diag_out_ref, c, c, c, c, t)?;
         }
 
         pf_phase!("y_norm+sum+g+output");
         Self::dump_tensors(
-            &mut self.rt,
+            self.backend.as_mut(),
             "seq",
             i,
-            &[("g", &sb.g), ("y_g", &sb.y_g), ("x_out", &sb.x)],
+            &[("g", sb.g), ("y_g", sb.y_g), ("x_out", sb.x)],
         )?;
 
         // ===== Channel Mixing =====
         // ln2 = layer_norm(x, ln2_w, ln2_b)
-        self.rt.norm(
-            &sb.x,
-            &layer.ln2_w,
-            &layer.ln2_b,
-            &mut sb.ln2,
-            c,
-            1,
-            LN_EPS,
-            t,
-        )?;
+        self.backend
+            .norm(sb.x, layer.ln2_w, layer.ln2_b, sb.ln2, c, 1, LN_EPS, t)?;
 
         // xb = token shift（t=0 用旧 cmix_x state，t>0 用前一轮 ln2）
-        self.rt.seq_shift(
-            &sb.ln2,
-            &state.layers[i].cmix_x,
-            &layer.ffn_x_k,
-            &mut sb.xb,
+        self.backend.seq_shift(
+            sb.ln2,
+            state.layers[i].cmix_x,
+            layer.ffn_x_k,
+            sb.xb,
             c,
             t,
             c,
             c,
         )?;
         // state[i].cmix_x = ln2[T-1]（须在 seq_shift 之后）
-        self.rt
-            .copy_token(&sb.ln2, &mut state.layers[i].cmix_x, c, c, t - 1)?;
+        self.backend
+            .copy_token(sb.ln2, state.layers[i].cmix_x, c, c, t - 1)?;
 
         // FFN = token 并行 GEMM；any4 默认走方案A（dequant→scratch→TC GEMM）
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn start");
         }
         if let Some(fka8) = &layer.ffn_key_a8 {
-            self.rt.to_f16(&sb.xb, &mut sb.xb16, c, t, m_pad, c, c)?;
-            self.rt.dequant_int8_to_f16(fka8, &sb.w_scratch, fh, c)?;
-            self.rt
-                .gemm_relu2(&sb.xb16, &sb.w_scratch, &mut sb.r2, m_pad, fh, c)?;
+            self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
+            self.backend
+                .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
+            self.backend
+                .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
         } else if let Some(fka4) = &layer.ffn_key_a4 {
             if any4_gemm_prefill {
-                self.rt
-                    .gemm_any4(fka4, &sb.xb, None, &mut sb.r2, fh, c, t, true)?;
+                self.backend
+                    .gemm_any4(fka4, sb.xb, None, sb.r2, fh, c, t, true)?;
             } else {
-                self.rt.to_f16(&sb.xb, &mut sb.xb16, c, t, m_pad, c, c)?;
-                self.rt.dequant_any4_to_f16(fka4, &sb.w_scratch, fh, c)?;
-                self.rt
-                    .gemm_relu2(&sb.xb16, &sb.w_scratch, &mut sb.r2, m_pad, fh, c)?;
+                self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
+                self.backend
+                    .dequant_any4_to_f16(fka4, sb.w_scratch, fh, c)?;
+                self.backend
+                    .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
             }
         } else {
-            self.rt.to_f16(&sb.xb, &mut sb.xb16, c, t, m_pad, c, c)?;
+            self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             let fk16 = layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?;
-            self.rt
-                .gemm_relu2(&sb.xb16, fk16, &mut sb.r2, m_pad, fh, c)?;
+            self.backend
+                .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
         }
         if let Some(fva8) = &layer.ffn_value_a8 {
-            self.rt
-                .to_f16(&sb.r2, &mut sb.r2_16, fh, t, m_pad, fh, fh)?;
-            self.rt.dequant_int8_to_f16(fva8, &sb.w_scratch, c, fh)?;
-            self.rt
-                .gemm_add(&sb.r2_16, &sb.w_scratch, &sb.x, &mut sb.v2, m_pad, c, fh)?;
+            self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+            self.backend
+                .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
+            self.backend
+                .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else if let Some(fva4) = &layer.ffn_value_a4 {
             if any4_gemm_prefill {
-                self.rt
-                    .gemm_any4(fva4, &sb.r2, Some(&sb.x), &mut sb.v2, c, fh, t, false)?;
+                self.backend
+                    .gemm_any4(fva4, sb.r2, Some(sb.x), sb.v2, c, fh, t, false)?;
             } else {
-                self.rt
-                    .to_f16(&sb.r2, &mut sb.r2_16, fh, t, m_pad, fh, fh)?;
-                self.rt.dequant_any4_to_f16(fva4, &sb.w_scratch, c, fh)?;
-                self.rt
-                    .gemm_add(&sb.r2_16, &sb.w_scratch, &sb.x, &mut sb.v2, m_pad, c, fh)?;
+                self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+                self.backend
+                    .dequant_any4_to_f16(fva4, sb.w_scratch, c, fh)?;
+                self.backend
+                    .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
             }
         } else {
-            self.rt
-                .to_f16(&sb.r2, &mut sb.r2_16, fh, t, m_pad, fh, fh)?;
+            self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
             let fv16 = layer
                 .ffn_value_w16
                 .as_ref()
                 .ok_or("ffn_value_w16 missing")?;
-            self.rt
-                .gemm_add(&sb.r2_16, fv16, &sb.x, &mut sb.v2, m_pad, c, fh)?;
+            self.backend
+                .gemm_add(sb.r2_16, *fv16, sb.x, sb.v2, m_pad, c, fh)?;
         }
         // 交换 x 与 v2：x 现在持有 block 最终输出残差，v2 持有旧 x（下轮被覆盖）。
         std::mem::swap(&mut sb.x, &mut sb.v2);
@@ -2176,37 +2048,41 @@ impl GpuModel {
 impl GpuLayer {
     /// 从 safetensors 加载单层权重并上传到 GPU
     fn load(
-        rt: &Runtime,
+        backend: &mut dyn ComputeBackend,
         st: &safetensors::SafeTensors,
         idx: usize,
         c: usize,
         cfg: &ModelConfig,
     ) -> R<Self> {
         // 一维参数
-        let load1 = |name: &str| -> R<GpuTensor> {
+        let load1 = |backend: &mut dyn ComputeBackend, name: &str| -> R<TensorId> {
             let key = format!("blocks.{idx}.{name}");
             let data = tensor_to_f32(&st.tensor(&key)?);
-            let t = rt.create_tensor(data.len())?;
-            rt.upload(&t, &data)?;
+            let t = backend.create_tensor(data.len(), TensorDtype::F32)?;
+            backend.upload(t, &data)?;
             Ok(t)
         };
         // 线性权重：只保留 output_w fp32 用于 GEMM_DIAG 诊断，其余已删 fp32 副本省显存
-        let load_linear_diag = |key: String| -> R<GpuTensor> {
+        let load_linear_diag = |backend: &mut dyn ComputeBackend, key: String| -> R<TensorId> {
             let data = tensor_to_f32(&st.tensor(&key)?);
-            let t = rt.create_tensor(data.len())?;
-            rt.upload(&t, &data)?;
+            let t = backend.create_tensor(data.len(), TensorDtype::F32)?;
+            backend.upload(t, &data)?;
             Ok(t)
         };
         // 线性权重 → fp16（tensor-core GEMM 用）
-        let load_linear_f16 = |key: String| -> R<GpuTensor16> {
+        let load_linear_f16 = |backend: &mut dyn ComputeBackend, key: String| -> R<TensorId> {
             let data = tensor_to_f32(&st.tensor(&key)?);
-            let t = rt.create_tensor_f16(data.len())?;
-            rt.upload_f16(&t, &data)?;
+            let t = backend.create_tensor(data.len(), TensorDtype::F16)?;
+            backend.upload(t, &data)?;
             Ok(t)
         };
         // 低秩权重：gemv 需要 [out, in] 行主序。
         // 各模型原始布局不同（g1h=[out,in]、g1d=[in,out]），按实际形状自适应转置。
-        let load_lowrank = |name: &str, out_dim: usize, in_dim: usize| -> R<GpuTensor> {
+        let load_lowrank = |backend: &mut dyn ComputeBackend,
+                            name: &str,
+                            out_dim: usize,
+                            in_dim: usize|
+         -> R<TensorId> {
             let key = format!("blocks.{idx}.att.{name}");
             let t = st.tensor(&key)?;
             let shape = t.shape();
@@ -2221,18 +2097,19 @@ impl GpuLayer {
                     "{key}: unexpected shape {shape:?}, want [{out_dim},{in_dim}] or [{in_dim},{out_dim}]"
                 )
             };
-            let t = rt.create_tensor(len)?;
-            rt.upload(&t, &oriented)?;
+            let t = backend.create_tensor(len, TensorDtype::F32)?;
+            backend.upload(t, &oriented)?;
             Ok(t)
         };
         // 低秩权重 → fp16（tensor-core GEMM 用，补齐到 [pad_out, pad_in]，不满的行/列填 0）。
         // 第一级投影 pad=[mid_pad, C]（n=mid_pad, k=C），第二级投影 pad=[C, mid_pad]（n=C, k=mid_pad）。
-        let load_lowrank_f16 = |name: &str,
+        let load_lowrank_f16 = |backend: &mut dyn ComputeBackend,
+                                name: &str,
                                 out_dim: usize,
                                 in_dim: usize,
                                 pad_out: usize,
                                 pad_in: usize|
-         -> R<GpuTensor16> {
+         -> R<TensorId> {
             let key = format!("blocks.{idx}.att.{name}");
             let t = st.tensor(&key)?;
             let shape = t.shape();
@@ -2248,12 +2125,12 @@ impl GpuLayer {
             };
             let mut padded = vec![0.0f32; pad_out * pad_in];
             for r in 0..out_dim {
-                for c in 0..in_dim {
-                    padded[r * pad_in + c] = oriented[r * in_dim + c];
+                for cc in 0..in_dim {
+                    padded[r * pad_in + cc] = oriented[r * in_dim + cc];
                 }
             }
-            let t = rt.create_tensor_f16(padded.len())?;
-            rt.upload_f16(&t, &padded)?;
+            let t = backend.create_tensor(padded.len(), TensorDtype::F16)?;
+            backend.upload(t, &padded)?;
             Ok(t)
         };
 
@@ -2263,7 +2140,11 @@ impl GpuLayer {
         // any4 量化权重：探测 {key}.any4_idx 是否存在。
         // 存在 → 上传 idx/lut/sz 三路张量，并 CPU 反量化出 f32 供 fp16 副本（prefill GEMM 用）；
         // 不存在 → None，走原 fp16 加载路径（单二进制兼容两种模型文件）。
-        let load_any4 = |key: &str, m: usize, k: usize| -> R<Option<GpuTensorAny4>> {
+        let load_any4 = |backend: &mut dyn ComputeBackend,
+                         key: &str,
+                         m: usize,
+                         k: usize|
+         -> R<Option<Any4Handle>> {
             if st.tensor(&format!("{key}.any4_idx")).is_err() {
                 return Ok(None);
             }
@@ -2276,14 +2157,14 @@ impl GpuLayer {
             assert_eq!(idx_u32.len(), m * k / 8, "{key}.any4_idx 形状不符");
             assert_eq!(lut32.len(), m * 16, "{key}.any4_lut 形状不符");
             assert_eq!(sz_u32.len(), m * k / 128, "{key}.any4_sz 形状不符");
-            let idx_gpu = rt.create_tensor_u32(m * k / 8)?;
-            rt.upload_u32(&idx_gpu, idx_u32)?;
-            let lut_gpu = rt.create_tensor_f16(m * 16)?;
-            rt.upload_f16(&lut_gpu, &lut32)?;
-            let sz_gpu = rt.create_tensor_u32(m * k / 128)?;
-            rt.upload_u32(&sz_gpu, sz_u32)?;
+            let idx_gpu = backend.create_tensor(m * k / 8, TensorDtype::U32)?;
+            backend.upload_u32(idx_gpu, idx_u32)?;
+            let lut_gpu = backend.create_tensor(m * 16, TensorDtype::F16)?;
+            backend.upload(lut_gpu, &lut32)?;
+            let sz_gpu = backend.create_tensor(m * k / 128, TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, sz_u32)?;
             log::info!("layer {idx}: {key} 使用 any4 量化权重（{m}x{k}）");
-            Ok(Some(GpuTensorAny4 {
+            Ok(Some(Any4Handle {
                 idx: idx_gpu,
                 lut: lut_gpu,
                 sz: sz_gpu,
@@ -2294,7 +2175,11 @@ impl GpuLayer {
         // int8 量化权重：探测 {key}.int8_idx 是否存在。
         // 存在 → 上传 idx/sz 二路张量（idx 为 U8 [M,K]，重解释为 uint32 [M,K/4]）；
         // 不存在 → None，走原 fp16/any4 加载路径（单二进制兼容三种模型文件）。
-        let load_int8 = |key: &str, m: usize, k: usize| -> R<Option<GpuTensorInt8>> {
+        let load_int8 = |backend: &mut dyn ComputeBackend,
+                         key: &str,
+                         m: usize,
+                         k: usize|
+         -> R<Option<Int8Handle>> {
             if st.tensor(&format!("{key}.int8_idx")).is_err() {
                 return Ok(None);
             }
@@ -2304,12 +2189,12 @@ impl GpuLayer {
             let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
             assert_eq!(idx_u32.len(), m * k / 4, "{key}.int8_idx 形状不符");
             assert_eq!(sz_u32.len(), m * k / 128, "{key}.int8_sz 形状不符");
-            let idx_gpu = rt.create_tensor_u32(m * k / 4)?;
-            rt.upload_u32(&idx_gpu, idx_u32)?;
-            let sz_gpu = rt.create_tensor_u32(m * k / 128)?;
-            rt.upload_u32(&sz_gpu, sz_u32)?;
+            let idx_gpu = backend.create_tensor(m * k / 4, TensorDtype::U32)?;
+            backend.upload_u32(idx_gpu, idx_u32)?;
+            let sz_gpu = backend.create_tensor(m * k / 128, TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, sz_u32)?;
             log::info!("layer {idx}: {key} 使用 int8 量化权重（{m}x{k}）");
-            Ok(Some(GpuTensorInt8 {
+            Ok(Some(Int8Handle {
                 idx: idx_gpu,
                 sz: sz_gpu,
                 m,
@@ -2318,109 +2203,129 @@ impl GpuLayer {
         };
         // 三路量化权重统一加载：优先 int8 → any4 → fp16（按模型文件内容自动路由）。
         // 返回 (int8, any4, fp16)，三者至多一个为 Some。
-        let load_linear = |key: &str,
-                           m: usize,
-                           k: usize|
-         -> R<(
-            Option<GpuTensorInt8>,
-            Option<GpuTensorAny4>,
-            Option<GpuTensor16>,
-        )> {
-            if let Some(a8) = load_int8(key, m, k)? {
-                return Ok((Some(a8), None, None));
-            }
-            match load_any4(key, m, k)? {
-                Some(a4) => Ok((None, Some(a4), None)),
-                None => Ok((None, None, Some(load_linear_f16(key.to_string())?))),
-            }
-        };
-        let (ffn_key_a8, ffn_key_a4, ffn_key_w16) =
-            load_linear(&format!("blocks.{idx}.ffn.key.weight"), cfg.ffn_hidden, c)?;
-        let (ffn_value_a8, ffn_value_a4, ffn_value_w16) =
-            load_linear(&format!("blocks.{idx}.ffn.value.weight"), c, cfg.ffn_hidden)?;
-        let (receptance_a8, receptance_a4, receptance_w16) =
-            load_linear(&format!("blocks.{idx}.att.receptance.weight"), c, c)?;
-        let (key_a8, key_a4, key_w16) = load_linear(&format!("blocks.{idx}.att.key.weight"), c, c)?;
+        let load_linear =
+            |backend: &mut dyn ComputeBackend,
+             key: &str,
+             m: usize,
+             k: usize|
+             -> R<(Option<Int8Handle>, Option<Any4Handle>, Option<TensorId>)> {
+                if let Some(a8) = load_int8(backend, key, m, k)? {
+                    return Ok((Some(a8), None, None));
+                }
+                match load_any4(backend, key, m, k)? {
+                    Some(a4) => Ok((None, Some(a4), None)),
+                    None => Ok((None, None, Some(load_linear_f16(backend, key.to_string())?))),
+                }
+            };
+        let (ffn_key_a8, ffn_key_a4, ffn_key_w16) = load_linear(
+            backend,
+            &format!("blocks.{idx}.ffn.key.weight"),
+            cfg.ffn_hidden,
+            c,
+        )?;
+        let (ffn_value_a8, ffn_value_a4, ffn_value_w16) = load_linear(
+            backend,
+            &format!("blocks.{idx}.ffn.value.weight"),
+            c,
+            cfg.ffn_hidden,
+        )?;
+        let (receptance_a8, receptance_a4, receptance_w16) = load_linear(
+            backend,
+            &format!("blocks.{idx}.att.receptance.weight"),
+            c,
+            c,
+        )?;
+        let (key_a8, key_a4, key_w16) =
+            load_linear(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?;
         let (value_a8, value_a4, value_w16) =
-            load_linear(&format!("blocks.{idx}.att.value.weight"), c, c)?;
+            load_linear(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?;
         // att.output：int8/any4 时走对应 GEMM（零 fp16 副本）；
         // fp32 诊断副本仅 GEMM_DIAG 时用反量化权重创建（正式推理不创建，省 ~26MB/层）
         let want_diag = std::env::var("GEMM_DIAG").is_ok();
-        let (att_output_a8, att_output_a4, output_w16, output_w) =
-            if let Some(a8) = load_int8(&format!("blocks.{idx}.att.output.weight"), c, c)? {
-                let ow = if want_diag {
-                    let key = format!("blocks.{idx}.att.output.weight");
-                    let idx_t = st.tensor(&format!("{key}.int8_idx"))?;
-                    let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
-                    let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-                    let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-                    let w32 = dequant_int8(idx_u32, sz_u32, c, c);
-                    let t32 = rt.create_tensor(w32.len())?;
-                    rt.upload(&t32, &w32)?;
-                    Some(t32)
-                } else {
-                    None
-                };
-                (Some(a8), None, None, ow)
-            } else if let Some(a4) = load_any4(&format!("blocks.{idx}.att.output.weight"), c, c)? {
-                let ow = if want_diag {
-                    let key = format!("blocks.{idx}.att.output.weight");
-                    let idx_t = st.tensor(&format!("{key}.any4_idx"))?;
-                    let lut_t = st.tensor(&format!("{key}.any4_lut"))?;
-                    let sz_t = st.tensor(&format!("{key}.any4_sz"))?;
-                    let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-                    let lut32 = tensor_to_f32(&lut_t);
-                    let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-                    let w32 = dequant_any4(idx_u32, &lut32, sz_u32, c, c);
-                    let t32 = rt.create_tensor(w32.len())?;
-                    rt.upload(&t32, &w32)?;
-                    Some(t32)
-                } else {
-                    None
-                };
-                (None, Some(a4), None, ow)
+        let (att_output_a8, att_output_a4, output_w16, output_w) = if let Some(a8) =
+            load_int8(backend, &format!("blocks.{idx}.att.output.weight"), c, c)?
+        {
+            let ow = if want_diag {
+                let key = format!("blocks.{idx}.att.output.weight");
+                let idx_t = st.tensor(&format!("{key}.int8_idx"))?;
+                let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
+                let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                let w32 = dequant_int8(idx_u32, sz_u32, c, c);
+                let t32 = backend.create_tensor(w32.len(), TensorDtype::F32)?;
+                backend.upload(t32, &w32)?;
+                Some(t32)
             } else {
-                (
-                    None,
-                    None,
-                    Some(load_linear_f16(format!("blocks.{idx}.att.output.weight"))?),
-                    if want_diag {
-                        Some(load_linear_diag(format!("blocks.{idx}.att.output.weight"))?)
-                    } else {
-                        None
-                    },
-                )
+                None
             };
+            (Some(a8), None, None, ow)
+        } else if let Some(a4) =
+            load_any4(backend, &format!("blocks.{idx}.att.output.weight"), c, c)?
+        {
+            let ow = if want_diag {
+                let key = format!("blocks.{idx}.att.output.weight");
+                let idx_t = st.tensor(&format!("{key}.any4_idx"))?;
+                let lut_t = st.tensor(&format!("{key}.any4_lut"))?;
+                let sz_t = st.tensor(&format!("{key}.any4_sz"))?;
+                let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+                let lut32 = tensor_to_f32(&lut_t);
+                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                let w32 = dequant_any4(idx_u32, &lut32, sz_u32, c, c);
+                let t32 = backend.create_tensor(w32.len(), TensorDtype::F32)?;
+                backend.upload(t32, &w32)?;
+                Some(t32)
+            } else {
+                None
+            };
+            (None, Some(a4), None, ow)
+        } else {
+            (
+                None,
+                None,
+                Some(load_linear_f16(
+                    backend,
+                    format!("blocks.{idx}.att.output.weight"),
+                )?),
+                if want_diag {
+                    Some(load_linear_diag(
+                        backend,
+                        format!("blocks.{idx}.att.output.weight"),
+                    )?)
+                } else {
+                    None
+                },
+            )
+        };
 
         let mut layer = Self {
-            ln1_w: load1("ln1.weight")?,
-            ln1_b: load1("ln1.bias")?,
-            ln2_w: load1("ln2.weight")?,
-            ln2_b: load1("ln2.bias")?,
-            ln_x_w: load1("att.ln_x.weight")?,
-            ln_x_b: load1("att.ln_x.bias")?,
-            x_r: load1("att.x_r")?,
-            x_w: load1("att.x_w")?,
-            x_k: load1("att.x_k")?,
-            x_v: load1("att.x_v")?,
-            x_a: load1("att.x_a")?,
-            x_g: load1("att.x_g")?,
-            w0: load1("att.w0")?,
-            a0: load1("att.a0")?,
-            v0: load1("att.v0")?,
+            ln1_w: load1(backend, "ln1.weight")?,
+            ln1_b: load1(backend, "ln1.bias")?,
+            ln2_w: load1(backend, "ln2.weight")?,
+            ln2_b: load1(backend, "ln2.bias")?,
+            ln_x_w: load1(backend, "att.ln_x.weight")?,
+            ln_x_b: load1(backend, "att.ln_x.bias")?,
+            x_r: load1(backend, "att.x_r")?,
+            x_w: load1(backend, "att.x_w")?,
+            x_k: load1(backend, "att.x_k")?,
+            x_v: load1(backend, "att.x_v")?,
+            x_a: load1(backend, "att.x_a")?,
+            x_g: load1(backend, "att.x_g")?,
+            w0: load1(backend, "att.w0")?,
+            a0: load1(backend, "att.a0")?,
+            v0: load1(backend, "att.v0")?,
             // 低秩权重转置为 [out, in]
-            w1: load_lowrank("w1", wm, c)?, // [out=wm, in=C]
-            w2: load_lowrank("w2", c, wm)?, // [out=C, in=wm]
-            a1: load_lowrank("a1", am, c)?,
-            a2: load_lowrank("a2", c, am)?,
-            v1: load_lowrank("v1", vm, c)?,
-            v2: load_lowrank("v2", c, vm)?,
-            g1: load_lowrank("g1", gm, c)?,
-            g2: load_lowrank("g2", c, gm)?,
-            r_k: load1("att.r_k")?,
-            k_k: load1("att.k_k")?,
-            k_a: load1("att.k_a")?,
-            ffn_x_k: load1("ffn.x_k")?,
+            w1: load_lowrank(backend, "w1", wm, c)?, // [out=wm, in=C]
+            w2: load_lowrank(backend, "w2", c, wm)?, // [out=C, in=wm]
+            a1: load_lowrank(backend, "a1", am, c)?,
+            a2: load_lowrank(backend, "a2", c, am)?,
+            v1: load_lowrank(backend, "v1", vm, c)?,
+            v2: load_lowrank(backend, "v2", c, vm)?,
+            g1: load_lowrank(backend, "g1", gm, c)?,
+            g2: load_lowrank(backend, "g2", c, gm)?,
+            r_k: load1(backend, "att.r_k")?,
+            k_k: load1(backend, "att.k_k")?,
+            k_a: load1(backend, "att.k_a")?,
+            ffn_x_k: load1(backend, "ffn.x_k")?,
             // 诊断用 fp32 输出权重（仅 GEMM_DIAG 参考路径）
             output_w,
             // fp16 线性权重（非 any4 矩阵常驻；any4 矩阵为 None，走 any4 GEMM/GEMV 零副本）
@@ -2443,22 +2348,22 @@ impl GpuLayer {
             key_a8,
             value_a8,
             // fp16 低秩权重（补齐到 mid_pad）
-            w1_16: load_lowrank_f16("w1", wm, c, wwp, c)?, // [wm_pad, C]
-            w2_16: load_lowrank_f16("w2", c, wm, c, wwp)?, // [C, wm_pad]
-            a1_16: load_lowrank_f16("a1", am, c, aap, c)?, // [am_pad, C]
-            a2_16: load_lowrank_f16("a2", c, am, c, aap)?, // [C, am_pad]
-            v1_16: load_lowrank_f16("v1", vm, c, vvp, c)?, // [vm_pad, C]
-            v2_16: load_lowrank_f16("v2", c, vm, c, vvp)?, // [C, vm_pad]
-            g1_16: load_lowrank_f16("g1", gm, c, ggp, c)?, // [gm_pad, C]
-            g2_16: load_lowrank_f16("g2", c, gm, c, ggp)?, // [C, gm_pad]
+            w1_16: load_lowrank_f16(backend, "w1", wm, c, wwp, c)?, // [wm_pad, C]
+            w2_16: load_lowrank_f16(backend, "w2", c, wm, c, wwp)?, // [C, wm_pad]
+            a1_16: load_lowrank_f16(backend, "a1", am, c, aap, c)?, // [am_pad, C]
+            a2_16: load_lowrank_f16(backend, "a2", c, am, c, aap)?, // [C, am_pad]
+            v1_16: load_lowrank_f16(backend, "v1", vm, c, vvp, c)?, // [vm_pad, C]
+            v2_16: load_lowrank_f16(backend, "v2", c, vm, c, vvp)?, // [C, vm_pad]
+            g1_16: load_lowrank_f16(backend, "g1", gm, c, ggp, c)?, // [gm_pad, C]
+            g2_16: load_lowrank_f16(backend, "g2", c, gm, c, ggp)?, // [C, gm_pad]
         };
         // 权重上传完成，释放全部 host（系统内存）缓冲，仅保留 device 拷贝
-        layer.drop_weight_hosts(rt);
+        layer.drop_weight_hosts(backend);
         Ok(layer)
     }
 
     /// 释放本层所有权重的 host（系统内存）缓冲。权重上传完成后调用，运行期只读 device。
-    fn drop_weight_hosts(&mut self, rt: &Runtime) {
+    fn drop_weight_hosts(&mut self, backend: &mut dyn ComputeBackend) {
         // fp32 一维/低秩权重
         for t in [
             &mut self.ln1_w,
@@ -2489,11 +2394,11 @@ impl GpuLayer {
             &mut self.k_a,
             &mut self.ffn_x_k,
         ] {
-            rt.drop_host(t);
+            backend.drop_host(*t);
         }
         // 诊断用 output_w（fp32，Option：仅 GEMM_DIAG 时存在）
-        if let Some(mut t) = self.output_w.take() {
-            rt.drop_host(&mut t);
+        if let Some(t) = self.output_w.take() {
+            backend.drop_host(t);
         }
         // fp16 低秩权重（常驻）
         for t in [
@@ -2506,7 +2411,7 @@ impl GpuLayer {
             &mut self.g1_16,
             &mut self.g2_16,
         ] {
-            rt.drop_host_f16(t);
+            backend.drop_host(*t);
         }
         // fp16 线性权重（Option）：非 any4 矩阵常驻，释放其 host；any4 矩阵此时为 None 跳过
         for t in [
@@ -2518,7 +2423,7 @@ impl GpuLayer {
             &mut self.ffn_value_w16,
         ] {
             if let Some(t) = t.as_mut() {
-                rt.drop_host_f16(t);
+                backend.drop_host(*t);
             }
         }
         // any4 量化权重
@@ -2533,21 +2438,21 @@ impl GpuLayer {
         .into_iter()
         .flatten()
         {
-            rt.drop_host_u32(&mut a4.idx);
-            rt.drop_host_f16(&mut a4.lut);
-            rt.drop_host_u32(&mut a4.sz);
+            backend.drop_host(a4.idx);
+            backend.drop_host(a4.lut);
+            backend.drop_host(a4.sz);
         }
     }
 }
 
 impl GpuState {
-    fn new(rt: &Runtime, c: usize, h: usize, n: usize) -> R<Self> {
-        let tmix_x = rt.create_tensor(c)?;
-        rt.upload(&tmix_x, &vec![0.0; c])?;
-        let tmix_rnn = rt.create_tensor(h * n * n)?;
-        rt.upload(&tmix_rnn, &vec![0.0; h * n * n])?;
-        let cmix_x = rt.create_tensor(c)?;
-        rt.upload(&cmix_x, &vec![0.0; c])?;
+    fn new(backend: &mut dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<Self> {
+        let tmix_x = backend.create_tensor(c, TensorDtype::F32)?;
+        backend.upload(tmix_x, &vec![0.0; c])?;
+        let tmix_rnn = backend.create_tensor(h * n * n, TensorDtype::F32)?;
+        backend.upload(tmix_rnn, &vec![0.0; h * n * n])?;
+        let cmix_x = backend.create_tensor(c, TensorDtype::F32)?;
+        backend.upload(cmix_x, &vec![0.0; c])?;
         Ok(Self {
             tmix_x,
             tmix_rnn,
@@ -2556,10 +2461,10 @@ impl GpuState {
     }
 
     /// 重置 RNN 状态为零（用于多次独立 forward）
-    fn reset(&self, rt: &Runtime, c: usize, h: usize, n: usize) -> R<()> {
-        rt.upload(&self.tmix_x, &vec![0.0; c])?;
-        rt.upload(&self.tmix_rnn, &vec![0.0; h * n * n])?;
-        rt.upload(&self.cmix_x, &vec![0.0; c])?;
+    fn reset(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<()> {
+        backend.upload(self.tmix_x, &vec![0.0; c])?;
+        backend.upload(self.tmix_rnn, &vec![0.0; h * n * n])?;
+        backend.upload(self.cmix_x, &vec![0.0; c])?;
         Ok(())
     }
 }
@@ -2580,8 +2485,8 @@ impl ModelBuilder {
 
     /// 构建模型并绑定一个零初始化的 `State`，得到 `Bundle`。
     pub fn build(self) -> R<Bundle> {
-        let rt = Runtime::new()?;
-        let model = GpuModel::from_safetensors(rt, &self.path)?;
+        let backend = crate::backend::VulkanBackend::new()?;
+        let mut model = GpuModel::from_safetensors(Box::new(backend), &self.path)?;
         let state = model.create_state()?;
         Ok(Bundle { model, state })
     }
@@ -2599,7 +2504,7 @@ pub struct Bundle {
 
 impl Bundle {
     /// 用给定模型创建一个 Bundle（内部为模型新建零初始态）。
-    pub fn new(model: GpuModel) -> R<Self> {
+    pub fn new(mut model: GpuModel) -> R<Self> {
         let state = model.create_state()?;
         Ok(Self { model, state })
     }
@@ -2794,19 +2699,25 @@ impl Default for SamplerParams {
 /// 是会话保存与 state tuning 的基础：`forward` 前进文本 → `back()` 取态 → 持久化 → `load()` 回灌。
 pub struct State {
     layers: Vec<GpuState>,
-    v_first: GpuTensor16,
+    v_first: TensorId,
     v_first_set: bool,
 }
 
 impl State {
     /// 创建零初始化的状态。
-    pub fn new(rt: &Runtime, c: usize, h: usize, n: usize, n_layer: usize) -> R<Self> {
+    pub fn new(
+        backend: &mut dyn ComputeBackend,
+        c: usize,
+        h: usize,
+        n: usize,
+        n_layer: usize,
+    ) -> R<Self> {
         let mut layers = Vec::with_capacity(n_layer);
         for _ in 0..n_layer {
-            layers.push(GpuState::new(rt, c, h, n)?);
+            layers.push(GpuState::new(backend, c, h, n)?);
         }
-        let v_first = rt.create_tensor_f16(c)?;
-        rt.upload_f16(&v_first, &vec![0.0; c])?;
+        let v_first = backend.create_tensor(c, TensorDtype::F16)?;
+        backend.upload(v_first, &vec![0.0; c])?;
         Ok(Self {
             layers,
             v_first,
@@ -2815,19 +2726,26 @@ impl State {
     }
 
     /// 把整态下载到 CPU 为连续 `Vec<f32>`（布局见 `load`）。
-    pub fn back(&self, rt: &Runtime, c: usize, h: usize, n: usize) -> R<Vec<f32>> {
+    pub fn back(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<Vec<f32>> {
         let mut out = Vec::with_capacity(self.layers.len() * (c + h * n * n + c) + c);
         for s in &self.layers {
-            out.extend_from_slice(&rt.download(&s.tmix_x)?);
-            out.extend_from_slice(&rt.download(&s.tmix_rnn)?);
-            out.extend_from_slice(&rt.download(&s.cmix_x)?);
+            out.extend_from_slice(&backend.download(s.tmix_x)?);
+            out.extend_from_slice(&backend.download(s.tmix_rnn)?);
+            out.extend_from_slice(&backend.download(s.cmix_x)?);
         }
-        out.extend_from_slice(&rt.download_f16(&self.v_first)?);
+        out.extend_from_slice(&backend.download(self.v_first)?);
         Ok(out)
     }
 
     /// 从 CPU 数据回灌整态（与 `back` 布局一一对应）。
-    pub fn load(&self, rt: &Runtime, data: &[f32], c: usize, h: usize, n: usize) -> R<()> {
+    pub fn load(
+        &self,
+        backend: &dyn ComputeBackend,
+        data: &[f32],
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
         let per = c + h * n * n + c;
         let expect = self.layers.len() * per + c;
         if data.len() != expect {
@@ -2835,177 +2753,183 @@ impl State {
         }
         let mut pos = 0usize;
         for s in &self.layers {
-            rt.upload(&s.tmix_x, &data[pos..pos + c])?;
+            backend.upload(s.tmix_x, &data[pos..pos + c])?;
             pos += c;
-            rt.upload(&s.tmix_rnn, &data[pos..pos + h * n * n])?;
+            backend.upload(s.tmix_rnn, &data[pos..pos + h * n * n])?;
             pos += h * n * n;
-            rt.upload(&s.cmix_x, &data[pos..pos + c])?;
+            backend.upload(s.cmix_x, &data[pos..pos + c])?;
             pos += c;
         }
-        rt.upload_f16(&self.v_first, &data[pos..pos + c])?;
+        backend.upload(self.v_first, &data[pos..pos + c])?;
         Ok(())
     }
 
     /// 清零全部状态（含 v_first 缓冲）。
-    pub fn reset(&self, rt: &Runtime, c: usize, h: usize, n: usize) -> R<()> {
+    pub fn reset(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<()> {
         for s in &self.layers {
-            s.reset(rt, c, h, n)?;
+            s.reset(backend, c, h, n)?;
         }
-        rt.upload_f16(&self.v_first, &vec![0.0; c])?;
+        backend.upload(self.v_first, &vec![0.0; c])?;
         Ok(())
     }
 }
 
 impl WorkBuffers {
-    fn new(rt: &Runtime, c: usize, vocab: usize, cfg: &ModelConfig) -> R<Self> {
+    fn new(backend: &mut dyn ComputeBackend, c: usize, vocab: usize, cfg: &ModelConfig) -> R<Self> {
         // 创建 C 大小的 buffer 并初始化为 0
-        let mk_c = || -> R<GpuTensor> {
-            let t = rt.create_tensor(c)?;
-            rt.upload(&t, &vec![0.0; c])?;
+        let mk_c = |b: &mut dyn ComputeBackend| -> R<TensorId> {
+            let t = b.create_tensor(c, TensorDtype::F32)?;
+            b.upload(t, &vec![0.0; c])?;
             Ok(t)
         };
-        let mk = |len: usize| -> R<GpuTensor> {
-            let t = rt.create_tensor(len)?;
-            rt.upload(&t, &vec![0.0; len])?;
+        let mk = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let t = b.create_tensor(len, TensorDtype::F32)?;
+            b.upload(t, &vec![0.0; len])?;
             Ok(t)
         };
         // fp16 零缓冲（w/a/g/v 输出，链第二级下游以 fp16 读取减半带宽）
-        let mk_c16 = || -> R<GpuTensor16> {
-            let t = rt.create_tensor_f16(c)?;
-            rt.upload_f16(&t, &vec![0.0f32; c])?;
+        let mk_c16 = |b: &mut dyn ComputeBackend| -> R<TensorId> {
+            let t = b.create_tensor(c, TensorDtype::F16)?;
+            b.upload(t, &vec![0.0f32; c])?;
             Ok(t)
         };
 
         Ok(Self {
-            x: mk_c()?,
-            ln1: mk_c()?,
-            xr: mk_c()?,
-            xw: mk_c()?,
-            xk: mk_c()?,
-            xv: mk_c()?,
-            xa: mk_c()?,
-            xg: mk_c()?,
-            prev_x: mk_c()?,
-            r: mk_c()?,
-            k: mk_c()?,
-            v: mk_c16()?,
-            v_full: mk_c()?,
-            gate: mk_c()?,
-            w_full: mk_c()?,
-            w_sig: mk_c()?,
-            w: mk_c16()?,
-            a_full: mk_c()?,
-            a: mk_c16()?,
-            kk_l2: mk_c()?,
-            k_mod: mk_c()?,
-            b_vec: mk_c()?,
-            y: mk_c()?,
-            y_norm: mk_c()?,
-            g: mk_c16()?,
-            y_g: mk_c()?,
-            y_out: mk_c()?,
-            ln2: mk_c()?,
-            prev_c: mk_c()?,
-            xb: mk_c()?,
-            v2: mk_c()?,
-            x_norm: mk_c()?,
-            tmp_c: mk_c()?,
+            x: mk_c(&mut *backend)?,
+            ln1: mk_c(&mut *backend)?,
+            xr: mk_c(&mut *backend)?,
+            xw: mk_c(&mut *backend)?,
+            xk: mk_c(&mut *backend)?,
+            xv: mk_c(&mut *backend)?,
+            xa: mk_c(&mut *backend)?,
+            xg: mk_c(&mut *backend)?,
+            prev_x: mk_c(&mut *backend)?,
+            r: mk_c(&mut *backend)?,
+            k: mk_c(&mut *backend)?,
+            v: mk_c16(&mut *backend)?,
+            v_full: mk_c(&mut *backend)?,
+            gate: mk_c(&mut *backend)?,
+            w_full: mk_c(&mut *backend)?,
+            w_sig: mk_c(&mut *backend)?,
+            w: mk_c16(&mut *backend)?,
+            a_full: mk_c(&mut *backend)?,
+            a: mk_c16(&mut *backend)?,
+            kk_l2: mk_c(&mut *backend)?,
+            k_mod: mk_c(&mut *backend)?,
+            b_vec: mk_c(&mut *backend)?,
+            y: mk_c(&mut *backend)?,
+            y_norm: mk_c(&mut *backend)?,
+            g: mk_c16(&mut *backend)?,
+            y_g: mk_c(&mut *backend)?,
+            y_out: mk_c(&mut *backend)?,
+            ln2: mk_c(&mut *backend)?,
+            prev_c: mk_c(&mut *backend)?,
+            xb: mk_c(&mut *backend)?,
+            v2: mk_c(&mut *backend)?,
+            x_norm: mk_c(&mut *backend)?,
+            tmp_c: mk_c(&mut *backend)?,
             // 其他大小
-            v_mid: mk(cfg.v_mid)?,
-            w_mid: mk(cfg.w_mid)?,
-            a_mid: mk(cfg.a_mid)?,
-            g_mid: mk(cfg.g_mid)?,
-            r2: mk(cfg.ffn_hidden)?,
-            logits: mk(vocab)?,
-            token_argmax: mk(1)?,
-            current_token: mk(1)?,
+            v_mid: mk(&mut *backend, cfg.v_mid)?,
+            w_mid: mk(&mut *backend, cfg.w_mid)?,
+            a_mid: mk(&mut *backend, cfg.a_mid)?,
+            g_mid: mk(&mut *backend, cfg.g_mid)?,
+            r2: mk(&mut *backend, cfg.ffn_hidden)?,
+            logits: mk(&mut *backend, vocab)?,
+            token_argmax: mk(&mut *backend, 1)?,
+            current_token: mk(&mut *backend, 1)?,
         })
     }
 }
 
 impl SeqBuffers {
     /// 创建序列并行的 [T, *] 工作缓冲区
-    fn new(rt: &Runtime, t: usize, c: usize, vocab: usize, cfg: &ModelConfig) -> R<Self> {
+    fn new(
+        backend: &mut dyn ComputeBackend,
+        t: usize,
+        c: usize,
+        vocab: usize,
+        cfg: &ModelConfig,
+    ) -> R<Self> {
         let m_pad = t.div_ceil(256) * 256;
-        let mk = |len: usize| -> R<GpuTensor> {
-            let buf = rt.create_tensor(len)?;
-            rt.upload(&buf, &vec![0.0; len])?;
+        let mk = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let buf = b.create_tensor(len, TensorDtype::F32)?;
+            b.upload(buf, &vec![0.0; len])?;
             Ok(buf)
         };
-        let mk_c = |len: usize| -> R<GpuTensor> {
-            let buf = rt.create_tensor(t * len)?;
-            rt.upload(&buf, &vec![0.0; t * len])?;
+        let mk_c = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let buf = b.create_tensor(t * len, TensorDtype::F32)?;
+            b.upload(buf, &vec![0.0; t * len])?;
             Ok(buf)
         };
-        let mk_pad = |len: usize| -> R<GpuTensor> {
-            let buf = rt.create_tensor(m_pad * len)?;
-            rt.upload(&buf, &vec![0.0; m_pad * len])?;
+        let mk_pad = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let buf = b.create_tensor(m_pad * len, TensorDtype::F32)?;
+            b.upload(buf, &vec![0.0; m_pad * len])?;
             Ok(buf)
         };
-        let mk_f16 = |len: usize| -> R<GpuTensor16> {
-            let buf = rt.create_tensor_f16(m_pad * len)?;
-            rt.upload_f16(&buf, &vec![0.0; m_pad * len])?;
+        let mk_f16 = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let buf = b.create_tensor(m_pad * len, TensorDtype::F16)?;
+            b.upload(buf, &vec![0.0; m_pad * len])?;
             Ok(buf)
         };
 
         Ok(Self {
             t,
             m_pad,
-            x: mk_pad(c)?,
-            ln1: mk_c(c)?,
-            xr: mk_c(c)?,
-            xw: mk_c(c)?,
-            xk: mk_c(c)?,
-            xv: mk_c(c)?,
-            xa: mk_c(c)?,
-            xg: mk_c(c)?,
-            r: mk_pad(c)?,
-            k: mk_pad(c)?,
-            v: mk_pad(c)?,
-            v_first: mk_pad(c)?,
-            v_full: mk_pad(c)?,
-            gate: mk_c(c)?,
-            w_full: mk_pad(c)?,
-            w_sig: mk_c(c)?,
-            w: mk_c(c)?,
-            a_full: mk_pad(c)?,
-            a: mk_c(c)?,
-            kk_l2: mk_c(c)?,
-            k_mod: mk_c(c)?,
-            b_vec: mk_c(c)?,
-            y: mk_c(c)?,
-            y_norm: mk_c(c)?,
-            g: mk_pad(c)?,
-            y_g: mk_c(c)?,
-            y_out: mk_pad(c)?,
-            diag_out_ref: mk_pad(c)?,
-            ln2: mk_c(c)?,
-            xb: mk_c(c)?,
-            v2: mk_pad(c)?,
-            x_norm: mk_c(c)?,
-            tmp_c: mk_c(c)?,
-            v_mid: mk_pad(cfg.v_mid_pad)?,
-            w_mid: mk_pad(cfg.w_mid_pad)?,
-            a_mid: mk_pad(cfg.a_mid_pad)?,
-            g_mid: mk_pad(cfg.g_mid_pad)?,
-            r2: mk_pad(cfg.ffn_hidden)?,
-            head_in: mk(c)?,
-            logits: mk(vocab)?,
-            xr16: mk_f16(c)?,
-            xk16: mk_f16(c)?,
-            xv16: mk_f16(c)?,
-            xw16: mk_f16(c)?,
-            xa16: mk_f16(c)?,
-            xg16: mk_f16(c)?,
-            y_g16: mk_f16(c)?,
-            xb16: mk_f16(c)?,
-            r2_16: mk_f16(cfg.ffn_hidden)?,
-            v_mid16: mk_f16(cfg.v_mid_pad)?,
-            w_mid16: mk_f16(cfg.w_mid_pad)?,
-            a_mid16: mk_f16(cfg.a_mid_pad)?,
-            g_mid16: mk_f16(cfg.g_mid_pad)?,
+            x: mk_pad(&mut *backend, c)?,
+            ln1: mk_c(&mut *backend, c)?,
+            xr: mk_c(&mut *backend, c)?,
+            xw: mk_c(&mut *backend, c)?,
+            xk: mk_c(&mut *backend, c)?,
+            xv: mk_c(&mut *backend, c)?,
+            xa: mk_c(&mut *backend, c)?,
+            xg: mk_c(&mut *backend, c)?,
+            r: mk_pad(&mut *backend, c)?,
+            k: mk_pad(&mut *backend, c)?,
+            v: mk_pad(&mut *backend, c)?,
+            v_first: mk_pad(&mut *backend, c)?,
+            v_full: mk_pad(&mut *backend, c)?,
+            gate: mk_c(&mut *backend, c)?,
+            w_full: mk_pad(&mut *backend, c)?,
+            w_sig: mk_c(&mut *backend, c)?,
+            w: mk_c(&mut *backend, c)?,
+            a_full: mk_pad(&mut *backend, c)?,
+            a: mk_c(&mut *backend, c)?,
+            kk_l2: mk_c(&mut *backend, c)?,
+            k_mod: mk_c(&mut *backend, c)?,
+            b_vec: mk_c(&mut *backend, c)?,
+            y: mk_c(&mut *backend, c)?,
+            y_norm: mk_c(&mut *backend, c)?,
+            g: mk_pad(&mut *backend, c)?,
+            y_g: mk_c(&mut *backend, c)?,
+            y_out: mk_pad(&mut *backend, c)?,
+            diag_out_ref: mk_pad(&mut *backend, c)?,
+            ln2: mk_c(&mut *backend, c)?,
+            xb: mk_c(&mut *backend, c)?,
+            v2: mk_pad(&mut *backend, c)?,
+            x_norm: mk_c(&mut *backend, c)?,
+            tmp_c: mk_c(&mut *backend, c)?,
+            v_mid: mk_pad(&mut *backend, cfg.v_mid_pad)?,
+            w_mid: mk_pad(&mut *backend, cfg.w_mid_pad)?,
+            a_mid: mk_pad(&mut *backend, cfg.a_mid_pad)?,
+            g_mid: mk_pad(&mut *backend, cfg.g_mid_pad)?,
+            r2: mk_pad(&mut *backend, cfg.ffn_hidden)?,
+            head_in: mk(&mut *backend, c)?,
+            logits: mk(&mut *backend, vocab)?,
+            xr16: mk_f16(&mut *backend, c)?,
+            xk16: mk_f16(&mut *backend, c)?,
+            xv16: mk_f16(&mut *backend, c)?,
+            xw16: mk_f16(&mut *backend, c)?,
+            xa16: mk_f16(&mut *backend, c)?,
+            xg16: mk_f16(&mut *backend, c)?,
+            y_g16: mk_f16(&mut *backend, c)?,
+            xb16: mk_f16(&mut *backend, c)?,
+            r2_16: mk_f16(&mut *backend, cfg.ffn_hidden)?,
+            v_mid16: mk_f16(&mut *backend, cfg.v_mid_pad)?,
+            w_mid16: mk_f16(&mut *backend, cfg.w_mid_pad)?,
+            a_mid16: mk_f16(&mut *backend, cfg.a_mid_pad)?,
+            g_mid16: mk_f16(&mut *backend, cfg.g_mid_pad)?,
             // dequant 每次 GEMM 前全量覆写，无需零初始化上传
-            w_scratch: rt.create_tensor_f16(cfg.ffn_hidden * c)?,
+            w_scratch: backend.create_tensor(cfg.ffn_hidden * c, TensorDtype::F16)?,
         })
     }
 }
