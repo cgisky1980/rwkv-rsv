@@ -253,16 +253,16 @@ Built-in weight-level acceptance (PASS/FAIL): int8 requires avg cos ≥ 0.999, a
 |---|---|---|
 | int8 | **98.8%** (506/512) | near-lossless; no OOD logit compression / ranking inversion |
 
-**GPU decode self-loop throughput** (argmax self-loop, 300 tokens, GPU 60°C cold):
+**GPU decode self-loop throughput** (argmax self-loop, 1000 tokens, GPU 60°C cold):
 
 | Weight | Backend | tok/s |
 |---|---|---|
-| fp16 | Vulkan | 79.8 |
-| fp16 | CUDA | 85.6 |
-| int8 | Vulkan | 105.5 |
-| int8 | CUDA | 110.2 |
+| fp16 | Vulkan | 80.0 |
+| fp16 | CUDA | 85.7 |
+| int8 | Vulkan | 110.6 |
+| int8 | CUDA | 110.8 |
 
-> Hardware: RTX 2080 Ti. Measured via `cargo run --release -- memtest` with `SELFLOOP_ONLY=1` / `SELFLOOP_N=300` (pure GPU argmax self-loop, Batch=N, re-measured 2026-08-09 GPU 60°C cold). int8 ≈ +32% over fp16 (Vulkan) / +29% (CUDA); CUDA ≈ +5% over Vulkan at same weight precision.
+> Hardware: RTX 2080 Ti. Measured via `cargo run --release -- memtest` with `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000` (pure GPU argmax self-loop, Batch=N, re-measured 2026-08-09 GPU 60°C cold). int8 ≈ +38% over fp16 (Vulkan) / +29% (CUDA).
 
 > VRAM note: `memtest`'s dedicated reading is system-level (includes desktop/browser noise); use "process delta = reading − idle value at the same time".
 

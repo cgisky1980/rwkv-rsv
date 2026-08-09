@@ -253,16 +253,16 @@ uv run tools/quantize_any4.py --in rwkv-g1h-3B.st --out rwkv-g1h-3B.int8.st --bi
 |---|---|---|
 | int8 | **98.8%**（506/512） | 近无损，无分布外 logit 压缩/排序翻转 |
 
-**GPU decode self-loop 吞吐**（argmax self-loop，300 tokens，GPU 60°C 冷态）：
+**GPU decode self-loop 吞吐**（argmax self-loop，1000 tokens，GPU 60°C 冷态）：
 
 | 权重 | 后端 | tok/s |
 |---|---|---|
-| fp16 | Vulkan | 79.8 |
-| fp16 | CUDA | 85.6 |
-| int8 | Vulkan | 105.5 |
-| int8 | CUDA | 110.2 |
+| fp16 | Vulkan | 80.0 |
+| fp16 | CUDA | 85.7 |
+| int8 | Vulkan | 110.6 |
+| int8 | CUDA | 110.8 |
 
-> 硬件：RTX 2080 Ti。通过 `cargo run --release -- memtest` 配以 `SELFLOOP_ONLY=1` / `SELFLOOP_N=300` 测得（纯 GPU argmax self-loop，Batch=N，2026-08-09 GPU 60°C 冷态重测）。int8 较 fp16 提升约 +32%（Vulkan）/+29%（CUDA）；同权重精度下 CUDA 较 Vulkan 提升约 +5%。
+> 硬件：RTX 2080 Ti。通过 `cargo run --release -- memtest` 配以 `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000` 测得（纯 GPU argmax self-loop，Batch=N，2026-08-09 GPU 60°C 冷态重测）。int8 较 fp16 提升约 +38%（Vulkan）/+29%（CUDA）。
 
 > 显存口径说明：`memtest` 的 dedicated 读数为系统级（含桌面/浏览器底噪），须用「进程增量 = 读数 − 同时刻空闲值」。
 
