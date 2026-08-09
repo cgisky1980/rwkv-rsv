@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文版](README_CN.md)
 
-RWKV-7 inference engine in **Rust + Vulkan compute shaders** — no CUDA dependency, portable across GPU vendors and platforms. Supports **fp16 / any4(4-bit) / int8(8-bit)** weight-quantization paths auto-routed by model file, coexisting exclusively, plus a **CPU fp32 reference** for accuracy verification.
+RWKV-7 inference engine in **Rust + Vulkan compute shaders** — no CUDA dependency, portable across GPU vendors and platforms. Supports **fp16 / int8(8-bit)** weight-quantization paths auto-routed by model file, coexisting exclusively, plus a **CPU fp32 reference** for accuracy verification.
 
 > Primary language is English. A Chinese version is available at [README_CN.md](README_CN.md).
 
@@ -16,7 +16,7 @@ RWKV-7 inference engine in **Rust + Vulkan compute shaders** — no CUDA depende
 2. [Design Goals](#2-design-goals)
 3. [Model Parameters](#3-model-parameters)
 4. [RWKV-7 Architecture Notes](#4-rwkv-7-architecture-notes)
-5. [Three Quantization Paths](#5-three-quantization-paths)
+5. [Two Quantization Paths](#5-two-quantization-paths)
 6. [Quantized File Format](#6-quantized-file-format)
 7. [Cross-Hardware Adaptation](#7-cross-hardware-adaptation)
 8. [Build](#8-build)
@@ -34,7 +34,7 @@ RWKV-7 inference engine in **Rust + Vulkan compute shaders** — no CUDA depende
 
 Two core goals:
 
-1. **Cut VRAM**: offline weight quantization (any4 4-bit saves 62%, int8 8-bit saves 41%) shrinks the 3B model's weights from 5.49GB (fp16) to 2–3GB with little accuracy loss.
+1. **Cut VRAM**: offline weight quantization (int8 8-bit saves 41%) shrinks the 3B model's weights from 5.49GB (fp16) to 3.22GB with little accuracy loss.
 2. **Reproducible verification**: a CPU fp32 reference plus GPU-kernel unit tests isolate kernel error from quantization error, verifiable layer-by-layer and token-by-token.
 
 It is validated against **RWKV-7 Goosed g1h-3B**, but the model structure adapts to safetensors tensor shapes, so other models in the same family load without code changes.
@@ -42,7 +42,7 @@ It is validated against **RWKV-7 Goosed g1h-3B**, but the model structure adapts
 ### 2. Design Goals
 
 - **Portability first**: Vulkan over CUDA, trading ~40% peak throughput for cross-vendor / cross-platform usability.
-- **Three quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless) / any4 (max savings), auto-routed by model file, one binary for all.
+- **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
 
@@ -79,7 +79,7 @@ Default validation model **RWKV-7 Goosed `g1h-3B`**:
 | Norms | `ln1, ln2, ln_x, ln0, ln_out` | [C] | ❌ |
 | FFN shift | `ffn.x_k` | [C] | ❌ |
 
-Total quantized matrices: **6 × 32 = 192**. head/emb (directly control logits; any4 paper also skips lm_head), LayerNorm, and low-rank small matrices are kept as-is.
+Total quantized matrices: **6 × 32 = 192**. head/emb (directly control logits), LayerNorm, and low-rank small matrices are kept as-is.
 
 ### 4. RWKV-7 Architecture Notes
 
@@ -113,19 +113,18 @@ x  += relu(xb @ ffn_key_w)² @ ffn_value_w
 
 **Per-layer RNN state**: `tmix_x` [C], `tmix_rnn` [H, N, N] (DPLR state), `cmix_x` [C]. O(1) state, per-token autoregressive.
 
-### 5. Three Quantization Paths
+### 5. Two Quantization Paths
 
-Weights are **auto-routed by model file** (priority int8 → any4 → fp16), mutually exclusive, one binary for all three:
+Weights are **auto-routed by model file** (priority int8 → fp16), mutually exclusive, one binary for all two:
 
 | Path | Weight bits | Format | 3B weight file | Saved | Weight-level | End-to-end Top-1 |
 |---|---|---|---|---|---|---|
 | fp16 | 16-bit | none | 5.49 GB | — | lossless (ref) | 100% |
 | int8 | 8-bit | asymmetric per-group(128), scale/zero, no LUT | 3.22 GB | 41% | avg cos **0.999820** / rel **0.6135%** | **98.8%** (506/512) |
-| any4 | 4-bit | per-row k-means LUT(16) + per-group scale/zero, ~4.35 bit/weight | 2.07 GB | 62% | avg cos 0.995718 / rel 9.18% | **94.5%** (nnq512) |
 
 - **Quantized ops**: 6 matrices per layer (att.receptance/key/value/output + ffn.key/value), 192 total; head/emb, LayerNorm, low-rank kept as-is.
-- **int8 advantage**: uniform per-group quantization has no k-means cluster-boundary nonlinearity, so it avoids any4's out-of-distribution logit-scale compression / ranking inversion — a near-lossless tier.
-- **Routing**: presence of `.int8_idx` / `.any4_idx` keys in the model file at `MODEL_PATH`.
+- **int8 advantage**: uniform per-group quantization has no k-means cluster-boundary nonlinearity or LUT, so it is a near-lossless tier.
+- **Routing**: presence of the `.int8_idx` key in the model file at `MODEL_PATH`.
 
 ### 6. Quantized File Format
 
@@ -140,17 +139,7 @@ Matrices stored `[M, K]`, K contraction dim, `group = 128`. Dequantization happe
 
 Dequant: `w[m,k] = scale[m, k/128] * idx[m,k] + zero[m, k/128]`, with `scale = (max-min)/255`, `zero = min`. Constant groups (scale=0) rebuild exactly as zero.
 
-**any4 (per-row k-means learned codebook + per-group scale/zero, arXiv:2507.04610):**
-
-| safetensors key suffix | Shape | dtype | Notes |
-|---|---|---|---|
-| `{name}.any4_idx` | [M, K/2] | U8 | 2 × 4-bit indices/byte (low nibble=even k, high nibble=odd k) |
-| `{name}.any4_lut` | [M, 16] | F16 | 16 learned centroids/row (per-row k-means, in group-normalized domain) |
-| `{name}.any4_sz` | [M, K/128] | U32 | (scale: fp16 low16 \| zero: fp16 high16) |
-
-Dequant: `w[m,k] = scale[m, k/128] * lut[m, idx[m,k]] + zero[m, k/128]`, ~**4.35 bit/weight** (27.2% of fp16 traffic at K=2560).
-
-> The format contract is locked by CPU unit tests in [src/model.rs](src/model.rs) (`dequant_any4` / `dequant_int8`), guaranteeing bit-exact pack (Python) → unpack (Rust/GPU).
+> The format contract is locked by CPU unit tests in [src/model.rs](src/model.rs) (`dequant_int8`), guaranteeing bit-exact pack (Python) → unpack (Rust/GPU).
 
 ### 7. Cross-Hardware Adaptation
 
@@ -192,7 +181,7 @@ Key env vars (see [src/main.rs](src/main.rs)):
 
 | Variable | Purpose |
 |---|---|
-| `MODEL_PATH` | Model path; `.int8_idx` → int8, `.any4_idx` → any4, otherwise fp16 |
+| `MODEL_PATH` | Model path; `.int8_idx` → int8, otherwise fp16 |
 | `TOP1_MULTI_SAVE` / `TOP1_MULTI_COMPARE` | Multi-prompt teacher-forced Top-1 agreement |
 | `TOP1_REF_SAVE` / `TOP1_REF_COMPARE` | Single-prompt CPU fp32 reference agreement |
 | `SAVE_LOGITS` / `COMPARE_LOGITS` | Single-prompt logits RMSE / Top-10 comparison |
@@ -252,30 +241,28 @@ Key arguments:
 
 Calibration prompt collection: [tools/prepare_calib_prompts.py](tools/prepare_calib_prompts.py) (aya_dataset multilingual stratified sampling: 30% zh / 30% en / 40% other).
 
-Built-in weight-level acceptance (PASS/FAIL): any4 requires avg cos ≥ 0.995, avg rel ≤ 10.5% and better than the int4 baseline (~11%); int8 requires avg cos ≥ 0.999, avg rel ≤ 1%.
+Built-in weight-level acceptance (PASS/FAIL): int8 requires avg cos ≥ 0.999, avg rel ≤ 1%.
 
 ### 11. Accuracy & Performance Benchmarks
 
-**Hardware: RTX 2080 Ti.** Full reports under [参考/](参考/) (`int8量化报告.md`, `any4量化报告_nnq512.md`, `GPU模型实现.md`).
+**Hardware: RTX 2080 Ti.** Full reports under [参考/](参考/) (`int8量化报告.md`, `GPU模型实现.md`).
 
 **End-to-end accuracy (teacher-forced Top-1 agreement vs fp16 reference):**
 
 | Path | Agreement | Notes |
 |---|---|---|
 | int8 | **98.8%** (506/512) | near-lossless; no OOD logit compression / ranking inversion |
-| any4 | **94.5%** (nnq512) | real multilingual 92.6%; vs AUXStar NVFP4 ~85%, FP8 93.75% |
 
-**Performance (fp16 path):**
+**GPU decode self-loop throughput** (argmax self-loop, 300 tokens, GPU 60°C cold):
 
-- Single-token inference: **69.3 tok/s** (14.44 ms/token)
-- Sequence-parallel: **398.4 tok/s** (2.51 ms/token)
-- Argmax inference: **68.4 tok/s**
+| Weight | Backend | tok/s |
+|---|---|---|
+| fp16 | Vulkan | 79.8 |
+| fp16 | CUDA | 85.6 |
+| int8 | Vulkan | 105.5 |
+| int8 | CUDA | 110.2 |
 
-**any4 quantization gains (same machine):**
-
-- decode self-loop: **114.7 tok/s** (from core milestone 63.0, **1.82×**)
-- seq prefill (T=512): **1102.5 tok/s** (~89.6% of fp16 baseline 1230.1; gap = dequant overhead)
-- any4 decode process VRAM delta: **~2.6GB**
+> Hardware: RTX 2080 Ti. Measured via `cargo run --release -- memtest` with `SELFLOOP_ONLY=1` / `SELFLOOP_N=300` (pure GPU argmax self-loop, Batch=N, re-measured 2026-08-09 GPU 60°C cold). int8 ≈ +32% over fp16 (Vulkan) / +29% (CUDA); CUDA ≈ +5% over Vulkan at same weight precision.
 
 > VRAM note: `memtest`'s dedicated reading is system-level (includes desktop/browser noise); use "process delta = reading − idle value at the same time".
 
@@ -311,14 +298,13 @@ The gap mainly comes from: ① Albatross's more aggressive kernel fusion reducin
 
 Inspired by both, this repository has since evolved independently, adding capabilities neither has:
 
-- **Three weight-quantization paths** (fp16 / any4 / int8) auto-routed by model file;
+- **Two weight-quantization paths** (fp16 / int8) auto-routed by model file;
 - **CPU fp32 reference** ([src/model.rs](src/model.rs)) plus GPU-kernel correctness unit tests, as a baseline isolating kernel error from quantization error;
-- **Offline quantization toolchain** (k-means any4 and per-group int8) with a reproducible accuracy-verification workflow.
+- **Offline quantization toolchain** (per-group int8) with a reproducible accuracy-verification workflow.
 
 ### 14. Known Limitations & Future Work
 
-- **any4 kernel bandwidth 58–67%** (fp16 82%): fixed overhead rises after byte count shrinks; explore register-resident LUT (tinygemm-style) or larger ROWS.
-- **prefill dequant overhead ~10%** (1102.5 vs fp16 1230.1 tok/s at T=512): full removal needs cooperative-matrix fused dequant+GEMM (Marlin-style zero-copy), a long-term direction.
+- **prefill dequant overhead ~10%** (int8 vs fp16 at T=512): full removal needs cooperative-matrix fused dequant+GEMM (Marlin-style zero-copy), a long-term direction.
 - **prefill time grows ~quadratically with T** (T=256: 0.33ms → T=512: 0.81ms, WKV parallel intra-chunk term); consider WKV chunking for long prompts.
 - **Precision enhancements** (roadmap): calibration-weighted k-means (`sample_weight=calibrate`), G=64 for denser metadata.
 

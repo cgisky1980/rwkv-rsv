@@ -36,25 +36,11 @@ pub struct GpuTensor16 {
     pub len: usize,
 }
 
-/// GPU 端 u32 张量（any4 打包索引 / scale-zero 对用）。
+/// GPU 端 u32 张量（int8 打包索引 / scale-zero 对用）。
 #[derive(Debug, Clone)]
 pub struct GpuTensorU32 {
     pub host: Option<Tensor<u32>>,
     pub device: Tensor<u32>,
-}
-
-/// any4 量化权重（arXiv:2507.04610，group=128）：
-/// `w[m,k] = scale[m,k/128] * lut[m, idx] + zero[m,k/128]`
-/// - idx: [M, K/8] uint32（每 uint32 打包 8 个 4-bit 索引）
-/// - lut: [M, 16] fp16（每行学习码本，组归一化域）
-/// - sz:  [M, K/128] uint32（scale fp16 低 16 位 | zero fp16 高 16 位）
-#[derive(Debug)]
-pub struct GpuTensorAny4 {
-    pub idx: GpuTensorU32,
-    pub lut: GpuTensor16,
-    pub sz: GpuTensorU32,
-    pub m: usize,
-    pub k: usize,
 }
 
 /// int8 非对称 per-group 量化权重（无 LUT，256 级均匀，近无损）：
@@ -171,7 +157,7 @@ impl Runtime {
         })
     }
 
-    /// 创建一维 u32 GPU 张量（any4 idx/sz 用）
+    /// 创建一维 u32 GPU 张量（int8 idx/sz 用）
     pub fn create_tensor_u32(&self, len: usize) -> R<GpuTensorU32> {
         let layout = Layout::from_shape([len]);
         let host = self.app.create_tensor::<u32>(&layout, None, true)?;
@@ -738,13 +724,14 @@ impl Runtime {
         k: usize,
         batch: usize,
     ) -> R<()> {
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [a16.device.address, 0, x.device.address, y.device.address];
         self.record_kernel(
             "shaders/spv/gemv_f32io.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[a16.device.buffer, x.device.buffer],
             &[y.device.buffer],
         )?;
@@ -761,226 +748,16 @@ impl Runtime {
         k: usize,
         batch: usize,
     ) -> R<()> {
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [a16.device.address, 0, x.device.address, y.device.address];
         self.record_kernel(
             "shaders/spv/gemv_f32io_relu2.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[a16.device.buffer, x.device.buffer],
             &[y.device.buffer],
-        )?;
-        Ok(())
-    }
-
-    /// y = relu²(x @ A)（any4 量化权重，f32 输入/输出）
-    /// 与 gemv_f16_relu2 同构，权重带宽降到 ~27%（4.35 bit/权重）。
-    pub fn gemv_any4_relu2(
-        &mut self,
-        a: &GpuTensorAny4,
-        x: &GpuTensor,
-        y: &mut GpuTensor,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()> {
-        debug_assert_eq!(a.m, m);
-        debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
-        let params = [
-            a.idx.device.address,
-            a.lut.device.address,
-            a.sz.device.address,
-            0,
-            x.device.address,
-            y.device.address,
-        ];
-        self.record_kernel(
-            "shaders/spv/gemv_any4_relu2.spv",
-            &spec,
-            &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
-            &[
-                a.idx.device.buffer,
-                a.lut.device.buffer,
-                a.sz.device.buffer,
-                x.device.buffer,
-            ],
-            &[y.device.buffer],
-        )?;
-        Ok(())
-    }
-
-    /// y = y + (x .* g) @ A（any4 量化权重，f32 输入/输出/累加，g 为 fp16 门控）。
-    /// 与 gemv_f16_mul_add 同构（att.output 用），残差累加目标 y 即输入 acc。
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_any4_mul_add(
-        &mut self,
-        a: &GpuTensorAny4,
-        x: &GpuTensor,
-        g: &GpuTensor16,
-        y: &mut GpuTensor,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()> {
-        debug_assert_eq!(a.m, m);
-        debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
-        let params = [
-            a.idx.device.address,
-            a.lut.device.address,
-            a.sz.device.address,
-            x.device.address,
-            g.device.address,
-            y.device.address,
-            y.device.address,
-        ];
-        self.record_kernel(
-            "shaders/spv/gemv_any4_add_mul.spv",
-            &spec,
-            &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
-            &[
-                a.idx.device.buffer,
-                a.lut.device.buffer,
-                a.sz.device.buffer,
-                x.device.buffer,
-                g.device.buffer,
-                y.device.buffer,
-            ],
-            &[y.device.buffer],
-        )?;
-        Ok(())
-    }
-
-    /// y = y + x @ A（any4 量化权重，f32 输入/输出/累加）。
-    /// 与 gemv_f16_add 同构（ffn.value 用），残差累加目标 y 即输入 acc。
-    pub fn gemv_any4_add(
-        &mut self,
-        a: &GpuTensorAny4,
-        x: &GpuTensor,
-        y: &mut GpuTensor,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()> {
-        debug_assert_eq!(a.m, m);
-        debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
-        let params = [
-            a.idx.device.address,
-            a.lut.device.address,
-            a.sz.device.address,
-            x.device.address,
-            0,
-            y.device.address,
-            y.device.address,
-        ];
-        self.record_kernel(
-            "shaders/spv/gemv_any4_add.spv",
-            &spec,
-            &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
-            &[
-                a.idx.device.buffer,
-                a.lut.device.buffer,
-                a.sz.device.buffer,
-                x.device.buffer,
-                y.device.buffer,
-            ],
-            &[y.device.buffer],
-        )?;
-        Ok(())
-    }
-
-    /// y = x @ A（any4 量化权重，并行 token prefill GEMM，f32 输入/输出）。
-    /// 与 gemv_any4 同构但含 token 维度：X 为 f32 [T, K]（行步长=K），Y 为 f32 [T, M]（行步长=M）。
-    /// 只在第一行写 T 个 token 对应的行（网格 y = ceil(T/TGROUP)），剩余 padding 行不变。
-    /// activation_relu2=true → Y = relu²(X@A^T)；res 非空 → Y = X@A^T + res（残差累加，如 att.output / ffn.value）。
-    /// 覆盖 prefill 全部 6 个 any4 矩阵（r/k/v/output/ffn.key/ffn.value），完全替代 fp16 GEMM 与临时 fp16 副本。
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_any4(
-        &mut self,
-        a: &GpuTensorAny4,
-        x: &GpuTensor,
-        res: Option<&GpuTensor>,
-        y: &mut GpuTensor,
-        m: usize,
-        k: usize,
-        t: usize,
-        activation_relu2: bool,
-    ) -> R<()> {
-        debug_assert_eq!(a.m, m);
-        debug_assert_eq!(a.k, k);
-        let spec = gemm_any4_spec(&self.app, m, k);
-        let shader = match (activation_relu2, res.is_some()) {
-            (false, false) => "shaders/spv/gemm_any4.spv",
-            (false, true) => "shaders/spv/gemm_any4_add.spv",
-            (true, false) => "shaders/spv/gemm_any4_relu2.spv",
-            (true, true) => "shaders/spv/gemm_any4_relu2_add.spv",
-        };
-        let params = [
-            a.idx.device.address,
-            a.lut.device.address,
-            a.sz.device.address,
-            x.device.address,
-            res.map_or(0, |r| r.device.address),
-            y.device.address,
-        ];
-        let mut reads = vec![
-            a.idx.device.buffer,
-            a.lut.device.buffer,
-            a.sz.device.buffer,
-            x.device.buffer,
-        ];
-        if let Some(r) = res {
-            reads.push(r.device.buffer);
-        }
-        self.record_kernel(
-            shader,
-            &spec,
-            &params,
-            (
-                (m / GEMV_ROWS) as u32,
-                (t.div_ceil(GEMM_ANY4_TGROUP)) as u32,
-                1,
-            ),
-            &reads,
-            &[y.device.buffer],
-        )?;
-        Ok(())
-    }
-
-    /// any4 → fp16 反量化（prefill 方案A）：把 any4 量化权重 [M, K] 解到 fp16 scratch，
-    /// 供 tensor-core GEMM 消费。输出布局与 load_linear_f16 上传的 [M, K] 行主序一致。
-    /// dispatch: (ceil(M*K/8 / 256), 1, 1)，每线程处理 1 个 uint32（8 权重）。
-    pub fn dequant_any4_to_f16(
-        &mut self,
-        a: &GpuTensorAny4,
-        out: &GpuTensor16,
-        m: usize,
-        k: usize,
-    ) -> R<()> {
-        debug_assert_eq!(a.m, m);
-        debug_assert_eq!(a.k, k);
-        debug_assert!(out.len >= m * k);
-        let spec = [m as u32, k as u32];
-        let params = [
-            a.idx.device.address,
-            a.lut.device.address,
-            a.sz.device.address,
-            out.device.address,
-        ];
-        let threads = (m * (k / 8)) as u32;
-        self.record_kernel(
-            "shaders/spv/dequant_any4_f16.spv",
-            &spec,
-            &params,
-            (threads.div_ceil(256), 1, 1),
-            &[a.idx.device.buffer, a.lut.device.buffer, a.sz.device.buffer],
-            &[out.device.buffer],
         )?;
         Ok(())
     }
@@ -1017,7 +794,7 @@ impl Runtime {
     }
 
     /// y = relu²(x @ A)（int8 量化权重，f32 输入/输出）
-    /// 与 gemv_any4_relu2 同构，权重带宽降到 fp16 的一半（1 byte/权重）。
+    /// 与 gemv_f16_relu2 同构，权重带宽降到 fp16 的一半（1 byte/权重）。
     pub fn gemv_int8_relu2(
         &mut self,
         a: &GpuTensorInt8,
@@ -1029,7 +806,8 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -1041,7 +819,42 @@ impl Runtime {
             "shaders/spv/gemv_int8_relu2.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
+            &[a.idx.device.buffer, a.sz.device.buffer, x.device.buffer],
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// y = x @ A（int8 量化权重，f32 输入/输出，覆盖写）。
+    /// head 投影用：直接 int8 gemv 覆盖写 logits，避免走「整行反量化到 fp16 scratch」路径——
+    /// 后者对 vocab=65536 的 head 会发出 grid.x=163840 的 dispatch，超过 Vulkan 的
+    /// maxComputeWorkGroupCount(65535) 导致 ERROR_DEVICE_LOST。
+    pub fn gemv_int8_plain(
+        &mut self,
+        a: &GpuTensorInt8,
+        x: &GpuTensor,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        debug_assert_eq!(a.m, m);
+        debug_assert_eq!(a.k, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
+        let params = [
+            a.idx.device.address,
+            a.sz.device.address,
+            0,
+            x.device.address,
+            y.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/gemv_int8.spv",
+            &spec,
+            &params,
+            ((m / rows) as u32, batch as u32, 1),
             &[a.idx.device.buffer, a.sz.device.buffer, x.device.buffer],
             &[y.device.buffer],
         )?;
@@ -1049,7 +862,7 @@ impl Runtime {
     }
 
     /// y = y + (x .* g) @ A（int8 量化权重，f32 输入/输出/累加，g 为 fp16 门控）。
-    /// 与 gemv_any4_mul_add 同构（att.output 用），残差累加目标 y 即输入 acc。
+    /// 与 gemv_f16_mul_add 同构（att.output 用），残差累加目标 y 即输入 acc。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_int8_mul_add(
         &mut self,
@@ -1063,7 +876,8 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -1076,7 +890,7 @@ impl Runtime {
             "shaders/spv/gemv_int8_add_mul.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
@@ -1090,7 +904,7 @@ impl Runtime {
     }
 
     /// y = y + x @ A（int8 量化权重，f32 输入/输出/累加）。
-    /// 与 gemv_any4_add 同构（ffn.value 用），残差累加目标 y 即输入 acc。
+    /// 与 gemv_f16_add 同构（ffn.value 用），残差累加目标 y 即输入 acc。
     pub fn gemv_int8_add(
         &mut self,
         a: &GpuTensorInt8,
@@ -1102,7 +916,8 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -1115,7 +930,7 @@ impl Runtime {
             "shaders/spv/gemv_int8_add.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
@@ -1141,7 +956,8 @@ impl Runtime {
         k: usize,
         batch: usize,
     ) -> R<()> {
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [
             a16.device.address,
             x.device.address,
@@ -1153,7 +969,7 @@ impl Runtime {
             "shaders/spv/gemv_f32io_add_mul.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[
                 a16.device.buffer,
                 x.device.buffer,
@@ -1178,7 +994,8 @@ impl Runtime {
         k: usize,
         batch: usize,
     ) -> R<()> {
-        let spec = gemv_spec(&self.app, m, k);
+        let rows = gemv_rows_for(m);
+        let spec = gemv_spec(&self.app, m, k, rows);
         let params = [
             a16.device.address,
             x.device.address,
@@ -1190,11 +1007,51 @@ impl Runtime {
             "shaders/spv/gemv_f32io_add.spv",
             &spec,
             &params,
-            ((m / GEMV_ROWS) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch as u32, 1),
             &[a16.device.buffer, x.device.buffer, y.device.buffer],
             &[y.device.buffer],
         )?;
         Ok(())
+    }
+
+    /// 稀疏 FFN value 投影：x += r2 @ ffn_value（fp16 平铺权重，r2 约 96% 稀疏）。
+    /// 只读 r2 非零列的权重并 buffer 级 fp32 原子累加（VK_EXT_shader_atomic_float）。
+    /// ffn_value_sparse_add.comp，dispatch (fh/TILE, c/C_TILE, 1)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_value_sparse_add(
+        &mut self,
+        value_tiled: &GpuTensor16,
+        r2: &GpuTensor,
+        x: &mut GpuTensor,
+        c: usize,
+        fh: usize,
+    ) -> R<()> {
+        const TILE: usize = 128;
+        const C_TILE: usize = 256;
+        debug_assert_eq!(fh % TILE, 0, "fh 需为 TILE 整数倍");
+        debug_assert_eq!(c % C_TILE, 0, "c 需为 C_TILE 整数倍");
+        let spec = [c as u32, fh as u32, TILE as u32, C_TILE as u32];
+        // 参数顺序需与 ffn_value_sparse_add.comp 的 Params 成员顺序一致：
+        //   BufR2 buf_r2; BufW buf_w; BufX buf_x;  →  [r2, value_tiled, x]
+        let params = [
+            r2.device.address,
+            value_tiled.device.address,
+            x.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/ffn_value_sparse_add.spv",
+            &spec,
+            &params,
+            ((fh / TILE) as u32, (c / C_TILE) as u32, 1),
+            &[value_tiled.device.buffer, r2.device.buffer, x.device.buffer],
+            &[x.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// 是否支持稀疏 FFN 内核（需设备支持 VK_EXT_shader_atomic_float 的 buffer fp32 原子）。
+    pub fn supports_sparse_ffn(&self) -> bool {
+        self.app.properties.atomic_float
     }
 
     /// GPU argmax：从 logits [N] 找最大值索引，写入 token（len 1 的 f32 缓冲，字节存 uint）。
@@ -1628,128 +1485,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// 深度融合（any4 版）：gemv_any4 r/k/v（三个 C×C 投影，any4 量化权重）
-    /// + lowrank_stage1（v1/w1/a1/g1 四个 mid 投影，fp32 权重）→ 1 次 dispatch。
-    ///
-    /// 与 gemv_rkv_stage1 网格/分工一致，r/k/v 权重带宽降到 ~27%（4.35 bit/权重）。
-    /// uniform 字段顺序必须与 gemv_any4_rkv_stage1.comp 的 Params 结构一致。
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_any4_rkv_stage1(
-        &mut self,
-        r_a4: &GpuTensorAny4,
-        k_a4: &GpuTensorAny4,
-        v_a4: &GpuTensorAny4,
-        v1: &GpuTensor,
-        w1: &GpuTensor,
-        a1: &GpuTensor,
-        g1: &GpuTensor,
-        xr: &GpuTensor,
-        xk: &GpuTensor,
-        xv: &GpuTensor,
-        xw: &GpuTensor,
-        xa: &GpuTensor,
-        xg: &GpuTensor,
-        out_r: &mut GpuTensor,
-        out_k: &mut GpuTensor,
-        out_v: &mut GpuTensor16,
-        out_vm: &mut GpuTensor,
-        out_wm: &mut GpuTensor,
-        out_am: &mut GpuTensor,
-        out_gm: &mut GpuTensor,
-        c: usize,
-        vm: usize,
-        wm: usize,
-        am: usize,
-        gm: usize,
-    ) -> R<()> {
-        debug_assert_eq!((r_a4.m, r_a4.k), (c, c));
-        debug_assert_eq!((k_a4.m, k_a4.k), (c, c));
-        debug_assert_eq!((v_a4.m, v_a4.k), (c, c));
-        let spec = [
-            c as u32,
-            vm as u32,
-            wm as u32,
-            am as u32,
-            gm as u32,
-            self.app.properties.subgroup_size, // 5: SUBGROUP_SIZE（跨硬件自适应）
-        ];
-        let params = [
-            r_a4.idx.device.address,
-            r_a4.lut.device.address,
-            r_a4.sz.device.address,
-            k_a4.idx.device.address,
-            k_a4.lut.device.address,
-            k_a4.sz.device.address,
-            v_a4.idx.device.address,
-            v_a4.lut.device.address,
-            v_a4.sz.device.address,
-            v1.device.address,
-            w1.device.address,
-            a1.device.address,
-            g1.device.address,
-            xr.device.address,
-            xk.device.address,
-            xv.device.address,
-            xw.device.address,
-            xa.device.address,
-            xg.device.address,
-            out_r.device.address,
-            out_k.device.address,
-            out_v.device.address,
-            out_vm.device.address,
-            out_wm.device.address,
-            out_am.device.address,
-            out_gm.device.address,
-        ];
-        let reads = vec![
-            r_a4.idx.device.buffer,
-            r_a4.lut.device.buffer,
-            r_a4.sz.device.buffer,
-            k_a4.idx.device.buffer,
-            k_a4.lut.device.buffer,
-            k_a4.sz.device.buffer,
-            v_a4.idx.device.buffer,
-            v_a4.lut.device.buffer,
-            v_a4.sz.device.buffer,
-            v1.device.buffer,
-            w1.device.buffer,
-            a1.device.buffer,
-            g1.device.buffer,
-            xr.device.buffer,
-            xk.device.buffer,
-            xv.device.buffer,
-            xw.device.buffer,
-            xa.device.buffer,
-            xg.device.buffer,
-        ];
-        let writes = vec![
-            out_r.device.buffer,
-            out_k.device.buffer,
-            out_v.device.buffer,
-            out_vm.device.buffer,
-            out_wm.device.buffer,
-            out_am.device.buffer,
-            out_gm.device.buffer,
-        ];
-        debug_assert!(
-            c.is_multiple_of(GEMV_ROWS),
-            "C must be divisible by GEMV_ROWS"
-        );
-        self.record_kernel(
-            "shaders/spv/gemv_any4_rkv_stage1.spv",
-            &spec,
-            &params,
-            ((c / GEMV_ROWS + vm + wm + am + gm) as u32, 1, 1),
-            &reads,
-            &writes,
-        )?;
-        Ok(())
-    }
-
     /// 深度融合（int8 版）：gemv_int8 r/k/v（三个 C×C 投影，int8 量化权重）
     /// + lowrank_stage1（v1/w1/a1/g1 四个 mid 投影，fp32 权重）→ 1 次 dispatch。
     ///
-    /// 与 gemv_any4_rkv_stage1 同构，差异：r/k/v 用 int8 权重（无 LUT），带宽 fp16 的 ~50%。
+    /// 与 gemv_rkv_stage1 同构，差异：r/k/v 用 int8 权重（无 LUT），带宽 fp16 的 ~50%。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_int8_rkv_stage1(
         &mut self,
@@ -1935,11 +1674,20 @@ impl Runtime {
             out_v.device.buffer,
             out_g.device.buffer,
         ];
+        // subgroup-per-row：每 workgroup 处理 BLOCK_SIZE/subgroup_size 个输出行
+        // （shader: row = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID，BLOCK_SIZE=256）。
+        // ⚠ 双锚点：dispatch 网格必须与 shader 行映射同源（2026-08-09 两次静默错误教训），
+        // 此处 rows_per_wg 与 shader 的 NUM_SUBGROUPS 均 = 256/subgroup_size。
+        let rows_per_wg = 256 / self.app.properties.subgroup_size as usize;
+        assert!(
+            m.is_multiple_of(rows_per_wg),
+            "gemv_lowrank_chain4: M={m} 不整除 rows_per_wg={rows_per_wg}"
+        );
         self.record_kernel(
             "shaders/spv/gemv_lowrank_chain4.spv",
             &spec,
             &params,
-            (m as u32, 1, 1),
+            ((m / rows_per_wg) as u32, 1, 1),
             &reads,
             &writes,
         )?;
@@ -2696,7 +2444,6 @@ impl Runtime {
     }
 
     // ===== sum_rk_rk 归约算子 =====
-
     /// y += sum(r * k_mod * r_k, 按 head 归约) * v
     /// 替代原 download → CPU 循环 → upload 的 PCIe 往返。
     /// dispatch: (H, batch, 1) — 每个工作组处理一个 (batch, head)
@@ -2906,18 +2653,18 @@ impl Runtime {
 /// 会与 shader 实际处理的行数错位，导致越界访问并触发 DEVICE_LOST。
 const GEMV_ROWS: usize = 4;
 
-/// gemm_any4 每 workgroup 处理的 token 数（须与 gemm_any4.comp 的 TGROUP 一致）。
-const GEMM_ANY4_TGROUP: usize = 4;
-
-/// gemm_any4 specialization（constant_id 0-2, 3: SUBGROUP_SIZE）。
-/// 跨硬件自适应：SUBGROUP_SIZE 由设备真实值传入（NVIDIA=32，AMD=64，Intel 可变）。
-fn gemm_any4_spec(app: &App, m: usize, k: usize) -> [u32; 4] {
-    [
-        m as u32,                     // 0: M (output dim)
-        k as u32,                     // 1: K (contraction dim)
-        GEMM_ANY4_TGROUP as u32,      // 2: TGROUP（每 workgroup token 数）
-        app.properties.subgroup_size, // 3: SUBGROUP_SIZE（跨硬件自适应）
-    ]
+/// gemv 每 workgroup 处理行数：实测结论（2026-08-09, RTX 2080 Ti）固定 ROWS=4 最优。
+/// 曾尝试按 M 自适应（大 M 如 ffn_key M=10240 用 ROWS=16 减 X 重读），实测放弃：
+///   - X 重读理论不成立：ROWS=4 时 X 重读总量 = 2560 wg × 10KB = 25MB，摊到内核时长
+///     （ffn_key fp16 ~0.126ms）仅占 L2 带宽零头；X（10KB）常驻 L2，无 DRAM 回取问题。
+///   - ROWS=16 在 int8 kernel 引发寄存器压力（acc[16] + 解包数学），decode 吞吐反降 ~12%。
+///   - 热降频噪声（同内核跨 token 波动可达 2×）曾导致 "18% 带宽利用率" 的误判。
+///
+/// 保留 constant_id=12 管线仅为实验便利；rows 必须 == shader ROWS，否则 grid 错位算错结果
+/// （如 head gemv M=65536 若 rows=16 而 shader ROWS=4 → 仅 1/4 行被计算，logits 错误）。
+fn gemv_rows_for(m: usize) -> usize {
+    let _ = m;
+    GEMV_ROWS
 }
 
 /// norm_lerp6 的 workgroup 大小（须与 norm_lerp6.comp 的 BLOCK_SIZE 一致）。
@@ -2929,7 +2676,7 @@ const NORM_LERP6_BLOCK: usize = 256;
 /// gemv specialization (constant_id 0-10, 11: SUBGROUP_SIZE)
 /// subgroup_size 为设备真实 subgroup（NVIDIA=32，AMD=64，Intel 可变），传入 gemv_f32io 家族
 /// shader 的 constant_id=11，保证 NUM_SUBGROUPS = BLOCK_SIZE/SUBGROUP_SIZE 跨硬件正确。
-fn gemv_spec(app: &App, m: usize, k: usize) -> [u32; 12] {
+fn gemv_spec(app: &App, m: usize, k: usize, rows: usize) -> [u32; 13] {
     [
         m as u32,                     // 0: M (output dim)
         k as u32,                     // 1: K (input dim)
@@ -2943,6 +2690,7 @@ fn gemv_spec(app: &App, m: usize, k: usize) -> [u32; 12] {
         1,                            // 9: STRIDE_Y_X
         m as u32,                     // 10: STRIDE_Y_Y
         app.properties.subgroup_size, // 11: SUBGROUP_SIZE（跨硬件自适应）
+        rows as u32,                  // 12: ROWS（每 workgroup 行数，大 M 用大 ROWS）
     ]
 }
 
@@ -3039,38 +2787,11 @@ fn est_kernel_bytes(shader: &str, spec: &[u32], dispatch: (u32, u32, u32)) -> u6
         }
         return bytes as u64;
     }
-    // any4 r/k/v 深度融合：spec=[C,VM,WM,AM,GM,SUBGROUP]。
-    // r/k/v any4 权重 3×(idx C·C/2 + lut C·32B + sz C·C/128·4B)；v1/w1/a1/g1 fp32 mid·C；
-    // 输入 xr/xk/xv/xw/xa/xg 6·C·4B；输出 r/k f32 + v f16 + mid f32。
-    if name.starts_with("gemv_any4_rkv_stage1") {
-        let (c, vm, wm, am, gm) = (s(0), s(1), s(2), s(3), s(4));
-        let mid = vm + wm + am + gm;
-        let bytes = 3 * (c * c / 2 + c * 32 + c * (c / 128) * 4)
-            + mid * c * 4
-            + 6 * c * 4
-            + 2 * c * 4
-            + c * 2
-            + mid * 4;
-        return bytes as u64;
-    }
     // fp16 r/k/v 深度融合：spec 同上。r/k/v fp16 权重 3×C·C·2B，其余同上。
     if name.starts_with("gemv_rkv_stage1") {
         let (c, vm, wm, am, gm) = (s(0), s(1), s(2), s(3), s(4));
         let mid = vm + wm + am + gm;
         let bytes = 3 * (2 * c * c) + mid * c * 4 + 6 * c * 4 + 2 * c * 4 + c * 2 + mid * 4;
-        return bytes as u64;
-    }
-    // any4 GEMV：idx u32[M,K/8] + lut f16[M,16] + sz u32[M,K/128] + X f32[K] + Y f32[M]
-    if name.starts_with("gemv_any4") {
-        let (m, k) = (s(0), s(1));
-        let mut bytes = m * k / 2 + m * 32 + m * (k / 128) * 4 + 4 * k + 4 * m;
-        // _add/_add_mul 额外读旧 Y（残差 acc）；_add_mul 另读 fp16 门控 g[K]
-        if name.contains("_add") {
-            bytes += 4 * m;
-        }
-        if name.contains("_mul") {
-            bytes += 2 * k;
-        }
         return bytes as u64;
     }
     // GEMV：A f16[M,K] + X f32[K] + Y f32[M]；_add/_add_mul 额外读旧 Y

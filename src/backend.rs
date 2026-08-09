@@ -12,9 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::runtime::{
-    GpuTensor, GpuTensor16, GpuTensorAny4, GpuTensorInt8, GpuTensorU32, R, Runtime,
-};
+use crate::runtime::{GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime};
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,17 +33,6 @@ pub enum BackendKind {
     Cuda,
 }
 
-/// any4 量化权重（平台无关组合句柄）：`w[m,k] = scale[m,k/128] * lut[m, idx[m,k]] + zero[m,k/128]`。
-/// 一组 `idx`/`lut`/`sz` 三路设备张量 + 形状元数据；后端据此调度对应 dequant/gemv kernel。
-#[derive(Debug, Clone, Copy)]
-pub struct Any4Handle {
-    pub idx: TensorId,
-    pub lut: TensorId,
-    pub sz: TensorId,
-    pub m: usize,
-    pub k: usize,
-}
-
 /// int8 量化权重（平台无关组合句柄）：`w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]`。
 /// 一组 `idx`/`sz` 二路设备张量 + 形状元数据。
 #[derive(Debug, Clone, Copy)]
@@ -57,7 +44,7 @@ pub struct Int8Handle {
 }
 
 /// 算子级后端抽象。首期抽象张量管理与 decode（单 token）路径全部算子。
-/// 所有张量以平台无关 `TensorId` 传递；量化权重以 `Any4Handle`/`Int8Handle` 组合句柄传递。
+/// 所有张量以平台无关 `TensorId` 传递；量化权重以 `Int8Handle` 组合句柄传递。
 pub trait ComputeBackend {
     // —— 张量管理 ——
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId>;
@@ -69,6 +56,51 @@ pub trait ComputeBackend {
     // —— 批处理（一次提交多条 kernel）——
     fn begin_batch(&mut self) -> R<()>;
     fn end_batch(&mut self) -> R<()>;
+
+    /// 清空累计的 per-kernel profiling 时间（仅诊断；CUDA 覆盖，其余为 no-op）。
+    fn clear_kernel_prof(&mut self) {}
+
+    /// 打印累计的 per-kernel profiling 时间（仅诊断；CUDA 覆盖，其余为 no-op）。
+    fn dump_kernel_prof(&mut self) {}
+
+    // —— CUDA graph 捕获/重放（decode 每 token launch 开销优化）——
+    /// 开始捕获后续 kernel 启动到 CUDA graph（重放时不再逐次 cuLaunchKernel）。
+    /// 默认 no-op；仅支持的后端（CUDA）覆盖。
+    fn begin_graph_capture(&mut self) -> R<()> {
+        Ok(())
+    }
+    /// 结束捕获并实例化可执行 graph。
+    fn end_graph_capture(&mut self) -> R<()> {
+        Ok(())
+    }
+    /// 重放已捕获的可执行 graph（固定的一组 kernel 序列）。
+    fn graph_replay(&mut self) -> R<()> {
+        Ok(())
+    }
+    /// 是否支持 CUDA graph 捕获/重放（self-loop 用）。默认 false；仅 CUDA 覆盖为 true。
+    /// 不支持的后端（Vulkan）在 self-loop 时改为把完整前向逐 token 记录进同一批次。
+    fn supports_graph_capture(&self) -> bool {
+        false
+    }
+
+    // —— CUDA prefill graph（整段 prefill 一次抓到图，消除跨层 launch 开销）——
+    /// 当前 T 是否已有捕获好的 prefill graph（无 → 需重新捕获）。
+    /// 默认 no-op；仅支持的后端（CUDA）覆盖。
+    fn prefill_graph_valid(&mut self, _t: usize) -> R<bool> {
+        Ok(false)
+    }
+    /// 开始捕获整段 prefill（须在 x 上传之后调用），`t` 为本次 token 数。
+    fn begin_prefill_capture(&mut self, _t: usize) -> R<()> {
+        Ok(())
+    }
+    /// 结束捕获并按 `begin_prefill_capture` 的 t 绑定保存可执行 graph。
+    fn end_prefill_capture(&mut self) -> R<()> {
+        Ok(())
+    }
+    /// 重放当前 T 的 prefill graph（已上传新 x）。
+    fn prefill_graph_replay(&mut self) -> R<()> {
+        Ok(())
+    }
 
     // —— host 前后端（embedding gather / 采样）——
     /// 把 token 索引（u32 位模式）写入 host-visible 缓冲（无 kernel、无 spec）。
@@ -203,37 +235,6 @@ pub trait ComputeBackend {
         gm: usize,
     ) -> R<()>;
 
-    /// 深度融合 gemv（any4 量化版，r/k/v 三路同量化格式）。
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_any4_rkv_stage1(
-        &mut self,
-        r: &Any4Handle,
-        k: &Any4Handle,
-        v: &Any4Handle,
-        v1: TensorId,
-        w1: TensorId,
-        a1: TensorId,
-        g1: TensorId,
-        xr: TensorId,
-        xk: TensorId,
-        xv: TensorId,
-        xw: TensorId,
-        xa: TensorId,
-        xg: TensorId,
-        out_r: TensorId,
-        out_k: TensorId,
-        out_v: TensorId,
-        out_vm: TensorId,
-        out_wm: TensorId,
-        out_am: TensorId,
-        out_gm: TensorId,
-        c: usize,
-        vm: usize,
-        wm: usize,
-        am: usize,
-        gm: usize,
-    ) -> R<()>;
-
     /// 深度融合 gemv（int8 量化版，r/k/v 三路同量化格式）。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int8_rkv_stage1(
@@ -304,17 +305,6 @@ pub trait ComputeBackend {
         k: usize,
         batch: usize,
     ) -> R<()>;
-    /// y = relu²(x @ A)（any4 权重）——ffn.key 用。
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_any4_relu2(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()>;
     /// y = relu²(x @ A)（int8 权重）——ffn.key 用。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int8_relu2(
@@ -332,18 +322,6 @@ pub trait ComputeBackend {
     fn gemv_f16_mul_add(
         &mut self,
         a: TensorId,
-        x: TensorId,
-        g: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()>;
-    /// y += (x .* g) @ A（any4 权重）——att.output 用。
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_any4_mul_add(
-        &mut self,
-        a: &Any4Handle,
         x: TensorId,
         g: TensorId,
         y: TensorId,
@@ -375,17 +353,6 @@ pub trait ComputeBackend {
         k: usize,
         batch: usize,
     ) -> R<()>;
-    /// y += x @ A（any4 权重）——ffn.value 残差用。
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_any4_add(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()>;
     /// y += x @ A（int8 权重）——ffn.value 残差用。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int8_add(
@@ -397,6 +364,43 @@ pub trait ComputeBackend {
         k: usize,
         batch: usize,
     ) -> R<()>;
+    /// y = x @ A（int8 权重，覆盖写）——head 用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_plain(
+        &mut self,
+        a: &Int8Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()>;
+
+    /// 稀疏 FFN value 投影：x += r2 @ ffn_value（r2=relu² 约 96% 稀疏）。
+    /// `value_tiled` 为平铺布局 [fh, C]（对齐 Albatross cmix_sparse_down），CUDA 稀疏内核用；
+    /// 默认实现退化为稠密 `gemv_f16_add`（Vulkan 等不支持稀疏内核的 backend 用 `value_w16`）。
+    /// `value_w16` 为 Some 时（fp16 模型）才可退化为稠密；None（int8 模型）时调用方应避免进入本路径。
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_value_sparse_add(
+        &mut self,
+        value_w16: Option<TensorId>,
+        value_tiled: TensorId,
+        r2: TensorId,
+        x: TensorId,
+        c: usize,
+        fh: usize,
+    ) -> R<()> {
+        let _ = value_tiled;
+        let w16 = value_w16.ok_or_else(|| {
+            "sparse FFN 需要稠密 fp16 权重（int8 模型请走稠密量化路径）".to_string()
+        })?;
+        self.gemv_f16_add(w16, r2, x, c, fh, 1)
+    }
+
+    /// 是否支持稀疏 FFN 内核（CUDA 原生支持；Vulkan 等返回 false，走稠密量化路径）。
+    fn supports_sparse_ffn(&self) -> bool {
+        false
+    }
 
     /// GPU argmax：把 logits 的 argmax 索引写入 token 缓冲（f32 位模式存 uint）。
     fn argmax(&mut self, logits: TensorId, token: TensorId, n: usize) -> R<()>;
@@ -500,9 +504,6 @@ pub trait ComputeBackend {
         x_stride: usize,
         y_stride: usize,
     ) -> R<()>;
-    /// any4 → fp16 反量化（prefill：解到 fp16 scratch 供 GEMM 消费）。
-    #[allow(clippy::too_many_arguments)]
-    fn dequant_any4_to_f16(&mut self, a: &Any4Handle, out: TensorId, m: usize, k: usize) -> R<()>;
     /// int8 → fp16 反量化（prefill：解到 fp16 scratch 供 GEMM 消费）。
     #[allow(clippy::too_many_arguments)]
     fn dequant_int8_to_f16(&mut self, a: &Int8Handle, out: TensorId, m: usize, k: usize) -> R<()>;
@@ -569,20 +570,6 @@ pub trait ComputeBackend {
         n: usize,
         t: usize,
         c: usize,
-    ) -> R<()>;
-    /// any4 原生 GEMM（ANY4_GEMM_PREFILL 备用路径）：C = A(x) @ a + res。
-    /// `res` 为 Some 时累加残差；`activation_relu2` 对输出做 relu²。
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_any4(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        res: Option<TensorId>,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        t: usize,
-        activation_relu2: bool,
     ) -> R<()>;
     /// C[M,N] = relu²(A[M,K] @ B[N,K]^T)（fp16 输入，f32 输出）。
     #[allow(clippy::too_many_arguments)]
@@ -690,11 +677,22 @@ pub trait ComputeBackend {
 /// CUDA 算子实现是否就绪。
 /// 当前 `CudaBackend` 为骨架（张量管理可用、算子未实现），故暂为 `false`；
 /// 待按 Albatross 补齐 decode 核心算子后翻转为 `true`，`detect_backend()` 即优先选择 CUDA。
-pub const CUDA_READY: bool = false;
+pub const CUDA_READY: bool = true; // TEMP baseline check
 
 /// 探测可用后端：CUDA 可用**且算子已就绪**优先，否则 Vulkan。
 /// 返回的是「能真正跑通模型」的后端，避免骨架阶段选中 CUDA 后运行报错。
 pub fn detect_backend() -> BackendKind {
+    // BACKEND=cuda / BACKEND=vulkan 显式覆盖（便于后端对比/调试）。
+    if let Ok(v) = std::env::var("BACKEND") {
+        return match v.to_ascii_lowercase().as_str() {
+            "cuda" => BackendKind::Cuda,
+            "vulkan" => BackendKind::Vulkan,
+            _ => {
+                log::warn!("unknown BACKEND={v}, falling back to auto-detect");
+                BackendKind::Vulkan
+            }
+        };
+    }
     if CUDA_READY && cuda_available() {
         BackendKind::Cuda
     } else {
@@ -728,12 +726,11 @@ pub struct VulkanBackend {
 }
 
 /// 后端内部张量包装（统一映射表元素类型）。
-/// `U32` 变体为后续 any4/int8 量化算子预留，当前核心算子集暂未消费其字段。
+/// `U32` 变体为 int8 量化算子（idx/sz）承载设备数据。
 #[derive(Debug)]
 enum VulkanTensor {
     F32(GpuTensor),
     F16(GpuTensor16),
-    #[allow(dead_code)] // 预留：any4/int8 量化张量由后续算子消费
     U32(GpuTensorU32),
 }
 
@@ -815,20 +812,6 @@ impl VulkanBackend {
     }
 
     // —— 量化句柄解析 ——
-    /// 从平台无关 `Any4Handle` 组装出 Runtime 所需的 `GpuTensorAny4`。
-    /// 张量经 `Tensor<T>`（Arc 包装）克隆，代价仅为引用计数递增，随后按引用传给 Runtime。
-    fn any4_ref(&self, a: &Any4Handle, op: &str) -> R<GpuTensorAny4> {
-        let idx = self.get_u32(a.idx, op)?;
-        let lut = self.get_f16(a.lut, op)?;
-        let sz = self.get_u32(a.sz, op)?;
-        Ok(GpuTensorAny4 {
-            idx,
-            lut,
-            sz,
-            m: a.m,
-            k: a.k,
-        })
-    }
     /// 从平台无关 `Int8Handle` 组装出 Runtime 所需的 `GpuTensorInt8`。
     fn int8_ref(&self, a: &Int8Handle, op: &str) -> R<GpuTensorInt8> {
         let idx = self.get_u32(a.idx, op)?;
@@ -1172,71 +1155,6 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
-    fn gemv_any4_rkv_stage1(
-        &mut self,
-        r: &Any4Handle,
-        k: &Any4Handle,
-        v: &Any4Handle,
-        v1: TensorId,
-        w1: TensorId,
-        a1: TensorId,
-        g1: TensorId,
-        xr: TensorId,
-        xk: TensorId,
-        xv: TensorId,
-        xw: TensorId,
-        xa: TensorId,
-        xg: TensorId,
-        out_r: TensorId,
-        out_k: TensorId,
-        out_v: TensorId,
-        out_vm: TensorId,
-        out_wm: TensorId,
-        out_am: TensorId,
-        out_gm: TensorId,
-        c: usize,
-        vm: usize,
-        wm: usize,
-        am: usize,
-        gm: usize,
-    ) -> R<()> {
-        let mut or_o = self.take_f32(out_r, "gemv_any4_rkv_stage1")?;
-        let mut ok_o = self.take_f32(out_k, "gemv_any4_rkv_stage1")?;
-        let mut ov_o = self.take_f16(out_v, "gemv_any4_rkv_stage1")?;
-        let mut ovm_o = self.take_f32(out_vm, "gemv_any4_rkv_stage1")?;
-        let mut owm_o = self.take_f32(out_wm, "gemv_any4_rkv_stage1")?;
-        let mut oam_o = self.take_f32(out_am, "gemv_any4_rkv_stage1")?;
-        let mut ogm_o = self.take_f32(out_gm, "gemv_any4_rkv_stage1")?;
-        let res = {
-            let ra4 = self.any4_ref(r, "gemv_any4_rkv_stage1")?;
-            let ka4 = self.any4_ref(k, "gemv_any4_rkv_stage1")?;
-            let va4 = self.any4_ref(v, "gemv_any4_rkv_stage1")?;
-            let v1_g = self.get_f32(v1, "gemv_any4_rkv_stage1")?;
-            let w1_g = self.get_f32(w1, "gemv_any4_rkv_stage1")?;
-            let a1_g = self.get_f32(a1, "gemv_any4_rkv_stage1")?;
-            let g1_g = self.get_f32(g1, "gemv_any4_rkv_stage1")?;
-            let xr_g = self.get_f32(xr, "gemv_any4_rkv_stage1")?;
-            let xk_g = self.get_f32(xk, "gemv_any4_rkv_stage1")?;
-            let xv_g = self.get_f32(xv, "gemv_any4_rkv_stage1")?;
-            let xw_g = self.get_f32(xw, "gemv_any4_rkv_stage1")?;
-            let xa_g = self.get_f32(xa, "gemv_any4_rkv_stage1")?;
-            let xg_g = self.get_f32(xg, "gemv_any4_rkv_stage1")?;
-            self.rt.gemv_any4_rkv_stage1(
-                &ra4, &ka4, &va4, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
-                &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
-                &mut ogm_o, c, vm, wm, am, gm,
-            )
-        };
-        self.put_f32(out_r, or_o);
-        self.put_f32(out_k, ok_o);
-        self.put_f16(out_v, ov_o);
-        self.put_f32(out_vm, ovm_o);
-        self.put_f32(out_wm, owm_o);
-        self.put_f32(out_am, oam_o);
-        self.put_f32(out_gm, ogm_o);
-        res
-    }
-
     fn gemv_int8_rkv_stage1(
         &mut self,
         r: &Int8Handle,
@@ -1376,25 +1294,6 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
-    fn gemv_any4_relu2(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()> {
-        let mut y_o = self.take_f32(y, "gemv_any4_relu2")?;
-        let res = {
-            let a_g = self.any4_ref(a, "gemv_any4_relu2")?;
-            let x_g = self.get_f32(x, "gemv_any4_relu2")?;
-            self.rt.gemv_any4_relu2(&a_g, &x_g, &mut y_o, m, k, batch)
-        };
-        self.put_f32(y, y_o);
-        res
-    }
-
     fn gemv_int8_relu2(
         &mut self,
         a: &Int8Handle,
@@ -1431,28 +1330,6 @@ impl ComputeBackend for VulkanBackend {
             let g_g = self.get_f16(g, "gemv_f16_mul_add")?;
             self.rt
                 .gemv_f16_mul_add(&a_g, &x_g, &g_g, &mut y_o, m, k, batch)
-        };
-        self.put_f32(y, y_o);
-        res
-    }
-
-    fn gemv_any4_mul_add(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        g: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
-    ) -> R<()> {
-        let mut y_o = self.take_f32(y, "gemv_any4_mul_add")?;
-        let res = {
-            let a_g = self.any4_ref(a, "gemv_any4_mul_add")?;
-            let x_g = self.get_f32(x, "gemv_any4_mul_add")?;
-            let g_g = self.get_f16(g, "gemv_any4_mul_add")?;
-            self.rt
-                .gemv_any4_mul_add(&a_g, &x_g, &g_g, &mut y_o, m, k, batch)
         };
         self.put_f32(y, y_o);
         res
@@ -1499,23 +1376,27 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
-    fn gemv_any4_add(
+    fn ffn_value_sparse_add(
         &mut self,
-        a: &Any4Handle,
+        _value_w16: Option<TensorId>,
+        value_tiled: TensorId,
+        r2: TensorId,
         x: TensorId,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        batch: usize,
+        c: usize,
+        fh: usize,
     ) -> R<()> {
-        let mut y_o = self.take_f32(y, "gemv_any4_add")?;
+        let mut x_o = self.take_f32(x, "ffn_value_sparse_add")?;
         let res = {
-            let a_g = self.any4_ref(a, "gemv_any4_add")?;
-            let x_g = self.get_f32(x, "gemv_any4_add")?;
-            self.rt.gemv_any4_add(&a_g, &x_g, &mut y_o, m, k, batch)
+            let vt_g = self.get_f16(value_tiled, "ffn_value_sparse_add")?;
+            let r2_g = self.get_f32(r2, "ffn_value_sparse_add")?;
+            self.rt.ffn_value_sparse_add(&vt_g, &r2_g, &mut x_o, c, fh)
         };
-        self.put_f32(y, y_o);
+        self.put_f32(x, x_o);
         res
+    }
+
+    fn supports_sparse_ffn(&self) -> bool {
+        self.rt.supports_sparse_ffn()
     }
 
     fn gemv_int8_add(
@@ -1534,6 +1415,38 @@ impl ComputeBackend for VulkanBackend {
             self.rt.gemv_int8_add(&a_g, &x_g, &mut y_o, m, k, batch)
         };
         self.put_f32(y, y_o);
+        res
+    }
+
+    fn gemv_int8_plain(
+        &mut self,
+        a: &Int8Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        // 直接 int8 gemv 覆盖写（gemv_int8.comp，grid.x = m/4）。
+        // 不再走「整行反量化到 fp16 scratch」路径：head(vocab=65536) 反量化的 dispatch
+        // grid.x=163840 超过 Vulkan maxComputeWorkGroupCount(65535) 会 ERROR_DEVICE_LOST。
+        let mut y_owned = match self
+            .tensors
+            .remove(&y)
+            .ok_or("gemv_int8_plain: unknown y")?
+        {
+            VulkanTensor::F32(g) => g,
+            other => {
+                self.tensors.insert(y, other);
+                return Err("gemv_int8_plain: y must be f32".into());
+            }
+        };
+        let a_g = self.int8_ref(a, "gemv_int8_plain")?;
+        let x_g = self.get_f32(x, "gemv_int8_plain")?;
+        let res = self
+            .rt
+            .gemv_int8_plain(&a_g, &x_g, &mut y_owned, m, k, batch);
+        self.tensors.insert(y, VulkanTensor::F32(y_owned));
         res
     }
 
@@ -1720,14 +1633,6 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
-    fn dequant_any4_to_f16(&mut self, a: &Any4Handle, out: TensorId, m: usize, k: usize) -> R<()> {
-        let out_o = self.take_f16(out, "dequant_any4_to_f16")?;
-        let a4 = self.any4_ref(a, "dequant_any4_to_f16")?;
-        let res = self.rt.dequant_any4_to_f16(&a4, &out_o, m, k);
-        self.put_f16(out, out_o);
-        res
-    }
-
     fn dequant_int8_to_f16(&mut self, a: &Int8Handle, out: TensorId, m: usize, k: usize) -> R<()> {
         let out_o = self.take_f16(out, "dequant_int8_to_f16")?;
         let a8 = self.int8_ref(a, "dequant_int8_to_f16")?;
@@ -1860,32 +1765,6 @@ impl ComputeBackend for VulkanBackend {
         self.put_f32(s, s_o);
         self.put_f32(y, y_o);
         res
-    }
-
-    fn gemm_any4(
-        &mut self,
-        a: &Any4Handle,
-        x: TensorId,
-        res: Option<TensorId>,
-        y: TensorId,
-        m: usize,
-        k: usize,
-        t: usize,
-        activation_relu2: bool,
-    ) -> R<()> {
-        let mut y_o = self.take_f32(y, "gemm_any4")?;
-        let a4 = self.any4_ref(a, "gemm_any4")?;
-        let x_g = self.get_f32(x, "gemm_any4")?;
-        let res_g = match res {
-            Some(r) => Some(self.get_f32(r, "gemm_any4")?),
-            None => None,
-        };
-        let res_ref = res_g.as_ref();
-        let r = self
-            .rt
-            .gemm_any4(&a4, &x_g, res_ref, &mut y_o, m, k, t, activation_relu2);
-        self.put_f32(y, y_o);
-        r
     }
 
     fn gemm_relu2(

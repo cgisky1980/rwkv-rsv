@@ -217,12 +217,6 @@ fn main() {
             AFFINE => [none(""), flag("affine")],
             ACTIVATION => [none(""), def(1, "relu2"), def(2, "tanh")],
         },
-        "gemv_any4" => "src/gemv_any4.comp" => {
-            ACTIVATION => [none(""), def(1, "relu2")],
-        },
-        "gemv_any4_add" => "src/gemv_any4_add.comp" => {
-            MUL => [def(0, ""), def(1, "mul")],
-        },
         "gemv_f32io_mul" => "src/gemv_f32io_mul.comp" => {
             TYPE => [none("")],
         },
@@ -235,26 +229,19 @@ fn main() {
         "gemv_rkv_stage1" => "src/gemv_rkv_stage1.comp" => {
             TYPE => [none("")],
         },
-        "gemv_any4_rkv_stage1" => "src/gemv_any4_rkv_stage1.comp" => {
-            TYPE => [none("")],
-        },
         "gemv_int8" => "src/gemv_int8.comp" => {
             ACTIVATION => [none(""), def(1, "relu2")],
         },
         "gemv_int8_add" => "src/gemv_int8_add.comp" => {
             MUL => [def(0, ""), def(1, "mul")],
         },
+        "ffn_value_sparse_add" => "src/ffn_value_sparse_add.comp" => {
+            TYPE => [none("")],
+        },
         "gemv_int8_rkv_stage1" => "src/gemv_int8_rkv_stage1.comp" => {
             TYPE => [none("")],
         },
         "dequant_int8_f16" => "src/dequant_int8_f16.comp" => {
-            TYPE => [none("")],
-        },
-        "gemm_any4" => "src/gemm_any4.comp" => {
-            ACTIVATION => [none(""), def(1, "relu2")],
-            ADD => [none(""), flag("add")],
-        },
-        "dequant_any4_f16" => "src/dequant_any4_f16.comp" => {
             TYPE => [none("")],
         },
         "norm_lerp6" => "src/norm_lerp6.comp" => {

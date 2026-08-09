@@ -22,3 +22,6 @@ state.bin
 # Python caches
 __pycache__/
 *.pyc
+
+# Embedded reference repo (Albatross; tracked separately upstream)
+/参考/Albatross

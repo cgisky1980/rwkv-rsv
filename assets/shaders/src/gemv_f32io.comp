@@ -48,7 +48,9 @@ const uint BLOCK_SIZE       = 128;
 layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
 const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
 const uint KV               = K / 8;   // 8 个 fp16 打包为两个 uint64（16 字节/次加载）
-const uint ROWS             = 4;       // 每个 workgroup 处理的行数（M % ROWS == 0）
+// 每个 workgroup 处理的行数（M % ROWS == 0）。由 runtime 按调用方 M 自适应传入：
+// 大 M（如 ffn_key M=10240）用大 ROWS（如 16）减少 workgroup 数与 X 重读，提升 DRAM 带宽利用率。
+layout(constant_id = 12) const uint ROWS = 4;
 
 const uvec3 STRIDE_A        = uvec3(STRIDE_A_X, STRIDE_A_Y, STRIDE_A_Z);
 const uvec2 STRIDE_B        = uvec2(STRIDE_B_X, STRIDE_B_Y);

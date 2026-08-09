@@ -47,6 +47,9 @@ QUANT_SUFFIXES = frozenset(
 
 K_CLUSTERS = 16  # 4-bit → 16 项 LUT
 
+# head 恒以 int8 量化（省 4× 带宽；head 是 decode 单 kernel 读取量最大者，三路模型共用瓶颈）。
+HEAD_KEY = "head.weight"
+
 
 def quant_target_layer(key: str) -> int | None:
     """若 key 是量化目标，返回层号；否则 None。"""
@@ -632,9 +635,9 @@ def main() -> int:
             + (f"，nnq 输出域 {len(nnq_map)} 个" if nnq_map else "")
         )
 
-        # 1) 非量化张量原样拷贝
+        # 1) 非量化张量原样拷贝（head.weight 单独 int8 量化，见下）
         for k in keys:
-            if k not in target_set:
+            if k not in target_set and k != HEAD_KEY:
                 out_tensors[k] = f.get_tensor(k)
 
         # 2) 逐矩阵量化（及时释放原 fp16，控制内存峰值）
@@ -690,13 +693,33 @@ def main() -> int:
                 flush=True,
             )
 
+        # 3) head：恒 int8 量化（省 4× 带宽；head 是 decode 单 kernel 读取量最大者，三路共用瓶颈）。
+        if HEAD_KEY in keys:
+            t0 = time.time()
+            W = f.get_tensor(HEAD_KEY)  # [vocab, C] fp16
+            W32 = W.astype(np.float32)
+            del W
+            tensors, stats = quantize_int8_matrix(W32, args.group)
+            del W32
+            out_tensors[f"{HEAD_KEY}.int8_idx"] = tensors["idx"]
+            out_tensors[f"{HEAD_KEY}.int8_sz"] = tensors["sz"]
+            report_rows.append((HEAD_KEY, stats))
+            print(
+                f"[int8-head] {HEAD_KEY} {stats['shape']} "
+                f"cos={stats['cos']:.6f} rel={stats['rel']:.4%} "
+                f"max_abs={stats['max_abs']:.4f} ({time.time() - t0:.1f}s)",
+                flush=True,
+            )
+
     print(f"[any4] 写出 {out} ...")
     save_file(out_tensors, str(out))
 
     # 汇总报告
     avg_cos = float(np.mean([s["cos"] for _, s in report_rows])) if report_rows else 1.0
     avg_rel = float(np.mean([s["rel"] for _, s in report_rows])) if report_rows else 0.0
-    avg_rel4 = float(np.mean([s["rel_int4"] for _, s in report_rows])) if report_rows else 0.0
+    avg_rel4 = float(
+        np.mean([s["rel_int4"] for _, s in report_rows if not np.isnan(s["rel_int4"])])
+    ) if any(not np.isnan(s["rel_int4"]) for _, s in report_rows) else 0.0
     worst = min(report_rows, key=lambda r: r[1]["cos"]) if report_rows else None
     nnq_rows = [s for _, s in report_rows if not np.isnan(s["out_rel_before"])]
     avg_out_before = float(np.mean([s["out_rel_before"] for s in nnq_rows])) if nnq_rows else None

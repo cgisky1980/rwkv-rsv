@@ -2,7 +2,7 @@
 
 [English primary doc](README.md) · [中文版](README_CN.md)
 
-**RWKV-7 推理引擎（Rust + Vulkan 计算着色器）**，无 CUDA 依赖，可跨 GPU 厂商与平台运行。支持 **fp16 / any4(4-bit) / int8(8-bit)** 三路权重量化推理，按模型文件自动路由、互斥共存；附 **CPU fp32 参考实现**用于精度验证与内核调优。
+**RWKV-7 推理引擎（Rust + Vulkan 计算着色器）**，无 CUDA 依赖，可跨 GPU 厂商与平台运行。支持 **fp16 / int8(8-bit)** 两路权重量化推理，按模型文件自动路由、互斥共存；附 **CPU fp32 参考实现**用于精度验证与内核调优。
 
 > 主文档为英文（[README.md](README.md)），本文件为中文版，内容与主文档一致。
 
@@ -16,7 +16,7 @@
 2. [设计目标](#2-设计目标)
 3. [模型参数（默认验证模型）](#3-模型参数默认验证模型)
 4. [RWKV-7 架构要点](#4-rwkv-7-架构要点)
-5. [三路量化推理路径](#5-三路量化推理路径)
+5. [两路量化推理路径](#5-两路量化推理路径)
 6. [量化文件格式协议](#6-量化文件格式协议)
 7. [跨硬件自适应](#7-跨硬件自适应)
 8. [构建](#8-构建)
@@ -34,7 +34,7 @@
 
 核心目标有二：
 
-1. **降低显存占用**：通过离线权重量化（any4 4-bit 省 62%、int8 8-bit 省 41%）在不大幅损失精度的前提下，把 3B 模型的权重从 5.49GB（fp16）压到 2~3GB。
+1. **降低显存占用**：通过离线权重量化（int8 8-bit 省 41%）在不大幅损失精度的前提下，把 3B 模型的权重从 5.49GB（fp16）压到 3.22GB。
 2. **可复现的精度验证**：提供 CPU fp32 参考实现与 GPU 内核级单测，可把「内核误差」与「量化误差」隔离，逐层逐 token 验证。
 
 默认面向 **RWKV-7 Goosed g1h-3B** 模型，但模型结构按 safetensors 张量形状自适应（层数、隐藏维、头数、低秩中间维均从形状推导），可加载同系其他规模模型。
@@ -42,7 +42,7 @@
 ### 2. 设计目标
 
 - **可移植性优先**：Vulkan 而非 CUDA，牺牲约 40% 峰值吞吐，换取跨厂商 / 跨平台可用性。
-- **三路量化共存**：fp16（无损参考）/ int8（近无损）/ any4（高省存）按模型文件自动路由，同一二进制全部兼容。
+- **两路量化共存**：fp16（无损参考）/ int8（近无损）按模型文件自动路由，同一二进制全部兼容。
 - **运行时自编译 shader**：`build.rs` 在构建期用 `glslangValidator` 把 `*.comp` 编译为 SPIR-V，`constant_id` 做跨硬件自适应。
 - **研发向**：内嵌 CPU fp32 参考、DIAG 三方核对、logits 对比、teacher-forced Top-1 一致率等验证工具链。
 
@@ -78,7 +78,7 @@
 | 归一化 | `ln1, ln2, ln_x, ln0, ln_out` weight/bias | [C] | ❌ 保留 |
 | FFN shift | `ffn.x_k` | [C] | ❌ 保留 |
 
-全模型量化矩阵共 **6 × 32 = 192** 个。不量化 head/emb（直控 logits，论文 any4 亦 skip lm_head）、LayerNorm、低秩小矩阵（仅占约 1.7% 流量）。
+全模型量化矩阵共 **6 × 32 = 192** 个。不量化 head/emb（直控 logits）、LayerNorm、低秩小矩阵（仅占约 1.7% 流量）。
 
 ### 4. RWKV-7 架构要点
 
@@ -113,19 +113,18 @@ x  += relu(xb @ ffn_key_w)² @ ffn_value_w
 
 **RNN 状态**（每层）：`tmix_x` [C]、`tmix_rnn` [H, N, N]（DPLR 状态）、`cmix_x` [C]。推理为 O(1) 状态、逐 token 自回归。
 
-### 5. 三路量化推理路径
+### 5. 两路量化推理路径
 
-权重按模型文件**自动路由**（优先级 int8 → any4 → fp16），互斥共存，同一二进制兼容三种模型：
+权重按模型文件**自动路由**（优先级 int8 → fp16），互斥共存，同一二进制兼容两种模型：
 
 | 路径 | 权重位宽 | 格式 | 3B 权重文件 | 省存 | 权重级精度 | 端到端 Top-1 一致率 |
 |---|---|---|---|---|---|---|
 | fp16 | 16-bit | 不量化 | 5.49 GB | — | 无损（参考） | 100% |
 | int8 | 8-bit | 非对称 per-group(128)，scale/zero，无 LUT | 3.22 GB | 41% | avg cos **0.999820** / rel **0.6135%** | **98.8%**（506/512） |
-| any4 | 4-bit | per-row k-means LUT(16) + per-group scale/zero，约 4.35 bit/权重 | 2.07 GB | 62% | avg cos 0.995718 / rel 9.18% | **94.5%**（nnq512） |
 
 - **量化对象**：每层 6 大矩阵（att.receptance/key/value/output + ffn.key/value），全模型 192 个；head/emb、LayerNorm、低秩小矩阵不量化。
-- **int8 精度优势**：相比 any4，int8 逐组均匀量化无 k-means 簇边界非线性，不出现 any4 在分布外的 logit 尺度压缩/排序翻转问题，是「近无损」档。
-- **路由依据**：`MODEL_PATH` 指向的模型文件中是否存在 `.int8_idx` / `.any4_idx` 键。
+- **int8 精度优势**：逐组均匀量化，无 k-means 簇边界非线性、无 LUT，是「近无损」档。
+- **路由依据**：`MODEL_PATH` 指向的模型文件是否存在 `.int8_idx` 键。
 
 ### 6. 量化文件格式协议
 
@@ -140,17 +139,7 @@ x  += relu(xb @ ffn_key_w)² @ ffn_value_w
 
 反量化：`w[m,k] = scale[m, k/128] * idx[m,k] + zero[m, k/128]`，其中 `scale = (max-min)/255`，`zero = min`。常数组（scale=0）精确重建为 zero。
 
-**any4（per-row k-means 学习码本 + per-group scale/zero，arXiv:2507.04610）：**
-
-| safetensors 键后缀 | 形状 | dtype | 说明 |
-|---|---|---|---|
-| `{name}.any4_idx` | [M, K/2] | U8 | 每字节 2 个 4-bit 索引（低 nibble=偶数 k，高 nibble=奇数 k） |
-| `{name}.any4_lut` | [M, 16] | F16 | 每行 16 项学习码本（per-row k-means 质心，定义在组归一化域） |
-| `{name}.any4_sz` | [M, K/128] | U32 | 每元素 = (scale: fp16 低16位 \| zero: fp16 高16位) |
-
-反量化：`w[m,k] = scale[m, k/128] * lut[m, idx[m,k]] + zero[m, k/128]`，约 **4.35 bit/权重**（K=2560 时权重流量为 fp16 的 27.2%）。
-
-> 格式协议与 GPU shader 解包逻辑由 [src/model.rs](src/model.rs) 的 CPU 单测（`dequant_any4` / `dequant_int8`）锁定，保证 Python 量化器打包 → Rust/GPU 解包逐位一致。
+> 格式协议与 GPU shader 解包逻辑由 [src/model.rs](src/model.rs) 的 CPU 单测（`dequant_int8`）锁定，保证 Python 量化器打包 → Rust/GPU 解包逐位一致。
 
 ### 7. 跨硬件自适应
 
@@ -192,7 +181,7 @@ cargo run --release
 
 | 变量 | 作用 |
 |---|---|
-| `MODEL_PATH` | 模型路径；含 `.int8_idx` → int8，含 `.any4_idx` → any4，否则 fp16 |
+| `MODEL_PATH` | 模型路径；含 `.int8_idx` → int8，否则 fp16 |
 | `TOP1_MULTI_SAVE` / `TOP1_MULTI_COMPARE` | 多 prompt 的 teacher-forced Top-1 一致率验证 |
 | `TOP1_REF_SAVE` / `TOP1_REF_COMPARE` | 单 prompt 的 CPU fp32 参考一致率 |
 | `SAVE_LOGITS` / `COMPARE_LOGITS` | 单 prompt logits 的 RMSE / Top-10 对比 |
@@ -252,30 +241,28 @@ uv run tools/quantize_any4.py --in rwkv-g1h-3B.st --out rwkv-g1h-3B.int8.st --bi
 
 校准 prompt 采集：[tools/prepare_calib_prompts.py](tools/prepare_calib_prompts.py)（aya_dataset 多语言分层抽样：中文 30% / 英文 30% / 其他 40%）。
 
-权重级验收阈值（量化器内置 PASS/FAIL）：any4 要求 avg cos ≥ 0.995、avg rel ≤ 10.5% 且优于同组 int4 基线（≈11%）；int8 要求 avg cos ≥ 0.999、avg rel ≤ 1%。
+权重级验收阈值（量化器内置 PASS/FAIL）：int8 要求 avg cos ≥ 0.999、avg rel ≤ 1%。
 
 ### 11. 精度与性能基准
 
-**硬件：RTX 2080 Ti。** 详细报告见 [参考/](参考/)（`int8量化报告.md`、`any4量化报告_nnq512.md`、`GPU模型实现.md`）。
+**硬件：RTX 2080 Ti。** 详细报告见 [参考/](参考/)（`int8量化报告.md`、`GPU模型实现.md`）。
 
 **端到端精度（teacher-forced Top-1 一致率，对比 fp16 参考）：**
 
 | 路径 | 一致率 | 说明 |
 |---|---|---|
 | int8 | **98.8%**（506/512） | 近无损，无分布外 logit 压缩/排序翻转 |
-| any4 | **94.5%**（nnq512） | 真实多语言 92.6%；对比 AUXStar NVFP4 ~85%、FP8 93.75% |
 
-**性能（fp16 路径）：**
+**GPU decode self-loop 吞吐**（argmax self-loop，300 tokens，GPU 60°C 冷态）：
 
-- 单 token 推理：**69.3 tok/s**（14.44 ms/token）
-- 序列推理（sequence-parallel）：**398.4 tok/s**（2.51 ms/token）
-- argmax 推理：**68.4 tok/s**
+| 权重 | 后端 | tok/s |
+|---|---|---|
+| fp16 | Vulkan | 79.8 |
+| fp16 | CUDA | 85.6 |
+| int8 | Vulkan | 105.5 |
+| int8 | CUDA | 110.2 |
 
-**any4 量化收益（同机）：**
-
-- decode self-loop：**114.7 tok/s**（相对核心里程碑 63.0，**1.82×**）
-- seq prefill（T=512）：**1102.5 tok/s**（约 fp16 基线 1230.1 的 89.6%，差距为 dequant 开销）
-- any4 decode 进程显存增量：**约 2.6GB**
+> 硬件：RTX 2080 Ti。通过 `cargo run --release -- memtest` 配以 `SELFLOOP_ONLY=1` / `SELFLOOP_N=300` 测得（纯 GPU argmax self-loop，Batch=N，2026-08-09 GPU 60°C 冷态重测）。int8 较 fp16 提升约 +32%（Vulkan）/+29%（CUDA）；同权重精度下 CUDA 较 Vulkan 提升约 +5%。
 
 > 显存口径说明：`memtest` 的 dedicated 读数为系统级（含桌面/浏览器底噪），须用「进程增量 = 读数 − 同时刻空闲值」。
 
@@ -311,14 +298,13 @@ test/           开发用脚本
 
 在以上两者的启发下，本仓库随后独立演进，新增了它们都没有的能力：
 
-- **三路权重量化推理**（fp16 / any4 / int8）按模型文件自动路由、互斥共存；
+- **两路权重量化推理**（fp16 / int8）按模型文件自动路由、互斥共存；
 - **CPU fp32 参考实现**（[src/model.rs](src/model.rs)）与 GPU 内核正确性单测，作为隔离内核误差与量化误差的基准；
-- **离线量化工具链**（k-means any4 与 per-group int8）与可复现的精度验证工作流。
+- **离线量化工具链**（per-group int8）与可复现的精度验证工作流。
 
 ### 14. 已知限制与后续方向
 
-- **any4 kernel 带宽利用率 58~67%**（fp16 版 82%）：字节数降后固定开销占比升高，可探索寄存器内联 LUT（tinygemm 式）或更大 ROWS。
-- **prefill dequant 开销 ~10%**（T=512 时 1102.5 vs fp16 1230.1 tok/s）：彻底消除需 cooperative-matrix 融合反量化+GEMM（Marlin 式零副本），列为长期方向。
+- **prefill dequant 开销 ~10%**（T=512 时 int8 vs fp16）：彻底消除需 cooperative-matrix 融合反量化+GEMM（Marlin 式零副本），列为长期方向。
 - **prefill 每 token 耗时随 T 近二次方增长**（T=256: 0.33ms → T=512: 0.81ms，WKV 并行形式的 chunk 内项），长 prompt 可关注 WKV 分块策略。
 - **精度增强后路**：校准加权 k-means（论文 `sample_weight=calibrate`）、G=64 提高元数据密度。
 

@@ -11,7 +11,7 @@
 use half::f16;
 use safetensors::tensor::TensorView;
 
-use crate::backend::{Any4Handle, ComputeBackend, Int8Handle, TensorDtype, TensorId};
+use crate::backend::{ComputeBackend, Int8Handle, TensorDtype, TensorId};
 use crate::runtime::R;
 
 /// LayerNorm eps（与 CPU model.rs 一致）
@@ -107,7 +107,8 @@ pub struct GpuModel {
     emb_ln_cpu: Vec<f32>, // [vocab, C] CPU 缓存（f16 舍入值，与 GPU 表逐位一致），避免每次 forward_seq 下载
     ln_out_w: TensorId,
     ln_out_b: TensorId,
-    head_w16: TensorId, // [vocab, C] fp16 变体（单 token 用 fp16 gemv）
+    head_w16: Option<TensorId>, // [vocab, C] fp16 变体（head 未 int8 量化时用）
+    head_a8: Option<Int8Handle>, // [vocab, C] int8 量化 head（模型含 head.weight.int8_* 时启用，省 4× 带宽）
     layers: Vec<GpuLayer>,
     // 工作缓冲区（forward 时复用，避免每 token 重新分配）
     bufs: WorkBuffers,
@@ -157,23 +158,17 @@ pub struct GpuLayer {
     /// 诊断用 fp32 输出权重（仅 GEMM_DIAG 参考路径使用；其余线性权重已删 fp32 副本省显存）。
     /// 仅在设置 GEMM_DIAG 时创建，正式推理不持有，省 ~26MB/层。
     output_w: Option<TensorId>, // [C, C]
-    // any4 量化矩阵的 fp16 线性权重（prefill tensor-core GEMM 用，fp32io16 模式）——
+    // fp16 线性权重（prefill tensor-core GEMM 用，fp32io16 模式）——
     // 不常驻：prefill（forward_seq）前由 host 反量化临时创建，decode 前释放归还显存。
-    // 非 any4 矩阵此处为 Some 常驻（直接读模型 fp16 键）；any4 矩阵为 None/临时。
     receptance_w16: Option<TensorId>, // [C, C]
     key_w16: Option<TensorId>,
     value_w16: Option<TensorId>,
     output_w16: Option<TensorId>,
     ffn_key_w16: Option<TensorId>,   // [ffn_hidden, C]
-    ffn_value_w16: Option<TensorId>, // [C, ffn_hidden]
-    // any4 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16 路径）
-    ffn_key_a4: Option<Any4Handle>,    // [ffn_hidden, C]
-    ffn_value_a4: Option<Any4Handle>,  // [C, ffn_hidden]
-    att_output_a4: Option<Any4Handle>, // [C, C]
-    receptance_a4: Option<Any4Handle>, // [C, C]
-    key_a4: Option<Any4Handle>,        // [C, C]
-    value_a4: Option<Any4Handle>,      // [C, C]
-    // int8 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16/any4 路径）
+    ffn_value_w16: Option<TensorId>, // [C, ffn_hidden]（稠密，稀疏内核回退用）
+    // fp16 ffn_value 的平铺布局 [fh, C]（CudaBackend 稀疏 FFN 用；Vulkan 回退稠密）。
+    ffn_value_tiled: Option<TensorId>,
+    // int8 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16 路径）
     ffn_key_a8: Option<Int8Handle>,    // [ffn_hidden, C]
     ffn_value_a8: Option<Int8Handle>,  // [C, ffn_hidden]
     att_output_a8: Option<Int8Handle>, // [C, C]
@@ -309,7 +304,7 @@ pub struct SeqBuffers {
     w_mid16: TensorId, // [M_PAD, wm_pad]
     a_mid16: TensorId, // [M_PAD, am_pad]
     g_mid16: TensorId, // [M_PAD, gm_pad]
-    /// any4→fp16 反量化共享 scratch（方案A prefill）：大小取 6 个 any4 矩阵最大值
+    /// int8→fp16 反量化共享 scratch（方案A prefill）：大小取 6 个 int8 矩阵最大值
     /// [ffn_hidden, C] = 26.2M 元素（52.4MB）。每矩阵 GEMM 前由 dequant 全量覆写，
     /// 顺序复用（barrier 由 record_kernel 读写序保证），替代旧逐层 3.4GB fp16 副本。
     w_scratch: TensorId,
@@ -339,13 +334,10 @@ impl GpuModel {
         let a_mid = mid_of(&st.tensor("blocks.0.att.a1")?);
         let v_mid = mid_of(&st.tensor("blocks.0.att.v1")?);
         let g_mid = mid_of(&st.tensor("blocks.0.att.g1")?);
-        // 原 fp16 键可能被 any4/int8 量化键替换，此时从量化张量推导 M（any4_idx [M,K/2] / int8_idx [M,K]）
+        // 原 fp16 键可能被 int8 量化键替换，此时从量化张量推导 M（int8_idx [M,K]）
         let ffn_hidden = match st.tensor("blocks.0.ffn.key.weight") {
             Ok(t) => t.shape()[0],
-            Err(_) => st
-                .tensor("blocks.0.ffn.key.weight.any4_idx")
-                .or_else(|_| st.tensor("blocks.0.ffn.key.weight.int8_idx"))?
-                .shape()[0],
+            Err(_) => st.tensor("blocks.0.ffn.key.weight.int8_idx")?.shape()[0],
         };
 
         let config = ModelConfig {
@@ -389,11 +381,39 @@ impl GpuModel {
         let ln_out_b_t = backend.create_tensor(n_embd, TensorDtype::F32)?;
         backend.upload(ln_out_b_t, &ln_out_b)?;
 
-        // head.weight 原始 [vocab, C] = [out, in]，直接用
-        // 仅保留 fp16 变体（单 token 用 fp16 gemv 减半带宽）；fp32 副本已删省显存
-        let head_w = tensor_to_f32(&st.tensor("head.weight")?);
-        let head_w16_t = backend.create_tensor(vocab * n_embd, TensorDtype::F16)?;
-        backend.upload(head_w16_t, &head_w)?;
+        // head：仅当模型自带 int8 量化（全 int8 模型的一部分）时用 int8（省 4× 带宽，
+        // head 是 decode 单 kernel 读取量最大者）；否则保留 fp16 变体。
+        // 2026-08-09 复测结论：fp16 模型单独量化 head 端到端收益 ≈1%（淹没于热噪声），
+        // 已删除加载时合成 int8 head 路径（HEAD_QUANT），head 量化只随全 int8 模型使用。
+        let head_a8 = if st.tensor("head.weight.int8_idx").is_ok() {
+            let idx_t = st.tensor("head.weight.int8_idx")?; // U8 [vocab, C]
+            let sz_t = st.tensor("head.weight.int8_sz")?; // U32 [vocab, C/128]
+            let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+            let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+            assert_eq!(idx_u32.len(), vocab * n_embd / 4, "head.int8_idx 形状不符");
+            assert_eq!(sz_u32.len(), vocab * n_embd / 128, "head.int8_sz 形状不符");
+            let idx_gpu = backend.create_tensor(vocab * n_embd / 4, TensorDtype::U32)?;
+            backend.upload_u32(idx_gpu, idx_u32)?;
+            let sz_gpu = backend.create_tensor(vocab * n_embd / 128, TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, sz_u32)?;
+            log::info!("head 使用 int8 量化权重（{vocab}x{n_embd}）");
+            Some(Int8Handle {
+                idx: idx_gpu,
+                sz: sz_gpu,
+                m: vocab,
+                k: n_embd,
+            })
+        } else {
+            None
+        };
+        let head_w16_t = if head_a8.is_none() {
+            let head_w = tensor_to_f32(&st.tensor("head.weight")?);
+            let t = backend.create_tensor(vocab * n_embd, TensorDtype::F16)?;
+            backend.upload(t, &head_w)?;
+            Some(t)
+        } else {
+            None
+        };
 
         // 加载每一层
         let mut layers = Vec::with_capacity(n_layer);
@@ -415,7 +435,9 @@ impl GpuModel {
         backend.drop_host(emb_ln_t);
         backend.drop_host(ln_out_w_t);
         backend.drop_host(ln_out_b_t);
-        backend.drop_host(head_w16_t);
+        if let Some(t) = head_w16_t {
+            backend.drop_host(t);
+        }
         backend.drop_host(scale_w);
 
         Ok(Self {
@@ -426,6 +448,7 @@ impl GpuModel {
             ln_out_w: ln_out_w_t,
             ln_out_b: ln_out_b_t,
             head_w16: head_w16_t,
+            head_a8,
             layers,
             bufs,
             seq_bufs: None,
@@ -444,6 +467,16 @@ impl GpuModel {
             .unwrap()
             .reset(&*self.backend, c, h, n)?;
         Ok(())
+    }
+
+    /// 清空累计的 per-kernel profiling 时间（仅诊断）。
+    pub fn clear_kernel_prof(&mut self) {
+        self.backend.clear_kernel_prof();
+    }
+
+    /// 打印累计的 per-kernel profiling 时间（仅诊断）。
+    pub fn dump_kernel_prof(&mut self) {
+        self.backend.dump_kernel_prof();
     }
 
     /// 重置一个**外部** `State`（例如 `Bundle` 持有的会话状态）为零。
@@ -589,68 +622,64 @@ impl GpuModel {
         self.backend
             .store_token_host(self.bufs.current_token, seed)?;
 
-        for round in 0..n {
-            // RNN 状态跨 token 保持，仅每个 token 重置 v_first
-            state.v_first_set = false;
+        // 预置 round 0 的 sampler（graph 捕获时 sample kernel 从 sampler 缓冲读参数）
+        self.backend.store_sampler_host(
+            sampler,
+            sp.temperature,
+            sp.top_k,
+            sp.top_p,
+            seed,
+            sp.repetition_penalty,
+            sp.frequency_penalty,
+            sp.presence_penalty,
+            0,
+        )?;
 
-            // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
-            self.backend.gather_row_device_f16(
-                self.emb_ln,
-                self.bufs.x,
-                self.bufs.current_token,
-                c,
+        if self.backend.supports_graph_capture() {
+            // CUDA graph：捕获一轮完整前向（gather→层→ln+head→GPU采样→record_token），
+            // 之后每 token 重放，消除 258 次/层的 cuLaunchKernel 启动开销。
+            // 每轮重放前用 store_sampler_host 更新 seed/hist_len，sample kernel 在重放时
+            // 读取最新设备参数（与 argmax 路径的 graph 反馈机制一致）。
+            self.backend.begin_graph_capture()?;
+            self.sample_selfloop_step(
+                state, c, h, ns, temp, mask, counter, sampler, token_seq, seq_cnt,
             )?;
+            self.backend.end_graph_capture()?;
 
-            for i in 0..self.config.n_layer {
-                self.forward_layer(i, c, h, ns, state)?;
+            for round in 0..n {
+                state.v_first_set = false;
+                self.backend.store_sampler_host(
+                    sampler,
+                    sp.temperature,
+                    sp.top_k,
+                    sp.top_p,
+                    seed + round as u32,
+                    sp.repetition_penalty,
+                    sp.frequency_penalty,
+                    sp.presence_penalty,
+                    round as u32,
+                )?;
+                self.backend.graph_replay()?;
             }
-
-            // ln_out + head
-            self.backend.norm(
-                self.bufs.x,
-                self.ln_out_w,
-                self.ln_out_b,
-                self.bufs.x_norm,
-                c,
-                1,
-                LN_EPS,
-                1,
-            )?;
-            self.backend.gemv_f16(
-                self.head_w16,
-                self.bufs.x_norm,
-                self.bufs.logits,
-                vocab,
-                c,
-                1,
-            )?;
-
-            // 每轮更新 seed 与惩罚历史长度（hist_len = 已生成 round 个 token），GPU 采样直接写回
-            // host-visible current_token（下一轮 gather 自动跟随）
-            self.backend.store_sampler_host(
-                sampler,
-                sp.temperature,
-                sp.top_k,
-                sp.top_p,
-                seed + round as u32,
-                sp.repetition_penalty,
-                sp.frequency_penalty,
-                sp.presence_penalty,
-                round as u32,
-            )?;
-            self.backend.sample_into_host_seeded(
-                self.bufs.logits,
-                self.bufs.current_token,
-                vocab,
-                temp,
-                mask,
-                counter,
-                sampler,
-                token_seq, // 前 round 个已生成 token 作为惩罚历史
-            )?;
-            // 把本轮 token 追加到序列缓冲（供一次性下载验证）
-            self.backend
-                .record_token(self.bufs.current_token, token_seq, seq_cnt)?;
+        } else {
+            // Vulkan：无 graph 捕获，把 n 轮完整前向逐 token 记录进同一批次；
+            // 每轮用 store_sampler_host 更新 seed/hist_len（sample kernel 执行时读取最新参数）。
+            for round in 0..n {
+                self.backend.store_sampler_host(
+                    sampler,
+                    sp.temperature,
+                    sp.top_k,
+                    sp.top_p,
+                    seed + round as u32,
+                    sp.repetition_penalty,
+                    sp.frequency_penalty,
+                    sp.presence_penalty,
+                    round as u32,
+                )?;
+                self.sample_selfloop_step(
+                    state, c, h, ns, temp, mask, counter, sampler, token_seq, seq_cnt,
+                )?;
+            }
         }
 
         // 一次性提交整段 self-loop
@@ -684,7 +713,6 @@ impl GpuModel {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let ns = self.config.head_size;
-        let vocab = self.config.vocab;
 
         // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
         let token_seq = self.backend.create_tensor(n, TensorDtype::F32)?;
@@ -699,48 +727,25 @@ impl GpuModel {
         self.backend
             .store_token_host(self.bufs.current_token, seed)?;
 
-        for _ in 0..n {
-            // RNN 状态跨 token 保持，仅每个 token 重置 v_first
-            state.v_first_set = false;
+        if self.backend.supports_graph_capture() {
+            // CUDA：捕获首个 token 的完整前向 kernel 序列，之后每 token 重放，
+            // 消除 258 次/层的 cuLaunchKernel 启动开销。
+            self.backend.begin_graph_capture()?;
+            self.selfloop_step(state, c, h, ns, token_seq, seq_cnt)?;
+            self.backend.end_graph_capture()?;
 
-            // 参数化 gather：读 host 缓冲中的 token 索引 → 取 embedding 行
-            self.backend.gather_row_device_f16(
-                self.emb_ln,
-                self.bufs.x,
-                self.bufs.current_token,
-                c,
-            )?;
-
-            for i in 0..self.config.n_layer {
-                self.forward_layer(i, c, h, ns, state)?;
+            // 执行 token 0（捕获的 graph），随后重放 n-1 次
+            self.backend.graph_replay()?;
+            for _ in 1..n {
+                state.v_first_set = false;
+                self.backend.graph_replay()?;
             }
-
-            // ln_out + head
-            self.backend.norm(
-                self.bufs.x,
-                self.ln_out_w,
-                self.ln_out_b,
-                self.bufs.x_norm,
-                c,
-                1,
-                LN_EPS,
-                1,
-            )?;
-            self.backend.gemv_f16(
-                self.head_w16,
-                self.bufs.x_norm,
-                self.bufs.logits,
-                vocab,
-                c,
-                1,
-            )?;
-
-            // GPU argmax 直接写回 host-visible current_token（self-loop 关键：下一轮 gather 自动跟随）
-            self.backend
-                .argmax_into_host(self.bufs.logits, self.bufs.current_token, vocab)?;
-            // 把本轮 token 追加到序列缓冲（供一次性下载验证）
-            self.backend
-                .record_token(self.bufs.current_token, token_seq, seq_cnt)?;
+        } else {
+            // Vulkan：无 graph 捕获，把 n 轮完整前向逐 token 记录进同一批次。
+            // selfloop_step 内部已重置 v_first_set，每轮会重新快照 v_first。
+            for _ in 0..n {
+                self.selfloop_step(state, c, h, ns, token_seq, seq_cnt)?;
+            }
         }
 
         // 一次性提交整段 self-loop
@@ -749,6 +754,93 @@ impl GpuModel {
         // 下载序列缓冲，按位解释为 u32
         let t = self.backend.download(token_seq)?;
         Ok(t[..n].iter().map(|x| x.to_bits()).collect())
+    }
+
+    /// self-loop 单步：gather → 全部层 → ln_out+head → argmax → record_token。
+    /// 供 CUDA graph 捕获/重放使用（kernel 序列固定，仅数据随 token 变化）。
+    #[allow(clippy::too_many_arguments)]
+    fn selfloop_step(
+        &mut self,
+        state: &mut State,
+        c: usize,
+        h: usize,
+        ns: usize,
+        token_seq: TensorId,
+        seq_cnt: TensorId,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
+        state.v_first_set = false;
+        self.backend
+            .gather_row_device_f16(self.emb_ln, self.bufs.x, self.bufs.current_token, c)?;
+        for i in 0..self.config.n_layer {
+            self.forward_layer(i, c, h, ns, state)?;
+        }
+        self.backend.norm(
+            self.bufs.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            self.bufs.x_norm,
+            c,
+            1,
+            LN_EPS,
+            1,
+        )?;
+        self.head_gemv(self.bufs.x_norm, self.bufs.logits, self.config.vocab, c)?;
+        self.backend.argmax_into_host(
+            self.bufs.logits,
+            self.bufs.current_token,
+            self.config.vocab,
+        )?;
+        self.backend
+            .record_token(self.bufs.current_token, token_seq, seq_cnt)
+    }
+
+    /// 采样 self-loop 单步：gather → 全部层 → ln_out+head → GPU 采样 → record_token。
+    /// 供 CUDA graph 捕获/重放使用（kernel 序列固定，seed/hist_len 经 sampler 缓冲逐轮更新）。
+    #[allow(clippy::too_many_arguments)]
+    fn sample_selfloop_step(
+        &mut self,
+        state: &mut State,
+        c: usize,
+        h: usize,
+        ns: usize,
+        temp: TensorId,
+        mask: TensorId,
+        counter: TensorId,
+        sampler: TensorId,
+        token_seq: TensorId,
+        seq_cnt: TensorId,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
+        state.v_first_set = false;
+        self.backend
+            .gather_row_device_f16(self.emb_ln, self.bufs.x, self.bufs.current_token, c)?;
+        for i in 0..self.config.n_layer {
+            self.forward_layer(i, c, h, ns, state)?;
+        }
+        self.backend.norm(
+            self.bufs.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            self.bufs.x_norm,
+            c,
+            1,
+            LN_EPS,
+            1,
+        )?;
+        self.head_gemv(self.bufs.x_norm, self.bufs.logits, self.config.vocab, c)?;
+        self.backend.sample_into_host_seeded(
+            self.bufs.logits,
+            self.bufs.current_token,
+            self.config.vocab,
+            temp,
+            mask,
+            counter,
+            sampler,
+            token_seq, // 前 round 个已生成 token 作为惩罚历史
+        )?;
+        self.backend
+            .record_token(self.bufs.current_token, token_seq, seq_cnt)
     }
 
     /// 单 token 前向：把该 token 的 logits 写入 bufs.logits（含 batch 记录与提交）。
@@ -809,14 +901,7 @@ impl GpuModel {
             1,
         )?;
         // logits = x_norm @ head.T = gemv_f16(head_w16, x_norm, M=vocab, K=c)
-        self.backend.gemv_f16(
-            self.head_w16,
-            self.bufs.x_norm,
-            self.bufs.logits,
-            vocab,
-            c,
-            1,
-        )?;
+        self.head_gemv(self.bufs.x_norm, self.bufs.logits, vocab, c)?;
         // 需要采样时，GPU 端 argmax / 带参数采样归约（与本次前向同批）
         if let Some(sp) = sampler {
             self.backend.sample(
@@ -842,6 +927,18 @@ impl GpuModel {
         Ok(())
     }
 
+    /// logits = x_in @ head.T，输出 [vocab]。
+    /// 模型含 int8 量化 head 时走 `gemv_int8_plain`（省 4× 带宽，head 是 decode 单 kernel 读取量最大者），
+    /// 否则走 fp16 `gemv_f16`。
+    fn head_gemv(&mut self, x_in: TensorId, out: TensorId, vocab: usize, c: usize) -> R<()> {
+        if let Some(a8) = &self.head_a8 {
+            self.backend.gemv_int8_plain(a8, x_in, out, vocab, c, 1)
+        } else {
+            let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
+            self.backend.gemv_f16(w16, x_in, out, vocab, c, 1)
+        }
+    }
+
     /// 单层前向：time mixing + channel mixing
     fn forward_layer(
         &mut self,
@@ -851,7 +948,7 @@ impl GpuModel {
         n: usize,
         state: &mut State,
     ) -> R<()> {
-        // decode 走 any4 GEMV，无需 fp16 副本；prefill 已逐层释放临时 fp16，decode 不再持有。
+        // decode 走 int8/fp16 GEMV，无需 fp16 副本；prefill 已逐层释放临时 fp16，decode 不再持有。
         let (wm, am, vm, gm, fh) = (
             self.config.w_mid,
             self.config.a_mid,
@@ -903,8 +1000,8 @@ impl GpuModel {
         pf_phase!("norm_lerp6");
 
         // r/k/v + v_mid/w_mid/a_mid/g_mid = 融合 gemv（一次 dispatch 算 r/k/v 三个 C×C 投影
-        // + v1/w1/a1/g1 四个 mid 投影）。三路量化权重自动路由：int8 → any4 → fp16
-        // （r/k/v 三者同量化格式才走对应融合版；权重带宽 fp16 2B / int8 1B / any4 ~0.5B）。
+        // + v1/w1/a1/g1 四个 mid 投影）。量化权重自动路由：int8 → fp16
+        // （r/k/v 三者同量化格式才走对应融合版；权重带宽 fp16 2B / int8 1B）。
         if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
             &self.layers[i].receptance_a8,
             &self.layers[i].key_a8,
@@ -937,52 +1034,20 @@ impl GpuModel {
                 am,
                 gm,
             )?;
-        } else if let (Some(r_a4), Some(k_a4), Some(v_a4)) = (
-            &self.layers[i].receptance_a4,
-            &self.layers[i].key_a4,
-            &self.layers[i].value_a4,
-        ) {
-            self.backend.gemv_any4_rkv_stage1(
-                r_a4,
-                k_a4,
-                v_a4,
-                self.layers[i].v1,
-                self.layers[i].w1,
-                self.layers[i].a1,
-                self.layers[i].g1,
-                self.bufs.xr,
-                self.bufs.xk,
-                self.bufs.xv,
-                self.bufs.xw,
-                self.bufs.xa,
-                self.bufs.xg,
-                self.bufs.r,
-                self.bufs.k,
-                self.bufs.v,
-                self.bufs.v_mid,
-                self.bufs.w_mid,
-                self.bufs.a_mid,
-                self.bufs.g_mid,
-                c,
-                vm,
-                wm,
-                am,
-                gm,
-            )?;
         } else {
             self.backend.gemv_rkv_stage1(
                 *self.layers[i]
                     .receptance_w16
                     .as_ref()
-                    .ok_or("receptance_w16 missing when not any4")?,
+                    .ok_or("receptance_w16 missing when not int8")?,
                 *self.layers[i]
                     .key_w16
                     .as_ref()
-                    .ok_or("key_w16 missing when not any4")?,
+                    .ok_or("key_w16 missing when not int8")?,
                 *self.layers[i]
                     .value_w16
                     .as_ref()
-                    .ok_or("value_w16 missing when not any4")?,
+                    .ok_or("value_w16 missing when not int8")?,
                 self.layers[i].v1,
                 self.layers[i].w1,
                 self.layers[i].a1,
@@ -1026,8 +1091,15 @@ impl GpuModel {
             self.backend.copy_device_f16(self.bufs.v, state.v_first)?;
             state.v_first_set = true;
         }
-        // ===== 低秩链第二级融合（w/a/g/v 二级投影 + 激活，1 次 dispatch）=====
-        // 首层 v_first==v，v 链 lerp 因子 sigmoid*(v_first-v)=0，v 保持不变（=value 投影）
+        // ===== 低秩链第二级（w/a/g/v 二级投影+激活）+ fuse_ka + dplr + group_norm + sum_rk_rk。
+        // 注：曾尝试把两者深度融合为单次 dispatch（fuse_chain4_dplr_norm），实测 fp16 -7.6%、
+        // int8 -12%（chain4 阶段并行度从 C/ROWS=640 workgroup 塌缩到 DPLR 的 H=40，SM 利用率
+        // 不足），已回退为两次 dispatch（2026-08-09，详见参考目录融合记录）。
+        //   k_mod_i = k_i * (1 + k_a_i * (a_i - 1))
+        //   kk_l2_i = normalize(k_i * k_k_i)
+        //   b_i     = -kk_l2_i * a_i
+        //   S 更新 + y = S @ r
+        //   y_norm  = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k)*v
         self.backend.gemv_lowrank_chain4(
             self.layers[i].w2,
             self.layers[i].a2,
@@ -1046,21 +1118,13 @@ impl GpuModel {
             self.bufs.a,
             self.bufs.v,
             self.bufs.g,
-            c,
+            h * n,
             wm,
             am,
             vm,
             gm,
         )?;
-        pf_phase!("lowrank_chain4");
-
-        // 融合 kernel（对标 albatross）：fuse_ka + dplr + group_norm + sum_rk_rk 一次 launch
-        //   k_mod_i = k_i * (1 + k_a_i * (a_i - 1))
-        //   kk_l2_i = normalize(k_i * k_k_i)
-        //   b_i     = -kk_l2_i * a_i
-        //   S 更新 + y = S @ r
-        //   y_norm  = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k)*v
-        // （省 1 次 dispatch/层，替代 fuse_ka_dplr + norm_sum_rk_rk 两次）
+        pf_phase!("gemv_lowrank_chain4");
         self.backend.fuse_ka_dplr_norm(
             state.layers[i].tmix_rnn,
             self.bufs.k,
@@ -1082,6 +1146,17 @@ impl GpuModel {
             GN_EPS,
         )?;
         pf_phase!("fuse_ka_dplr_norm");
+        Self::dump_tensors(
+            self.backend.as_mut(),
+            "tok",
+            i,
+            &[
+                ("w", self.bufs.w),
+                ("a", self.bufs.a),
+                ("v_chain", self.bufs.v),
+                ("g", self.bufs.g),
+            ],
+        )?;
         Self::dump_tensors(self.backend.as_mut(), "tok", i, &[("y", self.bufs.y)])?;
         Self::dump_tensors(
             self.backend.as_mut(),
@@ -1091,20 +1166,10 @@ impl GpuModel {
         )?;
 
         // x += (y_norm .* g) @ output_w（mul + 残差累加都折叠进 gemv，省 2 次 dispatch）；
-        // 三路量化权重自动路由：int8 → any4 → fp16
+        // 量化权重自动路由：int8 → fp16
         if let Some(a8) = &self.layers[i].att_output_a8 {
             self.backend.gemv_int8_mul_add(
                 a8,
-                self.bufs.y_norm,
-                self.bufs.g,
-                self.bufs.x,
-                c,
-                c,
-                1,
-            )?;
-        } else if let Some(a4) = &self.layers[i].att_output_a4 {
-            self.backend.gemv_any4_mul_add(
-                a4,
                 self.bufs.y_norm,
                 self.bufs.g,
                 self.bufs.x,
@@ -1117,7 +1182,7 @@ impl GpuModel {
                 *self.layers[i]
                     .output_w16
                     .as_ref()
-                    .ok_or("output_w16 missing when not any4")?,
+                    .ok_or("output_w16 missing when not int8")?,
                 self.bufs.y_norm,
                 self.bufs.g,
                 self.bufs.x,
@@ -1149,19 +1214,16 @@ impl GpuModel {
         )?;
         pf_phase!("cmix_norm_lerp");
 
-        // r2 = relu²(xb @ ffn_key.T) — M=ffn_hidden, K=C；三路量化权重自动路由：int8 → any4 → fp16
+        // r2 = relu²(xb @ ffn_key.T) — M=ffn_hidden, K=C；量化权重自动路由：int8 → fp16
         if let Some(a8) = &self.layers[i].ffn_key_a8 {
             self.backend
                 .gemv_int8_relu2(a8, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
-        } else if let Some(a4) = &self.layers[i].ffn_key_a4 {
-            self.backend
-                .gemv_any4_relu2(a4, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
         } else {
             self.backend.gemv_f16_relu2(
                 *self.layers[i]
                     .ffn_key_w16
                     .as_ref()
-                    .ok_or("ffn_key_w16 missing when not any4")?,
+                    .ok_or("ffn_key_w16 missing when not int8")?,
                 self.bufs.xb,
                 self.bufs.r2,
                 fh,
@@ -1170,20 +1232,35 @@ impl GpuModel {
             )?;
         }
         pf_phase!("gemv_f16_relu2");
-        // x += r2 @ ffn_value（残差累加折叠进 gemv，省 1 次 dispatch）；
-        // 三路量化权重自动路由：int8 → any4 → fp16
-        if let Some(a8) = &self.layers[i].ffn_value_a8 {
+        // x += r2 @ ffn_value（残差累加折叠进 gemv，省 1 次 dispatch）。
+        // 优先稀疏 FFN（r2 96% 稀疏，只读非零列，省带宽）：CUDA 上 fp16/int8 均反量化出
+        // fp16 平铺权重走稀疏内核（只读 ~4% 列，远优于稠密 int8 全量读取）。
+        // 不支持稀疏或 FFN_SPARSE_OFF 时退回稠密 gemv（int8 → fp16）。
+        let sparse_ok =
+            self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
+        let sparse_vt = if sparse_ok {
+            self.layers[i].ffn_value_tiled
+        } else {
+            None
+        };
+        if let Some(vt) = sparse_vt {
+            self.backend.ffn_value_sparse_add(
+                self.layers[i].ffn_value_w16,
+                vt,
+                self.bufs.r2,
+                self.bufs.x,
+                c,
+                fh,
+            )?;
+        } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
             self.backend
                 .gemv_int8_add(a8, self.bufs.r2, self.bufs.x, c, fh, 1)?;
-        } else if let Some(a4) = &self.layers[i].ffn_value_a4 {
-            self.backend
-                .gemv_any4_add(a4, self.bufs.r2, self.bufs.x, c, fh, 1)?;
         } else {
             self.backend.gemv_f16_add(
                 *self.layers[i]
                     .ffn_value_w16
                     .as_ref()
-                    .ok_or("ffn_value_w16 missing when not any4")?,
+                    .ok_or("ffn_value_w16 missing")?,
                 self.bufs.r2,
                 self.bufs.x,
                 c,
@@ -1191,7 +1268,7 @@ impl GpuModel {
                 1,
             )?;
         }
-        pf_phase!("gemv_f16_add");
+        pf_phase!("ffnv_sparse");
         let _ = t0; // 引用最后一次赋值，避免 unused_assignments 警告
 
         Ok(())
@@ -1241,44 +1318,73 @@ impl GpuModel {
 
         let seq_pf = std::env::var("SEQ_PROFILE").is_ok();
         let mut spf_t0 = std::time::Instant::now();
-        // 单批处理全部层：任何层都走 any4 GEMM（零 fp16 副本），无需逐层 begin/end_batch 隔离。
-        self.backend.begin_batch()?;
-        for i in 0..self.config.n_layer {
-            if std::env::var("GEMM_DIAG").is_ok() {
-                log::info!("[FS] layer {i} start");
+        // CUDA prefill graph：整段各层 + head 一次捕获为 graph，之后同 T 直接重放，
+        // 消除跨层 launch 开销。Vulkan 为 no-op（逐一提交）。诊断路径（GEMM_DIAG/PROFILE）
+        // 含下载/逐段 submit，与 graph 捕获互斥，故仅在普通路径启用。
+        let prefill_graph = std::env::var("PREFILL_GRAPH").as_deref() == Ok("1")
+            && std::env::var("GEMM_DIAG").is_err()
+            && std::env::var("PROFILE").is_err();
+        if prefill_graph && self.backend.prefill_graph_valid(t)? {
+            self.backend.prefill_graph_replay()?;
+        } else {
+            if prefill_graph {
+                self.backend.begin_prefill_capture(t)?;
             }
-            self.forward_seq_layer(i, t, c, n, sb, state)?;
-            if std::env::var("GEMM_DIAG").is_ok() {
-                log::info!("[FS] layer {i} done");
+            // 单批处理全部层：任何层都走 int8 GEMM（零 fp16 副本），无需逐层 begin/end_batch 隔离。
+            self.backend.begin_batch()?;
+            for i in 0..self.config.n_layer {
+                if std::env::var("GEMM_DIAG").is_ok() {
+                    log::info!("[FS] layer {i} start");
+                }
+                self.forward_seq_layer(i, t, c, n, sb, state)?;
+                if std::env::var("GEMM_DIAG").is_ok() {
+                    log::info!("[FS] layer {i} done");
+                }
+                if seq_pf {
+                    log::info!("[SP] layer {i}: {:.4}s", spf_t0.elapsed().as_secs_f64());
+                    spf_t0 = std::time::Instant::now();
+                }
             }
-            if seq_pf {
-                log::info!("[SP] layer {i}: {:.4}s", spf_t0.elapsed().as_secs_f64());
-                spf_t0 = std::time::Instant::now();
+            self.backend.end_batch()?;
+
+            // ln_out + head（只算最后 token，避免 [T, vocab] 全量 GEMM 与 67MB 下载）
+            self.backend.begin_batch()?;
+            if std::env::var("HEAD_DIAG").is_ok() {
+                log::info!("[HEAD] norm start");
+            }
+            // x_norm = layer_norm(x, ln_out_w, ln_out_b) over T 个 token
+            self.backend.norm(
+                sb.x,
+                self.ln_out_w,
+                self.ln_out_b,
+                sb.x_norm,
+                c,
+                1,
+                LN_EPS,
+                t,
+            )?;
+            if std::env::var("HEAD_DIAG").is_ok() {
+                log::info!("[HEAD] copy_token start");
+            }
+            // head_in = x_norm[T-1]（末 token 行）
+            self.backend
+                .copy_token(sb.x_norm, sb.head_in, c, c, t - 1)?;
+            if std::env::var("HEAD_DIAG").is_ok() {
+                log::info!("[HEAD] head_gemv start");
+            }
+            // logits = head_in @ head.T，输出 [vocab]（int8 量化 head 省 4× 带宽）
+            self.head_gemv(sb.head_in, sb.logits, vocab, c)?;
+            if std::env::var("HEAD_DIAG").is_ok() {
+                log::info!("[HEAD] head_gemv done");
+            }
+
+            self.backend.end_batch()?;
+            if prefill_graph {
+                self.backend.end_prefill_capture()?;
+                // 捕获不执行 kernel，立即重放一次以产生本次输出（同 T 后续调用直接走重放）。
+                self.backend.prefill_graph_replay()?;
             }
         }
-        self.backend.end_batch()?;
-
-        // ln_out + head（只算最后 token，避免 [T, vocab] 全量 GEMM 与 67MB 下载）
-        self.backend.begin_batch()?;
-        // x_norm = layer_norm(x, ln_out_w, ln_out_b) over T 个 token
-        self.backend.norm(
-            sb.x,
-            self.ln_out_w,
-            self.ln_out_b,
-            sb.x_norm,
-            c,
-            1,
-            LN_EPS,
-            t,
-        )?;
-        // head_in = x_norm[T-1]（末 token 行）
-        self.backend
-            .copy_token(sb.x_norm, sb.head_in, c, c, t - 1)?;
-        // logits = head_in @ head.T，输出 [vocab]（fp16 权重减半带宽）
-        self.backend
-            .gemv_f16(self.head_w16, sb.head_in, sb.logits, vocab, c, 1)?;
-
-        self.backend.end_batch()?;
 
         // 诊断：比较最后层 output GEMM vs gemv 参考
         if std::env::var("GEMM_DIAG").is_ok() {
@@ -1342,7 +1448,7 @@ impl GpuModel {
         }
         self.backend.upload(sb.x, &x_data)?;
         let mut snaps = Vec::new();
-        // 取出内部状态，逐层快照（与 forward_seq 一致：any4 GEMM 零 fp16 副本）
+        // 取出内部状态，逐层快照（与 forward_seq 一致：int8 GEMM 零 fp16 副本）
         let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
             self.backend.begin_batch()?;
@@ -1391,6 +1497,22 @@ impl GpuModel {
         let s = self
             .backend
             .download(self.state.as_ref().unwrap().layers[idx].tmix_rnn)?;
+        Ok(s[..n.min(s.len())].to_vec())
+    }
+
+    /// 诊断：下载 layer idx 的 tmix_x（time-mix 插值状态）前 n 个元素。
+    pub fn download_state_tmix_x(&mut self, idx: usize, n: usize) -> R<Vec<f32>> {
+        let s = self
+            .backend
+            .download(self.state.as_ref().unwrap().layers[idx].tmix_x)?;
+        Ok(s[..n.min(s.len())].to_vec())
+    }
+
+    /// 诊断：下载 layer idx 的 cmix_x（channel-mix 插值状态）前 n 个元素。
+    pub fn download_state_cmix_x(&mut self, idx: usize, n: usize) -> R<Vec<f32>> {
+        let s = self
+            .backend
+            .download(self.state.as_ref().unwrap().layers[idx].cmix_x)?;
         Ok(s[..n.min(s.len())].to_vec())
     }
 
@@ -1530,48 +1652,6 @@ impl GpuModel {
         Ok(())
     }
 
-    /// 诊断：校验 GPU dequant_any4_to_f16 输出与 CPU dequant_any4 参考一致
-    ///（GEMM_DIAG_VERIFY=层号 时对该层 receptance 触发，kernel 单测）。
-    /// 下载 any4 idx/lut/sz 与 w_scratch，CPU 端按同一公式（含 fp16 舍入）重算并比对。
-    fn verify_dequant(
-        backend: &mut dyn ComputeBackend,
-        a4: &Any4Handle,
-        scratch: TensorId,
-        i: usize,
-        m: usize,
-        k: usize,
-    ) -> R<()> {
-        let want = std::env::var("GEMM_DIAG_VERIFY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        if want != Some(i) {
-            return Ok(());
-        }
-        backend.end_batch()?;
-        let idx = backend.download_u32(a4.idx)?;
-        let lut = backend.download(a4.lut)?;
-        let sz = backend.download_u32(a4.sz)?;
-        let gpu = backend.download(scratch)?;
-        backend.begin_batch()?;
-        let w_ref = dequant_any4(&idx, &lut, &sz, m, k);
-        let mut max_diff = 0.0f32;
-        let mut bad = 0usize;
-        for (e, &wr) in w_ref.iter().enumerate() {
-            let d = (gpu[e] - f16::from_f32(wr).to_f32()).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-            if d > 1e-3 {
-                bad += 1;
-            }
-        }
-        log::info!(
-            "[DEQ] layer {i} dequant scratch vs cpu: max_diff={max_diff:.6} bad(>1e-3)={bad}/{}",
-            m * k
-        );
-        Ok(())
-    }
-
     /// 诊断：用 CPU fp16 参考验证 GPU GEMM 的 r/k/v 输出（GEMM_DIAG_VERIFY=层号时触发）。
     /// 下载 xk16/xv16 与 key_w16/value_w16，计算 k[0]/v[0] 的 fp16 精确参考，与 GPU 输出对比。
     fn verify_gemm_rkv(
@@ -1588,9 +1668,9 @@ impl GpuModel {
             return Ok(());
         }
         backend.end_batch()?;
-        // any4 模型无常驻 w16（方案A 下参考为 w_scratch 反量化结果，此处直接跳过）
+        // int8 模型无常驻 w16（方案A 下参考为 w_scratch 反量化结果，此处直接跳过）
         let (Some(key_w16), Some(value_w16)) = (&layer.key_w16, &layer.value_w16) else {
-            log::info!("[GEMMV] layer {i} skipped: any4 模型无常驻 w16 参考");
+            log::info!("[GEMMV] layer {i} skipped: int8 模型无常驻 w16 参考");
             backend.begin_batch()?;
             return Ok(());
         };
@@ -1698,11 +1778,9 @@ impl GpuModel {
             .copy_token(sb.ln1, state.layers[i].tmix_x, c, c, t - 1)?;
 
         // r/k/v = token 并行 GEMM。
-        // 方案A（默认）：any4 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
-        // ANY4_GEMM_PREFILL=1：保留的标量 any4 GEMM 路径（显存极限场景备用/方案C基线，慢 ~5.7×）；
-        // 非 any4 模型：直接用常驻 fp16 w16。
+        // 方案A（默认）：int8 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
+        // 非 int8 模型：直接用常驻 fp16 w16。
         let m_pad = sb.m_pad;
-        let any4_gemm_prefill = std::env::var("ANY4_GEMM_PREFILL").is_ok();
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv start");
         }
@@ -1721,31 +1799,6 @@ impl GpuModel {
             self.backend.dequant_int8_to_f16(va8, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
-        } else if let (Some(ra4), Some(ka4), Some(va4)) =
-            (&layer.receptance_a4, &layer.key_a4, &layer.value_a4)
-        {
-            if any4_gemm_prefill {
-                self.backend
-                    .gemm_any4(ra4, sb.xr, None, sb.r, c, c, t, false)?;
-                self.backend
-                    .gemm_any4(ka4, sb.xk, None, sb.k, c, c, t, false)?;
-                self.backend
-                    .gemm_any4(va4, sb.xv, None, sb.v, c, c, t, false)?;
-            } else {
-                self.backend.to_f16_triple(
-                    sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
-                )?;
-                self.backend.dequant_any4_to_f16(ra4, sb.w_scratch, c, c)?;
-                Self::verify_dequant(self.backend.as_mut(), ra4, sb.w_scratch, i, c, c)?;
-                self.backend
-                    .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-                self.backend.dequant_any4_to_f16(ka4, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-                self.backend.dequant_any4_to_f16(va4, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
-            }
         } else {
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
@@ -1913,22 +1966,12 @@ impl GpuModel {
         self.backend
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, t)?;
 
-        // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8/any4 默认走方案A（dequant→scratch→TC GEMM）
+        // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8 默认走方案A（dequant→scratch→TC GEMM）
         if let Some(a8) = &layer.att_output_a8 {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
             self.backend.dequant_int8_to_f16(a8, sb.w_scratch, c, c)?;
             self.backend
                 .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
-        } else if let Some(a4) = &layer.att_output_a4 {
-            if any4_gemm_prefill {
-                self.backend
-                    .gemm_any4(a4, sb.y_g, Some(sb.x), sb.y_out, c, c, t, false)?;
-            } else {
-                self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
-                self.backend.dequant_any4_to_f16(a4, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
-            }
         } else {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
             self.backend.gemm_add(
@@ -1981,7 +2024,7 @@ impl GpuModel {
         self.backend
             .copy_token(sb.ln2, state.layers[i].cmix_x, c, c, t - 1)?;
 
-        // FFN = token 并行 GEMM；any4 默认走方案A（dequant→scratch→TC GEMM）
+        // FFN = token 并行 GEMM；int8 默认走方案A（dequant→scratch→TC GEMM）
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn start");
         }
@@ -1991,17 +2034,6 @@ impl GpuModel {
                 .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
             self.backend
                 .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
-        } else if let Some(fka4) = &layer.ffn_key_a4 {
-            if any4_gemm_prefill {
-                self.backend
-                    .gemm_any4(fka4, sb.xb, None, sb.r2, fh, c, t, true)?;
-            } else {
-                self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
-                self.backend
-                    .dequant_any4_to_f16(fka4, sb.w_scratch, fh, c)?;
-                self.backend
-                    .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
-            }
         } else {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             let fk16 = layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?;
@@ -2014,17 +2046,6 @@ impl GpuModel {
                 .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
             self.backend
                 .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
-        } else if let Some(fva4) = &layer.ffn_value_a4 {
-            if any4_gemm_prefill {
-                self.backend
-                    .gemm_any4(fva4, sb.r2, Some(sb.x), sb.v2, c, fh, t, false)?;
-            } else {
-                self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
-                self.backend
-                    .dequant_any4_to_f16(fva4, sb.w_scratch, c, fh)?;
-                self.backend
-                    .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
-            }
         } else {
             self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
             let fv16 = layer
@@ -2076,6 +2097,58 @@ impl GpuLayer {
             backend.upload(t, &data)?;
             Ok(t)
         };
+        // ffn.value 权重 → 稀疏 FFN 平铺布局（对齐 Albatross cmix_sparse_down 的 value_weight_tiled）。
+        // 布局：元素 (f, c) 映射到 [f_block][c_block][f_local][c_local]，
+        //   f_block=f/FFN_TILE, f_local=f%FFN_TILE, c_block=c/FFN_SPMV_C_TILE, c_local=c%FFN_SPMV_C_TILE。
+        // 该布局使稀疏内核按「固定 f、连续 c」读取，命中合并访问。
+        // 三种量化（fp16/int8）均构建：CUDA 稀疏内核只读 r2 非零列（~4%），
+        // 反量化出 fp16 平铺权重远优于稠密 int8 全量读取。
+        let load_ffn_value_tiled =
+            |backend: &mut dyn ComputeBackend, key: String, c: usize, fh: usize| -> R<TensorId> {
+                const FFN_SPMV_TILE: usize = 128;
+                const FFN_SPMV_C_TILE: usize = 256;
+                // 从任意量化形式取原始 f32 数据（fp16 / int8），返回 (data, shape=[M,K])。
+                // int8 张量可能为 2D [M,K] 或 3D（group 打包，如 [M,K/128,128]），
+                // 故 M=shape[0]，K 由展平字节按量化比特数反推（与 load_int8 一致）。
+                let (data, shape) = if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
+                    let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
+                    let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+                    let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                    let m = idx_t.shape()[0];
+                    let k = idx_u32.len() * 4 / m;
+                    (dequant_int8(idx_u32, sz_u32, m, k), vec![m, k])
+                } else {
+                    let t = st.tensor(&key)?;
+                    let shape = t.shape().to_vec();
+                    (tensor_to_f32(&t), shape)
+                };
+                // 定向到 [c, fh]（与 load_linear_f16 一致，解码 gemv 按 [C, fh] 使用）。
+                let oriented = if shape[0] == c && shape[1] == fh {
+                    data
+                } else if shape[0] == fh && shape[1] == c {
+                    transpose(&data, fh, c)
+                } else {
+                    panic!("{key}: unexpected shape {shape:?}, want [{c},{fh}] or [{fh},{c}]")
+                };
+                let c_blocks = c / FFN_SPMV_C_TILE;
+                assert_eq!(c % FFN_SPMV_C_TILE, 0, "{key}: C 需为 C_TILE 整数倍");
+                assert_eq!(fh % FFN_SPMV_TILE, 0, "{key}: fh 需为 TILE 整数倍");
+                let mut tiled = vec![0.0f32; fh * c];
+                for f in 0..fh {
+                    let f_block = f / FFN_SPMV_TILE;
+                    let f_local = f % FFN_SPMV_TILE;
+                    for cc in 0..c {
+                        let c_block = cc / FFN_SPMV_C_TILE;
+                        let c_local = cc % FFN_SPMV_C_TILE;
+                        tiled[((f_block * c_blocks + c_block) * FFN_SPMV_TILE) * FFN_SPMV_C_TILE
+                            + f_local * FFN_SPMV_C_TILE
+                            + c_local] = oriented[cc * fh + f];
+                    }
+                }
+                let tg = backend.create_tensor(tiled.len(), TensorDtype::F16)?;
+                backend.upload(tg, &tiled)?;
+                Ok(tg)
+            };
         // 低秩权重：gemv 需要 [out, in] 行主序。
         // 各模型原始布局不同（g1h=[out,in]、g1d=[in,out]），按实际形状自适应转置。
         let load_lowrank = |backend: &mut dyn ComputeBackend,
@@ -2137,44 +2210,9 @@ impl GpuLayer {
         let (wm, am, vm, gm) = (cfg.w_mid, cfg.a_mid, cfg.v_mid, cfg.g_mid);
         let (wwp, aap, vvp, ggp) = (cfg.w_mid_pad, cfg.a_mid_pad, cfg.v_mid_pad, cfg.g_mid_pad);
 
-        // any4 量化权重：探测 {key}.any4_idx 是否存在。
-        // 存在 → 上传 idx/lut/sz 三路张量，并 CPU 反量化出 f32 供 fp16 副本（prefill GEMM 用）；
-        // 不存在 → None，走原 fp16 加载路径（单二进制兼容两种模型文件）。
-        let load_any4 = |backend: &mut dyn ComputeBackend,
-                         key: &str,
-                         m: usize,
-                         k: usize|
-         -> R<Option<Any4Handle>> {
-            if st.tensor(&format!("{key}.any4_idx")).is_err() {
-                return Ok(None);
-            }
-            let idx_t = st.tensor(&format!("{key}.any4_idx"))?; // U8 [M, K/2]
-            let lut_t = st.tensor(&format!("{key}.any4_lut"))?; // F16 [M, 16]
-            let sz_t = st.tensor(&format!("{key}.any4_sz"))?; // U32 [M, K/128]
-            let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-            let lut32 = tensor_to_f32(&lut_t);
-            let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-            assert_eq!(idx_u32.len(), m * k / 8, "{key}.any4_idx 形状不符");
-            assert_eq!(lut32.len(), m * 16, "{key}.any4_lut 形状不符");
-            assert_eq!(sz_u32.len(), m * k / 128, "{key}.any4_sz 形状不符");
-            let idx_gpu = backend.create_tensor(m * k / 8, TensorDtype::U32)?;
-            backend.upload_u32(idx_gpu, idx_u32)?;
-            let lut_gpu = backend.create_tensor(m * 16, TensorDtype::F16)?;
-            backend.upload(lut_gpu, &lut32)?;
-            let sz_gpu = backend.create_tensor(m * k / 128, TensorDtype::U32)?;
-            backend.upload_u32(sz_gpu, sz_u32)?;
-            log::info!("layer {idx}: {key} 使用 any4 量化权重（{m}x{k}）");
-            Ok(Some(Any4Handle {
-                idx: idx_gpu,
-                lut: lut_gpu,
-                sz: sz_gpu,
-                m,
-                k,
-            }))
-        };
         // int8 量化权重：探测 {key}.int8_idx 是否存在。
         // 存在 → 上传 idx/sz 二路张量（idx 为 U8 [M,K]，重解释为 uint32 [M,K/4]）；
-        // 不存在 → None，走原 fp16/any4 加载路径（单二进制兼容三种模型文件）。
+        // 不存在 → None，走原 fp16 加载路径（单二进制兼容两种模型文件）。
         let load_int8 = |backend: &mut dyn ComputeBackend,
                          key: &str,
                          m: usize,
@@ -2201,48 +2239,51 @@ impl GpuLayer {
                 k,
             }))
         };
-        // 三路量化权重统一加载：优先 int8 → any4 → fp16（按模型文件内容自动路由）。
-        // 返回 (int8, any4, fp16)，三者至多一个为 Some。
-        let load_linear =
-            |backend: &mut dyn ComputeBackend,
-             key: &str,
-             m: usize,
-             k: usize|
-             -> R<(Option<Int8Handle>, Option<Any4Handle>, Option<TensorId>)> {
-                if let Some(a8) = load_int8(backend, key, m, k)? {
-                    return Ok((Some(a8), None, None));
-                }
-                match load_any4(backend, key, m, k)? {
-                    Some(a4) => Ok((None, Some(a4), None)),
-                    None => Ok((None, None, Some(load_linear_f16(backend, key.to_string())?))),
-                }
-            };
-        let (ffn_key_a8, ffn_key_a4, ffn_key_w16) = load_linear(
+        // 二路量化权重统一加载：优先 int8 → fp16（按模型文件内容自动路由）。
+        // 返回 (int8, fp16)，二者至多一个为 Some。
+        let load_linear = |backend: &mut dyn ComputeBackend,
+                           key: &str,
+                           m: usize,
+                           k: usize|
+         -> R<(Option<Int8Handle>, Option<TensorId>)> {
+            if let Some(a8) = load_int8(backend, key, m, k)? {
+                return Ok((Some(a8), None));
+            }
+            Ok((None, Some(load_linear_f16(backend, key.to_string())?)))
+        };
+        let (ffn_key_a8, ffn_key_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.key.weight"),
             cfg.ffn_hidden,
             c,
         )?;
-        let (ffn_value_a8, ffn_value_a4, ffn_value_w16) = load_linear(
+        let (ffn_value_a8, ffn_value_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.value.weight"),
             c,
             cfg.ffn_hidden,
         )?;
-        let (receptance_a8, receptance_a4, receptance_w16) = load_linear(
+        // 稀疏 FFN 平铺权重（fp16，CUDA 稀疏内核用）：两种量化均构建，解码按 r2 非零列只读。
+        let ffn_value_tiled = Some(load_ffn_value_tiled(
+            backend,
+            format!("blocks.{idx}.ffn.value.weight"),
+            c,
+            cfg.ffn_hidden,
+        )?);
+        let (receptance_a8, receptance_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.att.receptance.weight"),
             c,
             c,
         )?;
-        let (key_a8, key_a4, key_w16) =
+        let (key_a8, key_w16) =
             load_linear(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?;
-        let (value_a8, value_a4, value_w16) =
+        let (value_a8, value_w16) =
             load_linear(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?;
-        // att.output：int8/any4 时走对应 GEMM（零 fp16 副本）；
+        // att.output：int8 时走对应 GEMM（零 fp16 副本）；
         // fp32 诊断副本仅 GEMM_DIAG 时用反量化权重创建（正式推理不创建，省 ~26MB/层）
         let want_diag = std::env::var("GEMM_DIAG").is_ok();
-        let (att_output_a8, att_output_a4, output_w16, output_w) = if let Some(a8) =
+        let (att_output_a8, output_w16, output_w) = if let Some(a8) =
             load_int8(backend, &format!("blocks.{idx}.att.output.weight"), c, c)?
         {
             let ow = if want_diag {
@@ -2258,29 +2299,9 @@ impl GpuLayer {
             } else {
                 None
             };
-            (Some(a8), None, None, ow)
-        } else if let Some(a4) =
-            load_any4(backend, &format!("blocks.{idx}.att.output.weight"), c, c)?
-        {
-            let ow = if want_diag {
-                let key = format!("blocks.{idx}.att.output.weight");
-                let idx_t = st.tensor(&format!("{key}.any4_idx"))?;
-                let lut_t = st.tensor(&format!("{key}.any4_lut"))?;
-                let sz_t = st.tensor(&format!("{key}.any4_sz"))?;
-                let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-                let lut32 = tensor_to_f32(&lut_t);
-                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-                let w32 = dequant_any4(idx_u32, &lut32, sz_u32, c, c);
-                let t32 = backend.create_tensor(w32.len(), TensorDtype::F32)?;
-                backend.upload(t32, &w32)?;
-                Some(t32)
-            } else {
-                None
-            };
-            (None, Some(a4), None, ow)
+            (Some(a8), None, ow)
         } else {
             (
-                None,
                 None,
                 Some(load_linear_f16(
                     backend,
@@ -2328,19 +2349,14 @@ impl GpuLayer {
             ffn_x_k: load1(backend, "ffn.x_k")?,
             // 诊断用 fp32 输出权重（仅 GEMM_DIAG 参考路径）
             output_w,
-            // fp16 线性权重（非 any4 矩阵常驻；any4 矩阵为 None，走 any4 GEMM/GEMV 零副本）
+            // fp16 线性权重（非 int8 矩阵常驻；int8 矩阵为 None，走 int8 GEMM/GEMV 零副本）
             receptance_w16,
             key_w16,
             value_w16,
             output_w16,
             ffn_key_w16,
             ffn_value_w16,
-            ffn_key_a4,
-            ffn_value_a4,
-            att_output_a4,
-            receptance_a4,
-            key_a4,
-            value_a4,
+            ffn_value_tiled,
             ffn_key_a8,
             ffn_value_a8,
             att_output_a8,
@@ -2413,7 +2429,7 @@ impl GpuLayer {
         ] {
             backend.drop_host(*t);
         }
-        // fp16 线性权重（Option）：非 any4 矩阵常驻，释放其 host；any4 矩阵此时为 None 跳过
+        // fp16 线性权重（Option）：非 int8 矩阵常驻，释放其 host；int8 矩阵此时为 None 跳过
         for t in [
             &mut self.receptance_w16,
             &mut self.key_w16,
@@ -2421,26 +2437,11 @@ impl GpuLayer {
             &mut self.output_w16,
             &mut self.ffn_key_w16,
             &mut self.ffn_value_w16,
+            &mut self.ffn_value_tiled,
         ] {
             if let Some(t) = t.as_mut() {
                 backend.drop_host(*t);
             }
-        }
-        // any4 量化权重
-        for a4 in [
-            &mut self.ffn_key_a4,
-            &mut self.ffn_value_a4,
-            &mut self.att_output_a4,
-            &mut self.receptance_a4,
-            &mut self.key_a4,
-            &mut self.value_a4,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            backend.drop_host(a4.idx);
-            backend.drop_host(a4.lut);
-            backend.drop_host(a4.sz);
         }
     }
 }
@@ -2478,7 +2479,7 @@ pub struct ModelBuilder {
 }
 
 impl ModelBuilder {
-    /// 指定模型文件路径（safetensors `.st`，按文件名自动路由 fp16/int8/any4）。
+    /// 指定模型文件路径（safetensors `.st`，按文件名自动路由 fp16/int8）。
     pub fn new(path: impl Into<String>) -> Self {
         Self { path: path.into() }
     }
@@ -2524,6 +2525,16 @@ impl Bundle {
     /// 前向推理（sequence-parallel）：把整段 tokens 一次贯穿各层。
     pub fn infer_seq(&mut self, tokens: &[u32]) -> R<Vec<f32>> {
         self.model.forward_seq_with_state(&mut self.state, tokens)
+    }
+
+    /// 清空累计的 per-kernel profiling 时间（仅诊断；CUDA 覆盖，其余为 no-op）。
+    pub fn clear_kernel_prof(&mut self) {
+        self.model.clear_kernel_prof();
+    }
+
+    /// 打印累计的 per-kernel profiling 时间（仅诊断）。
+    pub fn dump_kernel_prof(&mut self) {
+        self.model.dump_kernel_prof();
     }
 
     /// 把当前会话态整态下载到 CPU（存盘/state tuning 用）。
@@ -2961,9 +2972,6 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 /// int8 CPU 反量化（非对称 per-group=128，与 tools/quantize_any4.py --bits 8 及 model.rs 一致）。
-/// `w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]`。
-/// - idx: [M*K/4] uint32，每 uint32 打包 4 个 uint8 权重（低位字节在前：b0=byte0 … b3=byte3）
-/// - sz:  [M*K/128] uint32（scale fp16 低 16 位 | zero fp16 高 16 位）
 ///
 /// 供 GEMM_DIAG 诊断时重建 fp32 权重（正式推理直接走 int8 GEMV/GEMM，不创建此副本）
 fn dequant_int8(idx: &[u32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
@@ -2980,34 +2988,6 @@ fn dequant_int8(idx: &[u32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
                 let pack = idx[r * (k / 4) + ki / 4];
                 let q = ((pack >> ((ki % 4) * 8)) & 0xFF) as f32;
                 *wv = scale * q + zero;
-            }
-        }
-    }
-    w
-}
-
-/// any4 CPU 反量化（arXiv:2507.04610，group=128）：
-/// `w[m,k] = scale[m,k/128] * lut[m, idx[m,k]] + zero[m,k/128]`
-/// - idx: [M*K/8] uint32（每 uint32 打包 8 个 4-bit 索引，低位在前）
-/// - lut: [M*16] f32（每行学习码本）
-/// - sz:  [M*K/128] uint32（scale fp16 低 16 位 | zero fp16 高 16 位）
-///
-/// 加载时由 any4 权重重建 fp32 权重（转 fp16 供 prefill GEMM 用）
-fn dequant_any4(idx: &[u32], lut: &[f32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
-    let kg = k / 128;
-    let mut w = vec![0.0f32; m * k];
-    for r in 0..m {
-        let row_lut = &lut[r * 16..r * 16 + 16];
-        let row = &mut w[r * k..(r + 1) * k];
-        for (g, chunk) in row.chunks_mut(128).enumerate() {
-            let szv = sz[r * kg + g];
-            let scale = f16::from_bits((szv & 0xFFFF) as u16).to_f32();
-            let zero = f16::from_bits((szv >> 16) as u16).to_f32();
-            for (j, wv) in chunk.iter_mut().enumerate() {
-                let ki = g * 128 + j;
-                let pack = idx[r * (k / 8) + ki / 8];
-                let q = ((pack >> ((ki % 8) * 4)) & 0xF) as usize;
-                *wv = scale * row_lut[q] + zero;
             }
         }
     }

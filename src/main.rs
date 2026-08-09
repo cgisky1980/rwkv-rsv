@@ -934,6 +934,64 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        // 诊断：双 token 跨 token 状态分量对比（tmix_x / cmix_x / tmix_rnn），定位跨 token 分歧源
+        {
+            let two: Vec<u32> = vec![304, 25740];
+            let n = 8usize;
+            let nlayer = gpu_model.layers_len();
+            gpu_model.reset_state()?;
+            gpu_model.forward_seq(&two)?;
+            let mut seq2 = Vec::new();
+            for i in 0..nlayer {
+                seq2.push((
+                    gpu_model.download_state_tmix_x(i, n)?,
+                    gpu_model.download_state_cmix_x(i, n)?,
+                    gpu_model.download_state_rnn(i, n)?,
+                ));
+            }
+            gpu_model.reset_state()?;
+            gpu_model.forward(&two)?;
+            let mut tok2 = Vec::new();
+            for i in 0..nlayer {
+                tok2.push((
+                    gpu_model.download_state_tmix_x(i, n)?,
+                    gpu_model.download_state_cmix_x(i, n)?,
+                    gpu_model.download_state_rnn(i, n)?,
+                ));
+            }
+            for i in 0..nlayer {
+                let d_tx = seq2[i]
+                    .0
+                    .iter()
+                    .zip(&tok2[i].0)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |m, v| m.max(v));
+                let d_cx = seq2[i]
+                    .1
+                    .iter()
+                    .zip(&tok2[i].1)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |m, v| m.max(v));
+                let d_rnn = seq2[i]
+                    .2
+                    .iter()
+                    .zip(&tok2[i].2)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |m, v| m.max(v));
+                if d_tx > 1e-4 || d_cx > 1e-4 || d_rnn > 1e-4 {
+                    log::info!(
+                        "== DIAG2 tok-vs-seq after 2tok layer[{i}] tmix_x={d_tx:.6} cmix_x={d_cx:.6} tmix_rnn={d_rnn:.6} =="
+                    );
+                    if d_tx > 1e-4 {
+                        log::info!("   seq tmix_x[0..{n}] = {:?}", &seq2[i].0);
+                        log::info!("   tok tmix_x[0..{n}] = {:?}", &tok2[i].0);
+                    }
+                }
+                if i >= 8 && (d_tx > 1e-4 || d_cx > 1e-4 || d_rnn > 1e-4) {
+                    break;
+                }
+            }
+        }
         // 诊断：对比 seq 与 tok 路径进入第 i 层前的 x_norm 和 x 输入，定位首发差异来源
         {
             let n = 8usize;
@@ -1263,7 +1321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("blocks.0.att.value.weight", &model.layers[0].value_w),
             ("blocks.0.att.output.weight", &model.layers[0].output_w),
         ] {
-            // any4 模型原 fp16 键已删除，回退用 CPU 端反量化权重（[in,out] 转置回 [out,in]）
+            // int8 模型原 fp16 键已删除，回退用 CPU 端反量化权重（[in,out] 转置回 [out,in]）
             let (n, k, wf): (usize, usize, Vec<f32>) = match st.tensor(wname) {
                 Ok(w) => {
                     let shape = w.shape();

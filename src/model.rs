@@ -227,29 +227,6 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
-/// any4 CPU 反量化（arXiv:2507.04610，group=128，与 gpu_model.rs 的 GPU 侧加载一致）：
-/// `w[m,k] = scale[m,k/128] * lut[m, idx[m,k]] + zero[m,k/128]`
-fn dequant_any4(idx: &[u32], lut: &[f32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
-    let kg = k / 128;
-    let mut w = vec![0.0f32; m * k];
-    for r in 0..m {
-        let row_lut = &lut[r * 16..r * 16 + 16];
-        let row = &mut w[r * k..(r + 1) * k];
-        for (g, chunk) in row.chunks_mut(128).enumerate() {
-            let szv = sz[r * kg + g];
-            let scale = f16::from_bits((szv & 0xFFFF) as u16).to_f32();
-            let zero = f16::from_bits((szv >> 16) as u16).to_f32();
-            for (j, wv) in chunk.iter_mut().enumerate() {
-                let ki = g * 128 + j;
-                let pack = idx[r * (k / 8) + ki / 8];
-                let q = ((pack >> ((ki % 8) * 4)) & 0xF) as usize;
-                *wv = scale * row_lut[q] + zero;
-            }
-        }
-    }
-    w
-}
-
 /// int8 CPU 反量化（非对称 per-group=128，与 tools/quantize_any4.py --bits 8 及 GPU 侧一致）：
 /// `w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]`。
 /// - idx: [M*K/4] uint32，每 uint32 打包 4 个 uint8 权重（低位字节在前：b0=byte0 … b3=byte3）
@@ -275,7 +252,7 @@ fn dequant_int8(idx: &[u32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
 }
 
 /// 读线性权重 [out, in]（行主序 f32）。
-/// 路由：原 fp16/fp32 键 > int8 反量化 > any4 反量化（与 gpu_model.rs 三路一致性）。
+/// 路由：原 fp16/fp32 键 > int8 反量化（与 gpu_model.rs 一致性）。
 fn linear_to_f32(
     st: &safetensors::SafeTensors,
     key: &str,
@@ -285,26 +262,14 @@ fn linear_to_f32(
     if let Ok(t) = st.tensor(key) {
         return Ok(tensor_to_f32(&t));
     }
-    if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
-        let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
-        let idx: &[u32] = bytemuck::cast_slice(idx_t.data());
-        let sz: &[u32] = bytemuck::cast_slice(sz_t.data());
-        assert_eq!(idx.len(), m * k / 4, "{key}.int8_idx 形状不符");
-        assert_eq!(sz.len(), m * k / 128, "{key}.int8_sz 形状不符");
-        log::info!("{key}: 原键缺失，使用 int8 反量化（{m}x{k}）");
-        return Ok(dequant_int8(idx, sz, m, k));
-    }
-    let idx_t = st.tensor(&format!("{key}.any4_idx"))?;
-    let lut_t = st.tensor(&format!("{key}.any4_lut"))?;
-    let sz_t = st.tensor(&format!("{key}.any4_sz"))?;
+    let idx_t = st.tensor(&format!("{key}.int8_idx"))?;
+    let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
     let idx: &[u32] = bytemuck::cast_slice(idx_t.data());
-    let lut = tensor_to_f32(&lut_t);
     let sz: &[u32] = bytemuck::cast_slice(sz_t.data());
-    assert_eq!(idx.len(), m * k / 8, "{key}.any4_idx 形状不符");
-    assert_eq!(lut.len(), m * 16, "{key}.any4_lut 形状不符");
-    assert_eq!(sz.len(), m * k / 128, "{key}.any4_sz 形状不符");
-    log::info!("{key}: 原键缺失，使用 any4 反量化（{m}x{k}）");
-    Ok(dequant_any4(idx, &lut, sz, m, k))
+    assert_eq!(idx.len(), m * k / 4, "{key}.int8_idx 形状不符");
+    assert_eq!(sz.len(), m * k / 128, "{key}.int8_sz 形状不符");
+    log::info!("{key}: 原键缺失，使用 int8 反量化（{m}x{k}）");
+    Ok(dequant_int8(idx, sz, m, k))
 }
 
 impl Model {
@@ -330,13 +295,10 @@ impl Model {
         let a_mid = mid_of(&st.tensor("blocks.0.att.a1")?);
         let v_mid = mid_of(&st.tensor("blocks.0.att.v1")?);
         let g_mid = mid_of(&st.tensor("blocks.0.att.g1")?);
-        // 原 fp16 键可能被 int8/any4 量化键替换，此时从 int8_idx [M, K] 或 any4_idx [M, K/2] 推导 M
+        // 原 fp16 键可能被 int8 量化键替换，此时从 int8_idx [M, K] 推导 M
         let ffn_hidden = match st.tensor("blocks.0.ffn.key.weight") {
             Ok(t) => t.shape()[0],
-            Err(_) => st
-                .tensor("blocks.0.ffn.key.weight.int8_idx")
-                .or_else(|_| st.tensor("blocks.0.ffn.key.weight.any4_idx"))?
-                .shape()[0],
+            Err(_) => st.tensor("blocks.0.ffn.key.weight.int8_idx")?.shape()[0],
         };
 
         let config = ModelConfig {
@@ -361,8 +323,8 @@ impl Model {
         let ln0_b = tensor_to_f32(&st.tensor("blocks.0.ln0.bias")?);
         let ln_out_w = tensor_to_f32(&st.tensor("ln_out.weight")?);
         let ln_out_b = tensor_to_f32(&st.tensor("ln_out.bias")?);
-        // head.weight 原始 [vocab, C] → 预转置为 [C, vocab]
-        let head_raw = tensor_to_f32(&st.tensor("head.weight")?);
+        // head.weight 原始 [vocab, C] → 预转置为 [C, vocab]；原键缺失时回退 int8 反量化
+        let head_raw = linear_to_f32(&st, "head.weight", vocab, n_embd)?;
         let head_weight = transpose(&head_raw, vocab, n_embd);
 
         let mut layers = Vec::with_capacity(n_layer);
@@ -580,7 +542,7 @@ impl Layer {
             let key = format!("blocks.{idx}.{name}");
             Ok(tensor_to_f32(&st.tensor(&key)?))
         };
-        // 预转置 PyTorch Linear 权重 [out, in] → [in, out]；原键缺失时回退 any4 反量化
+        // 预转置 PyTorch Linear 权重 [out, in] → [in, out]；原键缺失时回退 int8 反量化
         let p2t = |name: &str,
                    out_dim: usize,
                    in_dim: usize|
@@ -863,84 +825,16 @@ fn sum_rk_rk(
     out
 }
 
-/// any4 量化推理流程的单元测试（`cargo test` 运行，自包含，不依赖 GPU / 真实模型）。
+/// int8 量化反量化的单元测试（`cargo test` 运行，自包含，不依赖 GPU / 真实模型）。
 ///
-/// 覆盖三类指标：
-/// - **格式契约**：Python 量化器（`tools/quantize_any4.py`）打包的 idx/lut/sz 与
-///   本文件 `dequant_any4` 解包一致（nibble 奇偶 k、scale/zero 位序、常数组）。
-/// - **量化精度**：合成高斯权重 → 等价 Lloyd k-means 量化 → 反量化，验证
-///   cos ≥ 0.995、rel ≤ 10.5%、且优于 int4 基线（与 Python 量化器验收标准一致）。
-/// - **性能**：`dequant_any4` 反量化吞吐的宽松下界（捕获灾难性退化，非精确基准）。
+/// 覆盖：
+/// - **格式契约**：Python 量化器（`tools/quantize_any4.py --bits 8`）打包的 idx/sz 与
+///   本文件 `dequant_int8` 解包一致（每 u32 打包 4 个 uint8、scale/zero 位序）。
+/// - **量化精度**：合成高斯权重 → 量化 → 反量化，验证 cos 近无损、rel ≤ 2%。
 #[cfg(test)]
-mod any4_tests {
-    use super::{dequant_any4, dequant_int8};
+mod quant_tests {
+    use super::dequant_int8;
     use half::f16;
-
-    const NC: usize = 16; // 4-bit 簇数
-
-    // ---------- 格式契约：Python 打包 → Rust 解包 ----------
-
-    #[test]
-    fn nibble_unpack_odd_even_k() {
-        // k=128（kg=1），单行。idx[0]=0x0000_5123：
-        //   bits[0:4]=3 → k0, bits[4:8]=2 → k1, bits[8:12]=1 → k2,
-        //   bits[12:16]=5 → k3, bits[16:20..]=0 → k4.. 全部 lut[0]
-        let m = 1usize;
-        let k = 128usize;
-        let mut idx = vec![0u32; m * k / 8];
-        idx[0] = 0x0000_5123;
-        let lut: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        // scale=1, zero=0 → w = lut[q]（明确验证 nibble 解包）
-        let s = f16::from_f32(1.0).to_bits() as u32;
-        let sz = vec![s; m * k / 128];
-        let w = dequant_any4(&idx, &lut, &sz, m, k);
-        assert_eq!(w[0], 3.0, "k0 (低 nibble) 应解出 3");
-        assert_eq!(w[1], 2.0, "k1 (次低 nibble) 应解出 2");
-        assert_eq!(w[2], 1.0, "k2 应解出 1");
-        assert_eq!(w[3], 5.0, "k3 应解出 5");
-        for (i, &wi) in w.iter().enumerate().skip(4) {
-            assert_eq!(wi, 0.0, "k{i} 应解出 lut[0]=0");
-        }
-    }
-
-    #[test]
-    fn scale_zero_pack_low16_high16() {
-        // sz 每元素 = (scale: fp16 低 16 位 | zero: fp16 高 16 位)
-        let m = 1usize;
-        let k = 128usize;
-        let mut idx = vec![0u32; m * k / 8];
-        idx[0] = 0x0000_5123;
-        let lut: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let scale = 1.5f32;
-        let zero = -0.5f32;
-        let s = f16::from_f32(scale).to_bits() as u32;
-        let z = f16::from_f32(zero).to_bits() as u32;
-        let sz = vec![(z << 16) | (s & 0xFFFF); m * k / 128];
-        let w = dequant_any4(&idx, &lut, &sz, m, k);
-        // w = scale*lut[q] + zero
-        assert!((w[0] - (1.5 * 3.0 - 0.5)).abs() < 1e-3);
-        assert!((w[1] - (1.5 * 2.0 - 0.5)).abs() < 1e-3);
-        assert!((w[2] - (1.5 * 1.0 - 0.5)).abs() < 1e-3);
-        assert!((w[3] - (1.5 * 5.0 - 0.5)).abs() < 1e-3);
-        assert!((w[4] - (1.5 * 0.0 - 0.5)).abs() < 1e-3);
-    }
-
-    #[test]
-    fn constant_group_exact_rebuild() {
-        // 常数组（scale=0）：w = zero 精确重建，与量化器 quantize_matrix 的 zero_scale 分支一致
-        let m = 1usize;
-        let k = 128usize;
-        let mut idx = vec![0u32; m * k / 8];
-        idx[0] = 0xFFFF_FFFF; // 任意索引
-        let lut: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let zero = 0.7f32;
-        let z = f16::from_f32(zero).to_bits() as u32;
-        let sz = vec![z << 16; m * k / 128]; // scale=0, zero=0.7
-        let w = dequant_any4(&idx, &lut, &sz, m, k);
-        for v in w {
-            assert!((v - 0.7).abs() < 1e-3, "常数组应精确重建为 zero");
-        }
-    }
 
     #[test]
     fn int8_byte_unpack_and_scale_zero() {
@@ -983,7 +877,7 @@ mod any4_tests {
 
     #[test]
     fn int8_precision_meets_target() {
-        // int8 非对称 per-group=128，相对误差应显著低于 any4（近无损）。
+        // int8 非对称 per-group=128，相对误差应显著低于 4-bit（近无损）。
         // 只要求 cos 极高、rel 很低，验证解包/反量化正确。
         let m = 32usize;
         let k = 2560usize;
@@ -1036,147 +930,6 @@ mod any4_tests {
             .collect()
     }
 
-    fn quantile_init(row: &[f32]) -> [f32; NC] {
-        let mut sorted = row.to_vec();
-        sorted.sort_by(f32::total_cmp);
-        let mut c = [0.0f32; NC];
-        for (j, cj) in c.iter_mut().enumerate() {
-            let pos = ((j as f32 + 0.5) / NC as f32 * sorted.len() as f32) as usize;
-            *cj = sorted[pos.min(sorted.len() - 1)];
-        }
-        c
-    }
-
-    /// 与 Python 量化器 `quantize_matrix` 等价的最小化实现（Lloyd k-means 16 簇，分位数初始化）。
-    /// 返回 (idx, lut_f16转f32, sz)，与 `dequant_any4` 的输入布局一致。
-    fn quantize_any4_synth(
-        w: &[f32],
-        m: usize,
-        k: usize,
-        group: usize,
-    ) -> (Vec<u32>, Vec<f32>, Vec<u32>) {
-        let kg = k / group;
-        assert_eq!(k % group, 0);
-        // 组归一化到 [0,1]：scale=max-min, zero=min
-        let mut scale = vec![0f32; m * kg];
-        let mut zero = vec![0f32; m * kg];
-        let mut ws = vec![0f32; m * k];
-        for r in 0..m {
-            for g in 0..kg {
-                let sl = r * k + g * group;
-                let mut mn = f32::MAX;
-                let mut mx = f32::MIN;
-                for j in 0..group {
-                    let v = w[sl + j];
-                    mn = mn.min(v);
-                    mx = mx.max(v);
-                }
-                let sc = mx - mn;
-                scale[r * kg + g] = sc;
-                zero[r * kg + g] = mn;
-                let inv = if sc <= 0.0 { 1.0 } else { 1.0 / sc };
-                for j in 0..group {
-                    ws[sl + j] = (w[sl + j] - mn) * inv;
-                }
-            }
-        }
-        // per-row Lloyd k-means
-        let mut lut = vec![0f32; m * NC];
-        let mut idx = vec![0usize; m * k];
-        for r in 0..m {
-            let row = &ws[r * k..(r + 1) * k];
-            let mut c = quantile_init(row);
-            for _ in 0..50 {
-                let mut sums = [0.0f32; NC];
-                let mut cnt = [0usize; NC];
-                for &x in row {
-                    let mut bi = 0;
-                    let mut bd = (x - c[0]).abs();
-                    for (j, cj) in c.iter().enumerate().skip(1) {
-                        let d = (x - cj).abs();
-                        if d < bd {
-                            bd = d;
-                            bi = j;
-                        }
-                    }
-                    sums[bi] += x;
-                    cnt[bi] += 1;
-                }
-                let mut drift = 0.0f32;
-                for j in 0..NC {
-                    // 空簇保持原质心（高斯 + 分位数初始化下极少出现，对精度影响可忽略）
-                    let nv = if cnt[j] > 0 {
-                        sums[j] / cnt[j] as f32
-                    } else {
-                        c[j]
-                    };
-                    drift = drift.max((nv - c[j]).abs());
-                    c[j] = nv;
-                }
-                if drift < 1e-4 {
-                    break;
-                }
-            }
-            for j in 0..NC {
-                lut[r * NC + j] = c[j];
-            }
-            for (i, &x) in row.iter().enumerate() {
-                let mut bi = 0;
-                let mut bd = (x - c[0]).abs();
-                for (j, cj) in c.iter().enumerate().skip(1) {
-                    let d = (x - cj).abs();
-                    if d < bd {
-                        bd = d;
-                        bi = j;
-                    }
-                }
-                idx[r * k + i] = bi;
-            }
-        }
-        // 打包：nibble（低 nibble=偶数 k，高 nibble=奇数 k）+ scale/zero fp16
-        let mut idxp = vec![0u32; m * k / 8];
-        for r in 0..m {
-            for ki in 0..k {
-                let byte = r * (k / 8) + ki / 8;
-                idxp[byte] |= (idx[r * k + ki] as u32) << ((ki % 8) * 4);
-            }
-        }
-        let lut16: Vec<f32> = lut.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-        let sz: Vec<u32> = (0..m * kg)
-            .map(|i| {
-                let s = f16::from_f32(scale[i]).to_bits() as u32;
-                let z = f16::from_f32(zero[i]).to_bits() as u32;
-                (z << 16) | (s & 0xFFFF)
-            })
-            .collect();
-        (idxp, lut16, sz)
-    }
-
-    /// int4 g128 基线（同组 min-max 均匀 16 级），对应量化器里的 int4 对比实现。
-    fn quantize_int4(w: &[f32], m: usize, k: usize, group: usize) -> Vec<f32> {
-        let kg = k / group;
-        let mut out = vec![0f32; m * k];
-        for r in 0..m {
-            for g in 0..kg {
-                let sl = r * k + g * group;
-                let mut mn = f32::MAX;
-                let mut mx = f32::MIN;
-                for j in 0..group {
-                    let v = w[sl + j];
-                    mn = mn.min(v);
-                    mx = mx.max(v);
-                }
-                let sc = mx - mn;
-                let inv = if sc <= 0.0 { 1.0 } else { 1.0 / sc };
-                for j in 0..group {
-                    let q = ((w[sl + j] - mn) * inv * 15.0).round().clamp(0.0, 15.0);
-                    out[sl + j] = q * sc / 15.0 + mn;
-                }
-            }
-        }
-        out
-    }
-
     fn rel_err(a: &[f32], b: &[f32]) -> f32 {
         let mut s = 0f64;
         let mut n = 0f64;
@@ -1198,59 +951,5 @@ mod any4_tests {
             nb += (*y as f64) * (*y as f64);
         }
         (dot / (na * nb).sqrt().max(1e-12)) as f32
-    }
-
-    #[test]
-    fn quantize_precision_meets_target() {
-        // 与 Python 量化器验收标准一致：cos ≥ 0.995，rel ≤ 10.5%
-        let m = 32usize;
-        let k = 2560usize;
-        let group = 128usize;
-        let w = gauss(m, k);
-        let (idx, lut, sz) = quantize_any4_synth(&w, m, k, group);
-        let w_hat = dequant_any4(&idx, &lut, &sz, m, k);
-        let cos = cos_sim(&w_hat, &w);
-        let rel = rel_err(&w_hat, &w);
-        assert!(cos >= 0.995, "cos={cos:.6} 低于验收线 0.995");
-        assert!(rel <= 0.105, "rel={rel:.4} 高于验收线 10.5%");
-    }
-
-    #[test]
-    fn any4_better_than_int4() {
-        // any4 相对误差必须严格优于同组 int4 基线（量化器验收的第二个条件）
-        let m = 32usize;
-        let k = 2560usize;
-        let group = 128usize;
-        let w = gauss(m, k);
-        let (idx, lut, sz) = quantize_any4_synth(&w, m, k, group);
-        let w_hat = dequant_any4(&idx, &lut, &sz, m, k);
-        let w4 = quantize_int4(&w, m, k, group);
-        let rel_a = rel_err(&w_hat, &w);
-        let rel4 = rel_err(&w4, &w);
-        assert!(
-            rel_a < rel4,
-            "any4 rel={rel_a:.4} 应优于 int4 rel={rel4:.4}"
-        );
-    }
-
-    // ---------- 性能微基准：反量化吞吐宽松下界 ----------
-
-    #[test]
-    fn dequant_throughput_sane() {
-        // 直接构造随机 idx/lut/sz（不跑 k-means，只测反量化吞吐）
-        let m = 256usize;
-        let k = 2560usize;
-        let mut r = fastrand::Rng::with_seed(7);
-        let idx: Vec<u32> = (0..m * k / 8).map(|_| r.u32(..)).collect();
-        let lut: Vec<f32> = (0..m * 16).map(|_| r.f32() * 2.0 - 1.0).collect();
-        let sz: Vec<u32> = (0..m * k / 128).map(|_| r.u32(..)).collect();
-        let _ = dequant_any4(&idx, &lut, &sz, m, k); // 预热
-        let t0 = std::time::Instant::now();
-        let _ = dequant_any4(&idx, &lut, &sz, m, k);
-        let dt = t0.elapsed().as_secs_f64();
-        let bytes = (m * k) as f64 * 4.0; // f32 输出字节
-        let mbps = bytes / dt / 1e6;
-        // 宽松下界：debug 构建也应轻松超过（release 达 GB/s 级），仅捕获灾难性退化
-        assert!(mbps > 50.0, "dequant 反量化吞吐过低: {mbps:.1} MB/s");
     }
 }

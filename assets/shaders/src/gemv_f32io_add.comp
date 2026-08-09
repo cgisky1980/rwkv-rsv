@@ -19,6 +19,10 @@
 //
 // 多行优化：每个 workgroup 处理 ROWS 行（默认 4），独立累加器提升 ILP 隐藏内存延迟。
 // 要求 M % ROWS == 0。
+//
+// 2026-08-09 曾尝试 subgroup-per-row 重构（同 chain4 模式，320wg/无 barrier）：A/B 两轮
+// 同窗口归一化均打平或略劣（K=2560 时旧形态 2.5 迭代×4 行累加器已有足够 ILP，与 chain4
+// 的 K=96~320 过并行场景不同），已回退。勿再沿此方向重复尝试。
 
 // Pipeline constants
 layout(constant_id = 0) const uint M = 4096;        // Number of output elements

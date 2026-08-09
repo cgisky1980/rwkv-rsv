@@ -30,7 +30,7 @@ layout(constant_id = 2) const uint WM = 96;   // w 链 mid 行数
 layout(constant_id = 3) const uint AM = 96;   // a 链 mid 行数
 layout(constant_id = 4) const uint GM = 320;  // g 链 mid 行数
 
-const uint ROWS           = 4;    // 每 workgroup 处理的 r/k/v 行数（须整除 C）
+const uint ROWS           = 4;    // 每 workgroup 处理的 r/k/v 行数（须整除 C，与 runtime GEMV_ROWS 严格一致）
 const uint BLOCK_SIZE     = 128;
 // 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=5），不能写死 32（AMD=64，Intel 可变）。
 // 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（128 % 32/64/16 均整除）。

@@ -279,6 +279,9 @@ pub struct Properties {
     pub subgroup_size: u32,
     /// 设备厂商 ID（NVIDIA=0x10DE，AMD=0x1002，Intel=0x8086），用于硬件特定优化。
     pub vendor_id: u32,
+    /// 设备是否支持 `VK_EXT_shader_atomic_float` 的 buffer 级 fp32 原子累加。
+    /// 决定稀疏 FFN 稀疏内核是否可用（不支持则回退稠密 gemv）。
+    pub atomic_float: bool,
 }
 
 impl std::fmt::Display for Properties {
@@ -637,7 +640,7 @@ impl App {
             .enabled_extension_names(&extensions);
         let instance = entry.create_instance(&info, None)?;
 
-        let (device, compute_family_index, transfer_family_index) = instance
+        let (device, compute_family_index, transfer_family_index, atomic_float) = instance
             .enumerate_physical_devices()?
             .into_iter()
             .filter_map(|device| {
@@ -660,6 +663,9 @@ impl App {
                     );
                     return None;
                 }
+                // 稀疏 FFN 稀疏内核需要 buffer 级 fp32 原子累加（VK_EXT_shader_atomic_float）。
+                // 非必需：不支持时回退稠密 gemv（supports_sparse_ffn=false）。
+                let atomic_float = supported.contains(&vk::EXT_SHADER_ATOMIC_FLOAT_EXTENSION.name);
 
                 let queue_families = instance.get_physical_device_queue_family_properties(device);
                 let compute_family_index = queue_families
@@ -676,9 +682,14 @@ impl App {
                     .min_by_key(|(_, p)| p.queue_flags.bits().count_ones())?
                     .0 as u32;
 
-                Some((device, compute_family_index, transfer_family_index))
+                Some((
+                    device,
+                    compute_family_index,
+                    transfer_family_index,
+                    atomic_float,
+                ))
             })
-            .min_by_key(|&(device, _, _)| {
+            .min_by_key(|&(device, _, _, _)| {
                 let properties = instance.get_physical_device_properties(device);
                 match properties.device_type {
                     vk::PhysicalDeviceType::DISCRETE_GPU => 0,
@@ -749,14 +760,19 @@ impl App {
             limits,
             subgroup_size: subgroup_props.subgroup_size,
             vendor_id, // 使用之前捕获的 vendor_id
+            atomic_float,
         };
         log::info!("{properties}");
         log::info!("\tsubgroup size: {}", subgroup_props.subgroup_size);
 
-        let extensions = DEVICE_EXTENSIONS
+        let mut extensions: Vec<*const std::os::raw::c_char> = DEVICE_EXTENSIONS
             .iter()
             .map(|ext| ext.name.as_ptr())
-            .collect_vec();
+            .collect();
+        // 稀疏 FFN 稀疏内核需要 VK_EXT_shader_atomic_float（buffer 级 fp32 原子累加）；设备不支持则跳过。
+        if atomic_float {
+            extensions.push(vk::EXT_SHADER_ATOMIC_FLOAT_EXTENSION.name.as_ptr());
+        }
         assert_ne!(compute_family_index, transfer_family_index);
         let infos = &[
             vk::DeviceQueueCreateInfo::builder()
@@ -784,14 +800,24 @@ impl App {
             .subgroup_size_control(true);
         let mut features_cooperative_matrix =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::builder().cooperative_matrix(true);
+        // 稀疏 FFN 稀疏内核：buffer 级 fp32 原子累加（仅当设备支持该扩展时启用）。
+        let mut features_atomic_float: Option<vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT> =
+            atomic_float.then(|| {
+                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::builder()
+                    .shader_buffer_float32_atomic_add(true)
+                    .build()
+            });
 
-        let info = vk::DeviceCreateInfo::builder()
+        let mut info = vk::DeviceCreateInfo::builder()
             .enabled_extension_names(&extensions)
             .queue_create_infos(infos)
             .push_next(&mut features_11)
             .push_next(&mut features_12)
             .push_next(&mut features_13)
             .push_next(&mut features_cooperative_matrix);
+        if let Some(f) = features_atomic_float.as_mut() {
+            info = info.push_next(f);
+        }
         let device = instance.create_device(device, &info, None)?;
 
         let compute = Submit::new(&device, compute_family_index, 0)?;
