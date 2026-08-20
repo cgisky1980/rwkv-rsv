@@ -132,6 +132,9 @@ fn cartesian_product(defines: &[DefineDimension]) -> Vec<Vec<(&str, &DefineVaria
 fn compile_shader(shaders_dir: &Path, spv_dir: &Path, spec: &ShaderSpec) {
     let source_path = shaders_dir.join(spec.source);
     println!("cargo:rerun-if-changed={}", source_path.display());
+    let source_mtime = std::fs::metadata(&source_path)
+        .and_then(|m| m.modified())
+        .ok();
 
     for combo in cartesian_product(&spec.defines) {
         let filename_parts: Vec<&str> = combo
@@ -152,6 +155,17 @@ fn compile_shader(shaders_dir: &Path, spv_dir: &Path, spec: &ShaderSpec) {
         };
 
         let output_path = spv_dir.join(&filename);
+
+        // Skip recompilation when the committed spv is up-to-date.
+        // This lets CI (and users without the Vulkan SDK) build from the
+        // checked-in binaries; only shader source edits trigger a rebuild.
+        if let (Some(src), Ok(out_meta)) = (source_mtime, std::fs::metadata(&output_path)) {
+            if let Ok(out_mtime) = out_meta.modified() {
+                if out_mtime >= src {
+                    continue;
+                }
+            }
+        }
 
         let mut cmd = Command::new("glslangValidator");
         cmd.arg("--target-env").arg("spirv1.3");

@@ -42,10 +42,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut bundle = ModelBuilder::new(&model_path).build()?;
     log::info!("model loaded, vocab={}", bundle.info().num_vocab);
 
-    // prompt prefill
-    let prompt: Vec<u32> = vec![304, 25740, 109];
+    // prompt：PROMPT 环境变量（需 VOCAB_JSON）指定文本；否则用默认 token 序列 " Eiffel"
+    let prompt: Vec<u32> = match (std::env::var("PROMPT").ok(), &tokenizer) {
+        (Some(text), Some(tok)) => tok.encode(text.as_bytes())?,
+        (Some(_), None) => {
+            return Err("PROMPT requires VOCAB_JSON".into());
+        }
+        _ => vec![304, 25740, 109],
+    };
     let _ = bundle.infer_tokens(&prompt)?;
-    log::info!("prompt prefill 完成：{:?}", prompt);
+    log::info!("prompt prefill 完成：{prompt:?}");
 
     // 用最后一个 prompt token 作为 self-loop 的起始 seed
     let seed = *prompt.last().unwrap();
