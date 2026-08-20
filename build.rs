@@ -155,6 +155,7 @@ fn compile_shader(shaders_dir: &Path, spv_dir: &Path, spec: &ShaderSpec) {
         };
 
         let output_path = spv_dir.join(&filename);
+        let committed = output_path.exists();
 
         // Skip recompilation when the committed spv is up-to-date.
         // This lets CI (and users without the Vulkan SDK) build from the
@@ -184,11 +185,25 @@ fn compile_shader(shaders_dir: &Path, spv_dir: &Path, spec: &ShaderSpec) {
 
         cmd.arg("-V").arg(&source_path).arg("-o").arg(&output_path);
 
-        let status = cmd
-            .status()
-            .expect("failed to run glslangValidator — make sure it is installed and in PATH");
-        if !status.success() {
-            panic!("glslangValidator failed for {}", filename);
+        // mtime is unreliable right after `git clone` (every file gets the
+        // same checkout timestamp; nanosecond ordering may make the source
+        // look newer than the committed spv). When glslangValidator is not
+        // installed but a committed spv exists, fall back to it instead of
+        // failing the build. Real compilation errors still panic.
+        match cmd.status() {
+            Ok(status) if status.success() => {}
+            Ok(_) => panic!("glslangValidator failed for {}", filename),
+            Err(_) if committed => {
+                println!(
+                    "cargo:warning=glslangValidator not found; using committed {}",
+                    filename
+                );
+            }
+            Err(e) => panic!(
+                "failed to run glslangValidator for {} — install it (Vulkan SDK / \
+                 glslang-tools) or ensure the spv is committed: {}",
+                filename, e
+            ),
         }
     }
 }
