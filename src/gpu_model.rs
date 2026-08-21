@@ -657,7 +657,7 @@ impl GpuModel {
     /// 与 argmax 版 self-loop 同构，但每轮用带参数（temperature/top-k/top-p）的采样替换
     /// argmax；采样临时缓冲（temp/mask/sampler）预建一次存活到 batch 提交后，每轮
     /// 用 `store_sampler_host` 更新 seed 后复用。返回生成的 n 个 token 索引。
-    fn forward_sample_selfloop_with_state(
+    pub fn forward_sample_selfloop_with_state(
         &mut self,
         state: &mut State,
         seed: u32,
