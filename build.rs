@@ -160,12 +160,11 @@ fn compile_shader(shaders_dir: &Path, spv_dir: &Path, spec: &ShaderSpec) {
         // Skip recompilation when the committed spv is up-to-date.
         // This lets CI (and users without the Vulkan SDK) build from the
         // checked-in binaries; only shader source edits trigger a rebuild.
-        if let (Some(src), Ok(out_meta)) = (source_mtime, std::fs::metadata(&output_path)) {
-            if let Ok(out_mtime) = out_meta.modified() {
-                if out_mtime >= src {
-                    continue;
-                }
-            }
+        if let (Some(src), Ok(out_meta)) = (source_mtime, std::fs::metadata(&output_path))
+            && let Ok(out_mtime) = out_meta.modified()
+            && out_mtime >= src
+        {
+            continue;
         }
 
         let mut cmd = Command::new("glslangValidator");

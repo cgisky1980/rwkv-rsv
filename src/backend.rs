@@ -426,6 +426,8 @@ pub trait ComputeBackend {
     fn clear_cache(&mut self);
     /// 释放 f32/f16/u32 张量的 host（系统内存）缓冲（权重上传完成后调用）。
     fn drop_host(&mut self, t: TensorId);
+    /// 释放张量的设备内存并从注册表移除（seq 缓冲按 T 重建时调用，防设备内存泄漏）。
+    fn free_tensor(&mut self, t: TensorId);
 
     // —— 设备侧拷贝 ——
     /// device→device 拷贝（f32）：v_first 快照 / 状态缓冲用。
@@ -1502,6 +1504,12 @@ impl ComputeBackend for VulkanBackend {
             Some(VulkanTensor::U32(g)) => self.rt.drop_host_u32(g),
             None => {}
         }
+    }
+
+    fn free_tensor(&mut self, t: TensorId) {
+        // 移除注册表条目；GpuTensor 为 Arc 包装，末引用 Drop 时释放设备缓冲。
+        self.tensors.remove(&t);
+        self.lens.remove(&t);
     }
 
     fn copy_device(&mut self, src: TensorId, dst: TensorId) -> R<()> {

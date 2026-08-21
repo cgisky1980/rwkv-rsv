@@ -310,6 +310,72 @@ pub struct SeqBuffers {
     w_scratch: TensorId,
 }
 
+impl SeqBuffers {
+    /// 释放全部工作缓冲的设备内存（T 变化重建前调用，防泄漏：
+    /// 旧缓冲的 TensorId 被结构体 Drop 后，后端注册表仍持有设备内存）。
+    fn free(&mut self, backend: &mut dyn ComputeBackend) {
+        let tensors = [
+            self.x,
+            self.ln1,
+            self.xr,
+            self.xw,
+            self.xk,
+            self.xv,
+            self.xa,
+            self.xg,
+            self.r,
+            self.k,
+            self.v,
+            self.v_first,
+            self.v_full,
+            self.gate,
+            self.w_full,
+            self.w_sig,
+            self.w,
+            self.a_full,
+            self.a,
+            self.kk_l2,
+            self.k_mod,
+            self.b_vec,
+            self.y,
+            self.y_norm,
+            self.g,
+            self.y_g,
+            self.y_out,
+            self.diag_out_ref,
+            self.ln2,
+            self.xb,
+            self.v2,
+            self.x_norm,
+            self.tmp_c,
+            self.v_mid,
+            self.w_mid,
+            self.a_mid,
+            self.g_mid,
+            self.r2,
+            self.head_in,
+            self.logits,
+            self.xr16,
+            self.xk16,
+            self.xv16,
+            self.xw16,
+            self.xa16,
+            self.xg16,
+            self.y_g16,
+            self.xb16,
+            self.r2_16,
+            self.v_mid16,
+            self.w_mid16,
+            self.a_mid16,
+            self.g_mid16,
+            self.w_scratch,
+        ];
+        for t in tensors {
+            backend.free_tensor(t);
+        }
+    }
+}
+
 impl GpuModel {
     /// 从 safetensors 文件加载模型并上传到 GPU
     pub fn from_safetensors(mut backend: Box<dyn ComputeBackend>, path: &str) -> R<Self> {
@@ -1295,6 +1361,10 @@ impl GpuModel {
         if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
             // T 变化 → 新缓冲地址 + 新 spec，旧 kernel 缓存失效，清空避免耗尽 descriptor pool
             self.backend.clear_cache();
+            // 释放旧缓冲的设备内存（防泄漏：注册表残留分配）
+            if let Some(mut old) = self.seq_bufs.take() {
+                old.free(self.backend.as_mut());
+            }
             self.seq_bufs = Some(SeqBuffers::new(
                 self.backend.as_mut(),
                 t,
@@ -1421,6 +1491,70 @@ impl GpuModel {
         Ok(last_logits)
     }
 
+    /// 序列 prefill 后返回最后一层 FFN 输出（残差流 sb.x）在 T 维的 mean pooling。
+    ///
+    /// 与 `forward_seq_with_state` 共享层循环语义，但跳过 ln_out/head
+    /// （省去 [vocab] GEMM 与全量 logits 下载），仅下载 [T, C] 后在 CPU 端
+    /// 对 T 维求均值 → [C]。供智能路由的 state-embedding 分类器提取特征。
+    pub fn forward_seq_mean_hidden(&mut self, state: &mut State, tokens: &[u32]) -> R<Vec<f32>> {
+        let t = tokens.len();
+        assert!(t >= 1, "forward_seq_mean_hidden requires at least 1 token");
+        let (c, n, vocab) = (self.config.n_embd, self.config.head_size, self.config.vocab);
+
+        // 按需创建/复用序列并行缓冲（与 forward_seq_with_state 一致）
+        if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
+            self.backend.clear_cache();
+            // 释放旧缓冲的设备内存（防泄漏）
+            if let Some(mut old) = self.seq_bufs.take() {
+                old.free(self.backend.as_mut());
+            }
+            self.seq_bufs = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                t,
+                c,
+                vocab,
+                &self.config,
+            )?);
+        }
+        let mut seq_bufs = self.seq_bufs.take().unwrap();
+        let sb = &mut seq_bufs;
+
+        // 收集整段嵌入行 [t, c]（CPU 缓存的 emb_ln 表）
+        let emb_ln = &self.emb_ln_cpu;
+        let mut x_data = vec![0.0; t * c];
+        for (ti, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            x_data[ti * c..(ti + 1) * c].copy_from_slice(&emb_ln[tok * c..(tok + 1) * c]);
+        }
+        self.backend.upload(sb.x, &x_data)?;
+
+        // 单批处理全部层：prefill 后 sb.x 即最后一层 FFN 输出（残差后）
+        self.backend.begin_batch()?;
+        for i in 0..self.config.n_layer {
+            self.forward_seq_layer(i, t, c, n, sb, state)?;
+        }
+        self.backend.end_batch()?;
+
+        // 下载 [t, c] 后对 T 维求均值 → [c]
+        let x_all = self.backend.download(sb.x)?;
+        let mut mean_hidden = vec![0.0f32; c];
+        for ti in 0..t {
+            let row = &x_all[ti * c..(ti + 1) * c];
+            for (acc, &v) in mean_hidden.iter_mut().zip(row) {
+                *acc += v;
+            }
+        }
+        let inv_t = 1.0 / t as f32;
+        for v in mean_hidden.iter_mut() {
+            *v *= inv_t;
+        }
+
+        // 归还 seq_bufs
+        self.seq_bufs = Some(seq_bufs);
+
+        Ok(mean_hidden)
+    }
+
     /// 诊断：逐层快照 x（前 D 维），用于定位 seq 路径两次运行的首发发散层。
     /// 返回 Vec<Vec<f32>>，第 i 项为第 i+1 层输出 x 的快照（i==0 为 layer 0 之后）。
     pub fn snapshot_seq_layers(&mut self, tokens: &[u32], d: usize) -> R<Vec<Vec<f32>>> {
@@ -1430,6 +1564,10 @@ impl GpuModel {
         self.backend.clear_cache();
         if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != t) {
             self.backend.clear_cache();
+            // 释放旧缓冲的设备内存（防泄漏）
+            if let Some(mut old) = self.seq_bufs.take() {
+                old.free(self.backend.as_mut());
+            }
             self.seq_bufs = Some(SeqBuffers::new(
                 self.backend.as_mut(),
                 t,

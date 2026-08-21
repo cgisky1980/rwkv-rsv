@@ -4418,9 +4418,9 @@ impl ComputeBackend for CudaBackend {
         self.sample_into_host_seeded(logits, token, n, temp, mask, counter, sampler, hist)
     }
     fn clear_cache(&mut self) {
-        // CUDA 统一 schema 的 kernel 缓存按 key 复用，清空后下次按需重编译。
-        self.kernels.clear();
-        // T 变化会重建 seq 缓冲（新地址），旧 prefill graph 的指针失效，一并销毁。
+        // CUDA kernel 与缓冲地址/形状无关（地址全部为启动参数，PTX 由静态源码
+        // 编译），跨 T 变化可安全复用，无需清空 kernels 重编译。
+        // 仅销毁 prefill graph：graph 内 bake 了缓冲指针，T 变化重建 seq 缓冲后失效。
         for (_, exec) in self.prefill_graphs.drain() {
             unsafe {
                 (self.drv.cu_graph_exec_destroy)(exec);
@@ -4429,6 +4429,21 @@ impl ComputeBackend for CudaBackend {
     }
     fn drop_host(&mut self, _t: TensorId) {
         // CUDA 后端张量仅持有设备指针，无 host 镜像缓冲，无需释放。
+    }
+
+    fn free_tensor(&mut self, t: TensorId) {
+        // 移除注册表条目并释放设备内存（防 seq 缓冲按 T 重建时泄漏）。
+        if let Some(tensor) = self.tensors.remove(&t) {
+            self.lens.remove(&t);
+            let dptr = match tensor {
+                CudaTensor::F32 { dptr, .. }
+                | CudaTensor::F16 { dptr, .. }
+                | CudaTensor::U32 { dptr, .. } => dptr,
+            };
+            unsafe {
+                (self.drv.cu_mem_free_v2)(dptr);
+            }
+        }
     }
     fn copy_device(&mut self, src: TensorId, dst: TensorId) -> R<()> {
         let src_d = self.f32_ptr(src, "copy_device")?;
