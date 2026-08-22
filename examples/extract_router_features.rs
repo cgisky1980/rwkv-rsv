@@ -35,6 +35,9 @@ const PAD_TOKEN: u32 = 0;
 struct GoldenRow {
     text: String,
     tier: u8,
+    /// v4：上一轮路由等级（0-3；None = 首轮/未知——golden 单轮数据无此字段）。
+    #[serde(default)]
+    prev_tier: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +51,8 @@ struct FeatureRow {
 struct FeatureOut {
     idx: usize,
     tier: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev_tier: Option<u8>,
     hidden: Vec<f32>,
 }
 
@@ -139,6 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let feature = FeatureOut {
             idx,
             tier: row.tier,
+            prev_tier: row.prev_tier,
             hidden,
         };
         serde_json::to_writer(&mut writer, &feature)?;

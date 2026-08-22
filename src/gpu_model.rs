@@ -103,8 +103,8 @@ pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
     config: ModelConfig,
     // 预计算的 GPU 权重
-    emb_ln: TensorId,     // [vocab, C] fp16 — 预计算 ln0(embed) 后的 embedding
-    emb_ln_cpu: Vec<f32>, // [vocab, C] CPU 缓存（f16 舍入值，与 GPU 表逐位一致），避免每次 forward_seq 下载
+    emb_ln: TensorId, // [vocab, C] fp16 — 预计算 ln0(embed) 后的 embedding
+    emb_ln_cpu: std::sync::Arc<Vec<f32>>, // [vocab, C] CPU 缓存（f16 舍入值，与 GPU 表逐位一致），避免每次 forward_seq 下载；Arc 供权重共享实例零复制
     ln_out_w: TensorId,
     ln_out_b: TensorId,
     head_w16: Option<TensorId>, // [vocab, C] fp16 变体（head 未 int8 量化时用）
@@ -112,6 +112,10 @@ pub struct GpuModel {
     layers: Vec<GpuLayer>,
     // 工作缓冲区（forward 时复用，避免每 token 重新分配）
     bufs: WorkBuffers,
+    // batch 并发工作缓冲区（[batch, ...] 布局；B 变化时重建。None = 未用 batch 路径）
+    batch_bufs: Option<(usize, WorkBuffers)>,
+    // batch prefill 的 lens 缓冲（[batch] u32；batch 变化时重建）
+    batch_lens: Option<(usize, TensorId)>,
     // 序列并行工作缓冲区（forward_seq 时按需创建/复用）
     seq_bufs: Option<SeqBuffers>,
     // 内部推理状态（web-rwkv 风格 `State`）。
@@ -123,6 +127,7 @@ pub struct GpuModel {
 }
 
 /// 单层权重（全部已上传到 GPU）
+#[derive(Clone)]
 pub struct GpuLayer {
     ln1_w: TensorId,
     ln1_b: TensorId,
@@ -193,7 +198,22 @@ pub struct GpuState {
     cmix_x: TensorId,   // [C] token shift
 }
 
+/// 在途 self-loop 句柄：submit 后全部轮次已在 GPU 流上排队（零 host 同步），
+/// collect 时一次同步取回生成序列并释放临时缓冲。
+/// 单线程使用约束：同一后端至多一个在途 ticket（pinned 行号复用前提）。
+pub struct SelfloopTicket {
+    temp: TensorId,
+    mask: TensorId,
+    counter: TensorId,
+    sampler: TensorId,
+    token_seq: TensorId,
+    seq_cnt: TensorId,
+    n: usize,
+}
+
 /// 工作缓冲区：forward 期间复用，避免反复创建 GpuTensor
+///（TensorId 全 Copy，Clone 零开销——batch 路径取副本避开 &self 与 &mut self 借用冲突）
+#[derive(Clone)]
 pub struct WorkBuffers {
     // [C] 大小
     x: TensorId,
@@ -488,7 +508,7 @@ impl GpuModel {
         }
 
         // 工作缓冲区
-        let bufs = WorkBuffers::new(backend.as_mut(), n_embd, vocab, &config)?;
+        let bufs = WorkBuffers::new(backend.as_mut(), n_embd, vocab, &config, 1)?;
 
         // 内部推理状态（可序列化 `State`：每层 RNN 状态 + v_first）
         let state = State::new(backend.as_mut(), n_embd, n_head, head_size, n_layer)?;
@@ -510,13 +530,15 @@ impl GpuModel {
             backend,
             config,
             emb_ln: emb_ln_t,
-            emb_ln_cpu: emb_ln,
+            emb_ln_cpu: std::sync::Arc::new(emb_ln),
             ln_out_w: ln_out_w_t,
             ln_out_b: ln_out_b_t,
             head_w16: head_w16_t,
             head_a8,
             layers,
             bufs,
+            batch_bufs: None,
+            batch_lens: None,
             seq_bufs: None,
             state: Some(state),
             scale_w,
@@ -567,6 +589,42 @@ impl GpuModel {
             self.config.head_size,
             self.config.n_layer,
         )
+    }
+
+    /// 权重共享并发实例：新后端（独立 CUDA stream）导入本实例的全部设备张量
+    ///（同一 primary ctx，设备指针跨实例有效；权重显存零复制），工作缓冲/seq
+    /// 缓冲/状态为本实例私有。配合 `submit/collect_sample_selfloop` 的拆分式
+    /// API，单线程即可让 K 个实例的流并发执行（提交即返回，收集时各自同步）。
+    /// 仅 CUDA 后端支持；实例须在创建它的线程上使用（cuCtxSetCurrent per-thread）。
+    pub fn build_shared(&self) -> R<GpuModel> {
+        let mut backend = crate::backend::create_backend(crate::backend::detect_backend())?;
+        backend.import_tensors_from(self.backend.as_ref())?;
+        let config = self.config.clone();
+        let bufs = WorkBuffers::new(backend.as_mut(), config.n_embd, config.vocab, &config, 1)?;
+        let state = State::new(
+            backend.as_mut(),
+            config.n_embd,
+            config.n_head,
+            config.head_size,
+            config.n_layer,
+        )?;
+        Ok(GpuModel {
+            backend,
+            config,
+            emb_ln: self.emb_ln,
+            emb_ln_cpu: std::sync::Arc::clone(&self.emb_ln_cpu),
+            ln_out_w: self.ln_out_w,
+            ln_out_b: self.ln_out_b,
+            head_w16: self.head_w16,
+            head_a8: self.head_a8,
+            layers: self.layers.clone(),
+            bufs,
+            batch_bufs: None,
+            batch_lens: None,
+            seq_bufs: None,
+            state: Some(state),
+            scale_w: self.scale_w,
+        })
     }
 
     /// 公开模型元信息（web-rwkv 风格 `ModelInfo`），供服务端读取模型规模。
@@ -656,7 +714,7 @@ impl GpuModel {
     /// GPU self-loop 批量采样生成：在**单次 submit** 内连续采样 n 个 token。
     /// 与 argmax 版 self-loop 同构，但每轮用带参数（temperature/top-k/top-p）的采样替换
     /// argmax；采样临时缓冲（temp/mask/sampler）预建一次存活到 batch 提交后，每轮
-    /// 用 `store_sampler_host` 更新 seed 后复用。返回生成的 n 个 token 索引。
+    /// 用 pinned 异步上传更新 seed 后复用。返回生成的 n 个 token 索引。
     pub fn forward_sample_selfloop_with_state(
         &mut self,
         state: &mut State,
@@ -664,6 +722,20 @@ impl GpuModel {
         n: usize,
         sp: &SamplerParams,
     ) -> R<Vec<u32>> {
+        let ticket = self.submit_sample_selfloop(state, seed, n, sp)?;
+        self.collect_sample_selfloop(ticket)
+    }
+
+    /// 在途 self-loop 句柄：submit 后全部轮次已在 GPU 流上排队（零 host 同步），
+    /// collect 时一次同步取回生成序列并释放临时缓冲。
+    /// 单线程使用约束：同一后端至多一个在途 ticket（pinned 行号复用前提）。
+    pub fn submit_sample_selfloop(
+        &mut self,
+        state: &mut State,
+        seed: u32,
+        n: usize,
+        sp: &SamplerParams,
+    ) -> R<SelfloopTicket> {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let ns = self.config.head_size;
@@ -704,8 +776,11 @@ impl GpuModel {
         if self.backend.supports_graph_capture() {
             // CUDA graph：捕获一轮完整前向（gather→层→ln+head→GPU采样→record_token），
             // 之后每 token 重放，消除 258 次/层的 cuLaunchKernel 启动开销。
-            // 每轮重放前用 store_sampler_host 更新 seed/hist_len，sample kernel 在重放时
-            // 读取最新设备参数（与 argmax 路径的 graph 反馈机制一致）。
+            // 每轮重放前更新 seed/hist_len，sample kernel 在重放时读取最新设备参数。
+            // 逐轮更新走 pinned 异步上传（流序，零 host 同步）——同步版每轮
+            // cuStreamSynchronize 会把整段 selfloop 退化成逐轮 CPU⟷GPU 往返。
+            let async_rows = self.backend.sampler_async_rows();
+            let use_async = n <= async_rows;
             self.backend.begin_graph_capture()?;
             self.sample_selfloop_step(
                 state, c, h, ns, temp, mask, counter, sampler, token_seq, seq_cnt,
@@ -714,17 +789,32 @@ impl GpuModel {
 
             for round in 0..n {
                 state.v_first_set = false;
-                self.backend.store_sampler_host(
-                    sampler,
-                    sp.temperature,
-                    sp.top_k,
-                    sp.top_p,
-                    seed + round as u32,
-                    sp.repetition_penalty,
-                    sp.frequency_penalty,
-                    sp.presence_penalty,
-                    round as u32,
-                )?;
+                if use_async {
+                    self.backend.store_sampler_async(
+                        sampler,
+                        round,
+                        sp.temperature,
+                        sp.top_k,
+                        sp.top_p,
+                        seed + round as u32,
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        round as u32,
+                    )?;
+                } else {
+                    self.backend.store_sampler_host(
+                        sampler,
+                        sp.temperature,
+                        sp.top_k,
+                        sp.top_p,
+                        seed + round as u32,
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        round as u32,
+                    )?;
+                }
                 self.backend.graph_replay()?;
             }
         } else {
@@ -748,12 +838,926 @@ impl GpuModel {
             }
         }
 
-        // 一次性提交整段 self-loop
+        // 一次性提交整段 self-loop（异步：不等 GPU 执行完）
+        self.backend.end_batch()?;
+        Ok(SelfloopTicket {
+            temp,
+            mask,
+            counter,
+            sampler,
+            token_seq,
+            seq_cnt,
+            n,
+        })
+    }
+
+    /// 取回 self-loop 结果：同步本实例流（只等这一条流，其它实例的流不受影响），
+    /// 下载生成序列并释放临时缓冲。
+    pub fn collect_sample_selfloop(&mut self, ticket: SelfloopTicket) -> R<Vec<u32>> {
+        let t = self.backend.download(ticket.token_seq)?;
+        let n = ticket.n;
+        self.backend.free_tensor(ticket.temp);
+        self.backend.free_tensor(ticket.mask);
+        self.backend.free_tensor(ticket.counter);
+        self.backend.free_tensor(ticket.sampler);
+        self.backend.free_tensor(ticket.token_seq);
+        self.backend.free_tensor(ticket.seq_cnt);
+        Ok(t[..n].iter().map(|x| x.to_bits()).collect())
+    }
+
+    // ==== batch 并发 API（单实例多序列：1 份权重 + 1 个 batch State，一次读权重算 B 份）====
+
+    /// 创建 batch 布局的推理状态（[batch, ...]）。仅 CUDA 后端支持 batch>1。
+    pub fn create_batch_state(&mut self, batch: usize) -> R<State> {
+        State::new_batched(
+            self.backend.as_mut(),
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+            self.config.n_layer,
+            batch,
+        )
+    }
+
+    /// 单 slot 状态回灌（batch State）：把单序列布局数据写入 batch_state 的
+    /// 第 `slot` 段（prefill 单序列 → 状态灌入 batch slot 的桥）。
+    pub fn state_slot_load(&self, batch_state: &State, slot: usize, data: &[f32]) -> R<()> {
+        batch_state.slot_load(
+            &*self.backend,
+            slot,
+            data,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
+    /// 单 slot 状态下载（batch State）。
+    pub fn state_slot_back(&self, batch_state: &State, slot: usize) -> R<Vec<f32>> {
+        batch_state.slot_back(
+            &*self.backend,
+            slot,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
+    /// batch prefill：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，直接
+    /// 更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的 M 维
+    /// = B*T_pad，权重读一份算全部行。返回每 slot 的末 token（decode seed）。
+    /// 仅 CUDA（seq_shift_batch/dplr_seq_batch/copy_token_batch）。
+    pub fn forward_seq_batch(
+        &mut self,
+        state: &mut State,
+        tokens_batch: &[Vec<u32>],
+    ) -> R<Vec<u32>> {
+        let batch = tokens_batch.len();
+        if batch == 0 {
+            return Err("forward_seq_batch: 空 batch".into());
+        }
+        if state.batch() != batch {
+            return Err(format!(
+                "forward_seq_batch: state batch {} != tokens {}",
+                state.batch(),
+                batch
+            )
+            .into());
+        }
+        let (c, n) = (self.config.n_embd, self.config.head_size);
+        let t_pad = tokens_batch.iter().map(|v| v.len()).max().unwrap().max(1);
+        let bt = batch * t_pad;
+
+        // 摊平 tokens（slot 主序，pad 0）与 lens。
+        let mut flat = vec![0u32; bt];
+        let lens: Vec<u32> = tokens_batch
+            .iter()
+            .map(|v| v.len().max(1).min(t_pad) as u32)
+            .collect();
+        for (b, toks) in tokens_batch.iter().enumerate() {
+            let l = toks.len().max(1).min(t_pad);
+            flat[b * t_pad..b * t_pad + l].copy_from_slice(&toks[..l]);
+        }
+        // seeds：每 slot 末 token（pad 段之前的实际末位）。
+        let seeds: Vec<u32> = tokens_batch.iter().map(|v| *v.last().unwrap()).collect();
+
+        // lens 缓冲（batch 变化时重建；内容每次覆盖上传）。
+        let lens_t = match self.batch_lens {
+            Some((b, t)) if b == batch => t,
+            _ => {
+                if let Some((_, old)) = self.batch_lens.take() {
+                    self.backend.free_tensor(old);
+                }
+                let t = self.backend.create_tensor(batch, TensorDtype::U32)?;
+                self.batch_lens = Some((batch, t));
+                t
+            }
+        };
+        self.backend.upload_u32(lens_t, &lens)?;
+
+        // token 缓冲 + embedding gather（一次取 B*T_pad 行）。
+        let tok = self.backend.create_tensor(bt, TensorDtype::U32)?;
+        self.backend.upload_u32(tok, &flat)?;
+
+        // 序列缓冲按 bt 重建（t 维换 B*T_pad，布局完全兼容）。
+        if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != bt) {
+            self.backend.clear_cache();
+            if let Some(mut old) = self.seq_bufs.take() {
+                old.free(self.backend.as_mut());
+            }
+            self.seq_bufs = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                bt,
+                c,
+                self.config.vocab,
+                &self.config,
+            )?);
+        }
+        let mut seq_bufs = self.seq_bufs.take().unwrap();
+
+        self.backend.begin_batch()?;
+        self.backend
+            .gather_rows_device_f16(self.emb_ln, seq_bufs.x, tok, c, bt)?;
+        for i in 0..self.config.n_layer {
+            self.forward_seq_layer_batch(i, t_pad, c, n, &mut seq_bufs, state, lens_t, batch)?;
+        }
         self.backend.end_batch()?;
 
-        // 下载序列缓冲，按位解释为 u32
-        let t = self.backend.download(token_seq)?;
-        Ok(t[..n].iter().map(|x| x.to_bits()).collect())
+        self.backend.free_tensor(tok);
+        self.seq_bufs = Some(seq_bufs);
+        Ok(seeds)
+    }
+
+    /// batch prefill 单层：全 kernel 的 token 维 = B*T_pad（信天翁 rows 模型），
+    /// 状态类 kernel 走 batch 变体（slot 边界 / lens 截断）。
+    #[allow(clippy::too_many_arguments)]
+    fn forward_seq_layer_batch(
+        &mut self,
+        i: usize,
+        t_pad: usize,
+        c: usize,
+        n: usize,
+        sb: &mut SeqBuffers,
+        state: &mut State,
+        lens: TensorId,
+        batch: usize,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
+        let fh = self.config.ffn_hidden;
+        let (wwp, aap, vvp, ggp) = (
+            self.config.w_mid_pad,
+            self.config.a_mid_pad,
+            self.config.v_mid_pad,
+            self.config.g_mid_pad,
+        );
+        let layer = &self.layers[i];
+        let bt = batch * t_pad;
+        let m_pad = sb.m_pad;
+
+        // ===== Time Mixing =====
+        self.backend
+            .norm(sb.x, layer.ln1_w, layer.ln1_b, sb.ln1, c, 1, LN_EPS, bt)?;
+
+        // token shift（slot 边界 t=0 读该 slot 的 tmix_x 段）
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_r,
+            sb.xr,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_w,
+            sb.xw,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_k,
+            sb.xk,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_v,
+            sb.xv,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_a,
+            sb.xa,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend.seq_shift_batch(
+            sb.ln1,
+            state.layers[i].tmix_x,
+            layer.x_g,
+            sb.xg,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        // state.tmix_x = 每 slot 的 ln1 末行（lens-1）
+        self.backend
+            .copy_token_batch(sb.ln1, state.layers[i].tmix_x, lens, c, t_pad, batch)?;
+
+        // r/k/v = token 并行 GEMM（M = B*T_pad；int8 → dequant scratch → TC GEMM）
+        if let (Some(ra8), Some(ka8), Some(va8)) =
+            (&layer.receptance_a8, &layer.key_a8, &layer.value_a8)
+        {
+            self.backend.to_f16_triple(
+                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, bt, m_pad, c, c,
+            )?;
+            self.backend.dequant_int8_to_f16(ra8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(ka8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(va8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+        } else {
+            self.backend.to_f16_triple(
+                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, bt, m_pad, c, c,
+            )?;
+            let r16 = layer
+                .receptance_w16
+                .as_ref()
+                .ok_or("receptance_w16 missing")?;
+            let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
+            let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
+            self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
+            self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
+            self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
+        }
+
+        // 低秩 w/a/g 第一级投影输入转 fp16
+        self.backend.to_f16_triple(
+            sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, bt, m_pad, c, c,
+        )?;
+
+        // v_first 逻辑（layer 0 快照；layer>0 交叉混合）
+        if i == 0 {
+            self.backend.copy_device(sb.v, sb.v_first)?;
+        } else {
+            self.backend
+                .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_pad, vvp, c)?;
+            self.backend
+                .to_f16(sb.v_mid, sb.v_mid16, vvp, bt, m_pad, vvp, vvp)?;
+            self.backend
+                .gemm_bias(sb.v_mid16, layer.v2_16, layer.v0, sb.v_full, m_pad, c, vvp)?;
+            self.backend
+                .elementwise_sigmoid(sb.v_full, sb.gate, c, bt)?;
+            self.backend
+                .v_first_lerp(sb.v, sb.gate, sb.v_first, c, bt, c)?;
+        }
+
+        // w 链：tanh(xw@w1)@w2 + w0 → sigmoid → exp(scale)
+        self.backend
+            .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_pad, wwp, c)?;
+        self.backend
+            .to_f16(sb.w_mid, sb.w_mid16, wwp, bt, m_pad, wwp, wwp)?;
+        self.backend
+            .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_pad, c, wwp)?;
+        self.backend
+            .elementwise_sigmoid(sb.w_full, sb.w_sig, c, bt)?;
+        self.backend
+            .elementwise_scale_exp(sb.w_sig, self.scale_w, sb.w, c, bt)?;
+
+        // a 链：xa@a1@a2 + a0 → sigmoid
+        self.backend
+            .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_pad, aap, c)?;
+        self.backend
+            .to_f16(sb.a_mid, sb.a_mid16, aap, bt, m_pad, aap, aap)?;
+        self.backend
+            .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_pad, c, aap)?;
+        self.backend.elementwise_sigmoid(sb.a_full, sb.a, c, bt)?;
+
+        // 融合 k/k_a
+        self.backend.fuse_ka(
+            sb.k,
+            layer.k_k,
+            sb.a,
+            layer.k_a,
+            sb.k_mod,
+            sb.kk_l2,
+            sb.b_vec,
+            self.config.n_head,
+            n,
+            bt,
+        )?;
+
+        // DPLR（batch 版：每 slot 独立 T 循环，lens 截断 padding）。
+        // 注意 k/a 参数是 fuse_ka 的融合输出 k_mod/kk_l2（与单序列版一致），
+        // 而非原始 sb.k/sb.a——曾误传原始值导致状态污染（采样出越界 token）。
+        self.backend.dplr_seq_batch(
+            state.layers[i].tmix_rnn,
+            sb.r,
+            sb.w,
+            sb.k_mod,
+            sb.v,
+            sb.kk_l2,
+            sb.b_vec,
+            sb.y,
+            lens,
+            self.config.n_head,
+            n,
+            t_pad,
+            c,
+            batch,
+        )?;
+
+        // y_norm = group_norm(y) + sum(r*k_mod*r_k)*v
+        self.backend.norm(
+            sb.y,
+            layer.ln_x_w,
+            layer.ln_x_b,
+            sb.y_norm,
+            n,
+            self.config.n_head,
+            GN_EPS,
+            bt,
+        )?;
+        self.backend.sum_rk_rk(
+            sb.r,
+            sb.k_mod,
+            layer.r_k,
+            sb.v,
+            sb.y_norm,
+            self.config.n_head,
+            n,
+            bt,
+        )?;
+
+        // g 链：sigmoid(xg@g1)@g2
+        self.backend
+            .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_pad, ggp, c)?;
+        self.backend
+            .elementwise_sigmoid_inplace(sb.g_mid, ggp, bt)?;
+        self.backend
+            .to_f16(sb.g_mid, sb.g_mid16, ggp, bt, m_pad, ggp, ggp)?;
+        self.backend
+            .gemm(sb.g_mid16, layer.g2_16, sb.g, m_pad, c, ggp)?;
+
+        // y_g = y_norm * g；y_out = GEMM(output_w, y_g) + x
+        self.backend
+            .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, bt)?;
+        if let Some(a8) = &layer.att_output_a8 {
+            self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
+            self.backend.dequant_int8_to_f16(a8, sb.w_scratch, c, c)?;
+            self.backend
+                .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
+        } else {
+            self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
+            self.backend.gemm_add(
+                sb.y_g16,
+                *layer.output_w16.as_ref().ok_or("output_w16 missing")?,
+                sb.x,
+                sb.y_out,
+                m_pad,
+                c,
+                c,
+            )?;
+        }
+        std::mem::swap(&mut sb.x, &mut sb.y_out);
+
+        // ===== Channel Mixing =====
+        self.backend
+            .norm(sb.x, layer.ln2_w, layer.ln2_b, sb.ln2, c, 1, LN_EPS, bt)?;
+        self.backend.seq_shift_batch(
+            sb.ln2,
+            state.layers[i].cmix_x,
+            layer.ffn_x_k,
+            sb.xb,
+            c,
+            t_pad,
+            c,
+            c,
+            batch,
+        )?;
+        self.backend
+            .copy_token_batch(sb.ln2, state.layers[i].cmix_x, lens, c, t_pad, batch)?;
+
+        // FFN key/value（token 并行 GEMM）
+        if let Some(fka8) = &layer.ffn_key_a8 {
+            self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
+            self.backend
+                .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
+            self.backend
+                .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
+        } else {
+            self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
+            let fk16 = layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?;
+            self.backend
+                .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
+        }
+        if let Some(fva8) = &layer.ffn_value_a8 {
+            self.backend
+                .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            self.backend
+                .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
+            self.backend
+                .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
+        } else {
+            self.backend
+                .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            let fv16 = layer
+                .ffn_value_w16
+                .as_ref()
+                .ok_or("ffn_value_w16 missing")?;
+            self.backend
+                .gemm_add(sb.r2_16, *fv16, sb.x, sb.v2, m_pad, c, fh)?;
+        }
+        std::mem::swap(&mut sb.x, &mut sb.v2);
+
+        Ok(())
+    }
+
+    /// 获取 batch 工作缓冲（B 变化时重建；B>1 仅 CUDA）。返回零开销 Clone 副本。
+    fn batch_buffers(&mut self, batch: usize) -> R<WorkBuffers> {
+        if self.batch_bufs.as_ref().is_none_or(|(b, _)| *b != batch) {
+            if let Some((_, mut old)) = self.batch_bufs.take() {
+                old.free(self.backend.as_mut());
+            }
+            let bufs = WorkBuffers::new(
+                self.backend.as_mut(),
+                self.config.n_embd,
+                self.config.vocab,
+                &self.config,
+                batch,
+            )?;
+            self.batch_bufs = Some((batch, bufs));
+        }
+        Ok(self.batch_bufs.as_ref().unwrap().1.clone())
+    }
+
+    /// batch 版单层前向：全部 kernel 走 batch 变体（B slot 共享权重一次读）。
+    /// `bb` 为 [batch, ...] 布局的 batch 工作缓冲；`state` 为 batch State。
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_batch(
+        &mut self,
+        i: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+        batch: usize,
+        state: &mut State,
+        bb: &WorkBuffers,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
+        let (wm, am, vm, gm, fh) = (
+            self.config.w_mid,
+            self.config.a_mid,
+            self.config.v_mid,
+            self.config.g_mid,
+            self.config.ffn_hidden,
+        );
+        // ===== Time Mixing =====
+        self.backend.norm_lerp6_batch(
+            bb.x,
+            state.layers[i].tmix_x,
+            self.layers[i].ln1_w,
+            self.layers[i].ln1_b,
+            self.layers[i].x_r,
+            self.layers[i].x_w,
+            self.layers[i].x_k,
+            self.layers[i].x_v,
+            self.layers[i].x_a,
+            self.layers[i].x_g,
+            bb.xr,
+            bb.xw,
+            bb.xk,
+            bb.xv,
+            bb.xa,
+            bb.xg,
+            c,
+            LN_EPS,
+            batch,
+        )?;
+
+        // r/k/v + mid 融合 gemv（batch 版；fp16 权重模型暂不支持 batch 路径）。
+        if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
+            &self.layers[i].receptance_a8,
+            &self.layers[i].key_a8,
+            &self.layers[i].value_a8,
+        ) {
+            self.backend.gemv_int8_rkv_stage1_batch(
+                r_a8,
+                k_a8,
+                v_a8,
+                self.layers[i].v1,
+                self.layers[i].w1,
+                self.layers[i].a1,
+                self.layers[i].g1,
+                bb.xr,
+                bb.xk,
+                bb.xv,
+                bb.xw,
+                bb.xa,
+                bb.xg,
+                bb.r,
+                bb.k,
+                bb.v,
+                bb.v_mid,
+                bb.w_mid,
+                bb.a_mid,
+                bb.g_mid,
+                c,
+                vm,
+                wm,
+                am,
+                gm,
+                batch,
+            )?;
+        } else {
+            return Err("batch 并发路径要求 r/k/v 为 int8 量化权重（fp16 模型暂不支持）".into());
+        }
+
+        // v_first 跨层快照（[batch, C] 全量拷贝，len 自适应）。
+        if !state.v_first_set {
+            self.backend.copy_device_f16(bb.v, state.v_first)?;
+            state.v_first_set = true;
+        }
+
+        // 低秩链第二级 + fuse_ka_dplr_norm（batch 版）。
+        self.backend.gemv_lowrank_chain4_batch(
+            self.layers[i].w2,
+            self.layers[i].a2,
+            self.layers[i].v2,
+            self.layers[i].g2,
+            bb.w_mid,
+            bb.a_mid,
+            bb.v_mid,
+            bb.g_mid,
+            self.layers[i].w0,
+            self.layers[i].a0,
+            self.layers[i].v0,
+            self.scale_w,
+            state.v_first,
+            bb.w,
+            bb.a,
+            bb.v,
+            bb.g,
+            h * n,
+            wm,
+            am,
+            vm,
+            gm,
+            batch,
+        )?;
+        self.backend.fuse_ka_dplr_norm_batch(
+            state.layers[i].tmix_rnn,
+            bb.k,
+            self.layers[i].k_k,
+            bb.a,
+            self.layers[i].k_a,
+            bb.r,
+            bb.v,
+            bb.w,
+            self.layers[i].ln_x_w,
+            self.layers[i].ln_x_b,
+            self.layers[i].r_k,
+            bb.k_mod,
+            bb.y,
+            bb.y_norm,
+            h,
+            n,
+            EPS_L2,
+            GN_EPS,
+            batch,
+        )?;
+
+        // x += (y_norm .* g) @ output_w（gemv_variant 已支持 batch 维）。
+        if let Some(a8) = &self.layers[i].att_output_a8 {
+            self.backend
+                .gemv_int8_mul_add(a8, bb.y_norm, bb.g, bb.x, c, c, batch)?;
+        } else {
+            let w16 = *self.layers[i]
+                .output_w16
+                .as_ref()
+                .ok_or("output_w16 missing when not int8")?;
+            self.backend
+                .gemv_f16_mul_add(w16, bb.y_norm, bb.g, bb.x, c, c, batch)?;
+        }
+
+        // ===== Channel Mixing =====
+        self.backend.cmix_norm_lerp_batch(
+            bb.x,
+            state.layers[i].cmix_x,
+            self.layers[i].ln2_w,
+            self.layers[i].ln2_b,
+            self.layers[i].ffn_x_k,
+            bb.xb,
+            c,
+            LN_EPS,
+            batch,
+        )?;
+
+        // r2 = relu²(xb @ ffn_key.T)
+        if let Some(a8) = &self.layers[i].ffn_key_a8 {
+            self.backend
+                .gemv_int8_relu2(a8, bb.xb, bb.r2, fh, c, batch)?;
+        } else {
+            let w16 = *self.layers[i]
+                .ffn_key_w16
+                .as_ref()
+                .ok_or("ffn_key_w16 missing when not int8")?;
+            self.backend
+                .gemv_f16_relu2(w16, bb.xb, bb.r2, fh, c, batch)?;
+        }
+        // x += r2 @ ffn_value（优先稀疏 FFN；回退稠密 int8/fp16）。
+        let sparse_ok =
+            self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
+        let sparse_vt = if sparse_ok {
+            self.layers[i].ffn_value_tiled
+        } else {
+            None
+        };
+        if let Some(vt) = sparse_vt {
+            self.backend
+                .ffn_value_sparse_add_batch(vt, bb.r2, bb.x, c, fh, batch)?;
+        } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
+            self.backend.gemv_int8_add(a8, bb.r2, bb.x, c, fh, batch)?;
+        } else {
+            let w16 = *self.layers[i]
+                .ffn_value_w16
+                .as_ref()
+                .ok_or("ffn_value_w16 missing")?;
+            self.backend.gemv_f16_add(w16, bb.r2, bb.x, c, fh, batch)?;
+        }
+
+        Ok(())
+    }
+
+    /// batch 采样 self-loop 单步：gather_rows → 全部层 → ln_out+head → batch 采样
+    /// → batch record_token。供 CUDA graph 捕获/重放（kernel 序列固定，seed 经
+    /// sampler 缓冲逐轮异步更新）。
+    #[allow(clippy::too_many_arguments)]
+    fn sample_selfloop_step_batch(
+        &mut self,
+        state: &mut State,
+        batch: usize,
+        bb: &WorkBuffers,
+        temp: TensorId,
+        mask: TensorId,
+        counter: TensorId,
+        sampler: TensorId,
+        token_seq: TensorId,
+        seq_cnt: TensorId,
+        seq_stride: usize,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
+        let (c, h, ns, vocab) = (
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+            self.config.vocab,
+        );
+        state.v_first_set = false;
+        self.backend
+            .gather_rows_device_f16(self.emb_ln, bb.x, bb.current_token, c, batch)?;
+        for i in 0..self.config.n_layer {
+            self.forward_layer_batch(i, c, h, ns, batch, state, bb)?;
+        }
+        self.backend.norm(
+            bb.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            bb.x_norm,
+            c,
+            1,
+            LN_EPS,
+            batch,
+        )?;
+        // head：logits [batch, vocab]（gemv_int8_plain/gemv_f16 已支持 batch 维）。
+        if let Some(a8) = &self.head_a8 {
+            self.backend
+                .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
+        } else {
+            let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
+            self.backend
+                .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
+        }
+        // batch 采样（token 写回 current_token[b]，下一轮 gather 自动跟随）。
+        // hist = token_seq（[batch, n] 布局，前 round 个已生成 token 在各 slot 段首）。
+        self.backend.sample_into_host_seeded_batch(
+            bb.logits,
+            bb.current_token,
+            vocab,
+            temp,
+            mask,
+            counter,
+            sampler,
+            token_seq,
+            batch,
+        )?;
+        self.backend
+            .record_tokens(bb.current_token, token_seq, seq_cnt, seq_stride, batch)
+    }
+
+    /// batch 采样 self-loop：B 个 slot 在**同一 GpuModel/同一 batch State** 上并发
+    /// 生成各 n 个 token——一次读权重算 B 份（weight-bound 场景吞吐 ≈ ×B）。
+    /// CUDA graph 捕获一轮 batch 前向后逐轮重放，seed 经 pinned 宽行异步更新。
+    /// `seeds`：每 slot 首个 token（如 prompt 末 token）；返回 ticket 供 collect。
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_sample_selfloop_batch(
+        &mut self,
+        state: &mut State,
+        seeds: &[u32],
+        n: usize,
+        sp: &SamplerParams,
+    ) -> R<SelfloopTicket> {
+        let batch = seeds.len();
+        if state.batch() != batch {
+            return Err(format!(
+                "submit_sample_selfloop_batch: state batch {} != seeds {}",
+                state.batch(),
+                batch
+            )
+            .into());
+        }
+        let vocab = self.config.vocab;
+
+        // batch 工作缓冲（B 变化时重建）。
+        let bb = self.batch_buffers(batch)?;
+        // 采样临时缓冲：[batch, vocab] / [batch, 8] / [batch, n] / [batch]。
+        let temp = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::F32)?;
+        let mask = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::F32)?;
+        let counter = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::U32)?;
+        let sampler = self.backend.create_tensor(8 * batch, TensorDtype::F32)?;
+        let token_seq = self.backend.create_tensor(n * batch, TensorDtype::F32)?;
+        let seq_cnt = self.backend.create_tensor(batch, TensorDtype::F32)?;
+        self.backend.upload(token_seq, &vec![0.0; n * batch])?;
+        self.backend
+            .upload(seq_cnt, &vec![f32::from_bits(0); batch])?;
+
+        // 首轮 token：B 个 seed 写入 current_token [batch]（位模式）。
+        self.backend.upload(
+            self.bufs_current_token_of(&bb),
+            &seeds.iter().map(|s| f32::from_bits(*s)).collect::<Vec<_>>(),
+        )?;
+        // 预置 round 0 的 sampler（graph 捕获时 sample kernel 从 sampler 缓冲读参数）。
+        let mut sampler0 = Vec::with_capacity(batch * 8);
+        for &s in seeds {
+            sampler0.extend_from_slice(&[
+                sp.temperature,
+                f32::from_bits(sp.top_k),
+                sp.top_p,
+                f32::from_bits(s),
+                sp.repetition_penalty,
+                sp.frequency_penalty,
+                sp.presence_penalty,
+                f32::from_bits(0),
+            ]);
+        }
+        self.backend.upload(sampler, &sampler0)?;
+
+        self.backend.begin_batch()?;
+        if std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty()) {
+            // 调试路径：不捕获 graph，逐轮直接提交（sanitizer 逐 kernel 定位用）。
+            for round in 0..n {
+                state.v_first_set = false;
+                let seeds_r: Vec<u32> =
+                    seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
+                let mut data = Vec::with_capacity(batch * 8);
+                for &s in &seeds_r {
+                    data.extend_from_slice(&[
+                        sp.temperature,
+                        f32::from_bits(sp.top_k),
+                        sp.top_p,
+                        f32::from_bits(s),
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        f32::from_bits(round as u32),
+                    ]);
+                }
+                self.backend.upload(sampler, &data)?;
+                self.sample_selfloop_step_batch(
+                    state, batch, &bb, temp, mask, counter, sampler, token_seq, seq_cnt, n,
+                )?;
+            }
+        } else if self.backend.supports_graph_capture() {
+            let async_rows = self.backend.sampler_async_rows() / batch.max(1);
+            let use_async = n <= async_rows;
+            self.backend.begin_graph_capture()?;
+            self.sample_selfloop_step_batch(
+                state, batch, &bb, temp, mask, counter, sampler, token_seq, seq_cnt, n,
+            )?;
+            self.backend.end_graph_capture()?;
+            for round in 0..n {
+                state.v_first_set = false;
+                let seeds_r: Vec<u32> =
+                    seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
+                if use_async {
+                    self.backend.store_sampler_async_batch(
+                        sampler,
+                        round,
+                        sp.temperature,
+                        sp.top_k,
+                        sp.top_p,
+                        &seeds_r,
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        round as u32,
+                    )?;
+                } else {
+                    let mut data = Vec::with_capacity(batch * 8);
+                    for &s in &seeds_r {
+                        data.extend_from_slice(&[
+                            sp.temperature,
+                            f32::from_bits(sp.top_k),
+                            sp.top_p,
+                            f32::from_bits(s),
+                            sp.repetition_penalty,
+                            sp.frequency_penalty,
+                            sp.presence_penalty,
+                            f32::from_bits(round as u32),
+                        ]);
+                    }
+                    self.backend.upload(sampler, &data)?;
+                }
+                self.backend.graph_replay()?;
+            }
+        } else {
+            // Vulkan：无 graph 捕获——batch 路径本就要求 CUDA，此处仅为兜底。
+            return Err(
+                "submit_sample_selfloop_batch: 后端不支持 graph 捕获（batch 路径仅 CUDA）".into(),
+            );
+        }
+        self.backend.end_batch()?;
+        Ok(SelfloopTicket {
+            temp,
+            mask,
+            counter,
+            sampler,
+            token_seq,
+            seq_cnt,
+            n,
+        })
+    }
+
+    /// batch collect：下载 [batch, n] 序列并按 slot 切分，释放临时缓冲。
+    pub fn collect_sample_selfloop_batch(
+        &mut self,
+        ticket: SelfloopTicket,
+        batch: usize,
+    ) -> R<Vec<Vec<u32>>> {
+        let t = self.backend.download(ticket.token_seq)?;
+        let n = ticket.n;
+        self.backend.free_tensor(ticket.temp);
+        self.backend.free_tensor(ticket.mask);
+        self.backend.free_tensor(ticket.counter);
+        self.backend.free_tensor(ticket.sampler);
+        self.backend.free_tensor(ticket.token_seq);
+        self.backend.free_tensor(ticket.seq_cnt);
+        let mut out = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let seg = &t[b * n..b * n + n];
+            out.push(seg.iter().map(|x| x.to_bits()).collect());
+        }
+        Ok(out)
+    }
+
+    /// 取 batch 工作缓冲的 current_token（submit 时写 seeds 用）。
+    fn bufs_current_token_of(&self, bb: &WorkBuffers) -> TensorId {
+        bb.current_token
     }
 
     /// GPU self-loop 批量生成：在**单次 submit** 内连续采样 n 个 token。
@@ -2586,12 +3590,24 @@ impl GpuLayer {
 
 impl GpuState {
     fn new(backend: &mut dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<Self> {
-        let tmix_x = backend.create_tensor(c, TensorDtype::F32)?;
-        backend.upload(tmix_x, &vec![0.0; c])?;
-        let tmix_rnn = backend.create_tensor(h * n * n, TensorDtype::F32)?;
-        backend.upload(tmix_rnn, &vec![0.0; h * n * n])?;
-        let cmix_x = backend.create_tensor(c, TensorDtype::F32)?;
-        backend.upload(cmix_x, &vec![0.0; c])?;
+        Self::new_batched(backend, c, h, n, 1)
+    }
+
+    /// batch 版：每张量为 [batch, ...]（slot 主序）。
+    fn new_batched(
+        backend: &mut dyn ComputeBackend,
+        c: usize,
+        h: usize,
+        n: usize,
+        batch: usize,
+    ) -> R<Self> {
+        let bsz = batch.max(1);
+        let tmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
+        backend.upload(tmix_x, &vec![0.0; c * bsz])?;
+        let tmix_rnn = backend.create_tensor(h * n * n * bsz, TensorDtype::F32)?;
+        backend.upload(tmix_rnn, &vec![0.0; h * n * n * bsz])?;
+        let cmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
+        backend.upload(cmix_x, &vec![0.0; c * bsz])?;
         Ok(Self {
             tmix_x,
             tmix_rnn,
@@ -2600,10 +3616,17 @@ impl GpuState {
     }
 
     /// 重置 RNN 状态为零（用于多次独立 forward）
-    fn reset(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<()> {
-        backend.upload(self.tmix_x, &vec![0.0; c])?;
-        backend.upload(self.tmix_rnn, &vec![0.0; h * n * n])?;
-        backend.upload(self.cmix_x, &vec![0.0; c])?;
+    fn reset(
+        &self,
+        backend: &dyn ComputeBackend,
+        c: usize,
+        h: usize,
+        n: usize,
+        batch: usize,
+    ) -> R<()> {
+        backend.upload(self.tmix_x, &vec![0.0; c * batch])?;
+        backend.upload(self.tmix_rnn, &vec![0.0; h * n * n * batch])?;
+        backend.upload(self.cmix_x, &vec![0.0; c * batch])?;
         Ok(())
     }
 }
@@ -2851,10 +3874,12 @@ pub struct State {
     layers: Vec<GpuState>,
     v_first: TensorId,
     v_first_set: bool,
+    /// batch 并发布局（batch > 1 时张量为 [batch, ...]；1 = 单序列）。
+    batch: usize,
 }
 
 impl State {
-    /// 创建零初始化的状态。
+    /// 创建零初始化的状态（单序列）。
     pub fn new(
         backend: &mut dyn ComputeBackend,
         c: usize,
@@ -2862,28 +3887,58 @@ impl State {
         n: usize,
         n_layer: usize,
     ) -> R<Self> {
+        Self::new_batched(backend, c, h, n, n_layer, 1)
+    }
+
+    /// 创建零初始化的 batch 状态：每层张量为 [batch, C] / [batch, H, N, N]，
+    /// v_first 为 [batch, C]（slot 主序；单序列 batch=1 与 `new` 等价）。
+    pub fn new_batched(
+        backend: &mut dyn ComputeBackend,
+        c: usize,
+        h: usize,
+        n: usize,
+        n_layer: usize,
+        batch: usize,
+    ) -> R<Self> {
+        let bsz = batch.max(1);
         let mut layers = Vec::with_capacity(n_layer);
         for _ in 0..n_layer {
-            layers.push(GpuState::new(backend, c, h, n)?);
+            layers.push(GpuState::new_batched(backend, c, h, n, bsz)?);
         }
-        let v_first = backend.create_tensor(c, TensorDtype::F16)?;
-        backend.upload(v_first, &vec![0.0; c])?;
+        let v_first = backend.create_tensor(c * bsz, TensorDtype::F16)?;
+        backend.upload(v_first, &vec![0.0; c * bsz])?;
         Ok(Self {
             layers,
             v_first,
             v_first_set: false,
+            batch: bsz,
         })
     }
 
+    /// 该状态的 batch 数（1 = 单序列）。
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
     /// 把整态下载到 CPU 为连续 `Vec<f32>`（布局见 `load`）。
+    /// batch>1 时返回 [batch] 份单序列布局顺序拼接（slot 主序）。
     pub fn back(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<Vec<f32>> {
-        let mut out = Vec::with_capacity(self.layers.len() * (c + h * n * n + c) + c);
-        for s in &self.layers {
-            out.extend_from_slice(&backend.download(s.tmix_x)?);
-            out.extend_from_slice(&backend.download(s.tmix_rnn)?);
-            out.extend_from_slice(&backend.download(s.cmix_x)?);
+        let per_layer = c + h * n * n + c;
+        let mut out = Vec::with_capacity(self.batch * (self.layers.len() * per_layer + c));
+        for b in 0..self.batch {
+            let off_x = b * c;
+            let off_rnn = b * h * n * n;
+            for s in &self.layers {
+                let x = backend.download(s.tmix_x)?;
+                out.extend_from_slice(&x[off_x..off_x + c]);
+                let rnn = backend.download(s.tmix_rnn)?;
+                out.extend_from_slice(&rnn[off_rnn..off_rnn + h * n * n]);
+                let cx = backend.download(s.cmix_x)?;
+                out.extend_from_slice(&cx[off_x..off_x + c]);
+            }
+            let vf = backend.download(self.v_first)?;
+            out.extend_from_slice(&vf[b * c..b * c + c]);
         }
-        out.extend_from_slice(&backend.download(self.v_first)?);
         Ok(out)
     }
 
@@ -2897,50 +3952,137 @@ impl State {
         n: usize,
     ) -> R<()> {
         let per = c + h * n * n + c;
-        let expect = self.layers.len() * per + c;
+        let expect = self.batch * (self.layers.len() * per + c);
         if data.len() != expect {
             return Err(format!("State::load 长度不符: 得 {} 期望 {expect}", data.len()).into());
         }
+        if self.batch == 1 {
+            // 单序列：整段覆盖上传（Vulkan/CUDA 通用线上路径）。
+            let mut pos = 0usize;
+            for s in &self.layers {
+                backend.upload(s.tmix_x, &data[pos..pos + c])?;
+                pos += c;
+                backend.upload(s.tmix_rnn, &data[pos..pos + h * n * n])?;
+                pos += h * n * n;
+                backend.upload(s.cmix_x, &data[pos..pos + c])?;
+                pos += c;
+            }
+            backend.upload(self.v_first, &data[pos..pos + c])?;
+            return Ok(());
+        }
+        // batch：逐 slot 段上传（仅 CUDA 支持 upload_part）。
         let mut pos = 0usize;
-        for s in &self.layers {
-            backend.upload(s.tmix_x, &data[pos..pos + c])?;
-            pos += c;
-            backend.upload(s.tmix_rnn, &data[pos..pos + h * n * n])?;
-            pos += h * n * n;
-            backend.upload(s.cmix_x, &data[pos..pos + c])?;
+        for b in 0..self.batch {
+            for s in &self.layers {
+                backend.upload_part(s.tmix_x, b * c, &data[pos..pos + c])?;
+                pos += c;
+                backend.upload_part(s.tmix_rnn, b * h * n * n, &data[pos..pos + h * n * n])?;
+                pos += h * n * n;
+                backend.upload_part(s.cmix_x, b * c, &data[pos..pos + c])?;
+                pos += c;
+            }
+            backend.upload_part(self.v_first, b * c, &data[pos..pos + c])?;
             pos += c;
         }
-        backend.upload(self.v_first, &data[pos..pos + c])?;
+        Ok(())
+    }
+
+    /// 单 slot 状态下载（batch 布局）：返回该 slot 的单序列布局数据。
+    pub fn slot_back(
+        &self,
+        backend: &dyn ComputeBackend,
+        slot: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<Vec<f32>> {
+        if slot >= self.batch {
+            return Err(format!("slot_back: slot {slot} >= batch {}", self.batch).into());
+        }
+        let per_layer = c + h * n * n + c;
+        let mut out = Vec::with_capacity(self.layers.len() * per_layer + c);
+        for s in &self.layers {
+            let x = backend.download(s.tmix_x)?;
+            out.extend_from_slice(&x[slot * c..slot * c + c]);
+            let rnn = backend.download(s.tmix_rnn)?;
+            out.extend_from_slice(&rnn[slot * h * n * n..slot * h * n * n + h * n * n]);
+            let cx = backend.download(s.cmix_x)?;
+            out.extend_from_slice(&cx[slot * c..slot * c + c]);
+        }
+        let vf = backend.download(self.v_first)?;
+        out.extend_from_slice(&vf[slot * c..slot * c + c]);
+        Ok(out)
+    }
+
+    /// 单 slot 状态回灌（batch 布局）：把单序列布局数据写入指定 slot 段。
+    pub fn slot_load(
+        &self,
+        backend: &dyn ComputeBackend,
+        slot: usize,
+        data: &[f32],
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if slot >= self.batch {
+            return Err(format!("slot_load: slot {slot} >= batch {}", self.batch).into());
+        }
+        let per = c + h * n * n + c;
+        let expect = self.layers.len() * per + c;
+        if data.len() != expect {
+            return Err(
+                format!("State::slot_load 长度不符: 得 {} 期望 {expect}", data.len()).into(),
+            );
+        }
+        let mut pos = 0usize;
+        for s in &self.layers {
+            backend.upload_part(s.tmix_x, slot * c, &data[pos..pos + c])?;
+            pos += c;
+            backend.upload_part(s.tmix_rnn, slot * h * n * n, &data[pos..pos + h * n * n])?;
+            pos += h * n * n;
+            backend.upload_part(s.cmix_x, slot * c, &data[pos..pos + c])?;
+            pos += c;
+        }
+        backend.upload_part(self.v_first, slot * c, &data[pos..pos + c])?;
         Ok(())
     }
 
     /// 清零全部状态（含 v_first 缓冲）。
     pub fn reset(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<()> {
         for s in &self.layers {
-            s.reset(backend, c, h, n)?;
+            s.reset(backend, c, h, n, self.batch)?;
         }
-        backend.upload(self.v_first, &vec![0.0; c])?;
+        backend.upload(self.v_first, &vec![0.0; c * self.batch])?;
         Ok(())
     }
 }
 
 impl WorkBuffers {
-    fn new(backend: &mut dyn ComputeBackend, c: usize, vocab: usize, cfg: &ModelConfig) -> R<Self> {
-        // 创建 C 大小的 buffer 并初始化为 0
+    /// 创建 decode 工作缓冲。`batch`：单序列路径传 1；batch 并发路径传 B
+    ///（所有 per-slot 缓冲为 [batch, ...] 布局，kernel 一次读权重算 B 份）。
+    fn new(
+        backend: &mut dyn ComputeBackend,
+        c: usize,
+        vocab: usize,
+        cfg: &ModelConfig,
+        batch: usize,
+    ) -> R<Self> {
+        let bsz = batch.max(1);
+        // 创建 C 大小的 buffer 并初始化为 0（×batch）
         let mk_c = |b: &mut dyn ComputeBackend| -> R<TensorId> {
-            let t = b.create_tensor(c, TensorDtype::F32)?;
-            b.upload(t, &vec![0.0; c])?;
+            let t = b.create_tensor(c * bsz, TensorDtype::F32)?;
+            b.upload(t, &vec![0.0; c * bsz])?;
             Ok(t)
         };
         let mk = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
-            let t = b.create_tensor(len, TensorDtype::F32)?;
-            b.upload(t, &vec![0.0; len])?;
+            let t = b.create_tensor(len * bsz, TensorDtype::F32)?;
+            b.upload(t, &vec![0.0; len * bsz])?;
             Ok(t)
         };
         // fp16 零缓冲（w/a/g/v 输出，链第二级下游以 fp16 读取减半带宽）
         let mk_c16 = |b: &mut dyn ComputeBackend| -> R<TensorId> {
-            let t = b.create_tensor(c, TensorDtype::F16)?;
-            b.upload(t, &vec![0.0f32; c])?;
+            let t = b.create_tensor(c * bsz, TensorDtype::F16)?;
+            b.upload(t, &vec![0.0f32; c * bsz])?;
             Ok(t)
         };
 
@@ -2988,6 +4130,55 @@ impl WorkBuffers {
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,
         })
+    }
+
+    /// 释放全部工作缓冲的设备内存（batch 变化重建时调用，防泄漏）。
+    fn free(&mut self, backend: &mut dyn ComputeBackend) {
+        for t in [
+            self.x,
+            self.ln1,
+            self.xr,
+            self.xw,
+            self.xk,
+            self.xv,
+            self.xa,
+            self.xg,
+            self.prev_x,
+            self.r,
+            self.k,
+            self.v,
+            self.v_full,
+            self.gate,
+            self.w_full,
+            self.w_sig,
+            self.w,
+            self.a_full,
+            self.a,
+            self.kk_l2,
+            self.k_mod,
+            self.b_vec,
+            self.y,
+            self.y_norm,
+            self.g,
+            self.y_g,
+            self.y_out,
+            self.ln2,
+            self.prev_c,
+            self.xb,
+            self.v2,
+            self.x_norm,
+            self.tmp_c,
+            self.v_mid,
+            self.w_mid,
+            self.a_mid,
+            self.g_mid,
+            self.r2,
+            self.logits,
+            self.token_argmax,
+            self.current_token,
+        ] {
+            backend.free_tensor(t);
+        }
     }
 }
 

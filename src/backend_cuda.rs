@@ -54,8 +54,10 @@ type FnCuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> CuResult;
 type FnCuDeviceComputeCapability = unsafe extern "C" fn(*mut c_int, *mut c_int, c_int) -> CuResult;
 type FnCuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
 type FnCuMemFree = unsafe extern "C" fn(u64) -> CuResult;
-type FnCuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> CuResult;
 type FnCuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> CuResult;
+type FnCuMemcpyHtoDAsync = unsafe extern "C" fn(u64, *const c_void, usize, CuStream) -> CuResult;
+type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CuResult;
+type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CuResult;
 type FnCuModuleLoadDataEx = unsafe extern "C" fn(
     *mut CuModule,
     *const c_void,
@@ -134,8 +136,10 @@ struct CudaDriver {
     cu_device_compute_capability: FnCuDeviceComputeCapability,
     cu_mem_alloc_v2: FnCuMemAlloc,
     cu_mem_free_v2: FnCuMemFree,
-    cu_memcpy_htod_v2: FnCuMemcpyHtoD,
     cu_memcpy_dtoh_v2: FnCuMemcpyDtoH,
+    cu_memcpy_htod_async: FnCuMemcpyHtoDAsync,
+    cu_mem_host_alloc: FnCuMemHostAlloc,
+    cu_mem_free_host: FnCuMemFreeHost,
     cu_module_load_data_ex: FnCuModuleLoadDataEx,
     cu_module_get_function: FnCuModuleGetFunction,
     cu_launch_kernel: FnCuLaunchKernel,
@@ -256,18 +260,32 @@ impl CudaDriver {
             unsafe { sym(&lib, "cuMemAlloc", &[b"cuMemAlloc_v2\0", b"cuMemAlloc\0"])? };
         let cu_mem_free_v2 =
             unsafe { sym(&lib, "cuMemFree", &[b"cuMemFree_v2\0", b"cuMemFree\0"])? };
-        let cu_memcpy_htod_v2 = unsafe {
-            sym(
-                &lib,
-                "cuMemcpyHtoD",
-                &[b"cuMemcpyHtoD_v2\0", b"cuMemcpyHtoD\0"],
-            )?
-        };
         let cu_memcpy_dtoh_v2 = unsafe {
             sym(
                 &lib,
                 "cuMemcpyDtoH",
                 &[b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"],
+            )?
+        };
+        let cu_memcpy_htod_async = unsafe {
+            sym(
+                &lib,
+                "cuMemcpyHtoDAsync",
+                &[b"cuMemcpyHtoDAsync_v2\0", b"cuMemcpyHtoDAsync\0"],
+            )?
+        };
+        let cu_mem_host_alloc = unsafe {
+            sym(
+                &lib,
+                "cuMemHostAlloc",
+                &[b"cuMemHostAlloc\0", b"cuMemHostAlloc_v2\0"],
+            )?
+        };
+        let cu_mem_free_host = unsafe {
+            sym(
+                &lib,
+                "cuMemFreeHost",
+                &[b"cuMemFreeHost\0", b"cuMemFreeHost_v2\0"],
             )?
         };
         let cu_module_load_data_ex =
@@ -351,8 +369,10 @@ impl CudaDriver {
             cu_device_compute_capability,
             cu_mem_alloc_v2,
             cu_mem_free_v2,
-            cu_memcpy_htod_v2,
             cu_memcpy_dtoh_v2,
+            cu_memcpy_htod_async,
+            cu_mem_host_alloc,
+            cu_mem_free_host,
             cu_module_load_data_ex,
             cu_module_get_function,
             cu_launch_kernel,
@@ -899,10 +919,24 @@ pub struct CudaBackend {
     /// 会互相竞争导致内核结果错乱。后端存活期间持有锁，`Drop` 时释放，天然串行化。
     #[allow(dead_code)]
     _ctx_lock: MutexGuard<'static, ()>,
+    /// pinned host 暂存区（sampler 异步行 + 小上传 scratch）。
+    pinned: *mut c_void,
+    /// pinned 暂存区总行数（固定 PINNED_ROWS；batch 宽行时按 batch 分组）。
+    pinned_rows: usize,
+    /// 从其它后端导入的张量（`import_tensors_from` 权重共享）：Drop 时不释放。
+    foreign: std::collections::HashSet<TensorId>,
 }
 
 /// 全局 CUDA 上下文锁：同一时刻仅一个 `CudaBackend` 访问 primary context。
 static CUDA_CTX_LOCK: Mutex<()> = Mutex::new(());
+
+/// pinned 暂存区单行字节数（sampler 参数行 = 8 个 f32）。
+const PINNED_ROW_BYTES: usize = 32;
+/// pinned 暂存区行数（async sampler 路径的上限：selfloop n ≤ 行数）。
+const PINNED_ROWS: usize = 8192;
+/// pinned 上传 scratch 大小（≤ 此大小的同步上传走常驻 pinned scratch，避免
+/// pageable 源在多线程并发 `cuMemcpyHtoDAsync` 时踩踏驱动内部共享 staging）。
+const PINNED_UPLOAD_SCRATCH: usize = 64 * 1024 * 1024;
 
 impl CudaBackend {
     /// 创建 CUDA 后端：初始化驱动、取首个设备、保留主上下文。
@@ -942,6 +976,13 @@ impl CudaBackend {
             "cuEventCreate"
         );
         cu_check!((drv.cu_event_create)(&mut gemm_ev_end, 0), "cuEventCreate");
+        // pinned host 暂存区：前 PINNED_ROWS 行作 sampler 异步参数行，尾部作上传 scratch。
+        let pinned_bytes = PINNED_ROWS * PINNED_ROW_BYTES + PINNED_UPLOAD_SCRATCH;
+        let mut pinned: *mut c_void = std::ptr::null_mut();
+        cu_check!(
+            (drv.cu_mem_host_alloc)(&mut pinned, pinned_bytes, 0),
+            "cuMemHostAlloc(pinned)"
+        );
         let prof_gpu = std::env::var("PROF_CUDA_GPU").is_ok();
         let gemm_prof = std::env::var("PROF_GEMM").is_ok();
         // per-kernel profiling（诊断用）：需要可变的 drv 引用来启用。
@@ -992,6 +1033,9 @@ impl CudaBackend {
             prefill_t: 0,
             cublas,
             _ctx_lock,
+            pinned,
+            pinned_rows: PINNED_ROWS,
+            foreign: std::collections::HashSet::new(),
         })
     }
 
@@ -1017,32 +1061,78 @@ impl CudaBackend {
 
     /// 部分上传：只拷贝前置 `n` 个元素（每元素 4 字节），device 其余部分不动。
     /// 对齐 Vulkan 的 `host.copy_from(data, 0)` 语义（允许 data.len() <= 张量 len）。
+    ///
+    /// 上传源必须为 pinned：pageable 源的 cuMemcpyHtoDAsync 走驱动内部**共享
+    /// staging 缓冲**，多线程并发上传互相践踏；同步 cuMemcpyHtoD 则与非阻塞
+    /// stream 无顺序关系（kernel 可能先于 DMA 启动）。≤ scratch 的上传用常驻
+    /// pinned scratch；更大的上传临时分配 pinned（一次性权重加载）。拷贝以流序
+    /// 异步挂到本 stream，前后同步保证：先序于后续 kernel、完成后才返回
+    ///（pageable 源可释放、scratch 可复用）。
     fn memcpy_htod_n(&self, dptr: u64, data: &[u8], n: usize) -> R<()> {
-        // 同步 stream：确保此前排队的 kernel 完成，避免同步拷贝读到半新半旧数据。
+        let bytes = n * 4;
+        assert!(bytes <= data.len(), "memcpy_htod_n: n 超出 data");
         cu_check!(
             (self.drv.cu_stream_synchronize)(self.stream),
             "cuStreamSynchronize(htod)"
         );
-        let bytes = n * 4;
-        assert!(bytes <= data.len(), "memcpy_htod_n: n 超出 data");
-        cu_check!(
-            (self.drv.cu_memcpy_htod_v2)(dptr, data.as_ptr() as *const c_void, bytes),
-            "cuMemcpyHtoD"
-        );
-        Ok(())
+        self.htod_pinned(dptr, data, bytes)
     }
 
     /// 部分上传（fp16）：只拷贝前置 `n` 个元素（每元素 2 字节），device 其余部分不动。
+    /// 语义同 memcpy_htod_n（pinned 源 + 流序异步 + 前后同步）。
     fn memcpy_htod_n2(&self, dptr: u64, data: &[u8], n: usize) -> R<()> {
+        let bytes = n * 2;
+        assert!(bytes <= data.len(), "memcpy_htod_n2: n 超出 data");
         cu_check!(
             (self.drv.cu_stream_synchronize)(self.stream),
             "cuStreamSynchronize(htod2)"
         );
-        let bytes = n * 2;
-        assert!(bytes <= data.len(), "memcpy_htod_n2: n 超出 data");
+        self.htod_pinned(dptr, data, bytes)
+    }
+
+    /// pinned 源流序上传 + 完成同步（调用前须已排空本 stream）。
+    fn htod_pinned(&self, dptr: u64, data: &[u8], bytes: usize) -> R<()> {
+        let scratch_off = PINNED_ROWS * PINNED_ROW_BYTES;
+        if bytes <= PINNED_UPLOAD_SCRATCH {
+            // 常驻 scratch：host 拷入 → 流序异步 DMA → 同步完成（scratch 可复用）。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.pinned as *mut u8).add(scratch_off),
+                    bytes,
+                );
+            }
+            let src = unsafe { (self.pinned as *const u8).add(scratch_off) };
+            cu_check!(
+                (self.drv.cu_memcpy_htod_async)(dptr, src as *const c_void, bytes, self.stream),
+                "cuMemcpyHtoDAsync(scratch)"
+            );
+        } else {
+            // 大上传（权重加载）：临时 pinned 分配，完成后释放。
+            let mut tmp: *mut c_void = std::ptr::null_mut();
+            cu_check!(
+                (self.drv.cu_mem_host_alloc)(&mut tmp, bytes, 0),
+                "cuMemHostAlloc(htod tmp)"
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), tmp as *mut u8, bytes);
+            }
+            cu_check!(
+                (self.drv.cu_memcpy_htod_async)(dptr, tmp as *const c_void, bytes, self.stream),
+                "cuMemcpyHtoDAsync(tmp pinned)"
+            );
+            cu_check!(
+                (self.drv.cu_stream_synchronize)(self.stream),
+                "cuStreamSynchronize(htod tmp-wait)"
+            );
+            unsafe {
+                (self.drv.cu_mem_free_host)(tmp);
+            }
+            return Ok(());
+        }
         cu_check!(
-            (self.drv.cu_memcpy_htod_v2)(dptr, data.as_ptr() as *const c_void, bytes),
-            "cuMemcpyHtoD"
+            (self.drv.cu_stream_synchronize)(self.stream),
+            "cuStreamSynchronize(htod-wait)"
         );
         Ok(())
     }
@@ -1093,6 +1183,8 @@ impl CudaBackend {
 
     /// 统一调度 gemv_variant kernel（wtype/op 见 GEMV_VARIANT_SRC）。
     /// 传入已解析的设备指针；未用指针传 0。
+    /// batch>1 时走 `gemv_variant_mb`（权重复用版：每 block 读一次权重算
+    /// BGRP 个 slot，带宽 ≈ 1/ceil(B/BGRP)——信天翁 rows 模型）；batch==1 走原版。
     #[allow(clippy::too_many_arguments)]
     fn gemv_variant_dispatch(
         &mut self,
@@ -1109,8 +1201,17 @@ impl CudaBackend {
         wtype: i32,
         op: i32,
     ) -> R<()> {
-        let func = self.kernel("gemv_variant", GEMV_VARIANT_SRC, "gemv_variant")?;
-        let grid = ((m / 4) as u32, batch as u32, 1u32);
+        let (func, grid) = if batch > 1 {
+            const GEMV_MB_BGRP: usize = 4;
+            let func = self.kernel("gemv_variant_mb", GEMV_VARIANT_MB_SRC, "gemv_variant_mb")?;
+            (
+                func,
+                ((m / 4) as u32, batch.div_ceil(GEMV_MB_BGRP) as u32, 1u32),
+            )
+        } else {
+            let func = self.kernel("gemv_variant", GEMV_VARIANT_SRC, "gemv_variant")?;
+            (func, ((m / 4) as u32, 1u32, 1u32))
+        };
         let block = (128u32, 1u32, 1u32);
         let m_i = m as i32;
         let k_i = k as i32;
@@ -1269,7 +1370,11 @@ impl CudaBackend {
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
-        for v in self.tensors.values() {
+        for (id, v) in self.tensors.iter() {
+            // 导入的共享权重张量（build_shared 权重共享）不释放：归源实例所有。
+            if self.foreign.contains(id) {
+                continue;
+            }
             let dptr = match v {
                 CudaTensor::F32 { dptr, .. }
                 | CudaTensor::F16 { dptr, .. }
@@ -1300,6 +1405,9 @@ impl Drop for CudaBackend {
             (self.drv.cu_event_destroy)(self.gemm_prof_ev_start);
             (self.drv.cu_event_destroy)(self.gemm_prof_ev_end);
             (self.drv.cu_stream_destroy)(self.stream);
+            if !self.pinned.is_null() {
+                (self.drv.cu_mem_free_host)(self.pinned);
+            }
         }
         unsafe {
             (self.drv.cu_primary_ctx_release)(self.device);
@@ -1386,6 +1494,911 @@ extern "C" __global__ void gemv_f16(
             if (row0 + r < m) y[m0 + row0 + r] = sum;
         }
     }
+}
+"#;
+
+// ==== batch 并发 kernel（单实例多序列：B slot 共享权重，一次读权重算 B 份）====
+
+/// norm_lerp6 batch CUDA kernel：x/state/or_..og 为 [batch, C]（slot 主序）；
+/// gamma/beta 与 **xr..xg（lerp 系数，共享权重）** 跨 slot 共享 [C]——无 slot 偏移。
+/// dispatch (ceil(c/BLOCK), batch, 1)：grid.y = slot id。
+const NORM_LERP6_BATCH_SRC: &str = r#"
+extern "C" __global__ void norm_lerp6_batch(
+    const float* __restrict__ x,
+    float* __restrict__ state,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ xr,
+    const float* __restrict__ xw,
+    const float* __restrict__ xk,
+    const float* __restrict__ xv,
+    const float* __restrict__ xa,
+    const float* __restrict__ xg,
+    float* __restrict__ or_,
+    float* __restrict__ ow,
+    float* __restrict__ ok,
+    float* __restrict__ ov,
+    float* __restrict__ oa,
+    float* __restrict__ og,
+    const int c,
+    const float eps)
+{
+    __shared__ float s_val[32];
+    __shared__ float s_sq[32];
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nw   = (blockDim.x + 31) >> 5;
+    const int gx   = blockIdx.x;
+    const int off  = blockIdx.y * c;   // slot 基址
+
+    float sum = 0.f;
+    float sq  = 0.f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float v = x[off + i];
+        sum += v;
+        sq = fmaf(v, v, sq);
+    }
+    #pragma unroll
+    for (int off_ = 16; off_ > 0; off_ >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off_);
+        sq  += __shfl_down_sync(0xffffffffu, sq, off_);
+    }
+    if (lane == 0) { s_val[warp] = sum; s_sq[warp] = sq; }
+    __syncthreads();
+    if (tid == 0) {
+        float tsum = 0.f;
+        float tsq  = 0.f;
+        for (int w = 0; w < nw; ++w) { tsum += s_val[w]; tsq += s_sq[w]; }
+        const float mean = tsum / (float)c;
+        const float variance = tsq / (float)c - mean * mean;
+        s_val[0] = mean;
+        s_sq[0]  = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+    const float mean    = s_val[0];
+    const float inv_std = s_sq[0];
+
+    const int start = gx * blockDim.x;
+    const int end   = min(start + blockDim.x, c);
+    #pragma unroll 4
+    for (int i = start + tid; i < end; i += blockDim.x) {
+        const float val  = x[off + i];
+        const float ln1  = (val - mean) * inv_std * gamma[i] + beta[i];
+        const float prev = state[off + i];
+        or_[off + i] = ln1 + xr[i] * (prev - ln1);
+        ow[off + i]  = ln1 + xw[i] * (prev - ln1);
+        ok[off + i]  = ln1 + xk[i] * (prev - ln1);
+        ov[off + i]  = ln1 + xv[i] * (prev - ln1);
+        oa[off + i]  = ln1 + xa[i] * (prev - ln1);
+        og[off + i]  = ln1 + xg[i] * (prev - ln1);
+        state[off + i] = ln1;
+    }
+}
+"#;
+
+/// cmix_norm_lerp batch CUDA kernel：x/state/out_xb 为 [batch, C]，gamma/beta/coeff 共享。
+/// dispatch (ceil(c/BLOCK), batch, 1)。
+const CMIX_NORM_LERP_BATCH_SRC: &str = r#"
+extern "C" __global__ void cmix_norm_lerp_batch(
+    const float* __restrict__ x,
+    float* __restrict__ state,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ coeff,
+    float* __restrict__ out_xb,
+    const int c,
+    const float eps)
+{
+    __shared__ float s_val[32];
+    __shared__ float s_sq[32];
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nw   = (blockDim.x + 31) >> 5;
+    const int gx   = blockIdx.x;
+    const int off  = blockIdx.y * c;
+
+    float sum = 0.f;
+    float sq  = 0.f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float v = x[off + i];
+        sum += v;
+        sq = fmaf(v, v, sq);
+    }
+    #pragma unroll
+    for (int off_ = 16; off_ > 0; off_ >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off_);
+        sq  += __shfl_down_sync(0xffffffffu, sq, off_);
+    }
+    if (lane == 0) { s_val[warp] = sum; s_sq[warp] = sq; }
+    __syncthreads();
+    if (tid == 0) {
+        float tsum = 0.f;
+        float tsq  = 0.f;
+        for (int w = 0; w < nw; ++w) { tsum += s_val[w]; tsq += s_sq[w]; }
+        const float mean = tsum / (float)c;
+        const float variance = tsq / (float)c - mean * mean;
+        s_val[0] = mean;
+        s_sq[0]  = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+    const float mean    = s_val[0];
+    const float inv_std = s_sq[0];
+
+    const int start = gx * blockDim.x;
+    const int end   = min(start + blockDim.x, c);
+    #pragma unroll 4
+    for (int i = start + tid; i < end; i += blockDim.x) {
+        const float val  = x[off + i];
+        const float ln2  = (val - mean) * inv_std * gamma[i] + beta[i];
+        const float prev = state[off + i];
+        out_xb[off + i] = ln2 + coeff[i] * (prev - ln2);
+        state[off + i] = ln2;
+    }
+}
+"#;
+
+/// gather_rows_f16 batch CUDA kernel：按 tok[b] 各取一行 → dst[b*C + i]（f32）。
+/// dispatch (ceil(C/256), batch, 1)。
+const GATHER_ROWS_F16_SRC: &str = r#"
+extern "C" __global__ void rwkv_gather_rows_f16(
+    const unsigned int* __restrict__ in_tok,  // [batch] token 索引（f32 位模式）
+    const __half*  __restrict__ in_src,       // [VOCAB, C] fp16
+    float* __restrict__ out_dst,              // [batch, C] fp32
+    const int c)
+{
+    const int b = blockIdx.y;
+    const int index = threadIdx.x + blockIdx.x * blockDim.x;
+    const unsigned int idx = in_tok[b];
+    if (index < c) {
+        out_dst[b * c + index] = __half2float(in_src[(size_t)idx * (size_t)c + (size_t)index]);
+    }
+}
+"#;
+
+/// gemv_int8_rkv_stage1 batch CUDA kernel（权重复用版）：每 block 读一次 int8 权重
+/// 与 scale/zero，在寄存器累加器中复用给 BGRP 个 slot——带宽 ≈ 1/ceil(B/BGRP)
+///（信天翁 rows 模型；旧 grid.y=slot 版每 slot 各读全量权重，带宽 ×B 零增益）。
+/// x 输入（xr..xg）与输出为 [batch, ...]（slot 主序）。
+/// dispatch (C/ROWS + VM + WM + AM + GM, ceil(batch/BGRP), 1)。
+const GEMV_INT8_RKV_STAGE1_BATCH_SRC: &str = r#"
+__device__ __forceinline__ void unpack_int8_sz_batch(
+    unsigned int sz, float& scale, float& zero)
+{
+    scale = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
+    zero  = __half2float(__ushort_as_half((unsigned short)(sz >> 16)));
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4) gemv_int8_rkv_stage1_batch(
+    const unsigned int* __restrict__ R_idx,
+    const unsigned int* __restrict__ R_sz,
+    const unsigned int* __restrict__ K_idx,
+    const unsigned int* __restrict__ K_sz,
+    const unsigned int* __restrict__ V_idx,
+    const unsigned int* __restrict__ V_sz,
+    const float*  __restrict__ V1,
+    const float*  __restrict__ W1,
+    const float*  __restrict__ A1,
+    const float*  __restrict__ G1,
+    const float*  __restrict__ xr,            // [batch, C]
+    const float*  __restrict__ xk,
+    const float*  __restrict__ xv,
+    const float*  __restrict__ xw,
+    const float*  __restrict__ xa,
+    const float*  __restrict__ xg,
+    float* __restrict__ out_r,                // [batch, C]
+    float* __restrict__ out_k,
+    __half* __restrict__ out_v,               // [batch, C] fp16
+    float* __restrict__ out_vm,               // [batch, VM]
+    float* __restrict__ out_wm,               // [batch, WM]
+    float* __restrict__ out_am,               // [batch, AM]
+    float* __restrict__ out_gm,               // [batch, GM]
+    const int c,
+    const int vm,
+    const int wm,
+    const int am,
+    const int gm,
+    const int batch)
+{
+    constexpr int ROWS = 4;
+    constexpr int KG_MAX = 32;
+    // BGRP=2：累加器 3 矩阵×4 行×2 slot = 24 half2（48 寄存器）。BGRP=4 时 96 寄存器
+    // 溢出到 local memory，实测反比单序列慢（profiling 22.8% 热点根因）。
+    constexpr int BGRP = 2;
+    const int tid  = threadIdx.x;
+    const int flat = blockIdx.x;
+    const int b0   = blockIdx.y * BGRP;
+    const int bcnt = min(BGRP, batch - b0);
+
+    if (flat < c / ROWS) {
+        const int row_base = flat * ROWS;
+        const int KV = c / 4;
+        const int KG = c / 128;
+
+        __shared__ float s_scale[3][ROWS][KG_MAX];
+        __shared__ float s_zero[3][ROWS][KG_MAX];
+
+        for (int i = tid; i < 3 * ROWS * KG; i += blockDim.x) {
+            const int mat = i / (ROWS * KG);
+            const int rem = i % (ROWS * KG);
+            const int r   = rem / KG;
+            const int g   = rem % KG;
+            const int row = row_base + r;
+            const unsigned int* szp = (mat == 0) ? R_sz : ((mat == 1) ? K_sz : V_sz);
+            float sc, zr;
+            unpack_int8_sz_batch(szp[row * KG + g], sc, zr);
+            s_scale[mat][r][g] = sc;
+            s_zero[mat][r][g]  = zr;
+        }
+        __syncthreads();
+
+        // 累加器：3 矩阵 × ROWS 行 × BGRP slot（half2，48 寄存器）。
+        half2 acc_r[ROWS][BGRP], acc_k[ROWS][BGRP], acc_v[ROWS][BGRP];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) {
+                acc_r[r][b] = __half2half2(0.f);
+                acc_k[r][b] = __half2half2(0.f);
+                acc_v[r][b] = __half2half2(0.f);
+            }
+        // 主循环：int8 idx 读一次 + 反量化一次 → 逐 slot FMA（权重读 1 份算 bcnt 份）。
+        for (int kk = tid; kk < KV; kk += blockDim.x) {
+            const int g = kk >> 5;
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int irow = (row_base + r) * KV + kk;
+                const unsigned int pr = R_idx[irow];
+                const unsigned int pk = K_idx[irow];
+                const unsigned int pv = V_idx[irow];
+                const float scr = s_scale[0][r][g], zrr = s_zero[0][r][g];
+                const float sck = s_scale[1][r][g], zrk = s_zero[1][r][g];
+                const float scv = s_scale[2][r][g], zrv = s_zero[2][r][g];
+                __align__(16) __half wr[4], wk[4], wv[4];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int nbr = (pr >> (8 * j)) & 0xFF;
+                    const int nbk = (pk >> (8 * j)) & 0xFF;
+                    const int nbv = (pv >> (8 * j)) & 0xFF;
+                    wr[j] = __float2half(scr * (float)nbr + zrr);
+                    wk[j] = __float2half(sck * (float)nbk + zrk);
+                    wv[j] = __float2half(scv * (float)nbv + zrv);
+                }
+                const half2 wr0 = *reinterpret_cast<const half2*>(&wr[0]);
+                const half2 wr1 = *reinterpret_cast<const half2*>(&wr[2]);
+                const half2 wk0 = *reinterpret_cast<const half2*>(&wk[0]);
+                const half2 wk1 = *reinterpret_cast<const half2*>(&wk[2]);
+                const half2 wv0 = *reinterpret_cast<const half2*>(&wv[0]);
+                const half2 wv1 = *reinterpret_cast<const half2*>(&wv[2]);
+                #pragma unroll
+                for (int b = 0; b < BGRP; b++) {
+                    if (b >= bcnt) break;
+                    const int off = (b0 + b) * c + 4 * kk;
+                    const half2 hxr0 = __floats2half2_rn(xr[off],     xr[off + 1]);
+                    const half2 hxr1 = __floats2half2_rn(xr[off + 2], xr[off + 3]);
+                    const half2 hxk0 = __floats2half2_rn(xk[off],     xk[off + 1]);
+                    const half2 hxk1 = __floats2half2_rn(xk[off + 2], xk[off + 3]);
+                    const half2 hxv0 = __floats2half2_rn(xv[off],     xv[off + 1]);
+                    const half2 hxv1 = __floats2half2_rn(xv[off + 2], xv[off + 3]);
+                    acc_r[r][b] = __hfma2(hxr0, wr0, acc_r[r][b]);
+                    acc_r[r][b] = __hfma2(hxr1, wr1, acc_r[r][b]);
+                    acc_k[r][b] = __hfma2(hxk0, wk0, acc_k[r][b]);
+                    acc_k[r][b] = __hfma2(hxk1, wk1, acc_k[r][b]);
+                    acc_v[r][b] = __hfma2(hxv0, wv0, acc_v[r][b]);
+                    acc_v[r][b] = __hfma2(hxv1, wv1, acc_v[r][b]);
+                }
+            }
+        }
+        float lr[ROWS][BGRP], lk[ROWS][BGRP], lv[ROWS][BGRP];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) {
+                const float2 rrf = __half22float2(acc_r[r][b]);
+                const float2 rkf = __half22float2(acc_k[r][b]);
+                const float2 rvf = __half22float2(acc_v[r][b]);
+                lr[r][b] = rrf.x + rrf.y;
+                lk[r][b] = rkf.x + rkf.y;
+                lv[r][b] = rvf.x + rvf.y;
+            }
+
+        __shared__ float partial_r[4 /*warp*/][ROWS][BGRP];
+        __shared__ float partial_k[4 /*warp*/][ROWS][BGRP];
+        __shared__ float partial_v[4 /*warp*/][ROWS][BGRP];
+        const int lane = tid & 31;
+        const int warp = tid >> 5;
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) {
+                float vr = lr[r][b];
+                float vk = lk[r][b];
+                float vv = lv[r][b];
+                #pragma unroll
+                for (int off2 = 16; off2 > 0; off2 >>= 1) {
+                    vr += __shfl_down_sync(0xffffffffu, vr, off2);
+                    vk += __shfl_down_sync(0xffffffffu, vk, off2);
+                    vv += __shfl_down_sync(0xffffffffu, vv, off2);
+                }
+                if (lane == 0) {
+                    partial_r[warp][r][b] = vr;
+                    partial_k[warp][r][b] = vk;
+                    partial_v[warp][r][b] = vv;
+                }
+            }
+        __syncthreads();
+        if (tid == 0) {
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int row = row_base + r;
+                if (row < c) {
+                    #pragma unroll
+                    for (int b = 0; b < BGRP; b++) {
+                        if (b >= bcnt) break;
+                        float sr_ = 0.f, sk_ = 0.f, sv_ = 0.f;
+                        #pragma unroll
+                        for (int w = 0; w < 4; w++) {
+                            sr_ += partial_r[w][r][b];
+                            sk_ += partial_k[w][r][b];
+                            sv_ += partial_v[w][r][b];
+                        }
+                        const int off = (b0 + b) * c + row;
+                        out_r[off] = sr_;
+                        out_k[off] = sk_;
+                        out_v[off] = __float2half(sv_);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // mid 投影分支：权重行读一次，逐 slot 累加（bcnt 份 dot 共享权重读取）。
+    const int mid_idx = flat - c / ROWS;
+    float local_dot[BGRP];
+    #pragma unroll
+    for (int b = 0; b < BGRP; b++) local_dot[b] = 0.f;
+    int chain = 3;
+    int row = 0;
+    const float* wsrc = nullptr;
+    const float* xsrc[BGRP];
+    if (mid_idx < vm) {
+        chain = 0; row = mid_idx;
+        wsrc = V1 + (long long)row * c;
+        for (int b = 0; b < bcnt; b++) xsrc[b] = xv + (b0 + b) * c;
+    } else if (mid_idx < vm + wm) {
+        chain = 1; row = mid_idx - vm;
+        wsrc = W1 + (long long)row * c;
+        for (int b = 0; b < bcnt; b++) xsrc[b] = xw + (b0 + b) * c;
+    } else if (mid_idx < vm + wm + am) {
+        chain = 2; row = mid_idx - vm - wm;
+        wsrc = A1 + (long long)row * c;
+        for (int b = 0; b < bcnt; b++) xsrc[b] = xa + (b0 + b) * c;
+    } else {
+        row = mid_idx - vm - wm - am;
+        wsrc = G1 + (long long)row * c;
+        for (int b = 0; b < bcnt; b++) xsrc[b] = xg + (b0 + b) * c;
+    }
+    for (int kk = tid; kk < c; kk += blockDim.x) {
+        const float w = wsrc[kk];
+        for (int b = 0; b < bcnt; b++) local_dot[b] += w * xsrc[b][kk];
+    }
+    __shared__ float sm[128][BGRP];
+    #pragma unroll
+    for (int b = 0; b < BGRP; b++) sm[tid][b] = local_dot[b];
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) sm[tid][b] += sm[tid + stride][b];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        #pragma unroll
+        for (int b = 0; b < BGRP; b++) {
+            if (b >= bcnt) break;
+            const float result = sm[0][b];
+            if (chain == 0) out_vm[(b0 + b) * vm + row] = result;
+            else if (chain == 1) out_wm[(b0 + b) * wm + row] = tanhf(result);
+            else if (chain == 2) out_am[(b0 + b) * am + row] = result;
+            else out_gm[(b0 + b) * gm + row] = result;
+        }
+    }
+}
+"#;
+
+/// gemv_lowrank_chain4 batch CUDA kernel（warp-per-row 版）：每 block 8 warp
+/// 各算 1 个输出行 × BGRP slot（原版整 block 归约 1 行，M=2560 时 grid 太大
+/// 占 14.9%——每 block 只做 512B 功重，syncthreads 6 次为主因）。
+/// dispatch (M/8, ceil(batch/BGRP), 1)；block=256（8 warp × 32 thread）。
+const GEMV_LOWRANK_CHAIN4_BATCH_SRC: &str = r#"
+__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_batch(
+    const float*  __restrict__ W2,   // [M, KW] fp32 行主序（共享权重）
+    const float*  __restrict__ A2,   // [M, KA]
+    const float*  __restrict__ V2,   // [M, KV]
+    const float*  __restrict__ G2,   // [M, KG]
+    const float*  __restrict__ xw,   // [batch, KW]
+    const float*  __restrict__ xa,   // [batch, KA]
+    const float*  __restrict__ xv,   // [batch, KV]
+    const float*  __restrict__ xg,   // [batch, KG]
+    const float*  __restrict__ w0,   // [M]（共享）
+    const float*  __restrict__ a0,   // [M]
+    const float*  __restrict__ v0,   // [M]
+    const float*  __restrict__ scale,// [1]
+    const __half* __restrict__ v_first, // [batch, M] fp16
+    __half* __restrict__ out_w,      // [batch, M] fp16
+    __half* __restrict__ out_a,      // [batch, M] fp16
+    __half* __restrict__ out_v,      // [batch, M] fp16（读改写）
+    __half* __restrict__ out_g,      // [batch, M] fp16
+    const int m,
+    const int kw,
+    const int ka,
+    const int kv,
+    const int kg,
+    const int batch)
+{
+    constexpr int BGRP = 4;
+    constexpr int WARPS = 8;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row  = blockIdx.x * WARPS + warp;
+    if (row >= m) return;
+    const int b0   = blockIdx.y * BGRP;
+    const int bcnt = min(BGRP, batch - b0);
+
+    const float sc = scale[0];
+    #pragma unroll
+    for (int bi = 0; bi < BGRP; bi++) {
+        if (bi >= bcnt) break;
+        const int b = b0 + bi;
+        const int mo = b * m + row;
+        const float* xwb = xw + b * kw;
+        const float* xab = xa + b * ka;
+        const float* xvb = xv + b * kv;
+        const float* xgb = xg + b * kg;
+
+        float lw = 0.f, la = 0.f, lv = 0.f, lg = 0.f;
+        for (int k = lane; k < kw; k += 32) lw += xwb[k] * W2[row * kw + k];
+        for (int k = lane; k < ka; k += 32) la += xab[k] * A2[row * ka + k];
+        for (int k = lane; k < kv; k += 32) lv += xvb[k] * V2[row * kv + k];
+        for (int k = lane; k < kg; k += 32) lg += sigmoidf_(xgb[k]) * G2[row * kg + k];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lw += __shfl_down_sync(0xffffffffu, lw, off);
+            la += __shfl_down_sync(0xffffffffu, la, off);
+            lv += __shfl_down_sync(0xffffffffu, lv, off);
+            lg += __shfl_down_sync(0xffffffffu, lg, off);
+        }
+        if (lane == 0) {
+            out_w[mo] = __float2half(expf(sc * sigmoidf_(lw + w0[row])));
+            out_a[mo] = __float2half(sigmoidf_(la + a0[row]));
+            const float vcur = __half2float(out_v[mo]);
+            out_v[mo] = __float2half(vcur + sigmoidf_(lv + v0[row]) * (__half2float(v_first[mo]) - vcur));
+            out_g[mo] = __float2half(lg);
+        }
+    }
+}
+"#;
+
+/// ffn_value_sparse_add batch CUDA kernel：r2 为 [batch, fh]，x 为 [batch, C]。
+/// dispatch (fh/TILE, c/C_TILE, batch)。
+const FFN_VALUE_SPARSE_BATCH_SRC: &str = r#"
+extern "C" __global__ void ffn_value_sparse_add_batch(
+    const float*    __restrict__ r2,          // [batch, fh] relu² 输出
+    const __half*   __restrict__ value_tiled, // [fh*C] 平铺布局（共享）
+    float*          __restrict__ x,           // [batch, C] 就地原子累加
+    const int c,
+    const int fh)
+{
+    constexpr int TILE    = 128;
+    constexpr int C_TILE  = 256;
+    __shared__ float r2_slice[TILE];
+    __shared__ int   nnz_ids[TILE];
+    __shared__ int   nnz_count;
+    __shared__ int   warp_counts[TILE / 32];
+    __shared__ int   warp_prefix[TILE / 32];
+
+    const int f_block = blockIdx.x;
+    const int c_block = blockIdx.y;
+    const int b       = blockIdx.z;
+    const int tid     = threadIdx.x;
+    const int lane    = tid & 31;
+    const int warp    = tid >> 5;
+    const int start_f = f_block * TILE;
+    const float* r2b  = r2 + b * fh;
+    float* xb         = x + b * c;
+
+    float r2v = 0.f;
+    bool  nonzero = false;
+    int   local_pos = 0;
+    if (tid < TILE) {
+        r2v = r2b[start_f + tid];
+        r2_slice[tid] = r2v;
+        nonzero = (r2v != 0.0f);
+        unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+        local_pos = __popc(mask & ((1u << lane) - 1u));
+        if (lane == 0) warp_counts[warp] = __popc(mask);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int s = 0;
+#pragma unroll
+        for (int w = 0; w < TILE / 32; ++w) {
+            warp_prefix[w] = s;
+            s += warp_counts[w];
+        }
+        nnz_count = s;
+    }
+    __syncthreads();
+    if (tid < TILE && nonzero) {
+        nnz_ids[warp_prefix[warp] + local_pos] = tid;
+    }
+    __syncthreads();
+
+    const int c_blocks = c / C_TILE;
+    const int tile_base = ((f_block * c_blocks + c_block) * TILE) * C_TILE;
+    const int c0 = c_block * C_TILE + tid * 2;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int i = 0; i < nnz_count; i += 2) {
+        const int f0 = nnz_ids[i];
+        const __half* w0 = value_tiled + (long long)tile_base + f0 * C_TILE + tid * 2;
+        const float a0 = r2_slice[f0];
+        acc0 += a0 * __half2float(w0[0]);
+        acc1 += a0 * __half2float(w0[1]);
+        if (i + 1 < nnz_count) {
+            const int f1 = nnz_ids[i + 1];
+            const __half* w1 = value_tiled + (long long)tile_base + f1 * C_TILE + tid * 2;
+            const float a1 = r2_slice[f1];
+            acc0 += a1 * __half2float(w1[0]);
+            acc1 += a1 * __half2float(w1[1]);
+        }
+    }
+    atomicAdd(xb + c0, acc0);
+    atomicAdd(xb + c0 + 1, acc1);
+}
+"#;
+
+/// rwkv_sample batch CUDA kernel：B slot 并行采样（每 slot 独立 logits/参数/seed）。
+/// logits/temp/mask/counter 为 [batch, n]；token 为 [batch]；sampler 为 [batch, 8]；
+/// hist 为 [batch, hist_len]。dispatch (1, batch, 1)，block=112。
+const SAMPLE_BATCH_SRC: &str = r#"
+__device__ __forceinline__ float u01_batch(unsigned int s) {
+    s += 0x9E3779B9u;
+    unsigned int z = s;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z ^= z >> 16;
+    return (float)z / 4294967296.0f;
+}
+
+extern "C" __global__ void rwkv_sample_batch(
+    const float*      __restrict__ logits,   // [batch, n]
+    float*            __restrict__ token,    // [batch] 写入索引的 f32 位模式
+    float*            __restrict__ temp,     // [batch, n] 工作区
+    float*            __restrict__ mask,     // [batch, n] 工作区
+    unsigned int*     __restrict__ counter,  // [batch, n] 直方图
+    const float*      __restrict__ sampler,  // [batch, 8] 参数
+    const unsigned int* __restrict__ hist,   // [batch, hist_len] 历史 token
+    const int n)
+{
+    const int tid = threadIdx.x;
+    const int b   = blockIdx.y;
+    const int bo  = b * n;
+    const float* sampler_b = sampler + b * 8;
+    constexpr int BS = 112;
+    constexpr int MAXK = 50;
+    __shared__ float s_val[BS][MAXK];
+    __shared__ int   s_idx[BS][MAXK];
+    __shared__ float s_topval[MAXK];
+    __shared__ int   s_topidx[MAXK];
+    __shared__ float s_sorted[MAXK];
+    __shared__ int   s_sortedidx[MAXK];
+    __shared__ float s_fval[BS];
+    __shared__ int   s_fidx[BS];
+    __shared__ float s_max;
+    __shared__ float s_sum;
+    __shared__ float s_u;
+    __shared__ float s_threshold;
+    __shared__ float g_cutoff;
+
+    const float temperature = sampler_b[0];
+    const unsigned int top_k = __float_as_uint(sampler_b[1]);
+    const float top_p = sampler_b[2];
+    const unsigned int seed = __float_as_uint(sampler_b[3]);
+    const float rep = sampler_b[4];
+    const float freq = sampler_b[5];
+    const float pres = sampler_b[6];
+    const unsigned int hist_len = __float_as_uint(sampler_b[7]);
+    const bool do_topk = (top_k > 0u && top_k < (unsigned int)n);
+    const int K = do_topk ? (int)top_k : 0;
+
+    float* temp_b = temp + bo;
+    float* mask_b = mask + bo;
+    unsigned int* counter_b = counter + bo;
+    const float* logits_b = logits + bo;
+    const unsigned int* hist_b = hist + b * hist_len;
+
+    // 1. 载入 logits
+    for (int i = tid; i < n; i += BS) temp_b[i] = logits_b[i];
+
+    // 2. 惩罚
+    if (hist_len > 0u && (rep != 1.0f || freq != 0.0f || pres != 0.0f)) {
+        for (int i = tid; i < n; i += BS) counter_b[i] = 0u;
+        __syncthreads();
+        for (int h = tid; h < (int)hist_len; h += BS) {
+            atomicAdd(&counter_b[hist_b[h]], 1u);
+        }
+        __syncthreads();
+        for (int i = tid; i < n; i += BS) {
+            const unsigned int cnt = counter_b[i];
+            float l = temp_b[i];
+            if (cnt > 0u) {
+                if (rep != 1.0f) l = l > 0.0f ? l / rep : l * rep;
+                if (pres != 0.0f) l -= pres;
+            }
+            if (freq != 0.0f) l -= freq * (float)cnt;
+            temp_b[i] = l;
+        }
+        __syncthreads();
+    }
+
+    // 3. temperature
+    float invT = 1.0f / temperature;
+    if (!(temperature > 0.0f)) invT = 1.0f;
+    for (int i = tid; i < n; i += BS) temp_b[i] *= invT;
+    __syncthreads();
+
+    if (K > 0 && K <= MAXK) {
+        // ================= 快速路径：单遍 top-K =================
+        for (int j = 0; j < MAXK; j++) { s_val[tid][j] = -1e30f; s_idx[tid][j] = -1; }
+        for (int i = tid; i < n; i += BS) {
+            const float v = temp_b[i];
+            if (v > s_val[tid][K - 1]) {
+                int pos = K - 1;
+                while (pos > 0 && v > s_val[tid][pos - 1]) {
+                    s_val[tid][pos] = s_val[tid][pos - 1];
+                    s_idx[tid][pos] = s_idx[tid][pos - 1];
+                    --pos;
+                }
+                s_val[tid][pos] = v;
+                s_idx[tid][pos] = i;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            auto sift = [&](int i, int h) {
+                while (true) {
+                    int l = 2 * i + 1, r = 2 * i + 2, m = i;
+                    if (l < h && s_topval[l] < s_topval[m]) m = l;
+                    if (r < h && s_topval[r] < s_topval[m]) m = r;
+                    if (m == i) break;
+                    float tv = s_topval[i]; s_topval[i] = s_topval[m]; s_topval[m] = tv;
+                    int ti = s_topidx[i]; s_topidx[i] = s_topidx[m]; s_topidx[m] = ti;
+                    i = m;
+                }
+            };
+            for (int j = 0; j < K; j++) { s_topval[j] = s_val[0][j]; s_topidx[j] = s_idx[0][j]; }
+            for (int j = K / 2 - 1; j >= 0; j--) sift(j, K);
+            for (int th = 1; th < BS; th++) {
+                for (int j = 0; j < K; j++) {
+                    const float v = s_val[th][j];
+                    if (v <= -1e29f) break;
+                    if (v > s_topval[0]) {
+                        s_topval[0] = v; s_topidx[0] = s_idx[th][j];
+                        sift(0, K);
+                    }
+                }
+            }
+            for (int r = K; r > 0; r--) {
+                s_sorted[r - 1] = s_topval[0];
+                s_sortedidx[r - 1] = s_topidx[0];
+                s_topval[0] = s_topval[r - 1];
+                s_topidx[0] = s_topidx[r - 1];
+                sift(0, r - 1);
+            }
+            s_threshold = s_sorted[K - 1];  // 第 K 大（降序末位）= 保留边界
+        }
+        __syncthreads();
+
+        for (int i = tid; i < n; i += BS) if (temp_b[i] < s_threshold) temp_b[i] = -1e30f;
+        __syncthreads();
+    } else {
+        // ================= 兜底路径 =================
+        if (do_topk) {
+            for (int i = tid; i < n; i += BS) mask_b[i] = 0.0f;
+            __syncthreads();
+            if (tid == 0) s_threshold = -1e30f;
+            __syncthreads();
+            for (unsigned int round = 0u; round < top_k; round++) {
+                float lm = -1e30f; int li = 0;
+                for (int i = tid; i < n; i += BS) {
+                    if (mask_b[i] == 0.0f && temp_b[i] > lm) { lm = temp_b[i]; li = i; }
+                }
+                s_fval[tid] = lm; s_fidx[tid] = li;
+                __syncthreads();
+                for (int step = BS >> 1; step > 0; step >>= 1) {
+                    if (tid < step) {
+                        const float bv = s_fval[tid + step];
+                        const int   bi = s_fidx[tid + step];
+                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
+                            s_fval[tid] = bv; s_fidx[tid] = bi;
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0) { s_threshold = s_fval[0]; mask_b[s_fidx[0]] = 1.0f; }
+                __syncthreads();
+            }
+            for (int i = tid; i < n; i += BS) if (temp_b[i] < s_threshold) temp_b[i] = -1e30f;
+            __syncthreads();
+        }
+    }
+
+    // 7. softmax：max -> exp -> normalize
+    // 归约为非幂 block 安全版：BS=112 非 2 的幂，纯树归约（step 减半）会让
+    // 部分 warp 的结果成为"孤儿"（如 step=7 时 s_fval[5..6] 不再被合并），
+    // max 漏读/sum 漏加 → m 偏小 → exp 上溢 inf（实测 temp≈0 时选错 token）。
+    // 修法：先把尾部 [P2, BS) 并入 [0, BS-P2)（P2 = ≤BS 的最大 2 幂），再 2 幂树归约。
+    {
+        float lm = -1e30f;
+        for (int i = tid; i < n; i += BS) lm = fmaxf(lm, temp_b[i]);
+        s_fval[tid] = lm;
+        __syncthreads();
+        {
+            constexpr int P2 = 64;  // BS=112 → 64 + 48
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] = fmaxf(s_fval[tid - P2], s_fval[tid]);
+            __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] = fmaxf(s_fval[tid], s_fval[tid + step]);
+                __syncthreads();
+            }
+        }
+        const float m = s_fval[0];
+        __syncthreads();
+        float s = 0.0f;
+        for (int i = tid; i < n; i += BS) {
+            const float v = expf(temp_b[i] - m);
+            temp_b[i] = v;
+            s += v;
+        }
+        s_fval[tid] = s;
+        __syncthreads();
+        {
+            constexpr int P2 = 64;
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] += s_fval[tid];
+            __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] += s_fval[tid + step];
+                __syncthreads();
+            }
+        }
+        const float total = s_fval[0];
+        __syncthreads();
+        if (total > 0.0f) {
+            for (int i = tid; i < n; i += BS) temp_b[i] /= total;
+        }
+        __syncthreads();
+    }
+
+    // 8. top-p
+    if (top_p > 0.0f && top_p < 1.0f) {
+        if (K > 0 && K <= MAXK) {
+            if (tid == 0) {
+                float cum = 0.0f, cutoffv = -1e30f;
+                for (int j = K - 1; j >= 0; j--) {
+                    const int idx = s_sortedidx[j];
+                    cum += temp_b[idx];
+                    cutoffv = temp_b[idx];
+                    if (cum >= top_p) break;
+                }
+                g_cutoff = cutoffv;
+            }
+        } else {
+            for (int i = tid; i < n; i += BS) mask_b[i] = 0.0f;
+            __syncthreads();
+            if (tid == 0) g_cutoff = 0.0f;
+            __syncthreads();
+            float cum = 0.0f;
+            for (int cnt = 0; cnt < 512 && cum < top_p; cnt++) {
+                float lm = -1e30f; int li = 0;
+                for (int i = tid; i < n; i += BS) {
+                    if (mask_b[i] == 0.0f && temp_b[i] > lm) { lm = temp_b[i]; li = i; }
+                }
+                s_fval[tid] = lm; s_fidx[tid] = li;
+                __syncthreads();
+                for (int step = BS >> 1; step > 0; step >>= 1) {
+                    if (tid < step) {
+                        const float bv = s_fval[tid + step];
+                        const int   bi = s_fidx[tid + step];
+                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
+                            s_fval[tid] = bv; s_fidx[tid] = bi;
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    mask_b[s_fidx[0]] = 1.0f;
+                    cum += s_fval[0];
+                    g_cutoff = s_fval[0];
+                }
+                __syncthreads();
+            }
+            __syncthreads();
+        }
+        for (int i = tid; i < n; i += BS) if (temp_b[i] < g_cutoff) temp_b[i] = 0.0f;
+        __syncthreads();
+    }
+
+    // 9. 采样
+    if (K > 0 && K <= MAXK) {
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int j = K - 1; j >= 0; j--) {
+                const int idx = s_sortedidx[j];
+                if (temp_b[idx] > 0.0f) total += temp_b[idx];
+            }
+            const float u = u01_batch(seed) * total;
+            float acc = 0.0f;
+            int chosen = s_sortedidx[K - 1];
+            for (int j = K - 1; j >= 0; j--) {
+                const int idx = s_sortedidx[j];
+                if (temp_b[idx] > 0.0f) {
+                    acc += temp_b[idx];
+                    if (acc > u) { chosen = idx; break; }
+                }
+            }
+            token[b] = __int_as_float(chosen);
+        }
+    } else {
+        float ts = 0.0f;
+        for (int i = tid; i < n; i += BS) ts += temp_b[i];
+        s_fval[tid] = ts;
+        __syncthreads();
+        {
+            constexpr int P2 = 64;
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] += s_fval[tid];
+            __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] += s_fval[tid + step];
+                __syncthreads();
+            }
+        }
+        const float total = s_fval[0];
+        __syncthreads();
+        if (tid == 0) s_u = u01_batch(seed) * total;
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 0.0f;
+            int chosen = n - 1;
+            for (int i = 0; i < n; i++) {
+                acc += temp_b[i];
+                if (acc > s_u) { chosen = i; break; }
+            }
+            token[b] = __int_as_float(chosen);
+        }
+    }
+}
+"#;
+
+/// record_tokens batch CUDA kernel：把 in_tok[b] 各自追加到
+/// out_seq[b*stride + atomicAdd(&cnt[b])]（每 slot 独立段独立计数）。
+/// dispatch (batch, 1, 1)，每 block 单线程。
+const RECORD_TOKENS_SRC: &str = r#"
+extern "C" __global__ void rwkv_record_tokens(
+    const unsigned int* __restrict__ in_tok,  // [batch] token（f32 位模式）
+    unsigned int* __restrict__ out_seq,       // [batch, stride] 序列缓冲
+    unsigned int* __restrict__ cnt,           // [batch] 计数器（各自原子自增）
+    const int stride)
+{
+    const int b = blockIdx.x;
+    const unsigned int i = atomicAdd(&cnt[b], 1u);
+    out_seq[b * stride + i] = in_tok[b];
 }
 "#;
 
@@ -2359,6 +3372,187 @@ extern "C" __global__ void gemv_variant(
 }
 "#;
 
+/// gemv_variant_mb CUDA kernel：batch 并发的**权重复用**版（信天翁 rows 模型）。
+/// 与 gemv_variant 的区别：不是 grid.y=slot 各读全量权重（带宽 ×B），而是
+/// 每 block 一次读权重（4 行 × K），在寄存器累加器中复用给 BGRP 个 slot——
+/// weight-bound 场景带宽 ≈ 1/ceil(B/BGRP)。
+/// dispatch (M/4, ceil(batch/BGRP), 1)；x/y 为 [batch, ...]（slot 主序）。
+/// op 语义与 gemv_variant 一致（0=relu2、1=mul_add、2=add、3=plain）。
+const GEMV_VARIANT_MB_SRC: &str = r#"
+__device__ __forceinline__ void unpack_mb_sz(
+    unsigned int sz, float& scale, float& zero)
+{
+    scale = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
+    zero  = __half2float(__ushort_as_half((unsigned short)(sz >> 16)));
+}
+__device__ __forceinline__ float relu2_mb(float x) { return x > 0.f ? x * x : 0.f; }
+__device__ __forceinline__ void load_half4_f4_mb(
+    const __half* p, float& x0, float& x1, float& x2, float& x3)
+{
+    const half2 h01 = *reinterpret_cast<const half2*>(p);
+    const half2 h23 = *reinterpret_cast<const half2*>(p + 2);
+    const float2 f01 = __half22float2(h01);
+    const float2 f23 = __half22float2(h23);
+    x0 = f01.x; x1 = f01.y; x2 = f23.x; x3 = f23.y;
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4) gemv_variant_mb(
+    const __half*         __restrict__ Af16,  // fp16 [M*K]（wtype==0 用）
+    const unsigned int*   __restrict__ aidx,  // int8 idx [M,K/4]
+    const __half*         __restrict__ alut,  // 保留（当前未使用）
+    const unsigned int*   __restrict__ asz,   // int8 sz [M,K/128]
+    const float*          __restrict__ x,     // [batch, K]
+    const __half*         __restrict__ g,     // [batch, K] fp16 门控（op==1 用）
+    float*                __restrict__ y,     // [batch, M]（op==2 累加式读改写）
+    const int m,
+    const int k,
+    const int batch,
+    const int wtype,   // 0=f16, 2=int8
+    const int op)      // 0=relu2, 1=mul_add, 2=add, 3=plain
+{
+    constexpr int BGRP = 4;   // 每 block 复用一份权重的 slot 数（8 会寄存器溢出，
+                              // 实测 spill 后反比单序列慢——profiling 43.5% 热点根因）
+    const int tid  = threadIdx.x;
+    const int b0   = blockIdx.y * BGRP;
+    const int bcnt = min(BGRP, batch - b0);
+    const int row0 = blockIdx.x * 4;
+    const int kvi4 = k / 4;
+    const int kg   = k / 128;
+
+    // half2 累加器：4 行 × BGRP slot（fp16 FMA 吞吐路径，与单序列版一致）。
+    half2 hacc[4][BGRP];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        #pragma unroll
+        for (int b = 0; b < BGRP; b++) hacc[r][b] = __half2half2(0.f);
+
+    if (wtype == 0) {
+        // ===== fp16 路径：权重 half4 读一次，逐 slot FMA =====
+        const int k4 = k & ~3;
+        for (int kq = tid * 4; kq < k4; kq += blockDim.x * 4) {
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) {
+                if (b >= bcnt) break;
+                const float4 xv = *reinterpret_cast<const float4*>(x + (b0 + b) * k + kq);
+                float gx = 1.f, gy = 1.f, gz = 1.f, gw = 1.f;
+                if (op == 1) {
+                    load_half4_f4_mb(g + (b0 + b) * k + kq, gx, gy, gz, gw);
+                }
+                const half2 hx01 = __floats2half2_rn(xv.x * gx, xv.y * gy);
+                const half2 hx23 = __floats2half2_rn(xv.z * gz, xv.w * gw);
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const __half* wj = Af16 + (row0 + r) * k + kq;
+                    hacc[r][b] = __hfma2(hx01, *reinterpret_cast<const half2*>(wj), hacc[r][b]);
+                    hacc[r][b] = __hfma2(hx23, *reinterpret_cast<const half2*>(wj + 2), hacc[r][b]);
+                }
+            }
+        }
+    } else {
+        // ===== int8 路径：反量化一次，逐 slot FMA =====
+        for (int kq = tid; kq < kvi4; kq += blockDim.x) {
+            const int kbase = kq * 4;
+            const int gr = kg > 0 ? (kbase / 128) : 0;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int row = row0 + r;
+                if (row >= m) continue;
+                const unsigned int p = aidx[row * kvi4 + kq];
+                float sc, zr;
+                unpack_mb_sz(asz[row * kg + gr], sc, zr);
+                __align__(16) __half w[4];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int byte = (int)((p >> (8 * j)) & 0xFFu);
+                    w[j] = __float2half(sc * (float)byte + zr);
+                }
+                const half2 w01 = *reinterpret_cast<const half2*>(&w[0]);
+                const half2 w23 = *reinterpret_cast<const half2*>(&w[2]);
+                #pragma unroll
+                for (int b = 0; b < BGRP; b++) {
+                    if (b >= bcnt) break;
+                    const int xb = (b0 + b) * k + kbase;
+                    float gv0 = 1.f, gv1 = 1.f, gv2 = 1.f, gv3 = 1.f;
+                    if (op == 1) {
+                        const __half* gq = g + xb;
+                        gv0 = __half2float(gq[0]); gv1 = __half2float(gq[1]);
+                        gv2 = __half2float(gq[2]); gv3 = __half2float(gq[3]);
+                    }
+                    const half2 hx01 = __floats2half2_rn(x[xb] * gv0, x[xb + 1] * gv1);
+                    const half2 hx23 = __floats2half2_rn(x[xb + 2] * gv2, x[xb + 3] * gv3);
+                    hacc[r][b] = __hfma2(hx01, w01, hacc[r][b]);
+                    hacc[r][b] = __hfma2(hx23, w23, hacc[r][b]);
+                }
+            }
+        }
+    }
+
+    // half2 → float（尾部标量并入用 float 累加）。
+    float acc[4][BGRP];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        #pragma unroll
+        for (int b = 0; b < BGRP; b++) {
+            const float2 f = __half22float2(hacc[r][b]);
+            acc[r][b] = f.x + f.y;
+        }
+
+    // 尾部标量兜底（fp16 路径 k 非 4 倍数时；int8 路径 k 恒为 4 倍数）。
+    if (wtype == 0) {
+        const int k4 = k & ~3;
+        for (int kk = k4 + tid; kk < k; kk += blockDim.x) {
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int row = row0 + r;
+                if (row >= m) continue;
+                const float wv = __half2float(Af16[row * k + kk]);
+                #pragma unroll
+                for (int b = 0; b < BGRP; b++) {
+                    if (b >= bcnt) break;
+                    acc[r][b] += wv * x[(b0 + b) * k + kk];
+                }
+            }
+        }
+    }
+
+    // warp shuffle 归约（4 行 × BGRP slot；只有 1 次 __syncthreads）。
+    __shared__ float partial[4 /*warp*/][4 /*row*/][BGRP];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int b = 0; b < BGRP; b++) {
+            float v = acc[r][b];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down_sync(0xffffffffu, v, off);
+            }
+            if (lane == 0) partial[warp][r][b] = v;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            const int row = row0 + r;
+            if (row >= m) continue;
+            #pragma unroll
+            for (int b = 0; b < BGRP; b++) {
+                if (b >= bcnt) break;
+                float sum = 0.f;
+                #pragma unroll
+                for (int w = 0; w < 4; w++) sum += partial[w][r][b];
+                const int yb = (b0 + b) * m + row;
+                if (op == 0) y[yb] = relu2_mb(sum);
+                else if (op == 3) y[yb] = sum;
+                else y[yb] += sum;
+            }
+        }
+    }
+}
+"#;
+
 /// 稀疏 FFN value 投影内核：x += r2 @ ffn_value，r2 已 relu²（约 96% 稀疏）。
 /// 对齐 Albatross `cmix_sparse_down_relu_one_vtile_hfma2_split2_kernel` 的平铺布局与稀疏遍历：
 /// 每 block 处理一个 f 片（TILE=128）和一个 c 片（C_TILE=256），只读取 r2 非零 f 对应的权重列，
@@ -2628,7 +3822,9 @@ extern "C" __global__ void rwkv_sample(
                 s_topidx[0] = s_topidx[r - 1];
                 sift(0, r - 1);
             }
-            s_threshold = s_sorted[0]; // 第 K 大（最小值）
+            s_threshold = s_sorted[K - 1]; // 第 K 大（降序末位）= 保留边界
+            // 历史注：曾误取 s_sorted[0]（最大值），top-K 名义保留 50 实际只留
+            // top-1 + 并列——温度较高时采样分布被错误坍缩到单点。
         }
         __syncthreads();
 
@@ -2668,21 +3864,21 @@ extern "C" __global__ void rwkv_sample(
     }
 
     // 7. softmax：max -> exp -> normalize
+    // 归约为非幂 block 安全版（BS=112 非 2 的幂，纯树归约会孤儿化部分 warp 的
+    // 结果——同 batch 版注释，max 漏读/sum 漏加 → softmax 全错）。
     {
         float lm = -1e30f;
         for (int i = tid; i < n; i += BS) lm = fmaxf(lm, temp[i]);
-        s_max = lm;
-        __syncthreads();
-        for (int step = BS >> 1; step > 0; step >>= 1) {
-            if (tid < step) s_max = fmaxf(s_max, s_max + 0.0f); // no-op placeholder
-            __syncthreads();
-        }
-        // 上面的占位步进会破坏 s_max；改用 s_fval 归约。
         s_fval[tid] = lm;
         __syncthreads();
-        for (int step = BS >> 1; step > 0; step >>= 1) {
-            if (tid < step) s_fval[tid] = fmaxf(s_fval[tid], s_fval[tid + step]);
+        {
+            constexpr int P2 = 64;  // BS=112 → 64 + 48
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] = fmaxf(s_fval[tid - P2], s_fval[tid]);
             __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] = fmaxf(s_fval[tid], s_fval[tid + step]);
+                __syncthreads();
+            }
         }
         const float m = s_fval[0];
         __syncthreads();
@@ -2694,9 +3890,14 @@ extern "C" __global__ void rwkv_sample(
         }
         s_fval[tid] = s;
         __syncthreads();
-        for (int step = BS >> 1; step > 0; step >>= 1) {
-            if (tid < step) s_fval[tid] += s_fval[tid + step];
+        {
+            constexpr int P2 = 64;
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] += s_fval[tid];
             __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] += s_fval[tid + step];
+                __syncthreads();
+            }
         }
         const float total = s_fval[0];
         __syncthreads();
@@ -2781,9 +3982,14 @@ extern "C" __global__ void rwkv_sample(
         for (int i = tid; i < n; i += BS) ts += temp[i];
         s_fval[tid] = ts;
         __syncthreads();
-        for (int step = BS >> 1; step > 0; step >>= 1) {
-            if (tid < step) s_fval[tid] += s_fval[tid + step];
+        {
+            constexpr int P2 = 64;
+            if (tid >= P2 && tid < BS) s_fval[tid - P2] += s_fval[tid];
             __syncthreads();
+            for (int step = P2 >> 1; step > 0; step >>= 1) {
+                if (tid < step) s_fval[tid] += s_fval[tid + step];
+                __syncthreads();
+            }
         }
         const float total = s_fval[0];
         __syncthreads();
@@ -3151,6 +4357,125 @@ extern "C" __global__ void rwkv_v_first_lerp(
 }
 "#;
 
+/// seq_shift_batch CUDA kernel：batch prefill 的 token shift（slot 边界 t=0 读该 slot 的 state）。
+/// x/y 为 [batch, T, C]（slot 主序），s 为 [batch, C]。dispatch (T, batch, 1)。
+const SEQ_SHIFT_BATCH_SRC: &str = r#"
+extern "C" __global__ void rwkv_seq_shift_batch(
+    const float* __restrict__ x,   // [batch, T, C]
+    const float* __restrict__ s,   // token-shift state [batch, C]
+    const float* __restrict__ tm,  // [C]（共享）
+    float* __restrict__ y,         // [batch, T, C]
+    const int c,
+    const int t,
+    const int stride_x,
+    const int stride_y)
+{
+    const int token = blockIdx.x;
+    const int b      = blockIdx.y;
+    if (token >= t) return;
+    const size_t base = ((size_t)b * t + token) * stride_x;
+    const size_t ybase = ((size_t)b * t + token) * stride_y;
+    const float* sprev = (token == 0) ? (s + (size_t)b * c) : (x + base - stride_x);
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        const float cur = x[base + i];
+        const float prev = sprev[i];
+        const float tmv = tm[i];
+        y[ybase + i] = cur + tmv * (prev - cur);
+    }
+}
+"#;
+
+/// copy_token_batch CUDA kernel：每 slot 把 x 的第 lens[b]-1 行拷到 state[b]。
+/// x 为 [batch, T, C]，state 为 [batch, C]。dispatch (batch, 1, 1)，block 256。
+const COPY_TOKEN_BATCH_SRC: &str = r#"
+extern "C" __global__ void rwkv_copy_token_batch(
+    const float* __restrict__ x,      // [batch, T, C]
+    float* __restrict__ state,        // [batch, C]
+    const int* __restrict__ lens,     // [batch]（实际 prompt 长度，>=1）
+    const int c,
+    const int t)
+{
+    const int b = blockIdx.x;
+    const int last = lens[b] - 1;
+    const float* src = x + ((size_t)b * t + last) * c;
+    float* dst = state + (size_t)b * c;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+"#;
+
+/// dplr_seq_batch CUDA kernel：batch prefill 的 DPLR 状态更新。
+/// s 为 [batch, H, N*N]（batch State 布局），r/w/k/v/a/b/y 为 [batch, T, C]，
+/// lens[b] 截断实际长度（padding 段不进 state）。dispatch (ceil(H*N/8), batch, 1)。
+const DPLR_SEQ_BATCH_SRC: &str = r#"
+__device__ __forceinline__ float dplr_b_halfwarp_sum_all_xor(float v) {
+#pragma unroll
+    for (int mask = 8; mask > 0; mask >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, mask, 16);
+    }
+    return v;
+}
+extern "C" __global__ void rwkv_dplr_seq_batch(
+    float* __restrict__ s,          // [batch, H, N*N] 状态（in/out）
+    const float* __restrict__ r,    // [batch, T, C]
+    const float* __restrict__ w,    // [batch, T, C]
+    const float* __restrict__ k,    // [batch, T, C]
+    const float* __restrict__ v,    // [batch, T, C]
+    const float* __restrict__ a,    // [batch, T, C]
+    const float* __restrict__ b,    // [batch, T, C]
+    float* __restrict__ y,          // [batch, T, C] 输出
+    const int* __restrict__ lens,   // [batch]
+    const int h,
+    const int n,
+    const int t,
+    const int c)
+{
+    const int bslot = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int half = lane >> 4;
+    const int subl = lane & 15;
+    const int row  = (int)(blockIdx.x * 8 + warp * 2 + half);
+    if (row >= h * n) return;
+    const int head = row / n;
+    const int i    = row % n;
+    const int j0 = subl, j1 = subl + 16, j2 = subl + 32, j3 = subl + 48;
+    // slot 内偏移：state 段 + token 基址。
+    const size_t s_base = (size_t)bslot * h * n * n + (size_t)head * n * n + (size_t)i * n;
+    const size_t slot_tok = (size_t)bslot * t;   // 该 slot 在 [batch,T,C] 中的 token 基址
+    const size_t tok_off = (size_t)head * n;      // 该 head 在 [C] 内的列偏移
+    float s0 = s[s_base + j0];
+    float s1 = s[s_base + j1];
+    float s2 = s[s_base + j2];
+    float s3 = s[s_base + j3];
+    const int len = lens[bslot];
+    for (int tt = 0; tt < len; tt++) {
+        const size_t e = (slot_tok + tt) * c + tok_off;
+        const float vv = v[e + i];
+        const float a0 = a[e + j0], a1 = a[e + j1], a2 = a[e + j2], a3 = a[e + j3];
+        float sa = s0 * a0 + s1 * a1 + s2 * a2 + s3 * a3;
+        sa = dplr_b_halfwarp_sum_all_xor(sa);
+        const float w0 = w[e + j0], w1 = w[e + j1], w2 = w[e + j2], w3 = w[e + j3];
+        const float k0 = k[e + j0], k1 = k[e + j1], k2 = k[e + j2], k3 = k[e + j3];
+        const float b0 = b[e + j0], b1 = b[e + j1], b2 = b[e + j2], b3 = b[e + j3];
+        const float r0 = r[e + j0], r1 = r[e + j1], r2 = r[e + j2], r3 = r[e + j3];
+        s0 = s0 * w0 + k0 * vv + sa * b0;
+        s1 = s1 * w1 + k1 * vv + sa * b1;
+        s2 = s2 * w2 + k2 * vv + sa * b2;
+        s3 = s3 * w3 + k3 * vv + sa * b3;
+        float yv = s0 * r0 + s1 * r1 + s2 * r2 + s3 * r3;
+        yv = dplr_b_halfwarp_sum_all_xor(yv);
+        if (subl == 0) y[e + i] = yv;
+    }
+    s[s_base + j0] = s0;
+    s[s_base + j1] = s1;
+    s[s_base + j2] = s2;
+    s[s_base + j3] = s3;
+}
+"#;
+
 /// dplr_seq CUDA kernel：sequence-parallel DPLR 状态更新（内部循环 T）。
 /// 语义对齐 Vulkan `dplr_seq.comp`：每个 block 一个 head，64 线程（==N），S 行存寄存器跨 token 传递。
 /// 要求 n <= 64（RWKV-7 恒 N=64）。
@@ -3359,6 +4684,76 @@ impl ComputeBackend for CudaBackend {
             }
             CudaTensor::U32 { .. } => Err("upload: u32 tensor requires upload_u32".into()),
         }
+    }
+
+    fn upload_part(&self, t: TensorId, offset: usize, data: &[f32]) -> R<()> {
+        // 部分上传：只写 [offset, offset+len) 段（元素偏移），其余不动。
+        // F32 直拷；F16 先转半精度再按 2 字节元素偏移上传（v_first 用）。
+        let (dptr, bytes, off_bytes, src_buf): (u64, usize, usize, Vec<u8>) =
+            match self.get(t, "upload_part")? {
+                CudaTensor::F32 { dptr, len } => {
+                    if offset + data.len() > len {
+                        return Err(format!(
+                            "upload_part: range {}..{} exceeds len {len}",
+                            offset,
+                            offset + data.len()
+                        )
+                        .into());
+                    }
+                    (
+                        dptr,
+                        data.len() * 4,
+                        offset * 4,
+                        bytemuck::cast_slice::<f32, u8>(data).to_vec(),
+                    )
+                }
+                CudaTensor::F16 { dptr, len } => {
+                    if offset + data.len() > len {
+                        return Err(format!(
+                            "upload_part(f16): range {}..{} exceeds len {len}",
+                            offset,
+                            offset + data.len()
+                        )
+                        .into());
+                    }
+                    let f16s: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
+                    (
+                        dptr,
+                        f16s.len() * 2,
+                        offset * 2,
+                        bytemuck::cast_slice::<f16, u8>(&f16s).to_vec(),
+                    )
+                }
+                _ => return Err("upload_part: tensor must be f32 or f16".into()),
+            };
+        // 源数据走 pinned scratch（同 htod_pinned 语义），拷贝到张量偏移段。
+        cu_check!(
+            (self.drv.cu_stream_synchronize)(self.stream),
+            "cuStreamSynchronize(upload_part)"
+        );
+        let scratch_off = PINNED_ROWS * PINNED_ROW_BYTES;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_buf.as_ptr(),
+                (self.pinned as *mut u8).add(scratch_off),
+                bytes,
+            );
+        }
+        let src = unsafe { (self.pinned as *const u8).add(scratch_off) };
+        cu_check!(
+            (self.drv.cu_memcpy_htod_async)(
+                dptr + off_bytes as u64,
+                src as *const c_void,
+                bytes,
+                self.stream
+            ),
+            "cuMemcpyHtoDAsync(upload_part)"
+        );
+        cu_check!(
+            (self.drv.cu_stream_synchronize)(self.stream),
+            "cuStreamSynchronize(upload_part-wait)"
+        );
+        Ok(())
     }
 
     fn upload_u32(&self, t: TensorId, data: &[u32]) -> R<()> {
@@ -3577,6 +4972,727 @@ impl ComputeBackend for CudaBackend {
         // token 张量为 F32（f32 位模式存 uint 索引），直接上传单个元素。
         self.upload(tok, &[f32::from_bits(token)])
     }
+
+    fn store_sampler_async(
+        &self,
+        sampler: TensorId,
+        row: usize,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u32,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        hist_len: u32,
+    ) -> R<()> {
+        if row >= self.pinned_rows {
+            return Err(format!(
+                "store_sampler_async: row {row} >= pinned rows {}",
+                self.pinned_rows
+            )
+            .into());
+        }
+        let dptr = match self.get(sampler, "store_sampler_async")? {
+            CudaTensor::F32 { dptr, .. } => dptr,
+            _ => return Err("store_sampler_async: sampler must be f32".into()),
+        };
+        let data = [
+            temperature,
+            f32::from_bits(top_k),
+            top_p,
+            f32::from_bits(seed),
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            f32::from_bits(hist_len),
+        ];
+        // 写 pinned 行 + 流序异步拷贝（零 host 同步；拷贝在 stream 中排在
+        // 此前已提交的 kernel 之后，供下一轮 graph replay 读取）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                (self.pinned as *mut u8).add(row * PINNED_ROW_BYTES),
+                PINNED_ROW_BYTES,
+            );
+        }
+        let src = unsafe { (self.pinned as *const u8).add(row * PINNED_ROW_BYTES) };
+        cu_check!(
+            (self.drv.cu_memcpy_htod_async)(
+                dptr,
+                src as *const c_void,
+                PINNED_ROW_BYTES,
+                self.stream
+            ),
+            "cuMemcpyHtoDAsync(sampler)"
+        );
+        Ok(())
+    }
+
+    fn sampler_async_rows(&self) -> usize {
+        self.pinned_rows
+    }
+
+    fn import_tensors_from(&mut self, src: &dyn ComputeBackend) -> R<()> {
+        let src = src
+            .as_any()
+            .downcast_ref::<CudaBackend>()
+            .ok_or("import_tensors_from: src is not a CudaBackend")?;
+        if src.device != self.device {
+            return Err("import_tensors_from: device mismatch".into());
+        }
+        // 全量复制张量表（同 TensorId → 同设备指针；同一 primary ctx 下有效）。
+        for (id, ct) in &src.tensors {
+            if self.tensors.insert(*id, ct.clone()).is_some() {
+                return Err(format!("import_tensors_from: tensor id {id:?} collision").into());
+            }
+            let len = *src
+                .lens
+                .get(id)
+                .ok_or("import_tensors_from: src lens missing")?;
+            self.lens.insert(*id, len);
+            self.foreign.insert(*id);
+        }
+        // 后续新张量 id 接续源后端计数（新实例自建工作缓冲/状态不与共享权重冲突）。
+        self.next_id = self.next_id.max(src.next_id);
+        // kernel 缓存同样共享：CuModule/CuFunction 句柄在同一 primary ctx 下跨
+        // 实例有效（省每实例 ~30s 的 nvrtc 编译）。
+        for (k, v) in &src.kernels {
+            self.kernels.insert(k.clone(), *v);
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    // ==== batch 并发算子（单实例多序列：B slot 共享权重，一次读权重算 B 份）====
+
+    fn gather_rows_device_f16(
+        &mut self,
+        s: TensorId,
+        d: TensorId,
+        t: TensorId,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        // in_src 为 fp16 表 [VOCAB, C]；out_dst 为 f32 [batch, C]；in_tok 为 [batch]（f32 位模式存 uint）。
+        let src_d = self.f16_ptr(s, "gather_rows_device_f16")?;
+        let dst_d = self.f32_ptr(d, "gather_rows_device_f16")?;
+        let tok_d = match self.get(t, "gather_rows_device_f16")? {
+            CudaTensor::U32 { dptr, .. } => dptr,
+            CudaTensor::F32 { dptr, .. } => dptr,
+            _ => return Err("gather_rows_device_f16: t must be u32 or f32".into()),
+        };
+        let func = self.kernel(
+            "gather_rows_f16",
+            GATHER_ROWS_F16_SRC,
+            "rwkv_gather_rows_f16",
+        )?;
+        let grid = ((c as u32).div_ceil(256), batch as u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let params = [
+            &tok_d as *const u64 as *mut c_void,
+            &src_d as *const u64 as *mut c_void,
+            &dst_d as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn norm_lerp6_batch(
+        &mut self,
+        x: TensorId,
+        s: TensorId,
+        g: TensorId,
+        b: TensorId,
+        xr: TensorId,
+        xw: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        or: TensorId,
+        ow: TensorId,
+        ok: TensorId,
+        ov: TensorId,
+        oa: TensorId,
+        og: TensorId,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let (x, s, g, b, xr) = (
+            f32(x, "norm_lerp6_batch")?,
+            f32(s, "norm_lerp6_batch")?,
+            f32(g, "norm_lerp6_batch")?,
+            f32(b, "norm_lerp6_batch")?,
+            f32(xr, "norm_lerp6_batch")?,
+        );
+        let (xw, xk, xv, xa, xg) = (
+            f32(xw, "norm_lerp6_batch")?,
+            f32(xk, "norm_lerp6_batch")?,
+            f32(xv, "norm_lerp6_batch")?,
+            f32(xa, "norm_lerp6_batch")?,
+            f32(xg, "norm_lerp6_batch")?,
+        );
+        let (or_, ow, ok) = (
+            f32(or, "norm_lerp6_batch")?,
+            f32(ow, "norm_lerp6_batch")?,
+            f32(ok, "norm_lerp6_batch")?,
+        );
+        let (ov, oa, og) = (
+            f32(ov, "norm_lerp6_batch")?,
+            f32(oa, "norm_lerp6_batch")?,
+            f32(og, "norm_lerp6_batch")?,
+        );
+        let func = self.kernel("norm_lerp6_batch", NORM_LERP6_BATCH_SRC, "norm_lerp6_batch")?;
+        let grid = (c.div_ceil(256).max(1) as u32, batch as u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let params = [
+            &x as *const u64 as *mut c_void,
+            &s as *const u64 as *mut c_void,
+            &g as *const u64 as *mut c_void,
+            &b as *const u64 as *mut c_void,
+            &xr as *const u64 as *mut c_void,
+            &xw as *const u64 as *mut c_void,
+            &xk as *const u64 as *mut c_void,
+            &xv as *const u64 as *mut c_void,
+            &xa as *const u64 as *mut c_void,
+            &xg as *const u64 as *mut c_void,
+            &or_ as *const u64 as *mut c_void,
+            &ow as *const u64 as *mut c_void,
+            &ok as *const u64 as *mut c_void,
+            &ov as *const u64 as *mut c_void,
+            &oa as *const u64 as *mut c_void,
+            &og as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cmix_norm_lerp_batch(
+        &mut self,
+        x: TensorId,
+        s: TensorId,
+        g: TensorId,
+        b: TensorId,
+        coeff: TensorId,
+        out_xb: TensorId,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let (x, s, g, b, coeff, out_xb) = (
+            f32(x, "cmix_norm_lerp_batch")?,
+            f32(s, "cmix_norm_lerp_batch")?,
+            f32(g, "cmix_norm_lerp_batch")?,
+            f32(b, "cmix_norm_lerp_batch")?,
+            f32(coeff, "cmix_norm_lerp_batch")?,
+            f32(out_xb, "cmix_norm_lerp_batch")?,
+        );
+        let func = self.kernel(
+            "cmix_norm_lerp_batch",
+            CMIX_NORM_LERP_BATCH_SRC,
+            "cmix_norm_lerp_batch",
+        )?;
+        let grid = (c.div_ceil(256).max(1) as u32, batch as u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let params = [
+            &x as *const u64 as *mut c_void,
+            &s as *const u64 as *mut c_void,
+            &g as *const u64 as *mut c_void,
+            &b as *const u64 as *mut c_void,
+            &coeff as *const u64 as *mut c_void,
+            &out_xb as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    /// batch 版：kernel 与单序列版同一份（内部已带 batch=blockIdx.y 维），仅 grid.y=batch。
+    #[allow(clippy::too_many_arguments)]
+    fn fuse_ka_dplr_norm_batch(
+        &mut self,
+        s: TensorId,
+        k: TensorId,
+        k_k: TensorId,
+        a: TensorId,
+        k_a: TensorId,
+        r: TensorId,
+        v: TensorId,
+        w: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        r_k: TensorId,
+        k_mod: TensorId,
+        y: TensorId,
+        y_norm: TensorId,
+        h: usize,
+        n: usize,
+        eps: f32,
+        gn_eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let f16 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F16 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f16").into()),
+            }
+        };
+        let sd = f32(s, "fuse_ka_dplr_norm_batch")?;
+        let kd = f32(k, "fuse_ka_dplr_norm_batch")?;
+        let kkd = f32(k_k, "fuse_ka_dplr_norm_batch")?;
+        let ad = f16(a, "fuse_ka_dplr_norm_batch")?;
+        let kad = f32(k_a, "fuse_ka_dplr_norm_batch")?;
+        let rd = f32(r, "fuse_ka_dplr_norm_batch")?;
+        let vd = f16(v, "fuse_ka_dplr_norm_batch")?;
+        let wd = f16(w, "fuse_ka_dplr_norm_batch")?;
+        let gd = f32(gamma, "fuse_ka_dplr_norm_batch")?;
+        let bd = f32(beta, "fuse_ka_dplr_norm_batch")?;
+        let rkd = f32(r_k, "fuse_ka_dplr_norm_batch")?;
+        let kmd = f32(k_mod, "fuse_ka_dplr_norm_batch")?;
+        let yd = f32(y, "fuse_ka_dplr_norm_batch")?;
+        let ynd = f32(y_norm, "fuse_ka_dplr_norm_batch")?;
+
+        let func = self.kernel(
+            "fuse_ka_dplr_norm",
+            FUSE_KA_DPLR_NORM_SRC,
+            "fuse_ka_dplr_norm",
+        )?;
+        // 每个 block 处理一个 (head, slot)；kernel 内 batch=blockIdx.y。
+        let grid = (h as u32, batch as u32, 1u32);
+        let block = (128u32, 1u32, 1u32);
+        let h_i = h as i32;
+        let n_i = n as i32;
+        let params = [
+            &sd as *const u64 as *mut c_void,
+            &kd as *const u64 as *mut c_void,
+            &kkd as *const u64 as *mut c_void,
+            &ad as *const u64 as *mut c_void,
+            &kad as *const u64 as *mut c_void,
+            &rd as *const u64 as *mut c_void,
+            &vd as *const u64 as *mut c_void,
+            &wd as *const u64 as *mut c_void,
+            &gd as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &rkd as *const u64 as *mut c_void,
+            &kmd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &ynd as *const u64 as *mut c_void,
+            &h_i as *const i32 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
+            &gn_eps as *const f32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_rkv_stage1_batch(
+        &mut self,
+        r: &Int8Handle,
+        k: &Int8Handle,
+        v: &Int8Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        let ridx = self.u32_ptr(r.idx, "gemv_int8_rkv_stage1_batch")?;
+        let rsz = self.u32_ptr(r.sz, "gemv_int8_rkv_stage1_batch")?;
+        let kidx = self.u32_ptr(k.idx, "gemv_int8_rkv_stage1_batch")?;
+        let ksz = self.u32_ptr(k.sz, "gemv_int8_rkv_stage1_batch")?;
+        let vidx = self.u32_ptr(v.idx, "gemv_int8_rkv_stage1_batch")?;
+        let vsz = self.u32_ptr(v.sz, "gemv_int8_rkv_stage1_batch")?;
+        let v1d = self.f32_ptr(v1, "gemv_int8_rkv_stage1_batch")?;
+        let w1d = self.f32_ptr(w1, "gemv_int8_rkv_stage1_batch")?;
+        let a1d = self.f32_ptr(a1, "gemv_int8_rkv_stage1_batch")?;
+        let g1d = self.f32_ptr(g1, "gemv_int8_rkv_stage1_batch")?;
+        let xrd = self.f32_ptr(xr, "gemv_int8_rkv_stage1_batch")?;
+        let xkd = self.f32_ptr(xk, "gemv_int8_rkv_stage1_batch")?;
+        let xvd = self.f32_ptr(xv, "gemv_int8_rkv_stage1_batch")?;
+        let xwd = self.f32_ptr(xw, "gemv_int8_rkv_stage1_batch")?;
+        let xad = self.f32_ptr(xa, "gemv_int8_rkv_stage1_batch")?;
+        let xgd = self.f32_ptr(xg, "gemv_int8_rkv_stage1_batch")?;
+        let ord = self.f32_ptr(out_r, "gemv_int8_rkv_stage1_batch")?;
+        let okd = self.f32_ptr(out_k, "gemv_int8_rkv_stage1_batch")?;
+        let ovd = self.f16_ptr(out_v, "gemv_int8_rkv_stage1_batch")?;
+        let ovmd = self.f32_ptr(out_vm, "gemv_int8_rkv_stage1_batch")?;
+        let owmd = self.f32_ptr(out_wm, "gemv_int8_rkv_stage1_batch")?;
+        let oamd = self.f32_ptr(out_am, "gemv_int8_rkv_stage1_batch")?;
+        let ogmd = self.f32_ptr(out_gm, "gemv_int8_rkv_stage1_batch")?;
+
+        let func = self.kernel(
+            "gemv_int8_rkv_stage1_batch",
+            GEMV_INT8_RKV_STAGE1_BATCH_SRC,
+            "gemv_int8_rkv_stage1_batch",
+        )?;
+        // grid.y = slot 分组数（kernel 内复用权重给 BGRP=2 个 slot，寄存器约束）。
+        const RKV_MB_BGRP: usize = 2;
+        let grid = (
+            (c / 4 + vm + wm + am + gm) as u32,
+            batch.div_ceil(RKV_MB_BGRP) as u32,
+            1u32,
+        );
+        let block = (128u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let vm_i = vm as i32;
+        let wm_i = wm as i32;
+        let am_i = am as i32;
+        let gm_i = gm as i32;
+        let batch_i = batch as i32;
+        let params = [
+            &ridx as *const u64 as *mut c_void,
+            &rsz as *const u64 as *mut c_void,
+            &kidx as *const u64 as *mut c_void,
+            &ksz as *const u64 as *mut c_void,
+            &vidx as *const u64 as *mut c_void,
+            &vsz as *const u64 as *mut c_void,
+            &v1d as *const u64 as *mut c_void,
+            &w1d as *const u64 as *mut c_void,
+            &a1d as *const u64 as *mut c_void,
+            &g1d as *const u64 as *mut c_void,
+            &xrd as *const u64 as *mut c_void,
+            &xkd as *const u64 as *mut c_void,
+            &xvd as *const u64 as *mut c_void,
+            &xwd as *const u64 as *mut c_void,
+            &xad as *const u64 as *mut c_void,
+            &xgd as *const u64 as *mut c_void,
+            &ord as *const u64 as *mut c_void,
+            &okd as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &ovmd as *const u64 as *mut c_void,
+            &owmd as *const u64 as *mut c_void,
+            &oamd as *const u64 as *mut c_void,
+            &ogmd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &vm_i as *const i32 as *mut c_void,
+            &wm_i as *const i32 as *mut c_void,
+            &am_i as *const i32 as *mut c_void,
+            &gm_i as *const i32 as *mut c_void,
+            &batch_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowrank_chain4_batch(
+        &mut self,
+        w2: TensorId,
+        a2: TensorId,
+        v2: TensorId,
+        g2: TensorId,
+        w_mid: TensorId,
+        a_mid: TensorId,
+        v_mid: TensorId,
+        g_mid: TensorId,
+        w0: TensorId,
+        a0: TensorId,
+        v0: TensorId,
+        scale: TensorId,
+        v_first: TensorId,
+        out_w: TensorId,
+        out_a: TensorId,
+        out_v: TensorId,
+        out_g: TensorId,
+        m: usize,
+        kw: usize,
+        ka: usize,
+        kv: usize,
+        kg: usize,
+        batch: usize,
+    ) -> R<()> {
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let f16 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F16 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f16").into()),
+            }
+        };
+        let w2d = f32(w2, "gemv_lowrank_chain4_batch")?;
+        let a2d = f32(a2, "gemv_lowrank_chain4_batch")?;
+        let v2d = f32(v2, "gemv_lowrank_chain4_batch")?;
+        let g2d = f32(g2, "gemv_lowrank_chain4_batch")?;
+        let wmd = f32(w_mid, "gemv_lowrank_chain4_batch")?;
+        let amd = f32(a_mid, "gemv_lowrank_chain4_batch")?;
+        let vmd = f32(v_mid, "gemv_lowrank_chain4_batch")?;
+        let gmd = f32(g_mid, "gemv_lowrank_chain4_batch")?;
+        let w0d = f32(w0, "gemv_lowrank_chain4_batch")?;
+        let a0d = f32(a0, "gemv_lowrank_chain4_batch")?;
+        let v0d = f32(v0, "gemv_lowrank_chain4_batch")?;
+        let scaled = f32(scale, "gemv_lowrank_chain4_batch")?;
+        let vfd = f16(v_first, "gemv_lowrank_chain4_batch")?;
+        let owd = f16(out_w, "gemv_lowrank_chain4_batch")?;
+        let oad = f16(out_a, "gemv_lowrank_chain4_batch")?;
+        let ovd = f16(out_v, "gemv_lowrank_chain4_batch")?;
+        let ogd = f16(out_g, "gemv_lowrank_chain4_batch")?;
+
+        let func = self.kernel(
+            "gemv_lowrank_chain4_batch",
+            GEMV_LOWRANK_CHAIN4_BATCH_SRC,
+            "gemv_lowrank_chain4_batch",
+        )?;
+        // warp-per-row：grid.x = ceil(M/8)（每 block 8 warp 各 1 行），grid.y = slot 分组。
+        const CHAIN4_WARPS: usize = 8;
+        const CHAIN4_BGRP: usize = 4;
+        let grid = (
+            m.div_ceil(CHAIN4_WARPS) as u32,
+            batch.div_ceil(CHAIN4_BGRP) as u32,
+            1u32,
+        );
+        let block = (256u32, 1u32, 1u32);
+        let m_i = m as i32;
+        let kw_i = kw as i32;
+        let ka_i = ka as i32;
+        let kv_i = kv as i32;
+        let kg_i = kg as i32;
+        let batch_i = batch as i32;
+        let params = [
+            &w2d as *const u64 as *mut c_void,
+            &a2d as *const u64 as *mut c_void,
+            &v2d as *const u64 as *mut c_void,
+            &g2d as *const u64 as *mut c_void,
+            &wmd as *const u64 as *mut c_void,
+            &amd as *const u64 as *mut c_void,
+            &vmd as *const u64 as *mut c_void,
+            &gmd as *const u64 as *mut c_void,
+            &w0d as *const u64 as *mut c_void,
+            &a0d as *const u64 as *mut c_void,
+            &v0d as *const u64 as *mut c_void,
+            &scaled as *const u64 as *mut c_void,
+            &vfd as *const u64 as *mut c_void,
+            &owd as *const u64 as *mut c_void,
+            &oad as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &ogd as *const u64 as *mut c_void,
+            &m_i as *const i32 as *mut c_void,
+            &kw_i as *const i32 as *mut c_void,
+            &ka_i as *const i32 as *mut c_void,
+            &kv_i as *const i32 as *mut c_void,
+            &kg_i as *const i32 as *mut c_void,
+            &batch_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_value_sparse_add_batch(
+        &mut self,
+        value_tiled: TensorId,
+        r2: TensorId,
+        x: TensorId,
+        c: usize,
+        fh: usize,
+        batch: usize,
+    ) -> R<()> {
+        let vt = self.f16_ptr(value_tiled, "ffn_value_sparse_add_batch")?;
+        let rd = self.f32_ptr(r2, "ffn_value_sparse_add_batch")?;
+        let xd = self.f32_ptr(x, "ffn_value_sparse_add_batch")?;
+        let func = self.kernel(
+            "ffn_value_sparse_add_batch",
+            FFN_VALUE_SPARSE_BATCH_SRC,
+            "ffn_value_sparse_add_batch",
+        )?;
+        let grid = ((fh / 128) as u32, (c / 256) as u32, batch as u32);
+        let block = (128u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let fh_i = fh as i32;
+        let params = [
+            &rd as *const u64 as *mut c_void,
+            &vt as *const u64 as *mut c_void,
+            &xd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &fh_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_into_host_seeded_batch(
+        &mut self,
+        logits: TensorId,
+        token: TensorId,
+        n: usize,
+        temp: TensorId,
+        mask: TensorId,
+        counter: TensorId,
+        sampler: TensorId,
+        hist: TensorId,
+        batch: usize,
+    ) -> R<()> {
+        let logits_d = self.f32_ptr(logits, "sample_into_host_seeded_batch")?;
+        let token_d = self.f32_ptr(token, "sample_into_host_seeded_batch")?;
+        let temp_d = self.f32_ptr(temp, "sample_into_host_seeded_batch")?;
+        let mask_d = self.f32_ptr(mask, "sample_into_host_seeded_batch")?;
+        let counter_d = self.u32_ptr(counter, "sample_into_host_seeded_batch")?;
+        let sampler_d = self.f32_ptr(sampler, "sample_into_host_seeded_batch")?;
+        let hist_d = match self.get(hist, "sample_into_host_seeded_batch")? {
+            CudaTensor::U32 { dptr, .. } => dptr,
+            CudaTensor::F32 { dptr, .. } => dptr,
+            _ => return Err("sample_into_host_seeded_batch: hist must be u32 or f32".into()),
+        };
+        let func = self.kernel("rwkv_sample_batch", SAMPLE_BATCH_SRC, "rwkv_sample_batch")?;
+        let grid = (1u32, batch as u32, 1u32);
+        let block = (112u32, 1u32, 1u32);
+        let n_i = n as i32;
+        let params = [
+            &logits_d as *const u64 as *mut c_void,
+            &token_d as *const u64 as *mut c_void,
+            &temp_d as *const u64 as *mut c_void,
+            &mask_d as *const u64 as *mut c_void,
+            &counter_d as *const u64 as *mut c_void,
+            &sampler_d as *const u64 as *mut c_void,
+            &hist_d as *const u64 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn record_tokens(
+        &mut self,
+        in_tok: TensorId,
+        out_seq: TensorId,
+        cnt: TensorId,
+        stride: usize,
+        batch: usize,
+    ) -> R<()> {
+        let ptr = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::U32 { dptr, .. } => Ok(dptr),
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be u32 or f32").into()),
+            }
+        };
+        let in_tok_d = ptr(in_tok, "record_tokens")?;
+        let out_d = ptr(out_seq, "record_tokens")?;
+        let cnt_d = ptr(cnt, "record_tokens")?;
+        let func = self.kernel(
+            "rwkv_record_tokens",
+            RECORD_TOKENS_SRC,
+            "rwkv_record_tokens",
+        )?;
+        let grid = (batch as u32, 1u32, 1u32);
+        let block = (1u32, 1u32, 1u32);
+        let stride_i = stride as i32;
+        let params = [
+            &in_tok_d as *const u64 as *mut c_void,
+            &out_d as *const u64 as *mut c_void,
+            &cnt_d as *const u64 as *mut c_void,
+            &stride_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    /// batch 版异步 sampler 上传：宽行（batch*8 f32 = batch*32 字节）。
+    /// pinned 区按宽行切分：可用轮数 = PINNED_ROWS / batch（行宽随 batch 增大）。
+    #[allow(clippy::too_many_arguments)]
+    fn store_sampler_async_batch(
+        &self,
+        sampler: TensorId,
+        row: usize,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seeds: &[u32],
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        hist_len: u32,
+    ) -> R<()> {
+        let batch = seeds.len();
+        let row_bytes = batch * PINNED_ROW_BYTES;
+        let max_rows = self.pinned_rows / batch.max(1);
+        if row >= max_rows {
+            return Err(format!(
+                "store_sampler_async_batch: row {row} >= max rows {max_rows} (batch {batch})"
+            )
+            .into());
+        }
+        let dptr = match self.get(sampler, "store_sampler_async_batch")? {
+            CudaTensor::F32 { dptr, .. } => dptr,
+            _ => return Err("store_sampler_async_batch: sampler must be f32".into()),
+        };
+        // 每 slot 8 个 f32：temperature/top_k/top_p/seed/rep/freq/pres/hist_len。
+        let mut data = Vec::with_capacity(batch * 8);
+        for &seed in seeds {
+            data.extend_from_slice(&[
+                temperature,
+                f32::from_bits(top_k),
+                top_p,
+                f32::from_bits(seed),
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                f32::from_bits(hist_len),
+            ]);
+        }
+        // 写 pinned 宽行 + 流序异步拷贝（零 host 同步）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                (self.pinned as *mut u8).add(row * row_bytes),
+                row_bytes,
+            );
+        }
+        let src = unsafe { (self.pinned as *const u8).add(row * row_bytes) };
+        cu_check!(
+            (self.drv.cu_memcpy_htod_async)(dptr, src as *const c_void, row_bytes, self.stream),
+            "cuMemcpyHtoDAsync(sampler batch)"
+        );
+        Ok(())
+    }
+
     fn gather_row_device_f16(&mut self, s: TensorId, d: TensorId, t: TensorId, c: usize) -> R<()> {
         // in_src 为 fp16 表 [VOCAB, C]；out_dst 为 f32 [C]；in_tok 为 f32 位模式存 uint 索引。
         let src_d = self.f16_ptr(s, "gather_row_device_f16")?;
@@ -4765,6 +6881,131 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn seq_shift_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        tm: TensorId,
+        y: TensorId,
+        c: usize,
+        t: usize,
+        stride_x: usize,
+        stride_y: usize,
+        batch: usize,
+    ) -> R<()> {
+        let (xd, sd, tmd, yd) = (
+            self.f32_ptr(x, "seq_shift_batch")?,
+            self.f32_ptr(state, "seq_shift_batch")?,
+            self.f32_ptr(tm, "seq_shift_batch")?,
+            self.f32_ptr(y, "seq_shift_batch")?,
+        );
+        let func = self.kernel(
+            "seq_shift_batch",
+            SEQ_SHIFT_BATCH_SRC,
+            "rwkv_seq_shift_batch",
+        )?;
+        let grid = (t as u32, batch as u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i, sx, sy) = (c as i32, t as i32, stride_x as i32, stride_y as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &sd as *const u64 as *mut c_void,
+            &tmd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &sx as *const i32 as *mut c_void,
+            &sy as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+    fn copy_token_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        lens: TensorId,
+        c: usize,
+        t: usize,
+        batch: usize,
+    ) -> R<()> {
+        let xd = self.f32_ptr(x, "copy_token_batch")?;
+        let sd = self.f32_ptr(state, "copy_token_batch")?;
+        let ld = self.u32_ptr(lens, "copy_token_batch")?;
+        let func = self.kernel(
+            "copy_token_batch",
+            COPY_TOKEN_BATCH_SRC,
+            "rwkv_copy_token_batch",
+        )?;
+        let grid = (batch as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i) = (c as i32, t as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &sd as *const u64 as *mut c_void,
+            &ld as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn dplr_seq_batch(
+        &mut self,
+        s: TensorId,
+        r: TensorId,
+        w: TensorId,
+        k: TensorId,
+        v: TensorId,
+        a: TensorId,
+        b: TensorId,
+        y: TensorId,
+        lens: TensorId,
+        h: usize,
+        n: usize,
+        t: usize,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let (sd, rd, wd, kd, vd, ad, bd, yd) = (
+            f32(s, "dplr_seq_batch")?,
+            f32(r, "dplr_seq_batch")?,
+            f32(w, "dplr_seq_batch")?,
+            f32(k, "dplr_seq_batch")?,
+            f32(v, "dplr_seq_batch")?,
+            f32(a, "dplr_seq_batch")?,
+            f32(b, "dplr_seq_batch")?,
+            f32(y, "dplr_seq_batch")?,
+        );
+        let ld = self.u32_ptr(lens, "dplr_seq_batch")?;
+        let func = self.kernel("dplr_seq_batch", DPLR_SEQ_BATCH_SRC, "rwkv_dplr_seq_batch")?;
+        let blocks = h * n;
+        let grid = ((blocks as u32).div_ceil(8), batch as u32, 1u32);
+        let block = (128u32, 1u32, 1u32);
+        let (h_i, n_i, t_i, c_i) = (h as i32, n as i32, t as i32, c as i32);
+        let params = [
+            &sd as *const u64 as *mut c_void,
+            &rd as *const u64 as *mut c_void,
+            &wd as *const u64 as *mut c_void,
+            &kd as *const u64 as *mut c_void,
+            &vd as *const u64 as *mut c_void,
+            &ad as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &ld as *const u64 as *mut c_void,
+            &h_i as *const i32 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
     fn dplr_seq(
         &mut self,
         s: TensorId,
@@ -5400,6 +7641,768 @@ mod tests {
         }
         assert!(max_diff < 1e-3, "norm mismatch, max_diff={max_diff}");
         log::info!("norm vs CPU reference OK (max_diff<1e-3)");
+    }
+
+    /// xorshift rng（batch 测试共享）。
+    fn test_rng(seed: u32) -> impl FnMut() -> f32 {
+        let mut seed = seed;
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// norm_lerp6_batch 与 CPU 参考对比：B slot 各自独立归一化 + lerp + state 写回。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn norm_lerp6_batch_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping norm_lerp6_batch test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let c = 512usize;
+        let batch = 4usize;
+        let eps = 1e-5f32;
+        let mut rng = test_rng(0xABCDEF01);
+
+        let xd: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let sd: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let gd: Vec<f32> = (0..c).map(|_| 0.5 + rng()).collect();
+        let bd: Vec<f32> = (0..c).map(|_| rng()).collect();
+        // lerp 系数为共享权重 [C]（跨 slot 共享，与线上 x_r..x_g 一致）。
+        let coeffs: Vec<Vec<f32>> = (0..6).map(|_| (0..c).map(|_| rng()).collect()).collect();
+
+        // CPU 参考（每 slot 独立归一化，系数共享）
+        let mut expect_o = vec![vec![0.0f32; batch * c]; 6];
+        let mut expect_s = vec![0.0f32; batch * c];
+        for bi in 0..batch {
+            let base = bi * c;
+            let mean: f32 = (0..c).map(|i| xd[base + i]).sum::<f32>() / c as f32;
+            let var: f32 = (0..c)
+                .map(|i| {
+                    let v = xd[base + i] - mean;
+                    v * v
+                })
+                .sum::<f32>()
+                / c as f32;
+            let inv_std = 1.0 / (var + eps).sqrt();
+            for i in 0..c {
+                let ln1 = (xd[base + i] - mean) * inv_std * gd[i] + bd[i];
+                for j in 0..6 {
+                    expect_o[j][base + i] = ln1 + coeffs[j][i] * (sd[base + i] - ln1);
+                }
+                expect_s[base + i] = ln1;
+            }
+        }
+
+        let x = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let s = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let g = mk_tensor(&mut b, c, TensorDtype::F32);
+        let beta = mk_tensor(&mut b, c, TensorDtype::F32);
+        let ct: Vec<_> = (0..6)
+            .map(|_| mk_tensor(&mut b, c, TensorDtype::F32))
+            .collect();
+        let outs: Vec<_> = (0..6)
+            .map(|_| mk_tensor(&mut b, batch * c, TensorDtype::F32))
+            .collect();
+        b.upload(x, &xd).unwrap();
+        b.upload(s, &sd).unwrap();
+        b.upload(g, &gd).unwrap();
+        b.upload(beta, &bd).unwrap();
+        for j in 0..6 {
+            b.upload(ct[j], &coeffs[j]).unwrap();
+        }
+        b.norm_lerp6_batch(
+            x, s, g, beta, ct[0], ct[1], ct[2], ct[3], ct[4], ct[5], outs[0], outs[1], outs[2],
+            outs[3], outs[4], outs[5], c, eps, batch,
+        )
+        .expect("norm_lerp6_batch");
+        let got_s = b.download(s).unwrap();
+        for j in 0..6 {
+            let got = b.download(outs[j]).unwrap();
+            let mut diff = 0.0f32;
+            for (e, gr) in expect_o[j].iter().zip(got.iter()) {
+                diff = diff.max((e - gr).abs());
+            }
+            assert!(
+                diff < 1e-3,
+                "norm_lerp6_batch out[{j}] mismatch, max_diff={diff}"
+            );
+        }
+        let mut s_diff = 0.0f32;
+        for (e, gr) in expect_s.iter().zip(got_s.iter()) {
+            s_diff = s_diff.max((e - gr).abs());
+        }
+        assert!(
+            s_diff < 1e-3,
+            "norm_lerp6_batch state mismatch, max_diff={s_diff}"
+        );
+        log::info!("norm_lerp6_batch vs CPU reference OK (batch={batch})");
+    }
+
+    /// cmix_norm_lerp_batch 与 CPU 参考对比：B slot 各自独立 ln2 + lerp + state 写回。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn cmix_norm_lerp_batch_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping cmix_norm_lerp_batch test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let c = 512usize;
+        let batch = 4usize;
+        let eps = 1e-5f32;
+        let mut rng = test_rng(0x12349999);
+
+        let xd: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let sd: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let gd: Vec<f32> = (0..c).map(|_| 0.5 + rng()).collect();
+        let bd: Vec<f32> = (0..c).map(|_| rng()).collect();
+        let cd: Vec<f32> = (0..c).map(|_| rng()).collect();
+
+        let mut expect_xb = vec![0.0f32; batch * c];
+        let mut expect_s = vec![0.0f32; batch * c];
+        for bi in 0..batch {
+            let base = bi * c;
+            let mean: f32 = (0..c).map(|i| xd[base + i]).sum::<f32>() / c as f32;
+            let var: f32 = (0..c)
+                .map(|i| {
+                    let v = xd[base + i] - mean;
+                    v * v
+                })
+                .sum::<f32>()
+                / c as f32;
+            let inv_std = 1.0 / (var + eps).sqrt();
+            for i in 0..c {
+                let ln2 = (xd[base + i] - mean) * inv_std * gd[i] + bd[i];
+                expect_xb[base + i] = ln2 + cd[i] * (sd[base + i] - ln2);
+                expect_s[base + i] = ln2;
+            }
+        }
+
+        let x = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let s = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let g = mk_tensor(&mut b, c, TensorDtype::F32);
+        let beta = mk_tensor(&mut b, c, TensorDtype::F32);
+        let co = mk_tensor(&mut b, c, TensorDtype::F32);
+        let o = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        b.upload(x, &xd).unwrap();
+        b.upload(s, &sd).unwrap();
+        b.upload(g, &gd).unwrap();
+        b.upload(beta, &bd).unwrap();
+        b.upload(co, &cd).unwrap();
+        b.cmix_norm_lerp_batch(x, s, g, beta, co, o, c, eps, batch)
+            .expect("cmix_norm_lerp_batch");
+        let got_xb = b.download(o).unwrap();
+        let got_s = b.download(s).unwrap();
+        let mut diff = 0.0f32;
+        for (e, gr) in expect_xb.iter().zip(got_xb.iter()) {
+            diff = diff.max((e - gr).abs());
+        }
+        assert!(
+            diff < 1e-3,
+            "cmix_norm_lerp_batch xb mismatch, max_diff={diff}"
+        );
+        let mut s_diff = 0.0f32;
+        for (e, gr) in expect_s.iter().zip(got_s.iter()) {
+            s_diff = s_diff.max((e - gr).abs());
+        }
+        assert!(
+            s_diff < 1e-3,
+            "cmix_norm_lerp_batch state mismatch, max_diff={s_diff}"
+        );
+        log::info!("cmix_norm_lerp_batch vs CPU reference OK (batch={batch})");
+    }
+
+    /// gather_rows_device_f16 与 CPU 参考对比：B slot 各自按 tok[b] 取行。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn gather_rows_f16_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping gather_rows test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let c = 256usize;
+        let vocab = 1024usize;
+        let batch = 4usize;
+        let mut rng = test_rng(0x5A5A5A5A);
+
+        let src: Vec<f32> = (0..vocab * c).map(|_| rng()).collect();
+        let toks: Vec<u32> = vec![0, 17, 512, vocab as u32 - 1];
+        // 期望值做 f32→f16→f32 round-trip（upload 时后端转 f16 存储）。
+        let mut expect = Vec::with_capacity(batch * c);
+        for &t in &toks {
+            let t = t as usize;
+            for i in 0..c {
+                expect.push(src[t * c + i]);
+            }
+        }
+
+        let src_t = mk_tensor(&mut b, vocab * c, TensorDtype::F16);
+        let dst = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let tok = mk_tensor(&mut b, batch, TensorDtype::F32);
+        b.upload(src_t, &src).unwrap();
+        b.upload(
+            tok,
+            &toks.iter().map(|t| f32::from_bits(*t)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        b.gather_rows_device_f16(src_t, dst, tok, c, batch)
+            .expect("gather_rows");
+        let got = b.download(dst).unwrap();
+        let mut max_diff = 0.0f32;
+        for (e, gr) in expect.iter().zip(got.iter()) {
+            max_diff = max_diff.max((e - gr).abs());
+        }
+        assert!(max_diff < 1e-2, "gather_rows mismatch, max_diff={max_diff}");
+        log::info!("gather_rows vs CPU reference OK (batch={batch})");
+    }
+
+    /// sample_into_host_seeded_batch 与 CPU argmax 一致性：temperature≈0 时退化为
+    /// argmax（确定性），验证每 slot 的 top-1 选择互不干扰。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn sample_batch_matches_single() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping sample_batch test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let n = 1024usize;
+        let batch = 4usize;
+        let mut rng = test_rng(0xFEED1234);
+
+        let logits: Vec<f32> = (0..batch * n).map(|_| rng() * 10.0).collect();
+        // 每 slot 的期望 argmax（CPU 参考）
+        let expect: Vec<usize> = logits
+            .chunks(n)
+            .map(|chunk| {
+                let mut best = 0usize;
+                for i in 1..n {
+                    if chunk[i] > chunk[best] {
+                        best = i;
+                    }
+                }
+                best
+            })
+            .collect();
+
+        let logits_t = mk_tensor(&mut b, batch * n, TensorDtype::F32);
+        let token_t = mk_tensor(&mut b, batch, TensorDtype::F32);
+        let temp_t = mk_tensor(&mut b, batch * n, TensorDtype::F32);
+        let mask_t = mk_tensor(&mut b, batch * n, TensorDtype::F32);
+        let counter_t = mk_tensor(&mut b, batch * n, TensorDtype::U32);
+        let sampler_t = mk_tensor(&mut b, batch * 8, TensorDtype::F32);
+        let hist_t = mk_tensor(&mut b, batch, TensorDtype::U32);
+        b.upload(logits_t, &logits).unwrap();
+
+        // 先跑单序列版 4 次（同一数据/参数），对照 batch 版——隔离"原版 bug vs batch 偏移 bug"。
+        let single_tokens: Vec<u32> = (0..batch)
+            .map(|bi| {
+                let single_logits = mk_tensor(&mut b, n, TensorDtype::F32);
+                let single_tok = mk_tensor(&mut b, 1, TensorDtype::F32);
+                b.upload(single_logits, &logits[bi * n..(bi + 1) * n])
+                    .unwrap();
+                b.sample(
+                    single_logits,
+                    single_tok,
+                    n,
+                    0.0001,
+                    if std::env::var("K1").is_ok() { 1 } else { 50 },
+                    1.0,
+                    42 + bi as u32,
+                    1.0,
+                    0.0,
+                    0.0,
+                    &[],
+                )
+                .expect("single sample");
+                b.download(single_tok).unwrap()[0].to_bits()
+            })
+            .collect();
+        eprintln!("single-seq tokens: {single_tokens:?}");
+
+        // sampler 参数：temperature=0.0001（≈argmax）、top_k=50、top_p=1.0、seed 逐 slot。
+        let mut sampler_data = Vec::with_capacity(batch * 8);
+        for bi in 0..batch {
+            sampler_data.extend_from_slice(&[
+                0.0001,
+                f32::from_bits(50),
+                1.0,
+                f32::from_bits(42 + bi as u32),
+                1.0,
+                0.0,
+                0.0,
+                f32::from_bits(0u32),
+            ]);
+        }
+        b.upload(sampler_t, &sampler_data).unwrap();
+
+        b.sample_into_host_seeded_batch(
+            logits_t, token_t, n, temp_t, mask_t, counter_t, sampler_t, hist_t, batch,
+        )
+        .expect("sample_batch");
+        let got = b.download(token_t).unwrap();
+        for bi in 0..batch {
+            let tok = got[bi].to_bits();
+            assert_eq!(
+                tok, expect[bi] as u32,
+                "sample_batch slot {bi}: got {tok} expect {}",
+                expect[bi]
+            );
+        }
+        log::info!("sample_batch vs CPU argmax OK (batch={batch}, temp≈0)");
+    }
+
+    /// record_tokens 与 CPU 参考对比：B slot 各自独立计数追加。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn record_tokens_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping record_tokens test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let batch = 4usize;
+        let stride = 8usize;
+        let rounds = 3usize;
+
+        // 每 slot 预置计数（验证原子追加起点）。
+        let init_cnt: Vec<u32> = vec![1, 0, 5, 2];
+        let mut expect_seq = vec![0u32; batch * stride];
+        let mut expect_cnt = init_cnt.clone();
+
+        let tok = mk_tensor(&mut b, batch, TensorDtype::F32);
+        let seq = mk_tensor(&mut b, batch * stride, TensorDtype::F32);
+        let cnt = mk_tensor(&mut b, batch, TensorDtype::F32);
+        // cnt 存 u32 位模式（f32 缓冲），初值必须按位写入而非数值转换。
+        b.upload(
+            cnt,
+            &init_cnt
+                .iter()
+                .map(|c| f32::from_bits(*c))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        // 逐轮：round r 每 slot 追加 token = slot*100 + r。
+        for r in 0..rounds {
+            let toks: Vec<u32> = (0..batch).map(|bi| bi as u32 * 100 + r as u32).collect();
+            b.upload(
+                tok,
+                &toks.iter().map(|t| f32::from_bits(*t)).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            b.record_tokens(tok, seq, cnt, stride, batch)
+                .expect("record_tokens");
+            for bi in 0..batch {
+                let pos = expect_cnt[bi];
+                expect_seq[bi * stride + pos as usize] = toks[bi];
+                expect_cnt[bi] += 1;
+            }
+        }
+
+        let got_seq = b.download(seq).unwrap();
+        for (e, gr) in expect_seq.iter().zip(got_seq.iter()) {
+            assert_eq!(e, &gr.to_bits(), "record_tokens seq mismatch");
+        }
+        let got_cnt = b.download(cnt).unwrap();
+        for (e, gr) in expect_cnt.iter().zip(got_cnt.iter()) {
+            assert_eq!(e, &gr.to_bits(), "record_tokens cnt mismatch");
+        }
+        log::info!("record_tokens vs CPU reference OK (batch={batch})");
+    }
+
+    /// gemv_variant_mb（batch 权重复用版）vs 逐 slot 单序列版数值一致性：
+    /// int8 relu2 / mul_add / plain 三种 op，batch=6（含 BGRP 分组边界 4 的跨界）。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn gemv_variant_mb_matches_single() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping gemv_variant_mb test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let m = 64usize; // M 为 4 的倍数（GEMV_ROWS）
+        let k = 256usize; // K 为 128 的倍数（int8 group）
+        let batch = 6usize; // 跨 BGRP=4 分组边界
+        let mut rng = test_rng(0x77AA33CC);
+
+        // int8 量化权重（scale/zero 打包进 sz；idx 打包 4×uint8）。
+        let mut w_host = vec![0.0f32; m * k];
+        for v in w_host.iter_mut() {
+            *v = rng() * 2.0;
+        }
+        let (idx, sz) = {
+            let mut idx = vec![0u32; m * (k / 4)];
+            let mut sz = vec![0u32; m * (k / 128)];
+            for row in 0..m {
+                for g in 0..k / 128 {
+                    let scale = 0.01f32;
+                    let zero = 0.5f32;
+                    let s16 = half::f16::from_f32(scale).to_bits() as u32;
+                    let z16 = half::f16::from_f32(zero).to_bits() as u32;
+                    sz[row * (k / 128) + g] = (s16 & 0xFFFF) | (z16 << 16);
+                    for j in 0..k / 4 {
+                        let mut packed = 0u32;
+                        for q in 0..4 {
+                            let wv = w_host[row * k + j * 4 + q];
+                            let qv = ((wv - zero) / scale).round().clamp(-128.0, 127.0) as i32;
+                            let qv = (qv as u32) & 0xFF;
+                            packed |= qv << (8 * q);
+                        }
+                        idx[row * (k / 4) + j] = packed;
+                    }
+                }
+            }
+            (idx, sz)
+        };
+
+        // 激活 [batch, K] + 门控 fp16 + 残差初值。
+        let x: Vec<f32> = (0..batch * k).map(|_| rng()).collect();
+        let g: Vec<f32> = (0..batch * k).map(|_| 0.5 + 0.5 * rng()).collect();
+        let y_init: Vec<f32> = (0..batch * m).map(|_| rng()).collect();
+
+        for op in [0i32, 1i32, 3i32] {
+            // 逐 slot 单序列基准（batch=1 原版 kernel，分 slot 调）。
+            let mut expect = vec![0.0f32; batch * m];
+            for bi in 0..batch {
+                let a8 = crate::backend::Int8Handle {
+                    idx: mk_tensor(&mut b, m * (k / 4), TensorDtype::U32),
+                    sz: mk_tensor(&mut b, m * (k / 128), TensorDtype::U32),
+                    m,
+                    k,
+                };
+                let xt = mk_tensor(&mut b, k, TensorDtype::F32);
+                let gt = mk_tensor(&mut b, k, TensorDtype::F16);
+                let yt = mk_tensor(&mut b, m, TensorDtype::F32);
+                b.upload_u32(a8.idx, &idx).unwrap();
+                b.upload_u32(a8.sz, &sz).unwrap();
+                b.upload(xt, &x[bi * k..(bi + 1) * k]).unwrap();
+                b.upload(gt, &g[bi * k..(bi + 1) * k]).unwrap();
+                // op==2(add) 用残差初值；其余覆盖写（mb 版同语义，覆盖即可对比）。
+                b.upload(yt, &y_init[bi * m..(bi + 1) * m]).unwrap();
+                match op {
+                    0 => b.gemv_int8_relu2(&a8, xt, yt, m, k, 1).unwrap(),
+                    1 => b.gemv_int8_mul_add(&a8, xt, gt, yt, m, k, 1).unwrap(),
+                    _ => b.gemv_int8_plain(&a8, xt, yt, m, k, 1).unwrap(),
+                }
+                let got = b.download(yt).unwrap();
+                expect[bi * m..(bi + 1) * m].copy_from_slice(&got);
+                // 释放临时张量（避免注册表膨胀）。
+                for t in [a8.idx, a8.sz, xt, gt, yt] {
+                    b.free_tensor(t);
+                }
+            }
+
+            // batch mb 版（一次算 6 slot，跨 BGRP=4 分组）。
+            let a8 = crate::backend::Int8Handle {
+                idx: mk_tensor(&mut b, m * (k / 4), TensorDtype::U32),
+                sz: mk_tensor(&mut b, m * (k / 128), TensorDtype::U32),
+                m,
+                k,
+            };
+            let xt = mk_tensor(&mut b, batch * k, TensorDtype::F32);
+            let gt = mk_tensor(&mut b, batch * k, TensorDtype::F16);
+            let yt = mk_tensor(&mut b, batch * m, TensorDtype::F32);
+            b.upload_u32(a8.idx, &idx).unwrap();
+            b.upload_u32(a8.sz, &sz).unwrap();
+            b.upload(xt, &x).unwrap();
+            b.upload(gt, &g).unwrap();
+            b.upload(yt, &y_init).unwrap();
+            match op {
+                0 => b.gemv_int8_relu2(&a8, xt, yt, m, k, batch).unwrap(),
+                1 => b.gemv_int8_mul_add(&a8, xt, gt, yt, m, k, batch).unwrap(),
+                _ => b.gemv_int8_plain(&a8, xt, yt, m, k, batch).unwrap(),
+            }
+            let got = b.download(yt).unwrap();
+
+            // half2 累加顺序与单序列版一致（per slot 独立），容差收紧到 fp16 级。
+            let mut diff = 0.0f32;
+            for (e, gv) in expect.iter().zip(got.iter()) {
+                diff = diff.max((e - gv).abs());
+            }
+            let tol = if op == 0 { 5e-2 } else { 2e-1 };
+            assert!(
+                diff < tol,
+                "gemv_variant_mb op={op} mismatch, max_diff={diff} (batch={batch})"
+            );
+            log::info!("gemv_variant_mb op={op} vs single OK (batch={batch}, max_diff={diff:.5})");
+            for t in [a8.idx, a8.sz, xt, gt, yt] {
+                b.free_tensor(t);
+            }
+        }
+    }
+
+    /// gemv_int8_rkv_stage1_batch（权重复用版）vs 逐 slot 单序列版数值一致性：
+    /// r/k/v + 4 mid 投影，batch=6（跨 BGRP=4 分组边界）。
+    /// 无 CUDA 设备时跳过。
+    #[test]
+    fn gemv_int8_rkv_stage1_batch_matches_single() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping rkv_stage1_batch test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let c = 256usize;
+        let vm = 32usize;
+        let wm = 32usize;
+        let am = 32usize;
+        let gm = 32usize;
+        let batch = 6usize;
+        let mut rng = test_rng(0x1357BEEF);
+
+        // int8 量化权重制造（与 mb 测试同一打包格式）。
+        fn mk_a8(m: usize, k: usize, rng: &mut dyn FnMut() -> f32) -> (Vec<u32>, Vec<u32>) {
+            let mut idx = vec![0u32; m * (k / 4)];
+            let mut sz = vec![0u32; m * (k / 128)];
+            for row in 0..m {
+                for g in 0..k / 128 {
+                    let scale = 0.01f32;
+                    let zero = 0.5f32;
+                    let s16 = half::f16::from_f32(scale).to_bits() as u32;
+                    let z16 = half::f16::from_f32(zero).to_bits() as u32;
+                    sz[row * (k / 128) + g] = (s16 & 0xFFFF) | (z16 << 16);
+                    for j in 0..k / 4 {
+                        let mut packed = 0u32;
+                        for q in 0..4 {
+                            let wv = rng() * 2.0;
+                            let qv = ((wv - zero) / scale).round().clamp(-128.0, 127.0) as i32;
+                            packed |= ((qv as u32) & 0xFF) << (8 * q);
+                        }
+                        idx[row * (k / 4) + j] = packed;
+                    }
+                }
+            }
+            (idx, sz)
+        }
+        let (r_idx, r_sz) = mk_a8(c, c, &mut rng);
+        let (k_idx, k_sz) = mk_a8(c, c, &mut rng);
+        let (v_idx, v_sz) = mk_a8(c, c, &mut rng);
+        // mid 权重（fp32 [mid, C]）。
+        let v1: Vec<f32> = (0..vm * c).map(|_| rng()).collect();
+        let w1: Vec<f32> = (0..wm * c).map(|_| rng()).collect();
+        let a1: Vec<f32> = (0..am * c).map(|_| rng()).collect();
+        let g1: Vec<f32> = (0..gm * c).map(|_| rng()).collect();
+        // 激活 [batch, C]。
+        let xr: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let xk: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let xv: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let xw: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let xa: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+        let xg: Vec<f32> = (0..batch * c).map(|_| rng()).collect();
+
+        // 逐 slot 单序列基准。
+        let mut expect_r = vec![0.0f32; batch * c];
+        let mut expect_k = vec![0.0f32; batch * c];
+        let mut expect_v = vec![0.0f32; batch * c];
+        let mut expect_vm = vec![0.0f32; batch * vm];
+        let mut expect_wm = vec![0.0f32; batch * wm];
+        let mut expect_am = vec![0.0f32; batch * am];
+        let mut expect_gm = vec![0.0f32; batch * gm];
+        {
+            let (r_i, r_s) = (
+                mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+                mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+            );
+            let (k_i, k_s) = (
+                mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+                mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+            );
+            let (v_i, v_s) = (
+                mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+                mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+            );
+            let rh = crate::backend::Int8Handle {
+                idx: r_i,
+                sz: r_s,
+                m: c,
+                k: c,
+            };
+            let kh = crate::backend::Int8Handle {
+                idx: k_i,
+                sz: k_s,
+                m: c,
+                k: c,
+            };
+            let vh = crate::backend::Int8Handle {
+                idx: v_i,
+                sz: v_s,
+                m: c,
+                k: c,
+            };
+            let (v1t, w1t, a1t, g1t) = (
+                mk_tensor(&mut b, vm * c, TensorDtype::F32),
+                mk_tensor(&mut b, wm * c, TensorDtype::F32),
+                mk_tensor(&mut b, am * c, TensorDtype::F32),
+                mk_tensor(&mut b, gm * c, TensorDtype::F32),
+            );
+            b.upload_u32(rh.idx, &r_idx).unwrap();
+            b.upload_u32(rh.sz, &r_sz).unwrap();
+            b.upload_u32(kh.idx, &k_idx).unwrap();
+            b.upload_u32(kh.sz, &k_sz).unwrap();
+            b.upload_u32(vh.idx, &v_idx).unwrap();
+            b.upload_u32(vh.sz, &v_sz).unwrap();
+            b.upload(v1t, &v1).unwrap();
+            b.upload(w1t, &w1).unwrap();
+            b.upload(a1t, &a1).unwrap();
+            b.upload(g1t, &g1).unwrap();
+            for bi in 0..batch {
+                let (xrt, xkt, xvt, xwt, xat, xgt) = (
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                );
+                let (ort, okt, ovt, ovmt, owmt, oamt, ogmt) = (
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F32),
+                    mk_tensor(&mut b, c, TensorDtype::F16),
+                    mk_tensor(&mut b, vm, TensorDtype::F32),
+                    mk_tensor(&mut b, wm, TensorDtype::F32),
+                    mk_tensor(&mut b, am, TensorDtype::F32),
+                    mk_tensor(&mut b, gm, TensorDtype::F32),
+                );
+                b.upload(xrt, &xr[bi * c..(bi + 1) * c]).unwrap();
+                b.upload(xkt, &xk[bi * c..(bi + 1) * c]).unwrap();
+                b.upload(xvt, &xv[bi * c..(bi + 1) * c]).unwrap();
+                b.upload(xwt, &xw[bi * c..(bi + 1) * c]).unwrap();
+                b.upload(xat, &xa[bi * c..(bi + 1) * c]).unwrap();
+                b.upload(xgt, &xg[bi * c..(bi + 1) * c]).unwrap();
+                b.gemv_int8_rkv_stage1(
+                    &rh, &kh, &vh, v1t, w1t, a1t, g1t, xrt, xkt, xvt, xwt, xat, xgt, ort, okt, ovt,
+                    ovmt, owmt, oamt, ogmt, c, vm, wm, am, gm,
+                )
+                .unwrap();
+                expect_r[bi * c..(bi + 1) * c].copy_from_slice(&b.download(ort).unwrap());
+                expect_k[bi * c..(bi + 1) * c].copy_from_slice(&b.download(okt).unwrap());
+                expect_v[bi * c..(bi + 1) * c].copy_from_slice(&b.download(ovt).unwrap());
+                expect_vm[bi * vm..(bi + 1) * vm].copy_from_slice(&b.download(ovmt).unwrap());
+                expect_wm[bi * wm..(bi + 1) * wm].copy_from_slice(&b.download(owmt).unwrap());
+                expect_am[bi * am..(bi + 1) * am].copy_from_slice(&b.download(oamt).unwrap());
+                expect_gm[bi * gm..(bi + 1) * gm].copy_from_slice(&b.download(ogmt).unwrap());
+                for t in [
+                    xrt, xkt, xvt, xwt, xat, xgt, ort, okt, ovt, ovmt, owmt, oamt, ogmt,
+                ] {
+                    b.free_tensor(t);
+                }
+            }
+            for t in [
+                rh.idx, rh.sz, kh.idx, kh.sz, vh.idx, vh.sz, v1t, w1t, a1t, g1t,
+            ] {
+                b.free_tensor(t);
+            }
+        }
+
+        // batch mb 版。
+        let (r_i, r_s) = (
+            mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+            mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+        );
+        let (k_i, k_s) = (
+            mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+            mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+        );
+        let (v_i, v_s) = (
+            mk_tensor(&mut b, c * (c / 4), TensorDtype::U32),
+            mk_tensor(&mut b, c * (c / 128), TensorDtype::U32),
+        );
+        let rh = crate::backend::Int8Handle {
+            idx: r_i,
+            sz: r_s,
+            m: c,
+            k: c,
+        };
+        let kh = crate::backend::Int8Handle {
+            idx: k_i,
+            sz: k_s,
+            m: c,
+            k: c,
+        };
+        let vh = crate::backend::Int8Handle {
+            idx: v_i,
+            sz: v_s,
+            m: c,
+            k: c,
+        };
+        let (v1t, w1t, a1t, g1t) = (
+            mk_tensor(&mut b, vm * c, TensorDtype::F32),
+            mk_tensor(&mut b, wm * c, TensorDtype::F32),
+            mk_tensor(&mut b, am * c, TensorDtype::F32),
+            mk_tensor(&mut b, gm * c, TensorDtype::F32),
+        );
+        let (xrt, xkt, xvt, xwt, xat, xgt) = (
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+        );
+        let (ort, okt, ovt, ovmt, owmt, oamt, ogmt) = (
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F32),
+            mk_tensor(&mut b, batch * c, TensorDtype::F16),
+            mk_tensor(&mut b, batch * vm, TensorDtype::F32),
+            mk_tensor(&mut b, batch * wm, TensorDtype::F32),
+            mk_tensor(&mut b, batch * am, TensorDtype::F32),
+            mk_tensor(&mut b, batch * gm, TensorDtype::F32),
+        );
+        b.upload_u32(rh.idx, &r_idx).unwrap();
+        b.upload_u32(rh.sz, &r_sz).unwrap();
+        b.upload_u32(kh.idx, &k_idx).unwrap();
+        b.upload_u32(kh.sz, &k_sz).unwrap();
+        b.upload_u32(vh.idx, &v_idx).unwrap();
+        b.upload_u32(vh.sz, &v_sz).unwrap();
+        b.upload(v1t, &v1).unwrap();
+        b.upload(w1t, &w1).unwrap();
+        b.upload(a1t, &a1).unwrap();
+        b.upload(g1t, &g1).unwrap();
+        b.upload(xrt, &xr).unwrap();
+        b.upload(xkt, &xk).unwrap();
+        b.upload(xvt, &xv).unwrap();
+        b.upload(xwt, &xw).unwrap();
+        b.upload(xat, &xa).unwrap();
+        b.upload(xgt, &xg).unwrap();
+        b.gemv_int8_rkv_stage1_batch(
+            &rh, &kh, &vh, v1t, w1t, a1t, g1t, xrt, xkt, xvt, xwt, xat, xgt, ort, okt, ovt, ovmt,
+            owmt, oamt, ogmt, c, vm, wm, am, gm, batch,
+        )
+        .unwrap();
+
+        let got_r = b.download(ort).unwrap();
+        let got_k = b.download(okt).unwrap();
+        let got_v = b.download(ovt).unwrap();
+        let got_vm = b.download(ovmt).unwrap();
+        let got_wm = b.download(owmt).unwrap();
+        let got_am = b.download(oamt).unwrap();
+        let got_gm = b.download(ogmt).unwrap();
+
+        for (name, e, g, tol) in [
+            ("r", &expect_r, &got_r, 2e-1f32),
+            ("k", &expect_k, &got_k, 2e-1),
+            ("v", &expect_v, &got_v, 2e-1),
+            ("vm", &expect_vm, &got_vm, 1e-2),
+            ("wm", &expect_wm, &got_wm, 1e-2),
+            ("am", &expect_am, &got_am, 1e-2),
+            ("gm", &expect_gm, &got_gm, 1e-2),
+        ] {
+            let mut diff = 0.0f32;
+            for (ev, gv) in e.iter().zip(g.iter()) {
+                diff = diff.max((ev - gv).abs());
+            }
+            assert!(
+                diff < tol,
+                "rkv_stage1_batch {name} mismatch, max_diff={diff} (batch={batch})"
+            );
+            log::info!("rkv_stage1_batch {name} vs single OK (max_diff={diff:.5})");
+        }
     }
 
     /// fuse_ka_dplr_norm 与 CPU 参考对比：fuse_ka + dplr(S 更新) + group_norm + sum_rk_rk。

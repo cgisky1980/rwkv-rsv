@@ -49,6 +49,12 @@ pub trait ComputeBackend {
     // —— 张量管理 ——
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId>;
     fn upload(&self, t: TensorId, data: &[f32]) -> R<()>;
+    /// 部分上传：把 data 写入张量 [offset, offset+len) 段（f32 元素偏移），
+    /// 其余部分不动（batch State 的 slot 回灌用）。
+    fn upload_part(&self, t: TensorId, offset: usize, data: &[f32]) -> R<()> {
+        let _ = (t, offset, data);
+        Err("upload_part not supported by this backend".into())
+    }
     fn upload_u32(&self, t: TensorId, data: &[u32]) -> R<()>;
     fn download(&self, t: TensorId) -> R<Vec<f32>>;
     fn download_u32(&self, t: TensorId) -> R<Vec<u32>>;
@@ -105,6 +111,38 @@ pub trait ComputeBackend {
     // —— host 前后端（embedding gather / 采样）——
     /// 把 token 索引（u32 位模式）写入 host-visible 缓冲（无 kernel、无 spec）。
     fn store_token_host(&self, tok: TensorId, token: u32) -> R<()>;
+    /// 异步写入 sampler 参数行（selfloop 逐轮 seed/hist_len 更新）：
+    /// 参数写入后端 pinned 暂存区第 `row` 行，`cuMemcpyHtoDAsync` 流序执行
+    /// （此前排队的 kernel 之后），零 host 同步。仅支持的后端（CUDA）覆盖；
+    /// 不支持时调用方回退同步 `store_sampler_host`。
+    #[allow(clippy::too_many_arguments)]
+    fn store_sampler_async(
+        &self,
+        _sampler: TensorId,
+        _row: usize,
+        _temperature: f32,
+        _top_k: u32,
+        _top_p: f32,
+        _seed: u32,
+        _repetition_penalty: f32,
+        _frequency_penalty: f32,
+        _presence_penalty: f32,
+        _hist_len: u32,
+    ) -> R<()> {
+        Err("store_sampler_async not supported by this backend".into())
+    }
+    /// pinned 暂存区行数上限（async sampler 路径的 selfloop n 上限）。
+    fn sampler_async_rows(&self) -> usize {
+        0
+    }
+    /// 从同进程另一后端导入全部张量（权重共享多流并发）：同一 CUDA primary
+    /// ctx 下设备指针跨实例有效；导入张量保持原 TensorId，新实例不拥有
+    ///（Drop 不释放）。仅支持的后端（CUDA）覆盖。
+    fn import_tensors_from(&mut self, _src: &dyn ComputeBackend) -> R<()> {
+        Err("import_tensors_from not supported by this backend".into())
+    }
+    /// trait 对象向下转型（`import_tensors_from` 需读取源后端内部张量表）。
+    fn as_any(&self) -> &dyn std::any::Any;
     /// 从 fp16 表按 token 索引取一行 → dst（f32）；tok 为 host 缓冲（存 token 位模式）。
     fn gather_row_device_f16(
         &mut self,
@@ -402,6 +440,213 @@ pub trait ComputeBackend {
         false
     }
 
+    // —— batch 并发算子（单实例多序列，权重共享读一次算 B 份；仅 CUDA 支持）——
+    // 布局约定：所有 per-slot 张量为 [batch, ...]（slot 主序）；权重张量跨 slot 共享。
+    // 默认实现返回 Err（Vulkan 等后端暂不支持 batch 并发路径）。
+
+    /// batch 版 embedding gather：按 tok[b] 各取一行 → dst[b*C + i]（f32）。
+    #[allow(clippy::too_many_arguments)]
+    fn gather_rows_device_f16(
+        &mut self,
+        _src: TensorId,
+        _dst: TensorId,
+        _tok: TensorId,
+        _c: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gather_rows_device_f16 not supported by this backend".into())
+    }
+    /// batch 版 norm_lerp6：x/state/xr..xg/or_..og 均为 [batch, C]；gamma/beta 共享。
+    #[allow(clippy::too_many_arguments)]
+    fn norm_lerp6_batch(
+        &mut self,
+        _x: TensorId,
+        _state: TensorId,
+        _gamma: TensorId,
+        _beta: TensorId,
+        _xr: TensorId,
+        _xw: TensorId,
+        _xk: TensorId,
+        _xv: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _or: TensorId,
+        _ow: TensorId,
+        _ok: TensorId,
+        _ov: TensorId,
+        _oa: TensorId,
+        _og: TensorId,
+        _c: usize,
+        _eps: f32,
+        _batch: usize,
+    ) -> R<()> {
+        Err("norm_lerp6_batch not supported by this backend".into())
+    }
+    /// batch 版 cmix_norm_lerp：x/state/out_xb 为 [batch, C]；gamma/beta/coeff 共享。
+    #[allow(clippy::too_many_arguments)]
+    fn cmix_norm_lerp_batch(
+        &mut self,
+        _x: TensorId,
+        _state: TensorId,
+        _gamma: TensorId,
+        _beta: TensorId,
+        _coeff: TensorId,
+        _out_xb: TensorId,
+        _c: usize,
+        _eps: f32,
+        _batch: usize,
+    ) -> R<()> {
+        Err("cmix_norm_lerp_batch not supported by this backend".into())
+    }
+    /// batch 版 gemv_int8_rkv_stage1：x 输入与输出为 [batch, ...]；权重共享。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_rkv_stage1_batch(
+        &mut self,
+        _r: &Int8Handle,
+        _k: &Int8Handle,
+        _v: &Int8Handle,
+        _v1: TensorId,
+        _w1: TensorId,
+        _a1: TensorId,
+        _g1: TensorId,
+        _xr: TensorId,
+        _xk: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_r: TensorId,
+        _out_k: TensorId,
+        _out_v: TensorId,
+        _out_vm: TensorId,
+        _out_wm: TensorId,
+        _out_am: TensorId,
+        _out_gm: TensorId,
+        _c: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int8_rkv_stage1_batch not supported by this backend".into())
+    }
+    /// batch 版 gemv_lowrank_chain4：mid 输入与 v_first/输出为 [batch, ...]；权重共享。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowrank_chain4_batch(
+        &mut self,
+        _w2: TensorId,
+        _a2: TensorId,
+        _v2: TensorId,
+        _g2: TensorId,
+        _w_mid: TensorId,
+        _a_mid: TensorId,
+        _v_mid: TensorId,
+        _g_mid: TensorId,
+        _w0: TensorId,
+        _a0: TensorId,
+        _v0: TensorId,
+        _scale: TensorId,
+        _v_first: TensorId,
+        _out_w: TensorId,
+        _out_a: TensorId,
+        _out_v: TensorId,
+        _out_g: TensorId,
+        _m: usize,
+        _kw: usize,
+        _ka: usize,
+        _kv: usize,
+        _kg: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_lowrank_chain4_batch not supported by this backend".into())
+    }
+    /// batch 版 fuse_ka_dplr_norm：kernel 本身支持 batch 维（grid.y）。
+    #[allow(clippy::too_many_arguments)]
+    fn fuse_ka_dplr_norm_batch(
+        &mut self,
+        _s: TensorId,
+        _k: TensorId,
+        _k_k: TensorId,
+        _a: TensorId,
+        _k_a: TensorId,
+        _r: TensorId,
+        _v: TensorId,
+        _w: TensorId,
+        _gamma: TensorId,
+        _beta: TensorId,
+        _r_k: TensorId,
+        _k_mod: TensorId,
+        _y: TensorId,
+        _y_norm: TensorId,
+        _h: usize,
+        _n: usize,
+        _eps: f32,
+        _gn_eps: f32,
+        _batch: usize,
+    ) -> R<()> {
+        Err("fuse_ka_dplr_norm_batch not supported by this backend".into())
+    }
+    /// batch 版 ffn_value_sparse_add：r2 为 [batch, fh]，x 为 [batch, C]；权重共享。
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_value_sparse_add_batch(
+        &mut self,
+        _value_tiled: TensorId,
+        _r2: TensorId,
+        _x: TensorId,
+        _c: usize,
+        _fh: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("ffn_value_sparse_add_batch not supported by this backend".into())
+    }
+    /// batch 版采样：logits/temp/mask/counter 为 [batch, n]，token 为 [batch]，
+    /// sampler 为 [batch, 8]（每 slot 独立参数），hist 为 [batch, hist_len]。
+    #[allow(clippy::too_many_arguments)]
+    fn sample_into_host_seeded_batch(
+        &mut self,
+        _logits: TensorId,
+        _token: TensorId,
+        _n: usize,
+        _temp: TensorId,
+        _mask: TensorId,
+        _counter: TensorId,
+        _sampler: TensorId,
+        _hist: TensorId,
+        _batch: usize,
+    ) -> R<()> {
+        Err("sample_into_host_seeded_batch not supported by this backend".into())
+    }
+    /// batch 版 record_token：把 in_tok[b] 追加到 out_seq[b*stride + cnt[b]++]。
+    fn record_tokens(
+        &mut self,
+        _in_tok: TensorId,
+        _out_seq: TensorId,
+        _cnt: TensorId,
+        _stride: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("record_tokens not supported by this backend".into())
+    }
+    /// batch 版异步 sampler 上传：每轮一行宽行（batch*8 f32），pinned 流序零同步。
+    /// `row` 为轮次（0..n）；seeds 为每 slot 的 seed（长度 = batch）。
+    #[allow(clippy::too_many_arguments)]
+    fn store_sampler_async_batch(
+        &self,
+        _sampler: TensorId,
+        _row: usize,
+        _temperature: f32,
+        _top_k: u32,
+        _top_p: f32,
+        _seeds: &[u32],
+        _repetition_penalty: f32,
+        _frequency_penalty: f32,
+        _presence_penalty: f32,
+        _hist_len: u32,
+    ) -> R<()> {
+        Err("store_sampler_async_batch not supported by this backend".into())
+    }
+
     /// GPU argmax：把 logits 的 argmax 索引写入 token 缓冲（f32 位模式存 uint）。
     fn argmax(&mut self, logits: TensorId, token: TensorId, n: usize) -> R<()>;
     /// GPU 采样（temperature/top-k/top-p + OpenAI 兼容惩罚），结果写 token 缓冲。
@@ -573,6 +818,56 @@ pub trait ComputeBackend {
         t: usize,
         c: usize,
     ) -> R<()>;
+    // —— batch prefill 算子（B 序列 × T_pad token，[batch, T, C] 布局）——
+    /// batch 版 token shift：t=0 读该 slot 的 state 段。仅 CUDA。
+    #[allow(clippy::too_many_arguments)]
+    fn seq_shift_batch(
+        &mut self,
+        _x: TensorId,
+        _state: TensorId,
+        _tm: TensorId,
+        _y: TensorId,
+        _c: usize,
+        _t: usize,
+        _stride_x: usize,
+        _stride_y: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("seq_shift_batch not supported by this backend".into())
+    }
+    /// batch 版 copy_token：每 slot 把 lens[b]-1 行拷到 state[b]。仅 CUDA。
+    fn copy_token_batch(
+        &mut self,
+        _x: TensorId,
+        _state: TensorId,
+        _lens: TensorId,
+        _c: usize,
+        _t: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("copy_token_batch not supported by this backend".into())
+    }
+    /// batch 版 DPLR 状态更新：s 为 [batch, H, N*N]，lens 截断实际长度。仅 CUDA。
+    #[allow(clippy::too_many_arguments)]
+    fn dplr_seq_batch(
+        &mut self,
+        _s: TensorId,
+        _r: TensorId,
+        _w: TensorId,
+        _k: TensorId,
+        _v: TensorId,
+        _a: TensorId,
+        _b: TensorId,
+        _y: TensorId,
+        _lens: TensorId,
+        _h: usize,
+        _n: usize,
+        _t: usize,
+        _c: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("dplr_seq_batch not supported by this backend".into())
+    }
     /// C[M,N] = relu²(A[M,K] @ B[N,K]^T)（fp16 输入，f32 输出）。
     #[allow(clippy::too_many_arguments)]
     fn gemm_relu2(
@@ -828,6 +1123,9 @@ impl VulkanBackend {
 }
 
 impl ComputeBackend for VulkanBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId> {
         let id = TensorId(self.next_id);
         self.next_id += 1;
