@@ -6,6 +6,8 @@
 //!
 //! 用法：
 //!   DATA=<golden.jsonl> OUT=<features.jsonl> cargo run --release --example extract_router_features
+//!   # 批量模式（B=16，信天翁 rows 并发 prefill + segmean，2-3× 提速）：
+//!   BATCH=16 DATA=... OUT=... cargo run --release --example extract_router_features
 //!
 //! 支持断点续跑：启动时扫描输出文件已有 idx 并跳过。中途终止后重跑即可。
 //! 训练脚本见 `client/scripts/router_head/train_mlp.py`。
@@ -93,10 +95,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vocab = std::fs::read_to_string(&vocab_path)?;
     let tokenizer = Tokenizer::new(&vocab)?;
 
+    // batch 并发度：BATCH>=2 启用批量 mean-hidden（信天翁 rows 并发 prefill +
+    // segmean）；缺省/1 走单序列。
+    let batch_size: usize = std::env::var("BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(0);
+
     let mut classify_state = model.create_state()?;
     let initial_state = model.state_back(&state)?;
     let emb_dim = model.info().num_emb;
-    log::info!("hidden dim = {emb_dim}");
+    log::info!(
+        "hidden dim = {emb_dim}, mode = {}",
+        if batch_size >= 2 {
+            format!("batch(B={batch_size})")
+        } else {
+            "single".to_string()
+        }
+    );
 
     // 追加打开输出。
     let out_file = std::fs::OpenOptions::new()
@@ -105,17 +122,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .open(&out_path)?;
     let mut writer = BufWriter::new(out_file);
 
-    // 逐行提取。
-    let data = std::fs::File::open(&data_path)?;
-    let reader = std::io::BufReader::new(data);
+    // 预读全部待处理行（批量模式需成组；行数 ~3 万内存无压力）。
     let t0 = Instant::now();
-    let mut processed: usize = 0;
+    let mut pending: Vec<(usize, GoldenRow, Vec<u32>)> = Vec::new();
     let mut skipped: usize = 0;
-    let total_lines = reader.lines().count();
-    let data = std::fs::File::open(&data_path)?;
-    let reader = std::io::BufReader::new(data);
-
-    for (idx, line) in reader.lines().enumerate() {
+    for (idx, line) in std::io::BufReader::new(std::fs::File::open(&data_path)?)
+        .lines()
+        .enumerate()
+    {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -131,38 +145,81 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
-
         let mut tokens = tokenizer.encode(row.text.as_bytes())?;
         if tokens.is_empty() {
             tokens.push(PAD_TOKEN);
         }
         tokens.truncate(max_tokens);
+        pending.push((idx, row, tokens));
+    }
+    let total = pending.len();
+    log::info!("{total} samples to extract ({skipped} already done)");
 
-        model.state_load(&classify_state, &initial_state)?;
-        let hidden = model.forward_seq_mean_hidden(&mut classify_state, &tokens)?;
-
-        let feature = FeatureOut {
-            idx,
-            tier: row.tier,
-            prev_tier: row.prev_tier,
-            hidden,
+    let mut processed: usize = 0;
+    let mut last_logged = 0usize;
+    macro_rules! log_progress {
+        () => {
+            if processed / 100 > last_logged / 100 {
+                writer.flush().ok();
+                let elapsed = t0.elapsed().as_secs_f32();
+                let throughput = processed as f32 / elapsed.max(0.001);
+                let remaining = (total - processed) as f32 / throughput;
+                log::info!(
+                    "progress: {}/{} ({:.1}/s, ETA {:.0}m)",
+                    processed,
+                    total,
+                    throughput,
+                    remaining / 60.0
+                );
+                last_logged = processed;
+            }
         };
-        serde_json::to_writer(&mut writer, &feature)?;
-        writer.write_all(b"\n")?;
-        processed += 1;
+    }
 
-        if processed.is_multiple_of(100) {
-            writer.flush()?;
-            let elapsed = t0.elapsed().as_secs_f32();
-            let throughput = processed as f32 / elapsed;
-            let remaining = (total_lines - skipped - processed) as f32 / throughput.max(0.001);
-            log::info!(
-                "progress: {}/{} ({:.1}/s, ETA {:.0}m)",
-                processed + skipped,
-                total_lines,
-                throughput,
-                remaining / 60.0
-            );
+    if batch_size >= 2 {
+        // 批量模式：pad_to=Some(max_tokens) 固定 bt = B*max_tokens，seq 缓冲只建
+        // 一次（避免逐 chunk 重建 ~GB 级缓冲）；lens 按原始长度计算（pad 行不计入
+        // segmean 均值——曾因预 pad 导致 lens=256，均值混入 pad 垃圾，已修）。
+        // 尾 chunk 用 PAD 哑行补齐（结果被 zip 丢弃）。
+        let mut batch_state = model.create_batch_state(batch_size)?;
+        for chunk in pending.chunks(batch_size) {
+            let mut tokens_batch: Vec<Vec<u32>> = chunk.iter().map(|(_, _, t)| t.clone()).collect();
+            while tokens_batch.len() < batch_size {
+                tokens_batch.push(vec![PAD_TOKEN]);
+            }
+            let hiddens = model.forward_seq_batch_mean_hidden(
+                &mut batch_state,
+                &tokens_batch,
+                Some(max_tokens),
+            )?;
+            for ((idx, row, _), hidden) in chunk.iter().zip(hiddens) {
+                let feature = FeatureOut {
+                    idx: *idx,
+                    tier: row.tier,
+                    prev_tier: row.prev_tier,
+                    hidden,
+                };
+                serde_json::to_writer(&mut writer, &feature)?;
+                writer.write_all(b"\n")?;
+            }
+            processed += chunk.len();
+            log_progress!();
+        }
+    } else {
+        // 单序列模式（缺省）：与线上 classify_with_engine 同路径。
+        for (idx, row, tokens) in &pending {
+            model.state_load(&classify_state, &initial_state)?;
+            let hidden = model.forward_seq_mean_hidden(&mut classify_state, tokens)?;
+            let feature = FeatureOut {
+                idx: *idx,
+                tier: row.tier,
+                prev_tier: row.prev_tier,
+                hidden,
+            };
+            serde_json::to_writer(&mut writer, &feature)?;
+            writer.write_all(b"\n")?;
+            processed += 1;
+            log_progress!();
         }
     }
 

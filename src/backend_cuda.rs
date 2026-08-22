@@ -4405,6 +4405,31 @@ extern "C" __global__ void rwkv_copy_token_batch(
 }
 "#;
 
+/// segmean CUDA kernel：分段均值——x [batch, T_pad, C] 每 slot 对前 lens[b] 行求均值
+/// → out [batch, C]（pad 行不计入）。批量 mean-hidden 特征提取用（语义对齐单序列
+/// forward_seq_mean_hidden 的 T 维均值，仅累加顺序不同）。
+/// dispatch (batch, 1, 1)，block 256（跨 C stride，循环 token 累加）。
+const SEGMEAN_SRC: &str = r#"
+extern "C" __global__ void rwkv_segmean(
+    const float* __restrict__ x,     // [batch, t_pad, c]
+    float* __restrict__ out,         // [batch, c]
+    const int* __restrict__ lens,    // [batch]（实际 token 数，>=1）
+    const int c,
+    const int t_pad)
+{
+    const int b = blockIdx.x;
+    const int len = lens[b];
+    const float* xb = x + (size_t)b * t_pad * c;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        float acc = 0.f;
+        for (int t = 0; t < len; t++) {
+            acc += xb[(size_t)t * c + i];
+        }
+        out[(size_t)b * c + i] = acc / (float)len;
+    }
+}
+"#;
+
 /// dplr_seq_batch CUDA kernel：batch prefill 的 DPLR 状态更新。
 /// s 为 [batch, H, N*N]（batch State 布局），r/w/k/v/a/b/y 为 [batch, T, C]，
 /// lens[b] 截断实际长度（padding 段不进 state）。dispatch (ceil(H*N/8), batch, 1)。
@@ -7006,6 +7031,31 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    fn segmean(
+        &mut self,
+        x: TensorId,
+        out: TensorId,
+        lens: TensorId,
+        c: usize,
+        t_pad: usize,
+        batch: usize,
+    ) -> R<()> {
+        let xd = self.f32_ptr(x, "segmean")?;
+        let od = self.f32_ptr(out, "segmean")?;
+        let ld = self.u32_ptr(lens, "segmean")?;
+        let func = self.kernel("segmean", SEGMEAN_SRC, "rwkv_segmean")?;
+        let grid = (batch as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i) = (c as i32, t_pad as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &od as *const u64 as *mut c_void,
+            &ld as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
     fn dplr_seq(
         &mut self,
         s: TensorId,
@@ -8403,6 +8453,53 @@ mod tests {
             );
             log::info!("rkv_stage1_batch {name} vs single OK (max_diff={diff:.5})");
         }
+    }
+
+    /// segmean 与 CPU 参考对比：x [batch, t_pad, c] 每 slot 前 lens[b] 行均值。
+    /// 含 lens < t_pad（padding 段必须不计入）与 batch=1 边界。无 CUDA 设备时跳过。
+    #[test]
+    fn segmean_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping segmean test");
+            return;
+        }
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let c = 512usize;
+        let t_pad = 8usize;
+        let batch = 5usize;
+        let lens: Vec<u32> = vec![8, 1, 5, 3, 8]; // 覆盖全 pad / 全长 / 中间档
+        let mut rng = test_rng(0x5EED5EED);
+        let x: Vec<f32> = (0..batch * t_pad * c).map(|_| rng()).collect();
+
+        // CPU 参考（只对前 lens[b] 行求均值）。
+        let mut expect = vec![vec![0.0f32; c]; batch];
+        for bi in 0..batch {
+            let l = lens[bi] as usize;
+            for t in 0..l {
+                for i in 0..c {
+                    expect[bi][i] += x[(bi * t_pad + t) * c + i];
+                }
+            }
+            for v in expect[bi].iter_mut() {
+                *v /= l as f32;
+            }
+        }
+
+        let xt = mk_tensor(&mut b, batch * t_pad * c, TensorDtype::F32);
+        let ot = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let lt = mk_tensor(&mut b, batch, TensorDtype::U32);
+        b.upload(xt, &x).unwrap();
+        b.upload_u32(lt, &lens).unwrap();
+        b.segmean(xt, ot, lt, c, t_pad, batch).unwrap();
+        let got = b.download(ot).unwrap();
+        let mut max_diff = 0.0f32;
+        for bi in 0..batch {
+            for i in 0..c {
+                max_diff = max_diff.max((expect[bi][i] - got[bi * c + i]).abs());
+            }
+        }
+        assert!(max_diff < 1e-4, "segmean mismatch, max_diff={max_diff}");
+        log::info!("segmean vs CPU reference OK (batch={batch}, max_diff={max_diff:.7})");
     }
 
     /// fuse_ka_dplr_norm 与 CPU 参考对比：fuse_ka + dplr(S 更新) + group_norm + sum_rk_rk。

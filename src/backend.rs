@@ -868,6 +868,19 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("dplr_seq_batch not supported by this backend".into())
     }
+    /// 分段均值：x [batch, t_pad, c] → out [batch, c]（每 slot 前 lens[b] 行均值，
+    /// pad 行不计入）。批量 mean-hidden 特征提取用。仅 CUDA。
+    fn segmean(
+        &mut self,
+        _x: TensorId,
+        _out: TensorId,
+        _lens: TensorId,
+        _c: usize,
+        _t_pad: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("segmean not supported by this backend".into())
+    }
     /// C[M,N] = relu²(A[M,K] @ B[N,K]^T)（fp16 输入，f32 输出）。
     #[allow(clippy::too_many_arguments)]
     fn gemm_relu2(

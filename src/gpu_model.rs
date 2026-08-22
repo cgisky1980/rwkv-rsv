@@ -903,15 +903,20 @@ impl GpuModel {
         )
     }
 
-    /// batch prefill：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，直接
-    /// 更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的 M 维
-    /// = B*T_pad，权重读一份算全部行。返回每 slot 的末 token（decode seed）。
-    /// 仅 CUDA（seq_shift_batch/dplr_seq_batch/copy_token_batch）。
-    pub fn forward_seq_batch(
+    /// batch prefill 公共核心：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，
+    /// 直接更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的
+    /// M 维 = B*T_pad，权重读一份算全部行。
+    /// `pad_to`：Some(n) 强制 T_pad = n（调用方保证 n >= 各 prompt 长度）——固定 bt
+    /// 让 seq 缓冲只建一次；None 取批内最大长度。lens 恒按**原始长度**计算
+    ///（pad 行不进 state、不计入 segmean 均值）。
+    /// 返回 (seeds, seq_bufs[已 take，调用方归还], lens_t, t_pad, batch, tok[调用方释放])。
+    /// 仅 CUDA（seq_shift_batch/dplr_seq_batch/copy_token_batch）。状态重置由调用方负责。
+    fn forward_seq_batch_core(
         &mut self,
         state: &mut State,
         tokens_batch: &[Vec<u32>],
-    ) -> R<Vec<u32>> {
+        pad_to: Option<usize>,
+    ) -> R<(Vec<u32>, SeqBuffers, TensorId, usize, usize, TensorId)> {
         let batch = tokens_batch.len();
         if batch == 0 {
             return Err("forward_seq_batch: 空 batch".into());
@@ -925,10 +930,14 @@ impl GpuModel {
             .into());
         }
         let (c, n) = (self.config.n_embd, self.config.head_size);
-        let t_pad = tokens_batch.iter().map(|v| v.len()).max().unwrap().max(1);
+        let t_pad = pad_to
+            .filter(|p| *p >= 1)
+            .unwrap_or_else(|| tokens_batch.iter().map(|v| v.len()).max().unwrap_or(1))
+            .max(tokens_batch.iter().map(|v| v.len()).max().unwrap_or(1))
+            .max(1);
         let bt = batch * t_pad;
 
-        // 摊平 tokens（slot 主序，pad 0）与 lens。
+        // 摊平 tokens（slot 主序，pad 0）与 lens（恒为原始长度——pad 行不进 state）。
         let mut flat = vec![0u32; bt];
         let lens: Vec<u32> = tokens_batch
             .iter()
@@ -983,9 +992,47 @@ impl GpuModel {
         }
         self.backend.end_batch()?;
 
+        // 调用方负责：释放 tok、归还 seq_bufs（mean-hidden 路径在归还前还需 segmean）。
+        Ok((seeds, seq_bufs, lens_t, t_pad, batch, tok))
+    }
+
+    /// batch prefill（公共入口，decode 用）：更新 batch State，返回每 slot 末
+    /// token（decode seed）。调用方须自行重置状态（每轮独立 prompt 从零态起步）。
+    pub fn forward_seq_batch(
+        &mut self,
+        state: &mut State,
+        tokens_batch: &[Vec<u32>],
+    ) -> R<Vec<u32>> {
+        let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
+            self.forward_seq_batch_core(state, tokens_batch, None)?;
         self.backend.free_tensor(tok);
         self.seq_bufs = Some(seq_bufs);
         Ok(seeds)
+    }
+
+    /// 批量 mean-hidden 特征提取：batch prefill 全层前向后，对每 slot 的末层残差
+    /// x 取 lens 感知 token 均值（语义对齐单序列 forward_seq_mean_hidden，仅 fp32
+    /// 累加顺序不同）。内部先重置状态（t=0 边界读取 tmix_x 须零态起步）。
+    /// `pad_to`：Some(n) 固定 T_pad（bt 恒定 → seq 缓冲只建一次；lens 仍按原始
+    /// 长度，pad 行不计入均值）；None 取批内最大长度。
+    pub fn forward_seq_batch_mean_hidden(
+        &mut self,
+        state: &mut State,
+        tokens_batch: &[Vec<u32>],
+        pad_to: Option<usize>,
+    ) -> R<Vec<Vec<f32>>> {
+        self.reset_state_of(state)?;
+        let (_seeds, seq_bufs, lens_t, t_pad, batch, tok) =
+            self.forward_seq_batch_core(state, tokens_batch, pad_to)?;
+        let c = self.config.n_embd;
+        let out = self.backend.create_tensor(batch * c, TensorDtype::F32)?;
+        self.backend
+            .segmean(seq_bufs.x, out, lens_t, c, t_pad, batch)?;
+        let flat = self.backend.download(out)?;
+        self.backend.free_tensor(out);
+        self.backend.free_tensor(tok);
+        self.seq_bufs = Some(seq_bufs);
+        Ok(flat.chunks(c).map(<[f32]>::to_vec).collect())
     }
 
     /// batch prefill 单层：全 kernel 的 token 维 = B*T_pad（信天翁 rows 模型），
