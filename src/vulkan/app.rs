@@ -830,6 +830,11 @@ impl App {
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(DESCRIPTOR_COUNT_UNIFORM_BUFFER as u32),
+            // uniform 池化路径（runtime record_kernel）：所有算子 kernel 的
+            // uniform 绑定均为 DYNAMIC 类型（offset 随 dispatch 变化）。
+            vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(DESCRIPTOR_COUNT_UNIFORM_BUFFER as u32),
             vk::DescriptorPoolSize::builder()
                 .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(DESCRIPTOR_COUNT_SAMPLER as u32),
@@ -2223,6 +2228,8 @@ pub enum UniformError {
     Lock,
     #[error("uniform is not mapped")]
     Unmapped,
+    #[error("uniform range out of bounds: offset {0} + size {1} > capacity {2}")]
+    Range(usize, usize, usize),
     #[error(transparent)]
     Memory(#[from] MemoryError),
     #[error(transparent)]
@@ -2257,6 +2264,43 @@ impl Uniform {
     #[inline]
     pub fn copy_from(&self, data: &[impl bytemuck::Pod]) -> Result<Self, UniformError> {
         unsafe { self.copy_from_unsafe(data) }
+    }
+
+    /// Copies data into the uniform buffer at a byte offset（uniform 池 bump 分配用）。
+    ///
+    /// 与 `copy_from` 不同：本方法写入 mapped 区域的 `[offset, offset+size)` 段，
+    /// 越界（超出 buffer 容量）返回 `UniformError::Range`。
+    ///
+    /// # Safety 说明
+    ///
+    /// 调用方须保证 offset 满足 `min_uniform_buffer_offset_alignment` 对齐
+    /// （作为 DYNAMIC offset descriptor 使用时）。
+    pub fn copy_from_at(
+        &self,
+        data: &[impl bytemuck::Pod],
+        offset: usize,
+    ) -> Result<Self, UniformError> {
+        unsafe { self.copy_from_at_unsafe(data, offset) }
+    }
+
+    unsafe fn copy_from_at_unsafe(
+        &self,
+        data: &[impl bytemuck::Pod],
+        offset: usize,
+    ) -> Result<Self, UniformError> {
+        let size = size_of_val(data);
+        if offset.checked_add(size).is_none_or(|end| end > self.size) {
+            return Err(UniformError::Range(offset, size, self.size));
+        }
+        let ptr = self
+            .ptr
+            .lock()
+            .map_err(|_| UniformError::Lock)?
+            .ok_or(UniformError::Unmapped)?;
+        let src = NonNull::from_ref(data).cast::<u8>();
+        // SAFETY: [offset, offset+size) 已校验落在 mapped 区域内
+        unsafe { ptr.add(offset).copy_from_nonoverlapping(src, size) };
+        Ok(self.clone())
     }
 }
 
@@ -2776,6 +2820,38 @@ impl Binder {
         self
     }
 
+    /// 绑定 uniform 池的一个定长窗口（DYNAMIC offset descriptor）。
+    ///
+    /// 与 `bind_uniform` 的区别：descriptor 类型为 `UNIFORM_BUFFER_DYNAMIC`，
+    /// `range` 指定单次 dispatch 读取的窗口大小（而非整个 buffer）；
+    /// 实际偏移在每次 `cmd_bind` 时通过 dynamic offsets 提供。
+    /// 用于 uniform 池化：一个池 buffer 服务任意多次 dispatch，
+    /// 消除 per-dispatch 的 buffer/memory/descriptor 创建。
+    unsafe fn bind_uniform_with_range_unsafe(
+        mut self,
+        uniform: &Uniform,
+        range: usize,
+        set: usize,
+        binding: usize,
+    ) -> Self {
+        let info = vk::DescriptorBufferInfo::builder()
+            .buffer(uniform.buffer)
+            .range(range as u64)
+            .offset(0)
+            .build();
+        let info: Pin<Box<[_]>> = Box::pin([info]);
+        let write = vk::WriteDescriptorSet::builder()
+            .dst_set(self.kernel.descriptor_sets[set])
+            .dst_binding(binding as u32)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .buffer_info(&info)
+            .build();
+        self.infos.push(DescriptorInfo::Buffer(info));
+        self.writes.push(write);
+        self.resources.push(KernelResource::from_uniform(uniform));
+        self
+    }
+
     unsafe fn bind_sampler_unsafe(mut self, sampler: &Sampler, set: usize, binding: usize) -> Self {
         let info = vk::DescriptorImageInfo::builder()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -2841,6 +2917,23 @@ impl Binder {
     /// Returns `Self` to allow method chaining.
     pub fn bind_uniform(self, uniform: &Uniform, set: usize, binding: usize) -> Self {
         unsafe { self.bind_uniform_unsafe(uniform, set, binding) }
+    }
+
+    /// 绑定 uniform 池窗口（DYNAMIC offset，详见 `bind_uniform_with_range_unsafe`）。
+    ///
+    /// # Arguments
+    ///
+    /// - `uniform`: 池 uniform buffer（整个池）
+    /// - `range`: 单次 dispatch 的 Params 窗口字节数
+    /// - `set` / `binding`: descriptor set 与 binding 索引
+    pub fn bind_uniform_with_range(
+        self,
+        uniform: &Uniform,
+        range: usize,
+        set: usize,
+        binding: usize,
+    ) -> Self {
+        unsafe { self.bind_uniform_with_range_unsafe(uniform, range, set, binding) }
     }
 
     /// Binds a sampler to the specified descriptor set and binding.

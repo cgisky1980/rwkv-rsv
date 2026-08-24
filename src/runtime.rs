@@ -10,7 +10,7 @@ use std::error::Error;
 use half::f16;
 use vulkanalia::prelude::v1_4::*;
 
-use crate::vulkan::app::{App, Kernel, QUERY_POOL_SIZE, Tensor};
+use crate::vulkan::app::{App, Kernel, QUERY_POOL_SIZE, Tensor, Uniform};
 use crate::vulkan::asset;
 use crate::vulkan::layout::Layout;
 
@@ -69,10 +69,22 @@ pub struct Runtime {
     /// 保留 kernel（其持有 descriptor set 与 uniform 资源）直到 submit 完成，
     /// 避免延迟 submit 期间资源被提前释放。
     pending: Vec<Kernel>,
-    /// kernel 缓存：按 (shader, spec, params) 复用已创建的 pipeline + descriptor set + uniform。
-    /// 模型加载后所有 tensor device address 固定，故相同 key 在每次 token 推理中均可复用，
-    /// 避免每 dispatch 重建 pipeline（对标 albatross 编译一次、运行多次）。
+    /// kernel 缓存：按 (shader, spec, n_params) 复用已创建的 pipeline + descriptor set。
+    /// **不含 buffer 地址**（与旧版的关键差异）：地址只写入 uniform 池的 slot 内容，
+    /// 由 DYNAMIC offset 在 cmd_bind 时指向——同形状不同层的 kernel 共享一个 pipeline，
+    /// 首次 prefill 的 ~1700 次 pipeline/descriptor/uniform 创建降到 ~20 次。
     cache: HashMap<KernelKey, Kernel>,
+    /// uniform 池：单个 host-visible mapped 大 buffer，所有 dispatch 的 Params 都
+    /// bump 分配在其中（按 min_uniform_buffer_offset_alignment 对齐）。
+    /// 池配合 UNIFORM_BUFFER_DYNAMIC descriptor：kernel 的 descriptor 绑定整个池 +
+    /// 定长 range，每次 dispatch 只写 slot 内容 + cmd_bind 传 offset。
+    /// 声明在 cache 之后：drop 顺序保证 cache 中的 Kernel（引用池）先释放。
+    uniform_pool: Uniform,
+    /// uniform 池 bump 游标（字节）。begin/end_batch 重置为 0（end_batch 已
+    /// queue_wait_idle，GPU 空闲，slot 内容可安全覆盖）。
+    pool_cursor: usize,
+    /// dynamic offset 对齐（min_uniform_buffer_offset_alignment，池为 0 时取 1）。
+    pool_align: usize,
     /// 本批内已写入、尚未被读取同步的缓冲（address → buffer handle）。
     /// 用于 buffer 级内存 barrier：仅同步当前 kernel 真正读取的缓冲，让无依赖的
     /// kernel 并发执行（替代每 dispatch 的全局全量 barrier，消除序列化）。
@@ -98,12 +110,14 @@ pub struct Runtime {
     prof_gpu_count: u32,
 }
 
-/// 唯一标识一个已创建的 kernel。
+/// 唯一标识一个已创建的 kernel（pipeline）。
+/// `n_params` 为 Params 的 u64 字段数（决定 DYNAMIC descriptor 的 range），
+/// 同一 shader 的 Params 布局恒定，故该维度仅作防御性区分。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct KernelKey {
     shader: String,
     spec: Vec<u32>,
-    params: Vec<u64>,
+    n_params: usize,
 }
 
 impl Runtime {
@@ -112,12 +126,24 @@ impl Runtime {
         let app = App::new()?;
         let cmd_buf = app.allocate_compute_command_buffers(1)?;
         let cmd = cmd_buf[0];
+        // uniform 池：默认 8MB（≈ 3 万次 dispatch 的 Params），UNIFORM_POOL_MB 可覆盖。
+        // host-visible + host-cached：写入即 mapped memcpy，无 staging。
+        let pool_mb: usize = std::env::var("UNIFORM_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let uniform_pool = app.create_uniform(pool_mb * 1024 * 1024)?;
+        let pool_align = app.properties.limits.min_uniform_buffer_offset_alignment as usize;
+        let pool_align = pool_align.max(1);
         Ok(Self {
             app,
             cmd,
             recording: false,
             pending: Vec::new(),
             cache: HashMap::new(),
+            uniform_pool,
+            pool_cursor: 0,
+            pool_align,
             written: HashMap::new(),
             read: HashMap::new(),
             written_batch: HashMap::new(),
@@ -294,6 +320,8 @@ impl Runtime {
         }
         self.recording = true;
         self.pending.clear();
+        // uniform 池游标复位（上一批已 wait_idle，slot 内容可安全覆盖）。
+        self.pool_cursor = 0;
         // 上一批 end_batch 已 queue_wait_idle 全量同步，所有缓冲写入对当前批可见；
         // 清空 written，避免把上一批的写入误判为本批需要同步。
         self.written.clear();
@@ -331,6 +359,8 @@ impl Runtime {
         self.written.clear();
         self.read.clear();
         self.written_batch.clear();
+        // uniform 池游标复位：GPU 已 wait_idle，下批 dispatch 从池头复用 slot。
+        self.pool_cursor = 0;
         // GPU 时间戳剖析：读取并按 kernel label 聚合，输出每个 kernel 的执行时间与带宽利用率。
         if self.prof_gpu && !self.prof_gpu_entries.is_empty() {
             let data = self.app.query_timestamps_n(self.prof_gpu_count)?;
@@ -567,20 +597,27 @@ impl Runtime {
         }
     }
 
-    /// 创建 uniform 绑定（1 个 UNIFORM_BUFFER at binding 0）
+    /// 创建 uniform 绑定（1 个 DYNAMIC UNIFORM_BUFFER at binding 0）。
+    /// DYNAMIC + uniform 池：descriptor 绑定整个池 buffer + 定长 range，
+    /// 实际偏移由 cmd_bind 的 dynamic offsets 提供（每次 dispatch 独立 slot）。
     fn uniform_binding() -> [vk::DescriptorSetLayoutBindingBuilder<'static>; 1] {
         [vk::DescriptorSetLayoutBinding::builder()
             .binding(0)
             .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
             .stage_flags(vk::ShaderStageFlags::COMPUTE)]
     }
 
     /// 创建 kernel、打包 uniform、绑定，并 record 到批处理 command buffer
     /// params 为 device address 列表
     ///
-    /// 按 (shader, spec, params) 缓存已创建的 kernel：模型加载后地址固定，故同一
-    /// key 的核心在每次 token 推理中可复用，避免重复创建 pipeline/descriptor set。
+    /// kernel（pipeline + descriptor set）按 (shader, spec, n_params) 缓存——
+    /// **key 不含 buffer 地址**（旧版含地址导致同形状不同层的 kernel 各建一套
+    /// pipeline，首次 prefill ~1700 次创建 ≈ 240ms）。地址改为写入 uniform 池的
+    /// slot 内容，由 DYNAMIC offset 在 cmd_bind 时指向：
+    ///   1. bump 分配池 slot（对齐 pool_align，批内每 dispatch 独立偏移，不互相覆盖）；
+    ///   2. cache 命中 → 复用 pipeline，仅 memcpy params 到 slot（~几十 ns）；
+    ///      未命中 → 创建 pipeline + descriptor（绑定池 + range），此后永久复用。
     fn record_kernel(
         &mut self,
         shader_name: &str,
@@ -595,16 +632,28 @@ impl Runtime {
         let key = KernelKey {
             shader: shader_name.to_string(),
             spec: specialization.to_vec(),
-            params: params.to_vec(),
+            n_params: params.len(),
         };
         let t_key = if prof_host {
             t0.elapsed()
         } else {
             std::time::Duration::ZERO
         };
-        // 缓存命中：直接复用已创建的 kernel（其 descriptor set 已绑定到同一 uniform）。
-        // 未命中：创建 kernel + uniform 并写入缓存。
-        // NO_CACHE=1 时绕过缓存（诊断用，验证缓存是否引入竞态）。
+        // uniform 池 bump 分配本 dispatch 的 slot。
+        let slot_bytes = std::mem::size_of_val(params);
+        let offset = (self.pool_cursor + self.pool_align - 1) & !(self.pool_align - 1);
+        if offset + slot_bytes > self.uniform_pool.size {
+            return Err(format!(
+                "uniform pool exhausted: need offset {offset} + {slot_bytes} bytes, \
+                 capacity {} bytes (一批 dispatch 过多；可用 UNIFORM_POOL_MB 调大)",
+                self.uniform_pool.size
+            )
+            .into());
+        }
+        self.uniform_pool.copy_from_at(params, offset)?;
+        self.pool_cursor = offset + slot_bytes;
+        // 缓存命中：复用 pipeline（descriptor 已绑池 + range），uniform 内容已写 slot。
+        // NO_CACHE=1 时绕过缓存（诊断用，验证缓存是否引入竞态；仍走池）。
         let no_cache = std::env::var("NO_CACHE").is_ok();
         let t_cache0 = std::time::Instant::now();
         let kernel = if !no_cache {
@@ -616,9 +665,10 @@ impl Runtime {
                 let kernel = self
                     .app
                     .create_kernel(code.as_ref(), specialization, &bindings)?;
-                let uniform = self.app.create_uniform(std::mem::size_of_val(params))?;
-                uniform.copy_from(params)?;
-                kernel.binder().bind_uniform(&uniform, 0, 0).build();
+                kernel
+                    .binder()
+                    .bind_uniform_with_range(&self.uniform_pool, slot_bytes, 0, 0)
+                    .build();
                 self.cache.insert(key.clone(), kernel.clone());
                 kernel
             }
@@ -628,9 +678,10 @@ impl Runtime {
             let kernel = self
                 .app
                 .create_kernel(code.as_ref(), specialization, &bindings)?;
-            let uniform = self.app.create_uniform(std::mem::size_of_val(params))?;
-            uniform.copy_from(params)?;
-            kernel.binder().bind_uniform(&uniform, 0, 0).build();
+            kernel
+                .binder()
+                .bind_uniform_with_range(&self.uniform_pool, slot_bytes, 0, 0)
+                .build();
             kernel
         };
         let t_cache = if prof_host {
@@ -669,7 +720,8 @@ impl Runtime {
             None
         };
         unsafe {
-            kernel.cmd_bind(self.cmd, &[]);
+            // DYNAMIC offset：descriptor 指向 uniform 池的本 dispatch slot。
+            kernel.cmd_bind(self.cmd, &[offset as u32]);
             self.app
                 .device
                 .cmd_dispatch(self.cmd, dispatch.0, dispatch.1, dispatch.2);
@@ -2398,7 +2450,15 @@ impl Runtime {
         eps: f32,
         gn_eps: f32,
     ) -> R<()> {
-        let spec = [h as u32, n as u32, eps.to_bits(), gn_eps.to_bits()];
+        // ⚠ 双锚点：spec 第 5 项（constant_id=4）= SUBGROUP_SIZE，与 shader 的
+        // subgroup-per-row 行/列分派同源（NUM_SUBGROUPS = 128/SUBGROUP_SIZE）。
+        let spec = [
+            h as u32,
+            n as u32,
+            eps.to_bits(),
+            gn_eps.to_bits(),
+            self.app.properties.subgroup_size,
+        ];
         let params = [
             s.device.address,
             k.device.address,
