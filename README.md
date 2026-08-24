@@ -113,14 +113,14 @@ Hardware: **RTX 2080 Ti**. Model: RWKV-7 Goosed g1h-3B (weights fp16 5.49GB / in
 |---|---|---|
 | int8 | **98.8%** (506/512) | near-lossless; weight avg cos 0.999820 / rel 0.6135% |
 
-**GPU decode self-loop throughput** (argmax self-loop, 1000 tokens, GPU 60°C cold; via `memtest` + `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000`):
+**GPU decode self-loop throughput** (argmax self-loop, 1000 tokens, GPU ~53°C cold start; via `memtest` + `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000`):
 
 | Weight | Vulkan | CUDA |
 |---|---|---|
-| fp16 | 80.0 tok/s | 85.7 tok/s |
-| int8 | 110.6 tok/s | 110.8 tok/s |
+| fp16 | 88.1 tok/s | 92.4 tok/s |
+| int8 | 116.0 tok/s | 126.0 tok/s |
 
-int8 ≈ +38% over fp16 (Vulkan) / +29% (CUDA).
+int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 
 **GPU prefill throughput** (T=256 steady-state, i.e. 2nd run onward after same-length warmup; `prof_prefill_steady`, Vulkan cooperative-matrix GEMM path):
 

@@ -113,14 +113,14 @@ uv run tools/quantize_any4.py --in rwkv-g1h-3B.st --out rwkv-g1h-3B.int8.st --bi
 |---|---|---|
 | int8 | **98.8%**（506/512） | 近无损；权重级 avg cos 0.999820 / rel 0.6135% |
 
-**GPU decode self-loop 吞吐**（argmax self-loop，1000 tokens，GPU 60°C 冷态；`memtest` + `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000`）：
+**GPU decode self-loop 吞吐**（argmax self-loop，1000 tokens，GPU ~53°C 冷态起；`memtest` + `SELFLOOP_ONLY=1` / `SELFLOOP_N=1000`）：
 
 | 权重 | Vulkan | CUDA |
 |---|---|---|
-| fp16 | 80.0 tok/s | 85.7 tok/s |
-| int8 | 110.6 tok/s | 110.8 tok/s |
+| fp16 | 88.1 tok/s | 92.4 tok/s |
+| int8 | 116.0 tok/s | 126.0 tok/s |
 
-int8 较 fp16 约 +38%（Vulkan）/ +29%（CUDA）。
+int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 
 **GPU prefill 吞吐**（T=256 稳态，即同长度预热后的第二次起；`prof_prefill_steady`，Vulkan cooperative-matrix GEMM 路径）：
 
