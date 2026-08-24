@@ -67,6 +67,7 @@ Key env vars (see [src/main.rs](src/main.rs)):
 | `GEN_TOKENS` / `REPORT_EVERY` | Continuous autoregressive generation (`memtest` sub-flow) |
 | `DIAG` | Three-way check (seq / tok / CPU) + dequant validation |
 | `PROF_GPU` / `PROF_HOST` | GPU / host-side profiling |
+| `UNIFORM_POOL_MB` | Vulkan uniform pool capacity in MB (default 8; ≈30k dispatches/batch) |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | Override cross-hardware adaptation |
 
 ### 4.1 Examples (web-rwkv style)
@@ -78,6 +79,8 @@ cargo run --release --example model_info
 cargo run --release --example generate          # env: NTOKENS, TEMP, TOPK, TOPP, GEN_MODE, VOCAB_JSON
 # Throughput benchmark: infer_seq / infer_tokens / argmax_selfloop / sample_selfloop
 cargo run --release --example benchmark
+# Steady-state prefill benchmark (2nd run onward after same-length warmup; excludes one-time pipeline creation)
+cargo run --release --example prof_prefill_steady   # env: PTOKENS
 # State serialization: forward→state_back→save→state_load→state_back lossless round-trip
 cargo run --release --example state_persist     # env: OUT=state.bin
 ```
@@ -119,6 +122,15 @@ Hardware: **RTX 2080 Ti**. Model: RWKV-7 Goosed g1h-3B (weights fp16 5.49GB / in
 
 int8 ≈ +38% over fp16 (Vulkan) / +29% (CUDA).
 
+**GPU prefill throughput** (T=256 steady-state, i.e. 2nd run onward after same-length warmup; `prof_prefill_steady`, Vulkan cooperative-matrix GEMM path):
+
+| Weight | Vulkan steady | Notes |
+|---|---|---|
+| fp16 | **2677-2700 tok/s** | effective GEMM 21-25 TFLOPS (75-89% of f32-accumulate tensor peak) |
+| int8 | 2263-2307 tok/s | includes per-layer dequant overhead (see Known Limitations) |
+
+A cold single-shot prefill additionally pays the one-time pipeline-creation cost of that length bucket (m_pad), ~tens to a hundred ms; servers can run one dummy prefill per common length bucket after loading. Details: [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md).
+
 ## 7. Layout
 
 ```
@@ -151,7 +163,9 @@ Inspired by both, this repository has since evolved independently, adding capabi
 
 - **prefill dequant overhead ~10%** (int8 vs fp16 at T=512): full removal needs cooperative-matrix fused dequant+GEMM (Marlin-style zero-copy), a long-term direction.
 - **prefill time grows ~quadratically with T** (T=256: 0.33ms → T=512: 0.81ms, WKV parallel intra-chunk term); consider WKV chunking for long prompts.
-- **Precision enhancements** (roadmap): calibration-weighted k-means, G=64 for denser metadata.
+- **Vulkan dplr_seq occupancy is low** (40 workgroups × 64 threads + 2 barriers per token, ~10ms in steady prefill): could adopt the CUDA structure (parallel-row blocks + shuffle reduction).
+- **First prefill of a new length bucket pays pipeline creation** (kernel cache now decouples uniforms via a shared pool + DYNAMIC offsets keyed on (shader, spec): 1722 → ~30 entries; the remainder is the inherent first-appearance cost of each spec): eliminable via startup warmup.
+- **Accuracy headroom**: calibration-weighted k-means, G=64 denser metadata.
 
 ## 10. License
 

@@ -67,6 +67,7 @@ cargo run --release
 | `GEN_TOKENS` / `REPORT_EVERY` | 连续自回归生成（`memtest` 子流程） |
 | `DIAG` | 三方核对（seq / tok / CPU）+ dequant 校验 |
 | `PROF_GPU` / `PROF_HOST` | GPU / 主机端性能剖析 |
+| `UNIFORM_POOL_MB` | Vulkan uniform 池容量（MB，默认 8；≈3 万次 dispatch/批） |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | 覆盖跨硬件自适应参数 |
 
 ### 4.1 示例程序（web-rwkv 风格）
@@ -78,6 +79,8 @@ cargo run --release --example model_info
 cargo run --release --example generate          # env: NTOKENS, TEMP, TOPK, TOPP, GEN_MODE, VOCAB_JSON
 # 吞吐基准：infer_seq / infer_tokens / argmax_selfloop / sample_selfloop
 cargo run --release --example benchmark
+# 稳态 prefill 基准（同长度预热后测第二次起，排除一次性 pipeline 创建开销）
+cargo run --release --example prof_prefill_steady   # env: PTOKENS
 # State 序列化：前进→state_back→存盘→state_load→state_back 无损闭环
 cargo run --release --example state_persist     # env: OUT=state.bin
 ```
@@ -119,6 +122,15 @@ uv run tools/quantize_any4.py --in rwkv-g1h-3B.st --out rwkv-g1h-3B.int8.st --bi
 
 int8 较 fp16 约 +38%（Vulkan）/ +29%（CUDA）。
 
+**GPU prefill 吞吐**（T=256 稳态，即同长度预热后的第二次起；`prof_prefill_steady`，Vulkan cooperative-matrix GEMM 路径）：
+
+| 权重 | Vulkan 稳态 | 备注 |
+|---|---|---|
+| fp16 | **2677-2700 tok/s** | GEMM 有效算力 21-25 TFLOPS（f32 累加 tensor 峰值 75-89%） |
+| int8 | 2263-2307 tok/s | 含每层 dequant 开销（见「已知限制」） |
+
+单次冷启动 prefill 会额外付出该长度桶（m_pad）首次的 pipeline 创建成本（~几十-上百 ms，一次性）；服务端可在加载后按常用长度桶各跑一次 dummy prefill 预热。详见 [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md)。
+
 ## 7. 目录结构
 
 ```
@@ -151,6 +163,8 @@ examples/       自包含示例程序
 
 - **prefill dequant 开销 ~10%**（T=512 时 int8 vs fp16）：彻底消除需 cooperative-matrix 融合反量化+GEMM（Marlin 式零副本），列为长期方向。
 - **prefill 每 token 耗时随 T 近二次方增长**（T=256: 0.33ms → T=512: 0.81ms，WKV 并行形式的 chunk 内项），长 prompt 可关注 WKV 分块策略。
+- **Vulkan dplr_seq 占用率偏低**（40 workgroup × 64 线程 + 每 token 2 次 barrier，稳态 prefill 中 ~10ms）：可对齐 CUDA 版结构（block 并行行 + shuffle 归约）。
+- **新长度桶首次 prefill 付 pipeline 创建成本**（kernel cache 已按 (shader, spec) 共享 uniform 池 + DYNAMIC offset 解耦，条目 1722 → ~30；剩余为 spec 首现的固有创建费）：可用启动预热消除。
 - **精度增强后路**：校准加权 k-means、G=64 提高元数据密度。
 
 ## 10. License
