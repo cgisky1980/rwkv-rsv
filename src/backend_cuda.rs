@@ -2615,7 +2615,11 @@ extern "C" __global__ void rwkv_norm(
 ///   k_mod_i = k_i * (1 + k_a_i * (a_i - 1))
 ///   S 更新：S[row,j] = S[row,j]*w[j] + sa[row]*b[j] + v[row]*k_mod[j]；y[row] = S@r
 ///   y_norm[row] = group_norm(y) + sum(r*k_mod*r_k) * v[row]
-/// 每个 block 处理一个 (head,batch)；128 线程 = N*SPLIT(N=64,SPLIT=2)。
+/// 每个 block 处理一个 (head,batch)；128 线程 = 4 warp。
+/// warp-per-row 映射：warp 串行处理 row ≡ warp (mod 4) 的状态行，lane ↔ 连续列
+/// （j0=lane、j1=lane+32）——state 行访问每条 warp 指令 128B 连续（100% coalesced；
+/// 旧映射 row=t/2 隔行分片时每 2 lane 才 8B 连续，仅 25% sector 利用率）。
+/// sa/y 行内归约用 warp 蝶形 shuffle（替代 shared 树归约，行循环内零 barrier）。
 /// a/v/w 为 fp16，其余 f32。
 const FUSE_KA_DPLR_NORM_SRC: &str = r#"
 extern "C" __global__ void fuse_ka_dplr_norm(
@@ -2638,7 +2642,6 @@ extern "C" __global__ void fuse_ka_dplr_norm(
     const float eps,
     const float gn_eps)
 {
-    constexpr int SPLIT = 2;
     constexpr int N_MAX = 64;
 
     __shared__ float sh_a[N_MAX];
@@ -2646,7 +2649,6 @@ extern "C" __global__ void fuse_ka_dplr_norm(
     __shared__ float sh_k[N_MAX];
     __shared__ float sh_w[N_MAX];
     __shared__ float sh_r[N_MAX];
-    __shared__ float sa_S[N_MAX];
     __shared__ float yv[N_MAX];
     __shared__ float sq[128];
     __shared__ float sqY[N_MAX];
@@ -2659,19 +2661,21 @@ extern "C" __global__ void fuse_ka_dplr_norm(
     const int head  = blockIdx.x;
     const int batch = blockIdx.y;
     const int t     = threadIdx.x;
-    const int row   = t / SPLIT;
-    const int ct    = t % SPLIT;
-    if (row >= n) return;
+    const int warp  = t >> 5;    // 0..3
+    const int lane  = t & 31;    // 0..31
+    if (t >= 2 * n) return;      // 与旧映射 row = t/2 >= n 的截断一致（n=64 时恒 false）
 
     const int v_base = batch * (h * n) + head * n;
     const int w_base = head * n;
     const int s_base = batch * (h * n * n) + head * (n * n);
-    const int s_row_base = s_base + row * n;
 
-    // Phase 0：L2 范数（冗余跨 ct，仅用于归约；结果与 shader 的 2 倍归约一致）
-    const float k_i  = k[v_base + row];
-    const float kk_i = k_i * kk[w_base + row];
-    sq[t] = kk_i * kk_i;
+    // Phase 0：L2 范数（保持旧版冗余归约：每行 2 线程各算一次 → 2 倍和，与 CPU 参考一致）
+    {
+        const int r2 = t >> 1;
+        const float k_i  = k[v_base + r2];
+        const float kk_i = k_i * kk[w_base + r2];
+        sq[t] = kk_i * kk_i;
+    }
     __syncthreads();
     for (int step = 128 >> 1; step > 0; step >>= 1) {
         if (t < step) sq[t] += sq[t + step];
@@ -2679,72 +2683,72 @@ extern "C" __global__ void fuse_ka_dplr_norm(
     }
     const float inv_norm = 1.0f / fmaxf(sqrtf(sq[0]), eps);
 
-    // Phase 1：各线程为自身列填充按列 shared
-    for (int kk_ = ct; kk_ < n; kk_ += SPLIT) {
-        const float kc  = k[v_base + kk_];
-        const float kkc = kc * kk[w_base + kk_];
-        const float ac  = __half2float(a[v_base + kk_]);
+    // Phase 1：t < n 的线程一人一列填充按列 shared（lane↔列，coalesced）
+    if (t < n) {
+        const float kc  = k[v_base + t];
+        const float kkc = kc * kk[w_base + t];
+        const float ac  = __half2float(a[v_base + t]);
         const float kl2 = kkc * inv_norm;
-        sh_a[kk_] = kl2;
-        sh_b[kk_] = -kl2 * ac;
-        sh_k[kk_] = kc * (1.0f + ka[w_base + kk_] * (ac - 1.0f));
-        sh_w[kk_] = __half2float(w[v_base + kk_]);
-        sh_r[kk_] = r[v_base + kk_];
+        sh_a[t] = kl2;
+        sh_b[t] = -kl2 * ac;
+        sh_k[t] = kc * (1.0f + ka[w_base + t] * (ac - 1.0f));
+        sh_w[t] = __half2float(w[v_base + t]);
+        sh_r[t] = r[v_base + t];
     }
     __syncthreads();
-    if (ct == 0) km[v_base + row] = sh_k[row];
+    if (t < n) km[v_base + t] = sh_k[t];
+
+    // Phase 2+3：warp-per-row —— 每 warp 串行处理 row ≡ warp (mod 4) 的状态行，
+    // lane ↔ 连续列（j0=lane、j1=lane+32），S 行元素寄存器化（每 lane 2 个），
+    // 一遍读一遍写；sa/y 行内归约用 warp 蝶形 shuffle（行循环内零 barrier）。
+    const int j0 = lane;
+    const int j1 = lane + 32;
+    const bool has_j1 = j1 < n;
+    for (int row = warp; row < n; row += 4) {
+        const int s_row_base = s_base + row * n;
+        const float v_i = __half2float(v[v_base + row]);
+        float s0 = s[s_row_base + j0];
+        float s1 = has_j1 ? s[s_row_base + j1] : 0.0f;
+        // sa[row] = sum_j S[row,j] * kk_l2[j]：本 lane 2 列部分和 + 蝶形归约（全 lane 得全和）
+        float sa_part = s0 * sh_a[j0];
+        if (has_j1) sa_part = fmaf(s1, sh_a[j1], sa_part);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sa_part += __shfl_xor_sync(0xffffffffu, sa_part, mask);
+        }
+        // S[row,j] = S[row,j]*w[j] + sa[row]*b[j] + v[row]*k_mod[j]
+        s0 = s0 * sh_w[j0] + sa_part * sh_b[j0] + v_i * sh_k[j0];
+        if (has_j1) s1 = s1 * sh_w[j1] + sa_part * sh_b[j1] + v_i * sh_k[j1];
+        // y[row] = sum_j S_new[row,j] * r[j]
+        float y_part = s0 * sh_r[j0];
+        if (has_j1) y_part = fmaf(s1, sh_r[j1], y_part);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            y_part += __shfl_xor_sync(0xffffffffu, y_part, mask);
+        }
+        if (lane == 0) yv[row] = y_part;
+        s[s_row_base + j0] = s0;
+        if (has_j1) s[s_row_base + j1] = s1;
+    }
     __syncthreads();
 
-    // Phase 2：sa[row] = sum_j S[row,j] * kk_l2[j]（列分片部分和 → 按行归约）
-    float sa_part = 0.0f;
-    for (int kk_ = ct; kk_ < n; kk_ += SPLIT) {
-        sa_part = fmaf(s[s_row_base + kk_], sh_a[kk_], sa_part);
-    }
-    sq[t] = sa_part;
-    __syncthreads();
-    if (ct == 0) {
-        float acc = 0.0f;
-        for (int c = 0; c < SPLIT; ++c) acc += sq[row * SPLIT + c];
-        sa_S[row] = acc;
-    }
-    __syncthreads();
-    const float sa_val = sa_S[row];
-    const float v_i    = __half2float(v[v_base + row]);
-
-    // Phase 3：更新 S[自身列]，并求 y[row] 的部分和
-    float y_part = 0.0f;
-    for (int kk_ = ct; kk_ < n; kk_ += SPLIT) {
-        const float s_ij  = s[s_row_base + kk_];
-        const float new_s = s_ij * sh_w[kk_] + sa_val * sh_b[kk_] + v_i * sh_k[kk_];
-        s[s_row_base + kk_] = new_s;
-        y_part = fmaf(new_s, sh_r[kk_], y_part);
-    }
-    sq[t] = y_part;
-    __syncthreads();
-    if (ct == 0) {
-        float acc = 0.0f;
-        for (int c = 0; c < SPLIT; ++c) acc += sq[row * SPLIT + c];
-        yv[row] = acc;
-    }
-    __syncthreads();
-
-    // Phase 4+5：group-norm(y) 与 s 归约（仅 ct==0，每行一个线程）
-    if (ct == 0) {
-        const float y_i = yv[row];
-        sqY[row]   = y_i;
-        sqY2[row]  = y_i * y_i;
-        ssRed[row] = sh_r[row] * sh_k[row] * rk[w_base + row];
+    // Phase 4+5：group-norm(y) 与 s 归约（t < n 一人一行，树归约同旧版结构）
+    if (t < n) {
+        const float y_i = yv[t];
+        sqY[t]   = y_i;
+        sqY2[t]  = y_i * y_i;
+        ssRed[t] = sh_r[t] * sh_k[t] * rk[w_base + t];
     }
     __syncthreads();
     for (int step = n >> 1; step > 0; step >>= 1) {
-        if (ct == 0 && row < step) {
-            sqY[row]   += sqY[row + step];
-            sqY2[row]  += sqY2[row + step];
-            ssRed[row] += ssRed[row + step];
+        if (t < step) {
+            sqY[t]   += sqY[t + step];
+            sqY2[t]  += sqY2[t + step];
+            ssRed[t] += ssRed[t + step];
         }
         __syncthreads();
     }
-    if (ct == 0 && row == 0) {
+    if (t == 0) {
         const float ssum = sqY[0];
         const float ssq  = sqY2[0];
         mean    = ssum / (float)n;
@@ -2755,10 +2759,11 @@ extern "C" __global__ void fuse_ka_dplr_norm(
     __syncthreads();
 
     // Phase 6：y_norm[row] = (y[row]-mean)*inv_std*gamma[row]+beta[row] + s*v[row]
-    if (ct == 0) {
+    if (t < n) {
+        const float v_i = __half2float(v[v_base + t]);
         const float normalized =
-            (yv[row] - mean) * inv_std * gamma[w_base + row] + beta[w_base + row];
-        yn[v_base + row] = normalized + s_acc * v_i;
+            (yv[t] - mean) * inv_std * gamma[w_base + t] + beta[w_base + t];
+        yn[v_base + t] = normalized + s_acc * v_i;
     }
 }
 "#;
