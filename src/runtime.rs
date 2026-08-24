@@ -83,6 +83,12 @@ pub struct Runtime {
     /// uniform 池 bump 游标（字节）。begin/end_batch 重置为 0（end_batch 已
     /// queue_wait_idle，GPU 空闲，slot 内容可安全覆盖）。
     pool_cursor: usize,
+    /// uniform 池 slot 表（批内 dedup）：params → 池内偏移。
+    /// decode/selfloop 每 token 的 kernel params 完全一致（buffer 地址不变），
+    /// dedup 后批内 slot 数 = 不同 params 组合数（~几百），与 token 数无关——
+    /// 对齐旧版按 (shader, spec, params) 缓存 uniform 的去重语义。
+    /// 未 dedup 时 1000-token selfloop（~26 万 dispatch × 对齐 slot）会耗尽池。
+    pool_slots: HashMap<Vec<u64>, usize>,
     /// dynamic offset 对齐（min_uniform_buffer_offset_alignment，池为 0 时取 1）。
     pool_align: usize,
     /// 本批内已写入、尚未被读取同步的缓冲（address → buffer handle）。
@@ -143,6 +149,7 @@ impl Runtime {
             cache: HashMap::new(),
             uniform_pool,
             pool_cursor: 0,
+            pool_slots: HashMap::new(),
             pool_align,
             written: HashMap::new(),
             read: HashMap::new(),
@@ -320,8 +327,9 @@ impl Runtime {
         }
         self.recording = true;
         self.pending.clear();
-        // uniform 池游标复位（上一批已 wait_idle，slot 内容可安全覆盖）。
+        // uniform 池游标/slot 表复位（上一批已 wait_idle，slot 内容可安全覆盖）。
         self.pool_cursor = 0;
+        self.pool_slots.clear();
         // 上一批 end_batch 已 queue_wait_idle 全量同步，所有缓冲写入对当前批可见；
         // 清空 written，避免把上一批的写入误判为本批需要同步。
         self.written.clear();
@@ -359,8 +367,9 @@ impl Runtime {
         self.written.clear();
         self.read.clear();
         self.written_batch.clear();
-        // uniform 池游标复位：GPU 已 wait_idle，下批 dispatch 从池头复用 slot。
+        // uniform 池游标/slot 表复位：GPU 已 wait_idle，下批 dispatch 从池头复用 slot。
         self.pool_cursor = 0;
+        self.pool_slots.clear();
         // GPU 时间戳剖析：读取并按 kernel label 聚合，输出每个 kernel 的执行时间与带宽利用率。
         if self.prof_gpu && !self.prof_gpu_entries.is_empty() {
             let data = self.app.query_timestamps_n(self.prof_gpu_count)?;
@@ -615,7 +624,8 @@ impl Runtime {
     /// **key 不含 buffer 地址**（旧版含地址导致同形状不同层的 kernel 各建一套
     /// pipeline，首次 prefill ~1700 次创建 ≈ 240ms）。地址改为写入 uniform 池的
     /// slot 内容，由 DYNAMIC offset 在 cmd_bind 时指向：
-    ///   1. bump 分配池 slot（对齐 pool_align，批内每 dispatch 独立偏移，不互相覆盖）；
+    ///   1. 池 slot 按 params 内容批内 dedup（decode/selfloop 每 token params 一致，
+    ///      池占用与 token 数无关，对齐旧版缓存 uniform 的去重语义）；
     ///   2. cache 命中 → 复用 pipeline，仅 memcpy params 到 slot（~几十 ns）；
     ///      未命中 → 创建 pipeline + descriptor（绑定池 + range），此后永久复用。
     fn record_kernel(
@@ -639,19 +649,28 @@ impl Runtime {
         } else {
             std::time::Duration::ZERO
         };
-        // uniform 池 bump 分配本 dispatch 的 slot。
+        // uniform 池分配本 dispatch 的 slot（批内 dedup：相同 params 复用偏移）。
+        // decode/selfloop 每 token 的 params 逐位一致，dedup 使池占用与 token 数
+        // 无关；两个 kernel 即便 shader 不同，只要 params 逐位相同，各自的 shader
+        // 按自身布局解读相同字节，结果与各自调用方传入的值一致，共享安全。
         let slot_bytes = std::mem::size_of_val(params);
-        let offset = (self.pool_cursor + self.pool_align - 1) & !(self.pool_align - 1);
-        if offset + slot_bytes > self.uniform_pool.size {
-            return Err(format!(
-                "uniform pool exhausted: need offset {offset} + {slot_bytes} bytes, \
-                 capacity {} bytes (一批 dispatch 过多；可用 UNIFORM_POOL_MB 调大)",
-                self.uniform_pool.size
-            )
-            .into());
-        }
-        self.uniform_pool.copy_from_at(params, offset)?;
-        self.pool_cursor = offset + slot_bytes;
+        let offset = if let Some(&off) = self.pool_slots.get(params) {
+            off
+        } else {
+            let off = (self.pool_cursor + self.pool_align - 1) & !(self.pool_align - 1);
+            if off + slot_bytes > self.uniform_pool.size {
+                return Err(format!(
+                    "uniform pool exhausted: need offset {off} + {slot_bytes} bytes, \
+                     capacity {} bytes（批内不同 params 组合过多；可用 UNIFORM_POOL_MB 调大）",
+                    self.uniform_pool.size
+                )
+                .into());
+            }
+            self.uniform_pool.copy_from_at(params, off)?;
+            self.pool_cursor = off + slot_bytes;
+            self.pool_slots.insert(params.to_vec(), off);
+            off
+        };
         // 缓存命中：复用 pipeline（descriptor 已绑池 + range），uniform 内容已写 slot。
         // NO_CACHE=1 时绕过缓存（诊断用，验证缓存是否引入竞态；仍走池）。
         let no_cache = std::env::var("NO_CACHE").is_ok();

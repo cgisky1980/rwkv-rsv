@@ -139,5 +139,24 @@ benchmark 层面可让 warmup 与计时同长度。
 
 - **descriptor 类型已全局改为 DYNAMIC**：新增算子若用 `bind_uniform`（非池路径）
   会类型不匹配——runtime 的算子统一走 `bind_uniform_with_range`；App 层两方法并存
-- uniform 池默认 8MB ≈ 3 万次 dispatch/batch；溢出报错（含 UNIFORM_POOL_MB 提示）
+- uniform 池默认 8MB ≈ 3 万个**不同 params 组合**/批（批内按内容去重后，
+  实际负载远低于此；溢出报错含 UNIFORM_POOL_MB 提示）
 - 改 descriptor 类型会使 NVIDIA GLCache 首次全量 miss（一次性重编译）
+
+### 补遗：uniform 池批内 dedup（同日发现并修复）
+
+README 重测（`memtest` 1000-token selfloop）暴露池设计缺陷：selfloop **单批**录制
+~26 万次 dispatch（每 token ~261 kernel），逐 dispatch bump 分配 slot → 8MB 池在
+数百 token 处耗尽报错。旧设计按 (shader, spec, params) 缓存 uniform，天然按
+params 去重（selfloop 每 token 的 params 逐位一致），无此限制；池化时丢失了该
+语义。benchmark（256 token）与既有单测恰好未越过池边界，故验证未暴露——
+**教训：惰性资源池类改动必须用长批次路径（如 1000-token selfloop）回归**。
+
+修复：`pool_slots: HashMap<Vec<u64>, usize>` 批内按 params 内容去重——相同
+params 复用同一偏移（不同 shader 解读相同字节，仍与各自调用方传入值一致，共享
+安全），begin/end_batch 随游标一并清空。selfloop 池占用回落至 O(kernel 种类数)，
+与 token 数无关。
+
+修复后按 README 原口径重测（GPU ~53°C 冷态起，1000 tokens）：
+fp16 Vulkan **88.1** / CUDA **92.4**；int8 Vulkan **116.0** / CUDA **126.0** tok/s
+（较 README 旧值 +7~14%：coalescing 修复 +1~3%，其余为环境差异）。
