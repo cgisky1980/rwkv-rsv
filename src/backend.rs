@@ -56,6 +56,11 @@ pub trait ComputeBackend {
         Err("upload_part not supported by this backend".into())
     }
     fn upload_u32(&self, t: TensorId, data: &[u32]) -> R<()>;
+    /// 批量上传开始（可选）：加载大量 tensor 时调用，后端可切换环形 pinned 暂存 +
+    /// 事件同步，消除逐 tensor 全流同步等待。默认无操作。
+    fn upload_bulk_begin(&mut self) {}
+    /// 批量上传结束：排空全部未完成 DMA 并释放批量上传资源。默认无操作。
+    fn upload_bulk_end(&mut self) {}
     fn download(&self, t: TensorId) -> R<Vec<f32>>;
     fn download_u32(&self, t: TensorId) -> R<Vec<u32>>;
 

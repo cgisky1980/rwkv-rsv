@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use half::f16;
 
@@ -915,19 +915,38 @@ pub struct CudaBackend {
     gemm_prof_ev_end: CuEvent,
     gemm_prof: bool,
     gemm_times: HashMap<(usize, usize, usize, i32), (u64, f64)>,
-    /// 串行化 CUDA primary context 访问：多线程测试并发 `cuCtxSetCurrent`/`cuPrimaryCtxRetain`
-    /// 会互相竞争导致内核结果错乱。后端存活期间持有锁，`Drop` 时释放，天然串行化。
-    #[allow(dead_code)]
-    _ctx_lock: MutexGuard<'static, ()>,
     /// pinned host 暂存区（sampler 异步行 + 小上传 scratch）。
     pinned: *mut c_void,
     /// pinned 暂存区总行数（固定 PINNED_ROWS；batch 宽行时按 batch 分组）。
     pinned_rows: usize,
+    /// 批量上传环形缓冲（upload_bulk_begin..end 期间启用，消除逐 tensor 全流同步）。
+    bulk: std::cell::RefCell<Option<BulkRing>>,
     /// 从其它后端导入的张量（`import_tensors_from` 权重共享）：Drop 时不释放。
     foreign: std::collections::HashSet<TensorId>,
 }
 
-/// 全局 CUDA 上下文锁：同一时刻仅一个 `CudaBackend` 访问 primary context。
+/// 批量上传环形缓冲：slots 个 pinned 槽轮转，按槽事件同步（只等即将复用的槽），
+/// 替代逐 tensor 的全流 cuStreamSynchronize（模型加载 1255 tensor 时 2500+ 次
+/// 全流同步是加载耗时的主要来源）。
+struct BulkRing {
+    base: *mut u8,
+    slot_bytes: usize,
+    slots: usize,
+    next: usize,
+    events: Vec<CuEvent>,
+}
+
+impl Drop for BulkRing {
+    fn drop(&mut self) {
+        // 资源释放由 CudaBackend::upload_bulk_end 驱动（需访问 drv）；
+        // 兜底：若直接 drop（未走 end），pinned/事件句柄随进程上下文回收。
+        let _ = self;
+    }
+}
+
+/// 全局 CUDA 上下文锁：串行化 `CudaBackend::new()` 的创建期（cuPrimaryCtxRetain/
+/// cuCtxSetCurrent 并发竞争防护）。仅覆盖初始化阶段——创建完成后即释放，
+/// 同进程多个后端实例可以共存（同线程顺序使用；见客户端常驻路由小模型场景）。
 static CUDA_CTX_LOCK: Mutex<()> = Mutex::new(());
 
 /// pinned 暂存区单行字节数（sampler 参数行 = 8 个 f32）。
@@ -941,7 +960,8 @@ const PINNED_UPLOAD_SCRATCH: usize = 64 * 1024 * 1024;
 impl CudaBackend {
     /// 创建 CUDA 后端：初始化驱动、取首个设备、保留主上下文。
     pub fn new() -> R<Self> {
-        // 加锁：串行化 CUDA primary context 访问（多线程测试安全）。
+        // 加锁：串行化创建期（多线程并发 new 的 cuPrimaryCtxRetain/cuCtxSetCurrent 竞争防护）。
+        // 守卫在函数返回时释放——后端存活期间不持有锁，多实例可共存。
         let _ctx_lock = CUDA_CTX_LOCK
             .lock()
             .map_err(|_| "CUDA context lock poisoned")?;
@@ -1032,9 +1052,9 @@ impl CudaBackend {
             prefill_graphs: HashMap::new(),
             prefill_t: 0,
             cublas,
-            _ctx_lock,
             pinned,
             pinned_rows: PINNED_ROWS,
+            bulk: std::cell::RefCell::new(None),
             foreign: std::collections::HashSet::new(),
         })
     }
@@ -1091,7 +1111,38 @@ impl CudaBackend {
     }
 
     /// pinned 源流序上传 + 完成同步（调用前须已排空本 stream）。
+    /// 批量上传开始：启用环形 pinned 暂存（8 槽 × 32MB）+ 按槽事件同步。
     fn htod_pinned(&self, dptr: u64, data: &[u8], bytes: usize) -> R<()> {
+        // 批量加载模式：环形槽 + 按槽事件同步（只等即将复用的槽的上一次拷贝）。
+        {
+            let mut ring_ref = self.bulk.borrow_mut();
+            if let Some(r) = ring_ref.as_mut()
+                && bytes <= r.slot_bytes
+            {
+                let slot = r.next;
+                let off = slot * r.slot_bytes;
+                // 复用前等该槽上一次拷贝完成（流内 FIFO，等它即等全部更早者）
+                cu_check!(
+                    (self.drv.cu_event_synchronize)(r.events[slot]),
+                    "cuEventSynchronize(bulk slot)"
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), r.base.add(off), bytes);
+                }
+                let src = unsafe { (r.base as *const u8).add(off) };
+                cu_check!(
+                    (self.drv.cu_memcpy_htod_async)(dptr, src as *const c_void, bytes, self.stream),
+                    "cuMemcpyHtoDAsync(bulk ring)"
+                );
+                cu_check!(
+                    (self.drv.cu_event_record)(r.events[slot], self.stream),
+                    "cuEventRecord(bulk)"
+                );
+                r.next = (slot + 1) % r.slots;
+                return Ok(());
+            }
+            // 超大 tensor 落到下方 tmp-pinned 同步路径（数量极少）
+        }
         let scratch_off = PINNED_ROWS * PINNED_ROW_BYTES;
         if bytes <= PINNED_UPLOAD_SCRATCH {
             // 常驻 scratch：host 拷入 → 流序异步 DMA → 同步完成（scratch 可复用）。
@@ -1370,6 +1421,20 @@ impl CudaBackend {
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
+        // 批量上传环形缓冲清理（若仍在 bulk 模式）
+        if let Some(r) = self.bulk.borrow_mut().take() {
+            unsafe {
+                let _ = (self.drv.cu_stream_synchronize)(self.stream);
+            }
+            for ev in &r.events {
+                unsafe {
+                    let _ = (self.drv.cu_event_destroy)(*ev);
+                }
+            }
+            unsafe {
+                let _ = (self.drv.cu_mem_free_host)(r.base as *mut c_void);
+            }
+        }
         for (id, v) in self.tensors.iter() {
             // 导入的共享权重张量（build_shared 权重共享）不释放：归源实例所有。
             if self.foreign.contains(id) {
@@ -2076,6 +2141,42 @@ __device__ __forceinline__ float u01_batch(unsigned int s) {
     return (float)z / 4294967296.0f;
 }
 
+// 从 temp[0..n)（mask==0 的项）中取最大的 BS 个候选，按 (值降序, 索引升序) 排序后写入
+// out_val/out_idx（长度 BS）；无剩余候选的空槽值为 -1e30 且排到末尾。
+// c_val/c_idx 为长度 BS 的暂存区，不得与 out_val/out_idx 别名。
+// 全块协同：内部含 __syncthreads，必须由所有线程统一调用。
+__device__ __forceinline__ void sample_top_candidates(
+    const float* __restrict__ temp,
+    const float* __restrict__ mask,
+    int n,
+    float* c_val, int* c_idx,
+    float* out_val, int* out_idx)
+{
+    constexpr int BS = 112;
+    const int tid = threadIdx.x;
+    float lm = -1e30f; int li = 0;
+    for (int i = tid; i < n; i += BS) {
+        const float v = temp[i];
+        if (mask[i] == 0.0f && v > lm) { lm = v; li = i; }
+    }
+    c_val[tid] = lm;
+    // 空槽给唯一哨兵索引：否则多个 (-1e30, 0) 撞秩，排序结果错乱。
+    c_idx[tid] = (lm > -1e29f) ? li : (n + tid);
+    __syncthreads();
+    // O(BS^2) 并行定秩（每线程只扫 BS 个 shared 元素），避免为 112 元素引入位排序。
+    const float mv = c_val[tid];
+    const int   mi = c_idx[tid];
+    int rank = 0;
+    for (int j = 0; j < BS; j++) {
+        const float vj = c_val[j];
+        const int   ij = c_idx[j];
+        if (vj > mv || (vj == mv && ij < mi)) rank++;
+    }
+    out_val[rank] = mv;
+    out_idx[rank] = mi;
+    __syncthreads();
+}
+
 extern "C" __global__ void rwkv_sample_batch(
     const float*      __restrict__ logits,   // [batch, n]
     float*            __restrict__ token,    // [batch] 写入索引的 f32 位模式
@@ -2105,6 +2206,10 @@ extern "C" __global__ void rwkv_sample_batch(
     __shared__ float s_u;
     __shared__ float s_threshold;
     __shared__ float g_cutoff;
+    __shared__ float s_cum;
+    __shared__ int   s_consumed;
+    __shared__ int   s_used;
+    __shared__ int   s_done;
 
     const float temperature = sampler_b[0];
     const unsigned int top_k = __float_as_uint(sampler_b[1]);
@@ -2222,15 +2327,31 @@ extern "C" __global__ void rwkv_sample_batch(
                 }
                 s_fval[tid] = lm; s_fidx[tid] = li;
                 __syncthreads();
-                for (int step = BS >> 1; step > 0; step >>= 1) {
-                    if (tid < step) {
-                        const float bv = s_fval[tid + step];
-                        const int   bi = s_fidx[tid + step];
-                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
-                            s_fval[tid] = bv; s_fidx[tid] = bi;
+                // BS=112 非 2 的幂：step 序列 56,28,14,7,3,1 会在 14→7→3→1 段孤儿化
+                // 索引 6 与 2 的结果（s_fval[0] 只是约 1/16 元素的最大值 → 阈值偏低）。
+                // 修法同 softmax：先把尾部 [P2, BS) 折进 [0, BS-P2)，再 2 幂树归约。
+                {
+                    constexpr int P2 = 64;
+                    if (tid >= P2 && tid < BS) {
+                        const float bv = s_fval[tid];
+                        const int   bi = s_fidx[tid];
+                        const float av = s_fval[tid - P2];
+                        const int   ai = s_fidx[tid - P2];
+                        if (bv > av || (bv == av && bi < ai)) {
+                            s_fval[tid - P2] = bv; s_fidx[tid - P2] = bi;
                         }
                     }
                     __syncthreads();
+                    for (int step = P2 >> 1; step > 0; step >>= 1) {
+                        if (tid < step) {
+                            const float bv = s_fval[tid + step];
+                            const int   bi = s_fidx[tid + step];
+                            if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
+                                s_fval[tid] = bv; s_fidx[tid] = bi;
+                            }
+                        }
+                        __syncthreads();
+                    }
                 }
                 if (tid == 0) { s_threshold = s_fval[0]; mask_b[s_fidx[0]] = 1.0f; }
                 __syncthreads();
@@ -2290,8 +2411,11 @@ extern "C" __global__ void rwkv_sample_batch(
     if (top_p > 0.0f && top_p < 1.0f) {
         if (K > 0 && K <= MAXK) {
             if (tid == 0) {
+                // s_sortedidx 为降序（[0] 最大），必须从 [0] 起累积——旧版从 K-1
+                // （最小）起累积，与其自身注释「从最大概率起累积」相悖：截断阈值
+                // 偏低 → 保留集合偏大（多峰分布下与兜底路径结果不一致）。
                 float cum = 0.0f, cutoffv = -1e30f;
-                for (int j = K - 1; j >= 0; j--) {
+                for (int j = 0; j < K; j++) {
                     const int idx = s_sortedidx[j];
                     cum += temp_b[idx];
                     cutoffv = temp_b[idx];
@@ -2300,33 +2424,36 @@ extern "C" __global__ void rwkv_sample_batch(
                 g_cutoff = cutoffv;
             }
         } else {
+            // 兜底（无 top-k 或 top_k > MAXK）：每轮取 BS 个候选，而非旧版每轮 1 个。
+            // 旧版在平坦分布下要跑满 512 轮 × 全词表扫描（实测 51.8 ms/token）。
+            // 暂存复用快速路径的 s_val/s_idx（此分支下二者未被使用）。
+            float* c_val = (float*)s_val;
+            int*   c_idx = (int*)s_idx;
+            float* o_val = (float*)s_val + BS;
+            int*   o_idx = (int*)s_idx + BS;
             for (int i = tid; i < n; i += BS) mask_b[i] = 0.0f;
             __syncthreads();
-            if (tid == 0) g_cutoff = 0.0f;
+            if (tid == 0) { g_cutoff = 0.0f; s_cum = 0.0f; s_consumed = 0; s_done = 0; }
             __syncthreads();
-            float cum = 0.0f;
-            for (int cnt = 0; cnt < 512 && cum < top_p; cnt++) {
-                float lm = -1e30f; int li = 0;
-                for (int i = tid; i < n; i += BS) {
-                    if (mask_b[i] == 0.0f && temp_b[i] > lm) { lm = temp_b[i]; li = i; }
-                }
-                s_fval[tid] = lm; s_fidx[tid] = li;
-                __syncthreads();
-                for (int step = BS >> 1; step > 0; step >>= 1) {
-                    if (tid < step) {
-                        const float bv = s_fval[tid + step];
-                        const int   bi = s_fidx[tid + step];
-                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
-                            s_fval[tid] = bv; s_fidx[tid] = bi;
-                        }
-                    }
-                    __syncthreads();
-                }
+            // 退出条件全块统一（shared），避免 __syncthreads 分歧死锁（同单流版）
+            while (!s_done) {
+                sample_top_candidates(temp_b, mask_b, n, c_val, c_idx, o_val, o_idx);
                 if (tid == 0) {
-                    mask_b[s_fidx[0]] = 1.0f;
-                    cum += s_fval[0];
-                    g_cutoff = s_fval[0];
+                    int used = 0;
+                    for (int j = 0; j < BS && s_consumed < 512; j++) {
+                        const float v = o_val[j];
+                        if (v <= -1e29f) break;  // 候选耗尽
+                        s_cum += v;
+                        g_cutoff = v;
+                        ++used; ++s_consumed;
+                        if (s_cum >= top_p) break;
+                    }
+                    s_used = used;
+                    if (used == 0 || s_cum >= top_p || s_consumed >= 512) s_done = 1;
                 }
+                __syncthreads();
+                // 标记本轮已消费候选（即将退出时多标也无害：mask 之后不再使用）
+                if (tid < s_used) mask_b[o_idx[tid]] = 1.0f;
                 __syncthreads();
             }
             __syncthreads();
@@ -3702,6 +3829,42 @@ __device__ __forceinline__ float u01(unsigned int s) {
     return (float)z / 4294967296.0f;
 }
 
+// 从 temp[0..n)（mask==0 的项）中取最大的 BS 个候选，按 (值降序, 索引升序) 排序后写入
+// out_val/out_idx（长度 BS）；无剩余候选的空槽值为 -1e30 且排到末尾。
+// c_val/c_idx 为长度 BS 的暂存区，不得与 out_val/out_idx 别名。
+// 全块协同：内部含 __syncthreads，必须由所有线程统一调用。
+__device__ __forceinline__ void sample_top_candidates(
+    const float* __restrict__ temp,
+    const float* __restrict__ mask,
+    int n,
+    float* c_val, int* c_idx,
+    float* out_val, int* out_idx)
+{
+    constexpr int BS = 112;
+    const int tid = threadIdx.x;
+    float lm = -1e30f; int li = 0;
+    for (int i = tid; i < n; i += BS) {
+        const float v = temp[i];
+        if (mask[i] == 0.0f && v > lm) { lm = v; li = i; }
+    }
+    c_val[tid] = lm;
+    // 空槽给唯一哨兵索引：否则多个 (-1e30, 0) 撞秩，排序结果错乱。
+    c_idx[tid] = (lm > -1e29f) ? li : (n + tid);
+    __syncthreads();
+    // O(BS^2) 并行定秩（每线程只扫 BS 个 shared 元素），避免为 112 元素引入位排序。
+    const float mv = c_val[tid];
+    const int   mi = c_idx[tid];
+    int rank = 0;
+    for (int j = 0; j < BS; j++) {
+        const float vj = c_val[j];
+        const int   ij = c_idx[j];
+        if (vj > mv || (vj == mv && ij < mi)) rank++;
+    }
+    out_val[rank] = mv;
+    out_idx[rank] = mi;
+    __syncthreads();
+}
+
 extern "C" __global__ void rwkv_sample(
     const float*      __restrict__ logits,   // [n]
     float*            __restrict__ token,    // [1] 写入索引的 f32 位模式
@@ -3731,6 +3894,10 @@ extern "C" __global__ void rwkv_sample(
     __shared__ float s_u;
     __shared__ float s_threshold;
     __shared__ float g_cutoff;
+    __shared__ float s_cum;
+    __shared__ int   s_consumed;
+    __shared__ int   s_used;
+    __shared__ int   s_done;
 
     const float temperature = sampler[0];
     const unsigned int top_k = __float_as_uint(sampler[1]);
@@ -3850,15 +4017,31 @@ extern "C" __global__ void rwkv_sample(
                 }
                 s_fval[tid] = lm; s_fidx[tid] = li;
                 __syncthreads();
-                for (int step = BS >> 1; step > 0; step >>= 1) {
-                    if (tid < step) {
-                        const float bv = s_fval[tid + step];
-                        const int   bi = s_fidx[tid + step];
-                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
-                            s_fval[tid] = bv; s_fidx[tid] = bi;
+                // BS=112 非 2 的幂：step 序列 56,28,14,7,3,1 会在 14→7→3→1 段孤儿化
+                // 索引 6 与 2 的结果（s_fval[0] 只是约 1/16 元素的最大值 → 阈值偏低）。
+                // 修法同 softmax：先把尾部 [P2, BS) 折进 [0, BS-P2)，再 2 幂树归约。
+                {
+                    constexpr int P2 = 64;
+                    if (tid >= P2 && tid < BS) {
+                        const float bv = s_fval[tid];
+                        const int   bi = s_fidx[tid];
+                        const float av = s_fval[tid - P2];
+                        const int   ai = s_fidx[tid - P2];
+                        if (bv > av || (bv == av && bi < ai)) {
+                            s_fval[tid - P2] = bv; s_fidx[tid - P2] = bi;
                         }
                     }
                     __syncthreads();
+                    for (int step = P2 >> 1; step > 0; step >>= 1) {
+                        if (tid < step) {
+                            const float bv = s_fval[tid + step];
+                            const int   bi = s_fidx[tid + step];
+                            if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
+                                s_fval[tid] = bv; s_fidx[tid] = bi;
+                            }
+                        }
+                        __syncthreads();
+                    }
                 }
                 if (tid == 0) { s_threshold = s_fval[0]; mask[s_fidx[0]] = 1.0f; }
                 __syncthreads();
@@ -3916,8 +4099,11 @@ extern "C" __global__ void rwkv_sample(
     if (top_p > 0.0f && top_p < 1.0f) {
         if (K > 0 && K <= MAXK) {
             if (tid == 0) {
+                // s_sortedidx 为降序（[0] 最大），必须从 [0] 起累积——旧版从 K-1
+                // （最小）起累积，与其自身注释「从最大概率起累积」相悖：截断阈值
+                // 偏低 → 保留集合偏大（多峰分布下与兜底路径结果不一致）。
                 float cum = 0.0f, cutoffv = -1e30f;
-                for (int j = K - 1; j >= 0; j--) {
+                for (int j = 0; j < K; j++) {
                     const int idx = s_sortedidx[j];
                     cum += temp[idx];
                     cutoffv = temp[idx];
@@ -3926,34 +4112,38 @@ extern "C" __global__ void rwkv_sample(
                 g_cutoff = cutoffv;
             }
         } else {
-            // 兜底：迭代 reduce_max（仅在无 top-k 时用到，罕见）
+            // 兜底（无 top-k 或 top_k > MAXK）：每轮取 BS 个候选，而非旧版每轮 1 个。
+            // 旧版在平坦分布下要跑满 512 轮 × 全词表扫描（实测 51.8 ms/token，单流
+            // selfloop 从 85 掉到 20 tok/s）。512 上限现在只需 5 轮。
+            // 暂存复用快速路径的 s_val/s_idx（此分支下二者未被使用）。
+            float* c_val = (float*)s_val;
+            int*   c_idx = (int*)s_idx;
+            float* o_val = (float*)s_val + BS;
+            int*   o_idx = (int*)s_idx + BS;
             for (int i = tid; i < n; i += BS) mask[i] = 0.0f;
             __syncthreads();
-            if (tid == 0) g_cutoff = 0.0f;
+            if (tid == 0) { g_cutoff = 0.0f; s_cum = 0.0f; s_consumed = 0; s_done = 0; }
             __syncthreads();
-            float cum = 0.0f;
-            for (int cnt = 0; cnt < 512 && cum < top_p; cnt++) {
-                float lm = -1e30f; int li = 0;
-                for (int i = tid; i < n; i += BS) {
-                    if (mask[i] == 0.0f && temp[i] > lm) { lm = temp[i]; li = i; }
-                }
-                s_fval[tid] = lm; s_fidx[tid] = li;
-                __syncthreads();
-                for (int step = BS >> 1; step > 0; step >>= 1) {
-                    if (tid < step) {
-                        const float bv = s_fval[tid + step];
-                        const int   bi = s_fidx[tid + step];
-                        if (bv > s_fval[tid] || (bv == s_fval[tid] && bi < s_fidx[tid])) {
-                            s_fval[tid] = bv; s_fidx[tid] = bi;
-                        }
-                    }
-                    __syncthreads();
-                }
+            // 退出条件必须全块统一（shared）：否则 tid0 先越 top_p 退出循环、
+            // 其余线程继续跑，__syncthreads 分歧 = 块内死锁（kernel 永久自旋 99% SM）
+            while (!s_done) {
+                sample_top_candidates(temp, mask, n, c_val, c_idx, o_val, o_idx);
                 if (tid == 0) {
-                    mask[s_fidx[0]] = 1.0f;
-                    cum += s_fval[0];
-                    g_cutoff = s_fval[0];
+                    int used = 0;
+                    for (int j = 0; j < BS && s_consumed < 512; j++) {
+                        const float v = o_val[j];
+                        if (v <= -1e29f) break;  // 候选耗尽
+                        s_cum += v;
+                        g_cutoff = v;
+                        ++used; ++s_consumed;
+                        if (s_cum >= top_p) break;
+                    }
+                    s_used = used;
+                    if (used == 0 || s_cum >= top_p || s_consumed >= 512) s_done = 1;
                 }
+                __syncthreads();
+                // 标记本轮已消费候选（即将退出时多标也无害：mask 之后不再使用）
+                if (tid < s_used) mask[o_idx[tid]] = 1.0f;
                 __syncthreads();
             }
             __syncthreads();
@@ -4801,6 +4991,64 @@ impl ComputeBackend for CudaBackend {
         }
     }
 
+    /// 加载大量 tensor 时消除逐 tensor 全流同步（原 19s 加载的主要开销）。
+    fn upload_bulk_begin(&mut self) {
+        const RING_SLOTS: usize = 4;
+        const RING_SLOT_BYTES: usize = 128 * 1024 * 1024;
+        if self.bulk.borrow().is_some() {
+            return;
+        }
+        unsafe {
+            let mut base: *mut c_void = std::ptr::null_mut();
+            let r = (self.drv.cu_mem_host_alloc)(&mut base, RING_SLOTS * RING_SLOT_BYTES, 0);
+            if r != 0 {
+                log::warn!("bulk ring pinned 分配失败（cuResult {r}），回退逐 tensor 同步上传");
+                return;
+            }
+            let mut events = Vec::with_capacity(RING_SLOTS);
+            for _ in 0..RING_SLOTS {
+                let mut ev: CuEvent = std::ptr::null_mut();
+                let er = (self.drv.cu_event_create)(&mut ev, 0);
+                if er != 0 {
+                    log::warn!("cuEventCreate 失败（{er}），回退逐 tensor 同步上传");
+                    let _ = (self.drv.cu_mem_free_host)(base);
+                    return;
+                }
+                events.push(ev);
+            }
+            self.bulk.borrow_mut().replace(BulkRing {
+                base: base as *mut u8,
+                slot_bytes: RING_SLOT_BYTES,
+                slots: RING_SLOTS,
+                next: 0,
+                events,
+            });
+            log::info!(
+                "bulk upload mode: {RING_SLOTS} × {} MB pinned ring",
+                RING_SLOT_BYTES / 1024 / 1024
+            );
+        }
+    }
+
+    /// 批量上传结束：排空全部 DMA、释放环形缓冲。
+    fn upload_bulk_end(&mut self) {
+        let ring = self.bulk.borrow_mut().take();
+        if let Some(r) = ring {
+            unsafe {
+                let _ = (self.drv.cu_stream_synchronize)(self.stream);
+            }
+            for ev in &r.events {
+                unsafe {
+                    let _ = (self.drv.cu_event_destroy)(*ev);
+                }
+            }
+            unsafe {
+                let _ = (self.drv.cu_mem_free_host)(r.base as *mut c_void);
+            }
+            log::info!("bulk upload mode ended");
+        }
+    }
+
     fn download(&self, t: TensorId) -> R<Vec<f32>> {
         match self.get(t, "download")? {
             CudaTensor::F32 { dptr, len } => {
@@ -4937,10 +5185,26 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn supports_graph_capture(&self) -> bool {
-        true
+        // 兼容开关：RWKV_GRAPH=0 时禁用 CUDA graph（降级为批量记录）。
+        // 背景：驱动 610.47 上图捕获+重放在个别请求上非确定性挂死（2026-09-19，
+        // town-model-server 实测）；修复前可用此开关绕过。结果缓存避免每调用读 env。
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let enabled = std::env::var("RWKV_GRAPH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if !enabled {
+                log::info!("RWKV_GRAPH=0：禁用 CUDA graph capture（降级批量记录路径）");
+            }
+            enabled
+        })
     }
 
     fn prefill_graph_valid(&mut self, t: usize) -> R<bool> {
+        // RWKV_GRAPH=0 兼容开关同时禁用 prefill 图捕获（见 supports_graph_capture）。
+        if !self.supports_graph_capture() {
+            return Ok(false);
+        }
         Ok(self.prefill_graphs.contains_key(&t))
     }
 
@@ -7954,32 +8218,6 @@ mod tests {
         let sampler_t = mk_tensor(&mut b, batch * 8, TensorDtype::F32);
         let hist_t = mk_tensor(&mut b, batch, TensorDtype::U32);
         b.upload(logits_t, &logits).unwrap();
-
-        // 先跑单序列版 4 次（同一数据/参数），对照 batch 版——隔离"原版 bug vs batch 偏移 bug"。
-        let single_tokens: Vec<u32> = (0..batch)
-            .map(|bi| {
-                let single_logits = mk_tensor(&mut b, n, TensorDtype::F32);
-                let single_tok = mk_tensor(&mut b, 1, TensorDtype::F32);
-                b.upload(single_logits, &logits[bi * n..(bi + 1) * n])
-                    .unwrap();
-                b.sample(
-                    single_logits,
-                    single_tok,
-                    n,
-                    0.0001,
-                    if std::env::var("K1").is_ok() { 1 } else { 50 },
-                    1.0,
-                    42 + bi as u32,
-                    1.0,
-                    0.0,
-                    0.0,
-                    &[],
-                )
-                .expect("single sample");
-                b.download(single_tok).unwrap()[0].to_bits()
-            })
-            .collect();
-        eprintln!("single-seq tokens: {single_tokens:?}");
 
         // sampler 参数：temperature=0.0001（≈argmax）、top_k=50、top_p=1.0、seed 逐 slot。
         let mut sampler_data = Vec::with_capacity(batch * 8);

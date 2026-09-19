@@ -447,6 +447,9 @@ impl GpuModel {
              ffn_hidden={ffn_hidden} w_mid={w_mid} a_mid={a_mid} v_mid={v_mid} g_mid={g_mid}"
         );
 
+        // 批量上传模式：环形 pinned 暂存 + 按槽事件同步（消除逐 tensor 全流同步）
+        backend.upload_bulk_begin();
+
         // 加载 ln0 并在 CPU 端预计算 emb_ln = ln0(embed)
         // 键名: blocks.0.ln0.weight
         let emb_f32 = tensor_to_f32(&emb);
@@ -525,6 +528,7 @@ impl GpuModel {
             backend.drop_host(t);
         }
         backend.drop_host(scale_w);
+        backend.upload_bulk_end();
 
         Ok(Self {
             backend,
@@ -1005,6 +1009,24 @@ impl GpuModel {
     ) -> R<Vec<u32>> {
         let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
             self.forward_seq_batch_core(state, tokens_batch, None)?;
+        self.backend.free_tensor(tok);
+        self.seq_bufs = Some(seq_bufs);
+        Ok(seeds)
+    }
+
+    /// 批量 prefill（固定 T_pad 版）：seq 缓冲按 `pad_to` 建一次、跨批复用，
+    /// 消除变长 prompt 逐批 clear_cache + kernel 重编译。lens 仍按各槽原始
+    /// 长度（pad 行不进 state）；返回各槽末 token（解码种子）。
+    /// 服务端应固定 pad_to（如 512）并保证 prompt 不超限，超限时 T_pad 自动
+    /// 抬升一次（重建一次缓冲，后续复用）。
+    pub fn forward_seq_batch_padded(
+        &mut self,
+        state: &mut State,
+        tokens_batch: &[Vec<u32>],
+        pad_to: usize,
+    ) -> R<Vec<u32>> {
+        let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
+            self.forward_seq_batch_core(state, tokens_batch, Some(pad_to))?;
         self.backend.free_tensor(tok);
         self.seq_bufs = Some(seq_bufs);
         Ok(seeds)
