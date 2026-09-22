@@ -131,6 +131,31 @@ int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 
 A cold single-shot prefill additionally pays the one-time pipeline-creation cost of that length bucket (m_pad), ~tens to a hundred ms; servers can run one dummy prefill per common length bucket after loading. Details: [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md).
 
+**CUDA batched-decode throughput vs Albatross** (int8 weights, C=2560 / H=40 / N=64 / V=65536 / L=32; `batch_decode_bench` vs `run_bench.bat`, both measured **back-to-back on the same machine in the same session**):
+
+| Batch | Albatross (tok/s) | rwkv-rsv (tok/s) | Speedup |
+|---:|---:|---:|---:|
+| 1 (single-stream) | 94.2 – 99.0 | 94.1 – 97.2 | **parity** (1.012× over 3 interleaved rounds) |
+| 8 | 465.4 | **547.8** | +17.7% |
+| 16 | 806.0 | **979.4** | +21.5% |
+| 32 | 1294.6 | **1632.8** | +26.1% |
+| 64 | 2123.3 | **2354.7** | +10.9% |
+| 128 | 2704.6 | **3123.1** | +15.5% |
+| 256 | 3036.9 | **3467.7** | +14.2% |
+
+> ⚠️ This card doubles as the desktop display: readings drift up to **±17%** across sessions
+> (Albatross's batch-1 reading alone spans 94.2–99.0). **Only same-session interleaved A/B is
+> trustworthy**; single readings can invert the conclusion by ±3%.
+
+What got us there: **int8 tensor cores** (`mma.m8n8k16.s8`, Turing's int8 TC peak is 2× its fp16
+TC peak) on **int8-resident weights** (2.68 GB/token read vs 5.37 GB for an fp16 engine), **split-K
+with a deterministic reduction kernel** (more blocks without extra traffic), **merged multi-chain
+launches** (r/k/v + the 4 low-rank chains), **shape-aware tiling** (BM by batch, BN ≈ batch,
+block count filled to the 68 SMs), **warp-per-row + `__shfl` reductions** replacing per-row block
+trees, **atomic-free sparse FFN accumulation**, and every scan pass in the samplers unrolled for
+memory-level parallelism. Full write-ups: [int8 IMMA record](参考/2026-09-21-int8-IMMA实施记录.md) ·
+[cross-arch baseline table](参考/2026-09-21-跨架构基线表.md).
+
 ## 7. Layout
 
 ```
@@ -153,9 +178,10 @@ This project initially referenced two existing RWKV inference implementations:
 |---|---|---|
 | Compute backend | CUDA (single vendor) | Vulkan / CUDA (cross-vendor / cross-platform) |
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
-| Relative gap | baseline | about **40%** (same GPU inference path) |
+| Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
+| Relative gap (CUDA batched decode) | baseline | **ahead** — parity at batch 1, +11% to +26% at batch 8–256 (see §6) |
 
-The gap mainly comes from: ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. This is a **portability (Vulkan) vs peak performance (CUDA) trade-off**, not an implementation defect.
+The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path remains the portability-first trade-off — the ~40% figure above still applies to it.
 
 Inspired by both, this repository has since evolved independently, adding capabilities neither has: **two weight-quantization paths** (fp16 / int8 auto-routed), **CPU fp32 reference plus GPU-kernel unit tests**, and an **offline quantization toolchain** with a reproducible accuracy-verification workflow.
 

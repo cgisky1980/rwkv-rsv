@@ -56,12 +56,24 @@ pub trait ComputeBackend {
         Err("upload_part not supported by this backend".into())
     }
     fn upload_u32(&self, t: TensorId, data: &[u32]) -> R<()>;
+    /// 部分上传（u32）：把 data 写入张量 [offset, offset+len) 段（u32 元素偏移），
+    /// 其余部分不动（惩罚历史逐 token 追加用）。
+    fn upload_u32_part(&self, t: TensorId, offset: usize, data: &[u32]) -> R<()> {
+        let _ = (t, offset, data);
+        Err("upload_u32_part not supported by this backend".into())
+    }
     /// 批量上传开始（可选）：加载大量 tensor 时调用，后端可切换环形 pinned 暂存 +
     /// 事件同步，消除逐 tensor 全流同步等待。默认无操作。
     fn upload_bulk_begin(&mut self) {}
     /// 批量上传结束：排空全部未完成 DMA 并释放批量上传资源。默认无操作。
     fn upload_bulk_end(&mut self) {}
     fn download(&self, t: TensorId) -> R<Vec<f32>>;
+    /// 部分下载：只取张量 [offset, offset+len) 段（f32 元素偏移）。
+    /// batch State 的「只取某 slot 一行」用（整表下载在 batch=16 时是 ~260MB）。
+    fn download_part(&self, t: TensorId, offset: usize, len: usize) -> R<Vec<f32>> {
+        let _ = (t, offset, len);
+        Err("download_part not supported by this backend".into())
+    }
     fn download_u32(&self, t: TensorId) -> R<Vec<u32>>;
 
     // —— 批处理（一次提交多条 kernel）——
@@ -74,24 +86,25 @@ pub trait ComputeBackend {
     /// 打印累计的 per-kernel profiling 时间（仅诊断；CUDA 覆盖，其余为 no-op）。
     fn dump_kernel_prof(&mut self) {}
 
-    // —— CUDA graph 捕获/重放（decode 每 token launch 开销优化）——
-    /// 开始捕获后续 kernel 启动到 CUDA graph（重放时不再逐次 cuLaunchKernel）。
-    /// 默认 no-op；仅支持的后端（CUDA）覆盖。
-    fn begin_graph_capture(&mut self) -> R<()> {
-        Ok(())
-    }
-    /// 结束捕获并实例化可执行 graph。
-    fn end_graph_capture(&mut self) -> R<()> {
-        Ok(())
-    }
-    /// 重放已捕获的可执行 graph（固定的一组 kernel 序列）。
-    fn graph_replay(&mut self) -> R<()> {
-        Ok(())
-    }
+    // —— CUDA graph（decode 每 token launch 开销优化）——
+    // 注：曾有无 key 的 `begin_graph_capture`/`end_graph_capture`/`graph_replay` 单槽 API，
+    // 形状一变就要重新实例化；实测高频 churn 会在 `cuGraphInstantiate` 驱动代码内部
+    // 触发 0xC0000005（nvcuda64.dll+0x297ca0）。已删除，统一走下面按 key 长期持有的 API。
+    // ★ 2026-09-22 补充：那个 `0xC0000005` 的**真正根因已找到** —— 是
+    // `cuGraphInstantiate` 的**符号解析顺序**取到了 v1（五参数）而按三参数调用
+    // （见 `backend_cuda.rs` 里 `cu_graph_instantiate` 的注释）。按 key 长期持有仍是
+    // 好设计（省去重复实例化），但"高频 churn 才崩"的印象其实是概率性的 ABI 踩空。
     /// 是否支持 CUDA graph 捕获/重放（self-loop 用）。默认 false；仅 CUDA 覆盖为 true。
     /// 不支持的后端（Vulkan）在 self-loop 时改为把完整前向逐 token 记录进同一批次。
     fn supports_graph_capture(&self) -> bool {
         false
+    }
+
+    /// 当前后端**登记在册**的张量占用的设备字节总数（诊断用：定位显存大户）。
+    /// 不统计 cudaMalloc 池余量/库内缓存，故小于 `nvidia-smi` 读数，但可用于**比较
+    /// 各阶段（模型加载 / 建 state / prefill / 解码）的增量**。默认 0（后端未实现）。
+    fn device_bytes(&self) -> usize {
+        0
     }
 
     // —— CUDA prefill graph（整段 prefill 一次抓到图，消除跨层 launch 开销）——
@@ -112,6 +125,40 @@ pub trait ComputeBackend {
     fn prefill_graph_replay(&mut self) -> R<()> {
         Ok(())
     }
+
+    // —— 解码 self-loop 图（按 key 长期持有：每个形状只捕获一次，此后只重放）——
+    // 动机：`begin/end_graph_capture` 是无 key 的单槽 API，形状一变就要重新实例化；
+    // 高频重复实例化会触发驱动崩溃（实测 nvcuda64.dll 0xC0000005，见参考文档）。
+    // 这组 API 让调用方按 (kind, batch, n) 缓存图，一次捕获后永久重放。
+    /// 该 key 是否已有可实例化的 graph（true = 直接重放，不要再捕获）。
+    fn selfloop_graph_ready(&mut self, _key: u64) -> bool {
+        false
+    }
+    /// 该 key 是否已被判定「图不可用」（捕获失败过，永久降级为非 graph 逐轮提交）。
+    fn selfloop_graph_skip(&mut self, _key: u64) -> bool {
+        false
+    }
+    /// 开始捕获 self-loop（`key` 绑定本次形状）。
+    fn begin_selfloop_capture(&mut self, _key: u64) -> R<()> {
+        Ok(())
+    }
+    /// 结束捕获并实例化，绑定到 `begin_selfloop_capture` 的 key。
+    /// 失败时内部清理并标记该 key 禁用（调用方应降级）。
+    fn end_selfloop_capture(&mut self) -> R<()> {
+        Ok(())
+    }
+    /// 捕获中途出错时的清理：丢弃半成品 graph、退出捕获态并同步 stream。
+    /// 必须调用，否则 stream 会永久停留在捕获状态。
+    fn abort_selfloop_capture(&mut self) {}
+    /// 重放 `key` 对应的 graph。
+    fn selfloop_graph_replay(&mut self, _key: u64) -> R<()> {
+        Ok(())
+    }
+    /// 丢弃已缓存的 self-loop 图（图内烘焙的缓冲指针失效时必须调用，如
+    /// batch 工作缓冲按 batch 变换被释放时）。`kind = None` 表示全部；
+    /// `Some(k)` 只丢弃该 kind（key 高 2 bit）——避免误清与 batch 缓冲无关的
+    /// 单流图（它们依赖的是常驻的单序列工作缓冲）。同时清除对应的「已禁用」标记。
+    fn clear_selfloop_graphs(&mut self, _kind: Option<u64>) {}
 
     // —— host 前后端（embedding gather / 采样）——
     /// 把 token 索引（u32 位模式）写入 host-visible 缓冲（无 kernel、无 spec）。
@@ -158,6 +205,19 @@ pub trait ComputeBackend {
     ) -> R<()>;
     /// fp16 缓冲间的设备侧拷贝（v_first 快照用）。
     fn copy_device_f16(&mut self, src: TensorId, dst: TensorId) -> R<()>;
+    /// 设备侧定长区间拷贝：dst[dst_off..+len] = src[src_off..+len]（f32 元素偏移）。
+    /// batch State 的单行迁移用（连续批调度的槽位紧凑化，全程不过主机）。
+    fn copy_range(
+        &mut self,
+        src: TensorId,
+        src_off: usize,
+        dst: TensorId,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        let _ = (src, src_off, dst, dst_off, len);
+        Err("copy_range not supported by this backend".into())
+    }
 
     // —— 核心算子（RWKV-7 decode 路径）——
     /// y = x @ A（fp16 权重，f32 输入/输出）；w=m*k, x=k*n, y=m*n
@@ -445,6 +505,12 @@ pub trait ComputeBackend {
         false
     }
 
+    /// 该 backend 是否支持 `ffn_value_imma_batch` 的给定形状（默认否）。
+    /// 门控放在 backend 里而不是调用点，避免调用点硬编码 `quant_x_i8` 的 128 分组约束。
+    fn supports_ffn_value_imma(&self, _c: usize, _fh: usize, _batch: usize) -> bool {
+        false
+    }
+
     // —— batch 并发算子（单实例多序列，权重共享读一次算 B 份；仅 CUDA 支持）——
     // 布局约定：所有 per-slot 张量为 [batch, ...]（slot 主序）；权重张量跨 slot 共享。
     // 默认实现返回 Err（Vulkan 等后端暂不支持 batch 并发路径）。
@@ -566,6 +632,77 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("gemv_lowrank_chain4_batch not supported by this backend".into())
     }
+    /// 低秩链两级融合 GEMM（fp16 张量核，`LOWRANK_GEMM=1`）：
+    /// 一级 `mid = act(x @ W1ᵀ)`（[batch, mid_pad] fp16）、二级按 chain4 语义出
+    /// w/a/v/g（[batch, C] fp16）——替代 `gemv_int8_rkv_stage1_batch` 的 mid 段与
+    /// `gemv_lowrank_chain4_batch`（后者是 fp32 SIMT 按行归约，带宽受限）。
+    #[allow(clippy::too_many_arguments)]
+    fn lowrank_gemm_batch(
+        &mut self,
+        _v1_16: TensorId,
+        _w1_16: TensorId,
+        _a1_16: TensorId,
+        _g1_16: TensorId,
+        _w2_16: TensorId,
+        _a2_16: TensorId,
+        _v2_16: TensorId,
+        _g2_16: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xv: TensorId,
+        _xg: TensorId,
+        _w0: TensorId,
+        _a0: TensorId,
+        _v0: TensorId,
+        _scale: TensorId,
+        _v_first: TensorId,
+        _out_w: TensorId,
+        _out_a: TensorId,
+        _out_v: TensorId,
+        _out_g: TensorId,
+        _c: usize,
+        _batch: usize,
+        _wm: usize,
+        _am: usize,
+        _vm: usize,
+        _gm: usize,
+        _wmp: usize,
+        _amp: usize,
+        _vmp: usize,
+        _gmp: usize,
+    ) -> R<()> {
+        Err("lowrank_gemm_batch not supported by this backend".into())
+    }
+    /// ffn_value 稠密 fp16 张量核 GEMM（`FFN_VALUE_GEMM`，默认开）：
+    /// `x[b, c] += Σ_f r2_16[b, f] · W[c, f]`。大 batch 下用稠密换掉稀疏 gather
+    /// （权重流量 `batch/BM` 遍 vs 稀疏的 `非零率×batch` 遍，见 kernel 内推导）。
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_value_gemm_batch(
+        &mut self,
+        _w16: TensorId,
+        _r2: TensorId,
+        _x: TensorId,
+        _c: usize,
+        _fh: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("ffn_value_gemm_batch not supported by this backend".into())
+    }
+    /// ffn_value 稠密 **int8 IMMA** GEMM（`FFN_VALUE_IMMA`，默认开）：
+    /// `x[b, c] += Σ_f r2[b, f] · W[c, f]`，W 为 int8 常驻（`Int8Handle`，`[c, fh]` 定向）。
+    /// 与 `ffn_value_gemm_batch` 同语义，但权重字节减半、A 侧在核内量化（省掉 `cast_f16`）。
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_value_imma_batch(
+        &mut self,
+        _a: &Int8Handle,
+        _r2: TensorId,
+        _x: TensorId,
+        _c: usize,
+        _fh: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("ffn_value_imma_batch not supported by this backend".into())
+    }
     /// batch 版 fuse_ka_dplr_norm：kernel 本身支持 batch 维（grid.y）。
     #[allow(clippy::too_many_arguments)]
     fn fuse_ka_dplr_norm_batch(
@@ -606,7 +743,8 @@ pub trait ComputeBackend {
         Err("ffn_value_sparse_add_batch not supported by this backend".into())
     }
     /// batch 版采样：logits/temp/mask/counter 为 [batch, n]，token 为 [batch]，
-    /// sampler 为 [batch, 8]（每 slot 独立参数），hist 为 [batch, hist_len]。
+    /// sampler 为 [batch, 10]（每 slot 独立参数），hist 为 [batch, hist_stride]
+    /// （每 slot 实际历史长度取自 sampler[7]，须 ≤ hist_stride）。
     #[allow(clippy::too_many_arguments)]
     fn sample_into_host_seeded_batch(
         &mut self,
@@ -619,6 +757,7 @@ pub trait ComputeBackend {
         _sampler: TensorId,
         _hist: TensorId,
         _batch: usize,
+        _hist_stride: usize,
     ) -> R<()> {
         Err("sample_into_host_seeded_batch not supported by this backend".into())
     }
@@ -633,7 +772,7 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("record_tokens not supported by this backend".into())
     }
-    /// batch 版异步 sampler 上传：每轮一行宽行（batch*8 f32），pinned 流序零同步。
+    /// batch 版异步 sampler 上传：每轮一行宽行（batch*10 f32），pinned 流序零同步。
     /// `row` 为轮次（0..n）；seeds 为每 slot 的 seed（长度 = batch）。
     #[allow(clippy::too_many_arguments)]
     fn store_sampler_async_batch(
@@ -648,6 +787,7 @@ pub trait ComputeBackend {
         _frequency_penalty: f32,
         _presence_penalty: f32,
         _hist_len: u32,
+        _penalty_decay: f32,
     ) -> R<()> {
         Err("store_sampler_async_batch not supported by this backend".into())
     }

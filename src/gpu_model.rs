@@ -98,6 +98,21 @@ pub struct ModelInfo {
     pub g_mid: usize,
 }
 
+/// 分块 prefill 的**子批宽度**（`PREFILL_SLOTS`，默认 8；0 = 关闭分块、沿用旧行为）。
+///
+/// prefill 工作区 `SeqBuffers` 大小 ∝ `子批宽度 × T_pad`（~45 个缓冲、多数 fp32），
+/// 而它**在解码期完全不用却常驻**。把宽度与解码并发解耦后，B=256 也能在 22GB 卡上跑通；
+/// 代价是 prefill 墙钟时间按 `ceil(B/子批宽度)` 叠加（解码吞吐不受影响）。
+fn prefill_chunk_slots() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PREFILL_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
@@ -118,6 +133,16 @@ pub struct GpuModel {
     batch_lens: Option<(usize, TensorId)>,
     // 序列并行工作缓冲区（forward_seq 时按需创建/复用）
     seq_bufs: Option<SeqBuffers>,
+    // 批量单步（batch_step_sample）专用序列缓冲：与 seq_bufs 隔离，避免与单序列
+    // prefill / 分类路径的 T 不同反复 clear_cache + 重建。
+    batch_seq_bufs: Option<SeqBuffers>,
+    // 分块 prefill 用的小状态（宽度 = `prefill_chunk_slots()`）。
+    // 动机：解码并发可以到 256，但 prefill 工作区不该跟着涨（见 forward_seq_batch_padded）。
+    prefill_state: Option<(usize, State)>,
+    // 批量单步的采样临时缓冲（vocab×batch 级大缓冲，按 batch 缓存复用）。
+    batch_step_tmp: Option<(usize, BatchStepTmp)>,
+    /// self-loop 常驻缓冲（按 (kind,batch,n) 缓存）。常驻原因见 [`SelfloopBufs`]。
+    selfloop_bufs: Vec<SelfloopBufs>,
     // 内部推理状态（web-rwkv 风格 `State`）。
     // 拆分为外部传入式 `forward_with_state`/`forward_seq_with_state`（主 API），
     // 旧 `forward`/`forward_seq`/`forward_argmax` 等便捷封装复用此内部态。
@@ -172,7 +197,11 @@ pub struct GpuLayer {
     ffn_key_w16: Option<TensorId>,   // [ffn_hidden, C]
     ffn_value_w16: Option<TensorId>, // [C, ffn_hidden]（稠密，稀疏内核回退用）
     // fp16 ffn_value 的平铺布局 [fh, C]（CudaBackend 稀疏 FFN 用；Vulkan 回退稠密）。
+    // `FFN_VALUE_GEMM`（默认开）时**不建**（改由 ffn_value_dense16 承担），省 1.68GB。
     ffn_value_tiled: Option<TensorId>,
+    /// ffn_value 的稠密 fp16 `[C, fh]`（Phase 2-3 稠密张量核 GEMM 用）。
+    /// 与 `ffn_value_tiled` **互斥**（同一份数据、同一体积 52.4MB/层），故显存净变化为 0。
+    ffn_value_dense16: Option<TensorId>,
     // int8 量化权重（decode 单 token GEMV 用；None 表示该矩阵未量化，走 fp16 路径）
     ffn_key_a8: Option<Int8Handle>,    // [ffn_hidden, C]
     ffn_value_a8: Option<Int8Handle>,  // [C, ffn_hidden]
@@ -198,17 +227,98 @@ pub struct GpuState {
     cmix_x: TensorId,   // [C] token shift
 }
 
+/// WKV 状态（`tmix_rnn`）的**存储** dtype：`WKV_STATE_F16=0` 时退回 fp32，否则 fp16。
+///
+/// ★ **默认开**（Phase 2-2，2026-09-22 翻默认）。依据 = **与信天翁同精度档**：
+/// `faster3a_2607/rwkv7_fast_v3a.py:2404` 的 `WKV_MODE="fp16"`（上游**默认值**）下
+/// 状态就是 `torch.float16`；且 `cuda/rwkv7_wkv_fp16_v2.cu` 连状态**运算**都是 fp16
+/// （`__hfma2` / `__hmul2` / `half2 state[]`）。本实现是**fp16 存 + fp32 算**
+/// ⇒ 比上游默认档**更准**。我们测的 2874.3 基线反而是上游更准的 `fp32io16` 档
+/// （fp16 档用 `cp.async`，sm_75 编不出来）。
+///
+/// ⚠️ 精度实测（`TOPK=1` 贪心逐 token 对拍 fp32 状态）：B=64 × 512 步 = 23.26% 分叉、
+/// B=256 × 64 步 = 17.69%；**B=8 × 512 步 = 0% 是假阳性**（batch<16 走 SIMT 路径，
+/// 输入值不同恰好不翻 argmax）——**长程数值门禁必须在生产批量档（≥64）上做**。
+///
+/// ⚠️ 三处状态内核（`fuse_ka_dplr_norm` / `dplr_seq_batch` / `dplr_seq`）由
+/// host 侧 `any_ptr` + `dplr_variant` 自动跟随本 dtype，无需手工同步。
+pub(crate) fn wkv_state_dtype() -> TensorDtype {
+    if std::env::var("WKV_STATE_F16").is_ok_and(|v| v == "0") {
+        TensorDtype::F32
+    } else {
+        TensorDtype::F16
+    }
+}
+
 /// 在途 self-loop 句柄：submit 后全部轮次已在 GPU 流上排队（零 host 同步），
-/// collect 时一次同步取回生成序列并释放临时缓冲。
+/// collect 时一次同步取回生成序列。
 /// 单线程使用约束：同一后端至多一个在途 ticket（pinned 行号复用前提）。
 pub struct SelfloopTicket {
-    temp: TensorId,
-    mask: TensorId,
-    counter: TensorId,
-    sampler: TensorId,
+    /// 生成序列缓冲。**常驻**：由 [`SelfloopBufs`] 形状缓存持有，collect 不释放
+    /// （graph 内已烘焙其指针，释放会导致重放野指针）。
     token_seq: TensorId,
-    seq_cnt: TensorId,
     n: usize,
+}
+
+/// 批量单步采样（`batch_step_sample`）的采样临时缓冲：vocab 级大缓冲
+///（temp/mask 各 [batch, vocab] f32 + counter [batch, vocab] u32 直方图），
+/// 按 batch 缓存复用——逐 token 主机介入路径每步都要用，不能每步重建。
+#[derive(Clone)]
+struct BatchStepTmp {
+    temp: TensorId,    // [batch, vocab]
+    mask: TensorId,    // [batch, vocab]
+    counter: TensorId, // [batch, vocab] u32
+    sampler: TensorId, // [batch, 10]
+}
+
+/// self-loop 的形状 key：`(kind, batch, n)` 折叠为 u64。
+/// kind：0 = 单流（`selfloop_step`），1 = 批量（`sample_selfloop_step_batch`）。
+/// 两者 kernel 序列不同，即使 batch 同为 1 也必须分开缓存。
+fn selfloop_shape_key(kind: u64, batch: usize, n: usize) -> u64 {
+    (kind << 62) | ((batch as u64) << 32) | (n as u64)
+}
+
+/// self-loop 常驻缓冲的形状数上限。超出时整体重置（释放缓冲并作废所有已捕获图）——
+/// 每个形状约 `6 × batch × vocab × 4` 字节，不设限会被 max_tokens 余数组合撑爆显存。
+const MAX_SELFLOOP_SHAPES: usize = 8;
+
+/// self-loop 的常驻工作缓冲，按形状缓存、**跨 submit 复用**。
+///
+/// 为什么必须常驻：这些缓冲的设备指针被烘焙进已捕获的 CUDA graph。原先每次
+/// submit 都 `create_tensor` 并在 collect 里释放，导致指针每次都变 → graph 每段
+/// 都要重新 capture + instantiate + destroy；实测这种高频 churn 会在
+/// `cuGraphInstantiate` 驱动代码内部触发 0xC0000005（nvcuda64.dll+0x297ca0）。
+/// 常驻后每个形状只需捕获一次，此后永久重放。
+/// ★ 2026-09-22：那个 `0xC0000005` 的**根因已定位** —— `cuGraphInstantiate` 的符号
+/// 解析取到了 v1（五参数）而按三参数调用（见 `backend_cuda.rs` 的 `cu_graph_instantiate`）。
+/// 常驻仍是好设计（省去重复实例化），但"churn 才崩"只是概率性 ABI 踩空的表象。
+#[derive(Clone)]
+struct SelfloopBufs {
+    kind: u64,
+    batch: usize,
+    n: usize,
+    temp: TensorId,      // [batch, vocab]
+    mask: TensorId,      // [batch, vocab]
+    counter: TensorId,   // [batch, vocab] u32
+    sampler: TensorId,   // [batch, 10]
+    token_seq: TensorId, // [batch, n]
+    seq_cnt: TensorId,   // [batch]
+}
+
+impl SelfloopBufs {
+    fn key(&self) -> u64 {
+        selfloop_shape_key(self.kind, self.batch, self.n)
+    }
+    fn all(&self) -> [TensorId; 6] {
+        [
+            self.temp,
+            self.mask,
+            self.counter,
+            self.sampler,
+            self.token_seq,
+            self.seq_cnt,
+        ]
+    }
 }
 
 /// 工作缓冲区：forward 期间复用，避免反复创建 GpuTensor
@@ -544,6 +654,10 @@ impl GpuModel {
             batch_bufs: None,
             batch_lens: None,
             seq_bufs: None,
+            batch_seq_bufs: None,
+            prefill_state: None,
+            batch_step_tmp: None,
+            selfloop_bufs: Vec::new(),
             state: Some(state),
             scale_w,
         })
@@ -626,6 +740,10 @@ impl GpuModel {
             batch_bufs: None,
             batch_lens: None,
             seq_bufs: None,
+            batch_seq_bufs: None,
+            prefill_state: None,
+            batch_step_tmp: None,
+            selfloop_bufs: Vec::new(),
             state: Some(state),
             scale_w: self.scale_w,
         })
@@ -634,6 +752,19 @@ impl GpuModel {
     /// 公开模型元信息（web-rwkv 风格 `ModelInfo`），供服务端读取模型规模。
     pub fn info(&self) -> ModelInfo {
         self.config.info()
+    }
+
+    /// 后端登记在册张量的设备字节总数（诊断用：分阶段比较显存增量）。
+    pub fn device_bytes(&self) -> usize {
+        self.backend.device_bytes()
+    }
+
+    /// 分阶段显存报告（诊断用，单位 MiB）。调用点在关键节点，便于定位大户。
+    pub fn log_vram(&self, stage: &str) {
+        log::info!(
+            "[VRAM] {stage:<22} 登记张量 {} MiB",
+            self.device_bytes() / (1024 * 1024)
+        );
     }
 
     /// 把 `State` 整态下载到 CPU 为连续 `Vec<f32>`（布局与 `state_load` 一一对应）。
@@ -743,19 +874,12 @@ impl GpuModel {
         let c = self.config.n_embd;
         let h = self.config.n_head;
         let ns = self.config.head_size;
-        let vocab = self.config.vocab;
 
-        // 采样临时缓冲（存活到 end_batch 后）：temp/mask 为 vocab 长工作区，sampler 存参数，
-        // counter 为 vocab 长 u32 直方图（惩罚计数用）
-        let temp = self.backend.create_tensor(vocab, TensorDtype::F32)?;
-        let mask = self.backend.create_tensor(vocab, TensorDtype::F32)?;
-        let counter = self.backend.create_tensor(vocab, TensorDtype::U32)?;
-        let sampler = self.backend.create_tensor(8, TensorDtype::F32)?;
-        // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
-        let token_seq = self.backend.create_tensor(n, TensorDtype::F32)?;
-        let seq_cnt = self.backend.create_tensor(1, TensorDtype::F32)?;
-        self.backend.upload(token_seq, &vec![0.0; n])?;
-        self.backend.upload(seq_cnt, &[0.0; 1])?;
+        // 常驻缓冲（按 (kind=0, batch=1, n) 缓存）：graph 内烘焙了这些指针，不能每段重建。
+        let b = self.selfloop_bufs(0, 1, n)?;
+        // 序列缓冲每段清零（内容每段覆盖；graph 内指针不变）。
+        self.backend.upload(b.token_seq, &vec![0.0; n])?;
+        self.backend.upload(b.seq_cnt, &[0.0; 1])?;
 
         // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
         self.backend.begin_batch()?;
@@ -766,7 +890,7 @@ impl GpuModel {
 
         // 预置 round 0 的 sampler（graph 捕获时 sample kernel 从 sampler 缓冲读参数）
         self.backend.store_sampler_host(
-            sampler,
+            b.sampler,
             sp.temperature,
             sp.top_k,
             sp.top_p,
@@ -780,22 +904,31 @@ impl GpuModel {
         if self.backend.supports_graph_capture() {
             // CUDA graph：捕获一轮完整前向（gather→层→ln+head→GPU采样→record_token），
             // 之后每 token 重放，消除 258 次/层的 cuLaunchKernel 启动开销。
+            // **每个形状只捕获一次**，此后跨 submit 永久重放（原先每段重捕获）。
             // 每轮重放前更新 seed/hist_len，sample kernel 在重放时读取最新设备参数。
             // 逐轮更新走 pinned 异步上传（流序，零 host 同步）——同步版每轮
             // cuStreamSynchronize 会把整段 selfloop 退化成逐轮 CPU⟷GPU 往返。
-            let async_rows = self.backend.sampler_async_rows();
-            let use_async = n <= async_rows;
-            self.backend.begin_graph_capture()?;
-            self.sample_selfloop_step(
-                state, c, h, ns, temp, mask, counter, sampler, token_seq, seq_cnt,
-            )?;
-            self.backend.end_graph_capture()?;
-
+            let key = b.key();
+            let graph_ok = self.ensure_selfloop_graph(key, |m| {
+                m.sample_selfloop_step(
+                    state,
+                    c,
+                    h,
+                    ns,
+                    b.temp,
+                    b.mask,
+                    b.counter,
+                    b.sampler,
+                    b.token_seq,
+                    b.seq_cnt,
+                )
+            });
+            let use_async = n <= self.backend.sampler_async_rows();
             for round in 0..n {
                 state.v_first_set = false;
                 if use_async {
                     self.backend.store_sampler_async(
-                        sampler,
+                        b.sampler,
                         round,
                         sp.temperature,
                         sp.top_k,
@@ -808,7 +941,7 @@ impl GpuModel {
                     )?;
                 } else {
                     self.backend.store_sampler_host(
-                        sampler,
+                        b.sampler,
                         sp.temperature,
                         sp.top_k,
                         sp.top_p,
@@ -819,14 +952,30 @@ impl GpuModel {
                         round as u32,
                     )?;
                 }
-                self.backend.graph_replay()?;
+                if graph_ok {
+                    self.backend.selfloop_graph_replay(key)?;
+                } else {
+                    // 降级：无 graph（不支持或捕获失败），逐轮直接提交本步 kernel。
+                    self.sample_selfloop_step(
+                        state,
+                        c,
+                        h,
+                        ns,
+                        b.temp,
+                        b.mask,
+                        b.counter,
+                        b.sampler,
+                        b.token_seq,
+                        b.seq_cnt,
+                    )?;
+                }
             }
         } else {
             // Vulkan：无 graph 捕获，把 n 轮完整前向逐 token 记录进同一批次；
             // 每轮用 store_sampler_host 更新 seed/hist_len（sample kernel 执行时读取最新参数）。
             for round in 0..n {
                 self.backend.store_sampler_host(
-                    sampler,
+                    b.sampler,
                     sp.temperature,
                     sp.top_k,
                     sp.top_p,
@@ -837,7 +986,16 @@ impl GpuModel {
                     round as u32,
                 )?;
                 self.sample_selfloop_step(
-                    state, c, h, ns, temp, mask, counter, sampler, token_seq, seq_cnt,
+                    state,
+                    c,
+                    h,
+                    ns,
+                    b.temp,
+                    b.mask,
+                    b.counter,
+                    b.sampler,
+                    b.token_seq,
+                    b.seq_cnt,
                 )?;
             }
         }
@@ -845,27 +1003,16 @@ impl GpuModel {
         // 一次性提交整段 self-loop（异步：不等 GPU 执行完）
         self.backend.end_batch()?;
         Ok(SelfloopTicket {
-            temp,
-            mask,
-            counter,
-            sampler,
-            token_seq,
-            seq_cnt,
+            token_seq: b.token_seq,
             n,
         })
     }
 
     /// 取回 self-loop 结果：同步本实例流（只等这一条流，其它实例的流不受影响），
-    /// 下载生成序列并释放临时缓冲。
+    /// 下载生成序列。缓冲常驻（由形状缓存持有），此处不释放。
     pub fn collect_sample_selfloop(&mut self, ticket: SelfloopTicket) -> R<Vec<u32>> {
         let t = self.backend.download(ticket.token_seq)?;
         let n = ticket.n;
-        self.backend.free_tensor(ticket.temp);
-        self.backend.free_tensor(ticket.mask);
-        self.backend.free_tensor(ticket.counter);
-        self.backend.free_tensor(ticket.sampler);
-        self.backend.free_tensor(ticket.token_seq);
-        self.backend.free_tensor(ticket.seq_cnt);
         Ok(t[..n].iter().map(|x| x.to_bits()).collect())
     }
 
@@ -881,6 +1028,36 @@ impl GpuModel {
             self.config.n_layer,
             batch,
         )
+    }
+
+    /// 分配一个外部持有的 U32 设备缓冲（并发池的惩罚历史 `hist` 等）。
+    /// 由调用方负责在用完后 `release_tensor`。
+    pub fn alloc_u32(&mut self, len: usize) -> R<TensorId> {
+        self.backend.create_tensor(len, TensorDtype::U32)
+    }
+
+    /// 上传外部 U32 缓冲（长度须 ≤ 分配长度）。
+    pub fn write_u32(&self, t: TensorId, data: &[u32]) -> R<()> {
+        self.backend.upload_u32(t, data)
+    }
+
+    /// 部分上传外部 U32 缓冲：把 data 写入 [offset, offset+len) 段。
+    /// 惩罚历史逐 token 追加用（O(1) 增量上传，避免每步重传整行）。
+    pub fn write_u32_part(&self, t: TensorId, offset: usize, data: &[u32]) -> R<()> {
+        self.backend.upload_u32_part(t, offset, data)
+    }
+
+    /// 该模型是否支持 batch 并发解码路径（要求 r/k/v 为 int8 量化权重——
+    /// batch 层 kernel 仅有 int8 变体；fp16 模型须回退逐槽单序列路径）。
+    pub fn supports_batch_decode(&self) -> bool {
+        self.layers.first().is_some_and(|l| {
+            l.receptance_a8.is_some() && l.key_a8.is_some() && l.value_a8.is_some()
+        })
+    }
+
+    /// 释放外部缓冲（`alloc_u32` 的配对操作）。
+    pub fn release_tensor(&mut self, t: TensorId) {
+        self.backend.free_tensor(t);
     }
 
     /// 单 slot 状态回灌（batch State）：把单序列布局数据写入 batch_state 的
@@ -907,6 +1084,19 @@ impl GpuModel {
         )
     }
 
+    /// 设备内单行迁移：把 batch 状态第 `from` 行拷到第 `to` 行
+    /// （连续批调度槽位紧凑化用，全程设备内，不过主机）。
+    pub fn state_slot_move(&mut self, batch_state: &State, from: usize, to: usize) -> R<()> {
+        batch_state.slot_move(
+            self.backend.as_mut(),
+            from,
+            to,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
     /// batch prefill 公共核心：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，
     /// 直接更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的
     /// M 维 = B*T_pad，权重读一份算全部行。
@@ -915,11 +1105,39 @@ impl GpuModel {
     ///（pad 行不进 state、不计入 segmean 均值）。
     /// 返回 (seeds, seq_bufs[已 take，调用方归还], lens_t, t_pad, batch, tok[调用方释放])。
     /// 仅 CUDA（seq_shift_batch/dplr_seq_batch/copy_token_batch）。状态重置由调用方负责。
+    /// 取（并在 T 变化时重建）序列缓冲：`dedicated=true` 走 `batch_seq_bufs`
+    /// （批量单步路径专用，避免与单序列 prefill 的 T 抖动互相 clear_cache），
+    /// false 走共享的 `seq_bufs`。返回的缓冲已被 take，调用方负责归还。
+    fn take_seq_bufs(&mut self, bt: usize, dedicated: bool) -> R<SeqBuffers> {
+        let c = self.config.n_embd;
+        let vocab = self.config.vocab;
+        let mut cur = if dedicated {
+            self.batch_seq_bufs.take()
+        } else {
+            self.seq_bufs.take()
+        };
+        if cur.as_ref().is_none_or(|sb| sb.t != bt) {
+            self.backend.clear_cache();
+            if let Some(mut old) = cur.take() {
+                old.free(self.backend.as_mut());
+            }
+            cur = Some(SeqBuffers::new(
+                self.backend.as_mut(),
+                bt,
+                c,
+                vocab,
+                &self.config,
+            )?);
+        }
+        Ok(cur.expect("seq_bufs 已重建"))
+    }
+
     fn forward_seq_batch_core(
         &mut self,
         state: &mut State,
         tokens_batch: &[Vec<u32>],
         pad_to: Option<usize>,
+        dedicated_bufs: bool,
     ) -> R<(Vec<u32>, SeqBuffers, TensorId, usize, usize, TensorId)> {
         let batch = tokens_batch.len();
         if batch == 0 {
@@ -973,20 +1191,7 @@ impl GpuModel {
         self.backend.upload_u32(tok, &flat)?;
 
         // 序列缓冲按 bt 重建（t 维换 B*T_pad，布局完全兼容）。
-        if self.seq_bufs.as_ref().is_none_or(|sb| sb.t != bt) {
-            self.backend.clear_cache();
-            if let Some(mut old) = self.seq_bufs.take() {
-                old.free(self.backend.as_mut());
-            }
-            self.seq_bufs = Some(SeqBuffers::new(
-                self.backend.as_mut(),
-                bt,
-                c,
-                self.config.vocab,
-                &self.config,
-            )?);
-        }
-        let mut seq_bufs = self.seq_bufs.take().unwrap();
+        let mut seq_bufs = self.take_seq_bufs(bt, dedicated_bufs)?;
 
         self.backend.begin_batch()?;
         self.backend
@@ -1008,7 +1213,7 @@ impl GpuModel {
         tokens_batch: &[Vec<u32>],
     ) -> R<Vec<u32>> {
         let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
-            self.forward_seq_batch_core(state, tokens_batch, None)?;
+            self.forward_seq_batch_core(state, tokens_batch, None, false)?;
         self.backend.free_tensor(tok);
         self.seq_bufs = Some(seq_bufs);
         Ok(seeds)
@@ -1025,10 +1230,49 @@ impl GpuModel {
         tokens_batch: &[Vec<u32>],
         pad_to: usize,
     ) -> R<Vec<u32>> {
-        let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
-            self.forward_seq_batch_core(state, tokens_batch, Some(pad_to))?;
-        self.backend.free_tensor(tok);
-        self.seq_bufs = Some(seq_bufs);
+        let limit = prefill_chunk_slots();
+        if limit == 0 || tokens_batch.len() <= limit {
+            let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
+                self.forward_seq_batch_core(state, tokens_batch, Some(pad_to), false)?;
+            self.backend.free_tensor(tok);
+            self.seq_bufs = Some(seq_bufs);
+            return Ok(seeds);
+        }
+        // —— 分块 prefill：把 **prefill 宽度** 与 **解码宽度** 解耦 ——
+        //
+        // 动机（2026-09-21 实测）：`SeqBuffers` 有 ~45 个 `[batch×T_pad, ·]` 缓冲（多数 fp32），
+        // 大小 ∝ 解码并发 × T_pad，且**解码期完全不用却常驻**。B=64/T_pad=160 时实测
+        // 占 4.4 GB（模型 5.1 GB + 状态 1.3 GB 之外），B=256 时必然 OOM
+        //（实测 B=128 峰值已 20.7 GB / 22 GB）。
+        //
+        // 做法与 Albatross 的 `copy_state_to_batch` 同构：各槽 prefill 相互独立，
+        // 故可按宽度 `limit` 逐块 prefill（用一块小状态），再把状态行灌进大 batch state。
+        // 峰值工作区从 `解码宽度×T_pad` 降到 `limit×T_pad`。
+        let w = limit.min(tokens_batch.len());
+        let mut sub = match self.prefill_state.take() {
+            Some((w0, s)) if w0 == w => s,
+            _ => self.create_batch_state(w)?,
+        };
+        let mut seeds: Vec<u32> = Vec::with_capacity(tokens_batch.len());
+        for (ci, chunk) in tokens_batch.chunks(w).enumerate() {
+            // 末块不足 w：用最后一个 prompt 补齐到 w（`forward_seq_batch_core` 要求
+            // state.batch()==batch）；补齐槽的结果不参与状态回灌，只是少量冗余计算。
+            let mut padded: Vec<Vec<u32>> = chunk.to_vec();
+            while padded.len() < w {
+                padded.push(chunk.last().cloned().unwrap_or_else(|| vec![0]));
+            }
+            self.reset_state_of(&sub)?;
+            let (s, seq_bufs, _l, _t, _b, tok) =
+                self.forward_seq_batch_core(&mut sub, &padded, Some(pad_to), false)?;
+            self.backend.free_tensor(tok);
+            self.seq_bufs = Some(seq_bufs); // 下块同 bt 直接复用
+            seeds.extend(s.into_iter().take(chunk.len()));
+            for i in 0..chunk.len() {
+                let d = self.state_slot_back(&sub, i)?;
+                self.state_slot_load(state, ci * w + i, &d)?;
+            }
+        }
+        self.prefill_state = Some((w, sub));
         Ok(seeds)
     }
 
@@ -1045,7 +1289,7 @@ impl GpuModel {
     ) -> R<Vec<Vec<f32>>> {
         self.reset_state_of(state)?;
         let (_seeds, seq_bufs, lens_t, t_pad, batch, tok) =
-            self.forward_seq_batch_core(state, tokens_batch, pad_to)?;
+            self.forward_seq_batch_core(state, tokens_batch, pad_to, false)?;
         let c = self.config.n_embd;
         let out = self.backend.create_tensor(batch * c, TensorDtype::F32)?;
         self.backend
@@ -1055,6 +1299,167 @@ impl GpuModel {
         self.backend.free_tensor(tok);
         self.seq_bufs = Some(seq_bufs);
         Ok(flat.chunks(c).map(<[f32]>::to_vec).collect())
+    }
+
+    /// **批量单步采样**（并发池的 host-in-the-loop 路径）：B 个 slot 在同一步各自
+    /// 喂入 `tokens[b]`（长度 1 = decode；>1 = chunked prefill），一次批量前向
+    ///（权重读一份算 B 份）+ 一次批量 GPU 采样，返回每 slot 采样的下一个 token。
+    ///
+    /// 与 `submit_sample_selfloop_batch` 的区别：那个是「一次提交跑完 n 轮、全程无
+    /// 主机介入」（graph 捕获），这个是「每步回主机一次」——stop 串判定 / 流式增量 /
+    /// 会话缓存回写都在主机侧（D5），因此不能捕获 CUDA graph。
+    ///
+    /// `hist`：[batch, hist_stride] U32 惩罚历史（每 slot 前 `hist_len[b]` 个有效）。
+    /// 本步采样**不计入**惩罚（语义与客户端池 `sample_token` 一致），调用方须在
+    /// 返回后自行把新 token 追加到历史。`sp[b].seed` 每步应递增（保证多样性）。
+    ///
+    /// 仅 CUDA（batch 层 kernel 与 `sample_into_host_seeded_batch` 均仅 CUDA）。
+    /// `sp[b]` 为该 slot 的采样参数（并发池各任务参数不同）；`sp.len()` 须 = batch。
+    /// `batch ≤ state.batch()`：只用 batch State 的前 batch 行（并发池活跃槽前缀）。
+    pub fn batch_step_sample(
+        &mut self,
+        state: &mut State,
+        tokens: &[Vec<u32>],
+        hist: TensorId,
+        hist_stride: usize,
+        hist_len: &[u32],
+        sp: &[SamplerParams],
+    ) -> R<Vec<u32>> {
+        let batch = tokens.len();
+        if hist_len.len() != batch || sp.len() != batch {
+            return Err(format!(
+                "batch_step_sample: hist_len {} / sp {} != tokens {}",
+                hist_len.len(),
+                sp.len(),
+                batch
+            )
+            .into());
+        }
+        if hist_len.iter().any(|&l| l as usize > hist_stride) {
+            return Err(
+                format!("batch_step_sample: hist_len 超出 hist_stride {hist_stride}").into(),
+            );
+        }
+        let (vocab, tmp) = (self.config.vocab, self.batch_step_tmp(batch)?);
+        let bb = self.batch_step_forward(state, tokens)?;
+        // 采样参数行 [batch, 10]（hist_len 走 sampler[7]，seed 走 sampler[3]）。
+        let mut sdata = Vec::with_capacity(batch * 10);
+        for (b, &hl) in hist_len.iter().enumerate() {
+            let p = &sp[b];
+            sdata.extend_from_slice(&[
+                p.temperature,
+                f32::from_bits(p.top_k),
+                p.top_p,
+                f32::from_bits(p.seed),
+                p.repetition_penalty,
+                p.frequency_penalty,
+                p.presence_penalty,
+                f32::from_bits(hl),
+                p.penalty_decay,
+                0.0,
+            ]);
+        }
+        self.backend.upload(tmp.sampler, &sdata)?;
+        self.backend.begin_batch()?;
+        self.backend.sample_into_host_seeded_batch(
+            bb.logits,
+            bb.current_token,
+            vocab,
+            tmp.temp,
+            tmp.mask,
+            tmp.counter,
+            tmp.sampler,
+            hist,
+            batch,
+            hist_stride,
+        )?;
+        let raw = self.backend.download(self.bufs_current_token_of(&bb))?;
+        self.backend.end_batch()?;
+        Ok(raw.iter().map(|v| f32::to_bits(*v)).collect())
+    }
+
+    /// 批量单步前向（`batch_step_sample` 的前半段）：喂入各 slot 的 token、
+    /// 批量贯穿全部层、写 ln_out+head，返回 batch 工作缓冲（logits 在 `bb.logits`
+    /// [batch, vocab]）。诊断 / 测试用（`batch_step_logits`）。
+    /// `batch ≤ state.batch()`：只用 batch State 的前 batch 行，多余行不动
+    ///（并发池活跃槽恒为前缀，槽位回收/新增只改前缀长度）。
+    fn batch_step_forward(&mut self, state: &mut State, tokens: &[Vec<u32>]) -> R<WorkBuffers> {
+        use crate::model::LN_EPS;
+        let batch = tokens.len();
+        if batch == 0 {
+            return Err("batch_step_forward: 空 batch".into());
+        }
+        if batch > state.batch() {
+            return Err(format!(
+                "batch_step_forward: state batch {} < tokens {}",
+                state.batch(),
+                batch
+            )
+            .into());
+        }
+        if tokens.iter().any(|t| t.is_empty()) {
+            return Err("batch_step_forward: 每 slot 至少 1 个 token".into());
+        }
+        let (c, h, ns, vocab) = (
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+            self.config.vocab,
+        );
+        let bb = self.batch_buffers(batch)?;
+        // 全 slot 单 token = decode 快路径（逐 slot 单步 kernel，无 pad 浪费）；
+        // 否则走变长 seq 路径（prefill 分块 / 混批），从各 slot 末 token 取残差。
+        let decode_only = tokens.iter().all(|t| t.len() == 1);
+
+        self.backend.begin_batch()?;
+        if decode_only {
+            let flat: Vec<f32> = tokens.iter().map(|t| f32::from_bits(t[0])).collect();
+            self.backend
+                .upload(self.bufs_current_token_of(&bb), &flat)?;
+            state.v_first_set = false;
+            self.backend
+                .gather_rows_device_f16(self.emb_ln, bb.x, bb.current_token, c, batch)?;
+            for i in 0..self.config.n_layer {
+                self.forward_layer_batch(i, c, h, ns, batch, state, &bb)?;
+            }
+        } else {
+            // 变长 seq 路径：用专用 batch_seq_bufs（与单序列 prefill 的 T 抖动隔离）。
+            let (_seeds, seq_bufs, lens_t, t_pad, _b, tok) =
+                self.forward_seq_batch_core(state, tokens, None, true)?;
+            // 各 slot 末 token 的残差 → bb.x（batch 布局），后续 norm/head/采样共用。
+            self.backend
+                .copy_token_batch(seq_bufs.x, bb.x, lens_t, c, t_pad, batch)?;
+            self.backend.free_tensor(tok);
+            self.batch_seq_bufs = Some(seq_bufs);
+        }
+
+        self.backend.norm(
+            bb.x,
+            self.ln_out_w,
+            self.ln_out_b,
+            bb.x_norm,
+            c,
+            1,
+            LN_EPS,
+            batch,
+        )?;
+        if let Some(a8) = &self.head_a8 {
+            self.backend
+                .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
+        } else {
+            let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
+            self.backend
+                .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
+        }
+        self.backend.end_batch()?;
+        Ok(bb)
+    }
+
+    /// 诊断 / 测试：批量单步前向的 logits（[batch, vocab]，slot 主序）。
+    /// 与 `batch_step_sample` 共用前向核心（采样之前的中间量一致）。
+    pub fn batch_step_logits(&mut self, state: &mut State, tokens: &[Vec<u32>]) -> R<Vec<f32>> {
+        let bb = self.batch_step_forward(state, tokens)?;
+        self.backend.download(bb.logits)
     }
 
     /// batch prefill 单层：全 kernel 的 token 维 = B*T_pad（信天翁 rows 模型），
@@ -1377,6 +1782,13 @@ impl GpuModel {
             if let Some((_, mut old)) = self.batch_bufs.take() {
                 old.free(self.backend.as_mut());
             }
+            // 旧工作缓冲已释放 → 烘焙了这些指针的 **batch** 图（kind=1）全部作废。
+            // **必须**清掉，否则重放旧图 = 对已释放显存做 use-after-free。
+            // （顺序不可颠倒：先释放缓冲、后清图会留下悬空图。）
+            // 单流图（kind 0/2）依赖常驻的单序列工作缓冲，不受影响，故只清 kind=1。
+            if !self.selfloop_bufs.is_empty() {
+                self.backend.clear_selfloop_graphs(Some(1));
+            }
             let bufs = WorkBuffers::new(
                 self.backend.as_mut(),
                 self.config.n_embd,
@@ -1387,6 +1799,124 @@ impl GpuModel {
             self.batch_bufs = Some((batch, bufs));
         }
         Ok(self.batch_bufs.as_ref().unwrap().1.clone())
+    }
+
+    /// 获取批量单步采样临时缓冲（batch 变化时重建）。返回零开销 Clone 副本。
+    fn batch_step_tmp(&mut self, batch: usize) -> R<BatchStepTmp> {
+        if self
+            .batch_step_tmp
+            .as_ref()
+            .is_none_or(|(b, _)| *b != batch)
+        {
+            if let Some((_, old)) = self.batch_step_tmp.take() {
+                for t in [old.temp, old.mask, old.counter, old.sampler] {
+                    self.backend.free_tensor(t);
+                }
+            }
+            let vocab = self.config.vocab;
+            let temp = self
+                .backend
+                .create_tensor(vocab * batch, TensorDtype::F32)?;
+            let mask = self
+                .backend
+                .create_tensor(vocab * batch, TensorDtype::F32)?;
+            let counter = self
+                .backend
+                .create_tensor(vocab * batch, TensorDtype::U32)?;
+            let sampler = self.backend.create_tensor(10 * batch, TensorDtype::F32)?;
+            self.batch_step_tmp = Some((
+                batch,
+                BatchStepTmp {
+                    temp,
+                    mask,
+                    counter,
+                    sampler,
+                },
+            ));
+        }
+        Ok(self.batch_step_tmp.as_ref().unwrap().1.clone())
+    }
+
+    /// 取（或新建）self-loop 常驻缓冲，按 `(kind, batch, n)` 缓存。
+    ///
+    /// 形状数超过 [`MAX_SELFLOOP_SHAPES`] 时整体重置：先作废全部已捕获图，再释放旧
+    /// 缓冲（顺序不可颠倒——图里烘焙了缓冲指针，先释放会留下悬空图）。
+    fn selfloop_bufs(&mut self, kind: u64, batch: usize, n: usize) -> R<SelfloopBufs> {
+        if let Some(b) = self
+            .selfloop_bufs
+            .iter()
+            .find(|b| b.kind == kind && b.batch == batch && b.n == n)
+        {
+            return Ok(b.clone());
+        }
+        if self.selfloop_bufs.len() >= MAX_SELFLOOP_SHAPES {
+            self.backend.clear_selfloop_graphs(None);
+            let old = std::mem::take(&mut self.selfloop_bufs);
+            for b in old {
+                for t in b.all() {
+                    self.backend.free_tensor(t);
+                }
+            }
+        }
+        let vocab = self.config.vocab;
+        let temp = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::F32)?;
+        let mask = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::F32)?;
+        let counter = self
+            .backend
+            .create_tensor(vocab * batch, TensorDtype::U32)?;
+        let sampler = self.backend.create_tensor(10 * batch, TensorDtype::F32)?;
+        let token_seq = self.backend.create_tensor(n * batch, TensorDtype::F32)?;
+        let seq_cnt = self.backend.create_tensor(batch, TensorDtype::F32)?;
+        let bufs = SelfloopBufs {
+            kind,
+            batch,
+            n,
+            temp,
+            mask,
+            counter,
+            sampler,
+            token_seq,
+            seq_cnt,
+        };
+        self.selfloop_bufs.push(bufs.clone());
+        Ok(bufs)
+    }
+
+    /// 捕获该形状的 self-loop 图（若尚未捕获）。
+    ///
+    /// 返回 `true` = 图可用（本次及后续同形状直接重放）；`false` = 捕获不可用，
+    /// 调用方应降级为逐轮直接提交。**任何失败都只在本次告警并永久禁用该形状**，
+    /// 绝不向上抛错打断服务。
+    fn ensure_selfloop_graph(
+        &mut self,
+        key: u64,
+        capture: impl FnOnce(&mut Self) -> R<()>,
+    ) -> bool {
+        if self.backend.selfloop_graph_ready(key) {
+            return true;
+        }
+        if self.backend.selfloop_graph_skip(key) {
+            return false;
+        }
+        if let Err(e) = self.backend.begin_selfloop_capture(key) {
+            log::warn!("self-loop 图捕获不可用（key=0x{key:x}）：{e:#}；该形状降级为逐轮提交");
+            return false;
+        }
+        if let Err(e) = capture(self) {
+            // 捕获区间内出错：必须 abort 让 stream 退出捕获态，否则后续 CUDA 调用全废。
+            self.backend.abort_selfloop_capture();
+            log::warn!("self-loop 捕获中出错（key=0x{key:x}）：{e:#}；该形状降级为逐轮提交");
+            return false;
+        }
+        if let Err(e) = self.backend.end_selfloop_capture() {
+            log::warn!("self-loop 图实例化失败（key=0x{key:x}）：{e:#}；该形状降级为逐轮提交");
+            return false;
+        }
+        true
     }
 
     /// batch 版单层前向：全部 kernel 走 batch 变体（B slot 共享权重一次读）。
@@ -1409,6 +1939,12 @@ impl GpuModel {
             self.config.v_mid,
             self.config.g_mid,
             self.config.ffn_hidden,
+        );
+        let (wmp, amp, vmp, gmp) = (
+            self.config.w_mid_pad,
+            self.config.a_mid_pad,
+            self.config.v_mid_pad,
+            self.config.g_mid_pad,
         );
         // ===== Time Mixing =====
         self.backend.norm_lerp6_batch(
@@ -1434,11 +1970,29 @@ impl GpuModel {
         )?;
 
         // r/k/v + mid 融合 gemv（batch 版；fp16 权重模型暂不支持 batch 路径）。
+        // ★ `LOWRANK_GEMM`（Phase 2，默认开，见 [Phase 2 计划]）：低秩链两级改走 **fp16 张量核
+        // tiled GEMM**（复用加载时已常驻的 `*_16` 权重），替代 fp32 SIMT 的
+        // 「mid 投影段 + chain4」两处（97ms → 24.6ms/步，端到端 1025.5 → 1466.5 tok/s = 1.43×）。
+        // 依赖：GEMV_IMMA 开（r/k/v 由 IMMA 代劳，本函数只剩 r/k/v 三段）。
+        // 两个开关均**默认开**（显式 `=0` 关闭）；低秩链精度档与信天翁一致（同为 fp16 张量核）。
+        let lowrank_gemm = batch >= 16
+            && c.is_multiple_of(64)
+            && [wmp, amp, vmp, gmp].iter().all(|p| p.is_multiple_of(64))
+            && std::env::var("LOWRANK_GEMM")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            && std::env::var("GEMV_IMMA").map(|v| v != "0").unwrap_or(true);
         if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
             &self.layers[i].receptance_a8,
             &self.layers[i].key_a8,
             &self.layers[i].value_a8,
         ) {
+            // LOWRANK_GEMM 时 mid 伪行数传 0 ⇒ `gemv_int8_rkv_stage1_batch` 只发 r/k/v。
+            let (mvm, mwm, mam, mgm) = if lowrank_gemm {
+                (0, 0, 0, 0)
+            } else {
+                (vm, wm, am, gm)
+            };
             self.backend.gemv_int8_rkv_stage1_batch(
                 r_a8,
                 k_a8,
@@ -1461,10 +2015,10 @@ impl GpuModel {
                 bb.a_mid,
                 bb.g_mid,
                 c,
-                vm,
-                wm,
-                am,
-                gm,
+                mvm,
+                mwm,
+                mam,
+                mgm,
                 batch,
             )?;
         } else {
@@ -1478,31 +2032,68 @@ impl GpuModel {
         }
 
         // 低秩链第二级 + fuse_ka_dplr_norm（batch 版）。
-        self.backend.gemv_lowrank_chain4_batch(
-            self.layers[i].w2,
-            self.layers[i].a2,
-            self.layers[i].v2,
-            self.layers[i].g2,
-            bb.w_mid,
-            bb.a_mid,
-            bb.v_mid,
-            bb.g_mid,
-            self.layers[i].w0,
-            self.layers[i].a0,
-            self.layers[i].v0,
-            self.scale_w,
-            state.v_first,
-            bb.w,
-            bb.a,
-            bb.v,
-            bb.g,
-            h * n,
-            wm,
-            am,
-            vm,
-            gm,
-            batch,
-        )?;
+        if lowrank_gemm {
+            // Phase 2：两级都走 fp16 张量核 GEMM（一级 mid + 二级 chain4 epilogue）。
+            self.backend.lowrank_gemm_batch(
+                self.layers[i].v1_16,
+                self.layers[i].w1_16,
+                self.layers[i].a1_16,
+                self.layers[i].g1_16,
+                self.layers[i].w2_16,
+                self.layers[i].a2_16,
+                self.layers[i].v2_16,
+                self.layers[i].g2_16,
+                bb.xw,
+                bb.xa,
+                bb.xv,
+                bb.xg,
+                self.layers[i].w0,
+                self.layers[i].a0,
+                self.layers[i].v0,
+                self.scale_w,
+                state.v_first,
+                bb.w,
+                bb.a,
+                bb.v,
+                bb.g,
+                c,
+                batch,
+                wm,
+                am,
+                vm,
+                gm,
+                wmp,
+                amp,
+                vmp,
+                gmp,
+            )?;
+        } else {
+            self.backend.gemv_lowrank_chain4_batch(
+                self.layers[i].w2,
+                self.layers[i].a2,
+                self.layers[i].v2,
+                self.layers[i].g2,
+                bb.w_mid,
+                bb.a_mid,
+                bb.v_mid,
+                bb.g_mid,
+                self.layers[i].w0,
+                self.layers[i].a0,
+                self.layers[i].v0,
+                self.scale_w,
+                state.v_first,
+                bb.w,
+                bb.a,
+                bb.v,
+                bb.g,
+                h * n,
+                wm,
+                am,
+                vm,
+                gm,
+                batch,
+            )?;
+        }
         self.backend.fuse_ka_dplr_norm_batch(
             state.layers[i].tmix_rnn,
             bb.k,
@@ -1563,25 +2154,52 @@ impl GpuModel {
             self.backend
                 .gemv_f16_relu2(w16, bb.xb, bb.r2, fh, c, batch)?;
         }
-        // x += r2 @ ffn_value（优先稀疏 FFN；回退稠密 int8/fp16）。
-        let sparse_ok =
-            self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
-        let sparse_vt = if sparse_ok {
-            self.layers[i].ffn_value_tiled
+        // x += r2 @ ffn_value。★ Phase 2-3：**大 batch 走稠密 fp16 张量核 GEMM**，
+        // 小 batch 才回退稀疏/量化 GEMV——稀疏 gather 的权重流量随 batch 线性涨
+        // （B=256 时 13.4GB/层），而稠密 tiled 只读 `batch/BM` 遍（105MB/层），
+        // 多算的 FLOP 在张量核上近乎免费（详见 `ffn_value_gemm` 内推导）。
+        let dense_ffn = batch >= 16
+            && fh.is_multiple_of(64)
+            && c.is_multiple_of(16)
+            && self.layers[i].ffn_value_dense16.is_some()
+            && std::env::var("FFN_VALUE_GEMM")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        if dense_ffn {
+            // ★ Phase 2-5（2026-09-22）：优先走 **int8 IMMA**（`FFN_VALUE_IMMA`，默认开）。
+            // 与 fp16 版同语义，但权重字节减半（26.2 vs 52.4 MB/层，且 `batch/BM` 遍重读
+            // ⇒ 105 vs 210 MB/层），A 侧改由 `quant_x_i8` 在核内量化 ⇒ 顺带省掉 `cast_f16`。
+            let use_imma = self.layers[i].ffn_value_a8.is_some()
+                && self.backend.supports_ffn_value_imma(c, fh, batch);
+            if use_imma {
+                let a8 = self.layers[i].ffn_value_a8.as_ref().unwrap();
+                self.backend
+                    .ffn_value_imma_batch(a8, bb.r2, bb.x, c, fh, batch)?;
+            } else {
+                let w16 = self.layers[i].ffn_value_dense16.unwrap();
+                self.backend
+                    .ffn_value_gemm_batch(w16, bb.r2, bb.x, c, fh, batch)?;
+            }
         } else {
-            None
-        };
-        if let Some(vt) = sparse_vt {
-            self.backend
-                .ffn_value_sparse_add_batch(vt, bb.r2, bb.x, c, fh, batch)?;
-        } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
-            self.backend.gemv_int8_add(a8, bb.r2, bb.x, c, fh, batch)?;
-        } else {
-            let w16 = *self.layers[i]
-                .ffn_value_w16
-                .as_ref()
-                .ok_or("ffn_value_w16 missing")?;
-            self.backend.gemv_f16_add(w16, bb.r2, bb.x, c, fh, batch)?;
+            let sparse_ok =
+                self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
+            let sparse_vt = if sparse_ok {
+                self.layers[i].ffn_value_tiled
+            } else {
+                None
+            };
+            if let Some(vt) = sparse_vt {
+                self.backend
+                    .ffn_value_sparse_add_batch(vt, bb.r2, bb.x, c, fh, batch)?;
+            } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
+                self.backend.gemv_int8_add(a8, bb.r2, bb.x, c, fh, batch)?;
+            } else {
+                let w16 = *self.layers[i]
+                    .ffn_value_w16
+                    .as_ref()
+                    .ok_or("ffn_value_w16 missing")?;
+                self.backend.gemv_f16_add(w16, bb.r2, bb.x, c, fh, batch)?;
+            }
         }
 
         Ok(())
@@ -1637,7 +2255,8 @@ impl GpuModel {
                 .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
         }
         // batch 采样（token 写回 current_token[b]，下一轮 gather 自动跟随）。
-        // hist = token_seq（[batch, n] 布局，前 round 个已生成 token 在各 slot 段首）。
+        // hist = token_seq（[batch, n] 布局，前 round 个已生成 token 在各 slot 段首；
+        // 每 slot 实际历史长度 = sampler[7] = round，stride 恒为 n）。
         self.backend.sample_into_host_seeded_batch(
             bb.logits,
             bb.current_token,
@@ -1648,6 +2267,7 @@ impl GpuModel {
             sampler,
             token_seq,
             batch,
+            seq_stride,
         )?;
         self.backend
             .record_tokens(bb.current_token, token_seq, seq_cnt, seq_stride, batch)
@@ -1666,6 +2286,11 @@ impl GpuModel {
         sp: &SamplerParams,
     ) -> R<SelfloopTicket> {
         let batch = seeds.len();
+        // 注：曾放开为 batch ≤ state.batch()（解码按实际批宽跑，避免补齐空转槽）。
+        // 实测在 conc 16 + 长 prompt 下触发 access violation（0xC0000005），
+        // 尚未定位到具体越界点，故回退为严格相等。要做动态批宽需先审计
+        // WorkBuffers/pinned sampler 行宽/State 行步长在 batch < 分配宽 时的全部
+        // 索引假设（见参考/2026-09-19-batch内核权重零摊薄根因修复记录.md 第 8 节）。
         if state.batch() != batch {
             return Err(format!(
                 "submit_sample_selfloop_batch: state batch {} != seeds {}",
@@ -1674,26 +2299,24 @@ impl GpuModel {
             )
             .into());
         }
-        let vocab = self.config.vocab;
+        // batch 路径依赖 CUDA 专有的 batch kernel 变体（Vulkan 未实现）——保留原语义。
+        // 例外：SKIP_GRAPH 是逐 kernel 剖析/排障用的非图路径，须允许它在
+        // RWKV_GRAPH=0（supports_graph_capture()==false）下继续走通。
+        let skip_graph = std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty());
+        if !skip_graph && !self.backend.supports_graph_capture() {
+            return Err(
+                "submit_sample_selfloop_batch: 后端不支持 graph 捕获（batch 路径仅 CUDA）".into(),
+            );
+        }
 
-        // batch 工作缓冲（B 变化时重建）。
+        // batch 工作缓冲（B 变化时重建；重建会作废所有已捕获图，见 batch_buffers）。
         let bb = self.batch_buffers(batch)?;
-        // 采样临时缓冲：[batch, vocab] / [batch, 8] / [batch, n] / [batch]。
-        let temp = self
-            .backend
-            .create_tensor(vocab * batch, TensorDtype::F32)?;
-        let mask = self
-            .backend
-            .create_tensor(vocab * batch, TensorDtype::F32)?;
-        let counter = self
-            .backend
-            .create_tensor(vocab * batch, TensorDtype::U32)?;
-        let sampler = self.backend.create_tensor(8 * batch, TensorDtype::F32)?;
-        let token_seq = self.backend.create_tensor(n * batch, TensorDtype::F32)?;
-        let seq_cnt = self.backend.create_tensor(batch, TensorDtype::F32)?;
-        self.backend.upload(token_seq, &vec![0.0; n * batch])?;
+        // 常驻采样缓冲（按 (kind=1, batch, n) 缓存）：graph 内烘焙了这些指针，
+        // 不能每段重建（否则每段都必须重新捕获，即 churn 根因）。
+        let b = self.selfloop_bufs(1, batch, n)?;
+        self.backend.upload(b.token_seq, &vec![0.0; n * batch])?;
         self.backend
-            .upload(seq_cnt, &vec![f32::from_bits(0); batch])?;
+            .upload(b.seq_cnt, &vec![f32::from_bits(0); batch])?;
 
         // 首轮 token：B 个 seed 写入 current_token [batch]（位模式）。
         self.backend.upload(
@@ -1701,7 +2324,7 @@ impl GpuModel {
             &seeds.iter().map(|s| f32::from_bits(*s)).collect::<Vec<_>>(),
         )?;
         // 预置 round 0 的 sampler（graph 捕获时 sample kernel 从 sampler 缓冲读参数）。
-        let mut sampler0 = Vec::with_capacity(batch * 8);
+        let mut sampler0 = Vec::with_capacity(batch * 10);
         for &s in seeds {
             sampler0.extend_from_slice(&[
                 sp.temperature,
@@ -1712,18 +2335,51 @@ impl GpuModel {
                 sp.frequency_penalty,
                 sp.presence_penalty,
                 f32::from_bits(0),
+                sp.penalty_decay,
+                0.0,
             ]);
         }
-        self.backend.upload(sampler, &sampler0)?;
+        self.backend.upload(b.sampler, &sampler0)?;
 
         self.backend.begin_batch()?;
-        if std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty()) {
-            // 调试路径：不捕获 graph，逐轮直接提交（sanitizer 逐 kernel 定位用）。
-            for round in 0..n {
-                state.v_first_set = false;
-                let seeds_r: Vec<u32> =
-                    seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
-                let mut data = Vec::with_capacity(batch * 8);
+        let key = b.key();
+        let graph_ok = !skip_graph
+            && self.ensure_selfloop_graph(key, |m| {
+                m.sample_selfloop_step_batch(
+                    state,
+                    batch,
+                    &bb,
+                    b.temp,
+                    b.mask,
+                    b.counter,
+                    b.sampler,
+                    b.token_seq,
+                    b.seq_cnt,
+                    n,
+                )
+            });
+        // 逐轮：更新本轮的 seed/hist_len，然后执行（重放图，或降级直接提交本步 kernel）。
+        // 异步更新只在重放路径用（降级路径本来就每轮同步上传 sampler）。
+        let use_async = graph_ok && n <= self.backend.sampler_async_rows() / batch.max(1);
+        for round in 0..n {
+            state.v_first_set = false;
+            let seeds_r: Vec<u32> = seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
+            if use_async {
+                self.backend.store_sampler_async_batch(
+                    b.sampler,
+                    round,
+                    sp.temperature,
+                    sp.top_k,
+                    sp.top_p,
+                    &seeds_r,
+                    sp.repetition_penalty,
+                    sp.frequency_penalty,
+                    sp.presence_penalty,
+                    round as u32,
+                    sp.penalty_decay,
+                )?;
+            } else {
+                let mut data = Vec::with_capacity(batch * 10);
                 for &s in &seeds_r {
                     data.extend_from_slice(&[
                         sp.temperature,
@@ -1734,75 +2390,39 @@ impl GpuModel {
                         sp.frequency_penalty,
                         sp.presence_penalty,
                         f32::from_bits(round as u32),
+                        sp.penalty_decay,
+                        0.0,
                     ]);
                 }
-                self.backend.upload(sampler, &data)?;
+                self.backend.upload(b.sampler, &data)?;
+            }
+            if graph_ok {
+                self.backend.selfloop_graph_replay(key)?;
+            } else {
+                // 降级：无图（SKIP_GRAPH 调试开关 / 不支持 / 捕获失败），逐轮直接提交。
                 self.sample_selfloop_step_batch(
-                    state, batch, &bb, temp, mask, counter, sampler, token_seq, seq_cnt, n,
+                    state,
+                    batch,
+                    &bb,
+                    b.temp,
+                    b.mask,
+                    b.counter,
+                    b.sampler,
+                    b.token_seq,
+                    b.seq_cnt,
+                    n,
                 )?;
             }
-        } else if self.backend.supports_graph_capture() {
-            let async_rows = self.backend.sampler_async_rows() / batch.max(1);
-            let use_async = n <= async_rows;
-            self.backend.begin_graph_capture()?;
-            self.sample_selfloop_step_batch(
-                state, batch, &bb, temp, mask, counter, sampler, token_seq, seq_cnt, n,
-            )?;
-            self.backend.end_graph_capture()?;
-            for round in 0..n {
-                state.v_first_set = false;
-                let seeds_r: Vec<u32> =
-                    seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
-                if use_async {
-                    self.backend.store_sampler_async_batch(
-                        sampler,
-                        round,
-                        sp.temperature,
-                        sp.top_k,
-                        sp.top_p,
-                        &seeds_r,
-                        sp.repetition_penalty,
-                        sp.frequency_penalty,
-                        sp.presence_penalty,
-                        round as u32,
-                    )?;
-                } else {
-                    let mut data = Vec::with_capacity(batch * 8);
-                    for &s in &seeds_r {
-                        data.extend_from_slice(&[
-                            sp.temperature,
-                            f32::from_bits(sp.top_k),
-                            sp.top_p,
-                            f32::from_bits(s),
-                            sp.repetition_penalty,
-                            sp.frequency_penalty,
-                            sp.presence_penalty,
-                            f32::from_bits(round as u32),
-                        ]);
-                    }
-                    self.backend.upload(sampler, &data)?;
-                }
-                self.backend.graph_replay()?;
-            }
-        } else {
-            // Vulkan：无 graph 捕获——batch 路径本就要求 CUDA，此处仅为兜底。
-            return Err(
-                "submit_sample_selfloop_batch: 后端不支持 graph 捕获（batch 路径仅 CUDA）".into(),
-            );
         }
         self.backend.end_batch()?;
         Ok(SelfloopTicket {
-            temp,
-            mask,
-            counter,
-            sampler,
-            token_seq,
-            seq_cnt,
+            token_seq: b.token_seq,
             n,
         })
     }
 
-    /// batch collect：下载 [batch, n] 序列并按 slot 切分，释放临时缓冲。
+    /// batch collect：下载 [batch, n] 序列并按 slot 切分。
+    /// 缓冲常驻（由形状缓存持有），此处不释放。
     pub fn collect_sample_selfloop_batch(
         &mut self,
         ticket: SelfloopTicket,
@@ -1810,12 +2430,6 @@ impl GpuModel {
     ) -> R<Vec<Vec<u32>>> {
         let t = self.backend.download(ticket.token_seq)?;
         let n = ticket.n;
-        self.backend.free_tensor(ticket.temp);
-        self.backend.free_tensor(ticket.mask);
-        self.backend.free_tensor(ticket.counter);
-        self.backend.free_tensor(ticket.sampler);
-        self.backend.free_tensor(ticket.token_seq);
-        self.backend.free_tensor(ticket.seq_cnt);
         let mut out = Vec::with_capacity(batch);
         for b in 0..batch {
             let seg = &t[b * n..b * n + n];
@@ -1853,11 +2467,11 @@ impl GpuModel {
         let h = self.config.n_head;
         let ns = self.config.head_size;
 
-        // 序列缓冲 [n] 与原子计数器 [1]（record_token 用，spec 恒空不重建 pipeline）
-        let token_seq = self.backend.create_tensor(n, TensorDtype::F32)?;
-        let seq_cnt = self.backend.create_tensor(1, TensorDtype::F32)?;
-        self.backend.upload(token_seq, &vec![0.0; n])?;
-        self.backend.upload(seq_cnt, &[0.0; 1])?;
+        // 常驻缓冲（按 (kind=2, batch=1, n) 缓存）：graph 内烘焙了这些指针，不能每次重建。
+        // kind=2 与 sample_selfloop（kind=0）区分——两者 kernel 序列不同（argmax vs 采样）。
+        let b = self.selfloop_bufs(2, 1, n)?;
+        self.backend.upload(b.token_seq, &vec![0.0; n])?;
+        self.backend.upload(b.seq_cnt, &[0.0; 1])?;
 
         // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
         self.backend.begin_batch()?;
@@ -1869,21 +2483,28 @@ impl GpuModel {
         if self.backend.supports_graph_capture() {
             // CUDA：捕获首个 token 的完整前向 kernel 序列，之后每 token 重放，
             // 消除 258 次/层的 cuLaunchKernel 启动开销。
-            self.backend.begin_graph_capture()?;
-            self.selfloop_step(state, c, h, ns, token_seq, seq_cnt)?;
-            self.backend.end_graph_capture()?;
+            // **每个形状只捕获一次**，此后跨调用永久重放（原先每次调用重捕获）。
+            let key = b.key();
+            let graph_ok = self.ensure_selfloop_graph(key, |m| {
+                m.selfloop_step(state, c, h, ns, b.token_seq, b.seq_cnt)
+            });
 
-            // 执行 token 0（捕获的 graph），随后重放 n-1 次
-            self.backend.graph_replay()?;
-            for _ in 1..n {
-                state.v_first_set = false;
-                self.backend.graph_replay()?;
+            // 执行 token 0，随后重放 n-1 次
+            for round in 0..n {
+                if round > 0 {
+                    state.v_first_set = false;
+                }
+                if graph_ok {
+                    self.backend.selfloop_graph_replay(key)?;
+                } else {
+                    self.selfloop_step(state, c, h, ns, b.token_seq, b.seq_cnt)?;
+                }
             }
         } else {
             // Vulkan：无 graph 捕获，把 n 轮完整前向逐 token 记录进同一批次。
             // selfloop_step 内部已重置 v_first_set，每轮会重新快照 v_first。
             for _ in 0..n {
-                self.selfloop_step(state, c, h, ns, token_seq, seq_cnt)?;
+                self.selfloop_step(state, c, h, ns, b.token_seq, b.seq_cnt)?;
             }
         }
 
@@ -1891,7 +2512,7 @@ impl GpuModel {
         self.backend.end_batch()?;
 
         // 下载序列缓冲，按位解释为 u32
-        let t = self.backend.download(token_seq)?;
+        let t = self.backend.download(b.token_seq)?;
         Ok(t[..n].iter().map(|x| x.to_bits()).collect())
     }
 
@@ -3314,52 +3935,108 @@ impl GpuLayer {
         // 该布局使稀疏内核按「固定 f、连续 c」读取，命中合并访问。
         // 三种量化（fp16/int8）均构建：CUDA 稀疏内核只读 r2 非零列（~4%），
         // 反量化出 fp16 平铺权重远优于稠密 int8 全量读取。
-        let load_ffn_value_tiled =
-            |backend: &mut dyn ComputeBackend, key: String, c: usize, fh: usize| -> R<TensorId> {
-                const FFN_SPMV_TILE: usize = 128;
-                const FFN_SPMV_C_TILE: usize = 256;
-                // 从任意量化形式取原始 f32 数据（fp16 / int8），返回 (data, shape=[M,K])。
-                // int8 张量可能为 2D [M,K] 或 3D（group 打包，如 [M,K/128,128]），
-                // 故 M=shape[0]，K 由展平字节按量化比特数反推（与 load_int8 一致）。
-                let (data, shape) = if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
-                    let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
-                    let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-                    let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-                    let m = idx_t.shape()[0];
-                    let k = idx_u32.len() * 4 / m;
-                    (dequant_int8(idx_u32, sz_u32, m, k), vec![m, k])
+        let load_ffn_value_tiled = |backend: &mut dyn ComputeBackend,
+                                    key: String,
+                                    c: usize,
+                                    fh: usize|
+         -> R<(Option<TensorId>, Option<TensorId>)> {
+            const FFN_SPMV_TILE: usize = 128;
+            const FFN_SPMV_C_TILE: usize = 256;
+            // 从任意量化形式取原始 f32 数据（fp16 / int8），返回 (data, shape=[M,K])。
+            // int8 张量可能为 2D [M,K] 或 3D（group 打包，如 [M,K/128,128]），
+            // 故 M=shape[0]，K 由展平字节按量化比特数反推（与 load_int8 一致）。
+            let (data, shape) = if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
+                let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
+                let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                let m = idx_t.shape()[0];
+                let k = idx_u32.len() * 4 / m;
+                (dequant_int8(idx_u32, sz_u32, m, k), vec![m, k])
+            } else {
+                let t = st.tensor(&key)?;
+                let shape = t.shape().to_vec();
+                (tensor_to_f32(&t), shape)
+            };
+            // 定向到 [c, fh]（与 load_linear_f16 一致，解码 gemv 按 [C, fh] 使用）。
+            let oriented = if shape[0] == c && shape[1] == fh {
+                data
+            } else if shape[0] == fh && shape[1] == c {
+                transpose(&data, fh, c)
+            } else {
+                panic!("{key}: unexpected shape {shape:?}, want [{c},{fh}] or [{fh},{c}]")
+            };
+            let c_blocks = c / FFN_SPMV_C_TILE;
+            assert_eq!(c % FFN_SPMV_C_TILE, 0, "{key}: C 需为 C_TILE 整数倍");
+            assert_eq!(fh % FFN_SPMV_TILE, 0, "{key}: fh 需为 TILE 整数倍");
+            // ★ Phase 2-3：稠密 fp16 路径（`FFN_VALUE_GEMM`，默认开）**只需要 oriented 本身**
+            // （`[C, fh]` 行主序 = 稠密 GEMM 的 B 操作数），于是：
+            // ① 省掉整块 tiled 构建（加载期平铺 + 1.68GB 显存）；
+            // ② 与 `ffn_value_tiled` **互斥**（同一份数据、同一体积）⇒ 显存净变化为 0。
+            let dense16 = {
+                let tg = backend.create_tensor(oriented.len(), TensorDtype::F16)?;
+                backend.upload(tg, &oriented)?;
+                Some(tg)
+            };
+            if std::env::var("FFN_VALUE_GEMM")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            {
+                return Ok((None, dense16));
+            }
+            let mut tiled = vec![0.0f32; fh * c];
+            // 加载关键路径：按 f_block 分块多线程平铺（各块写不相交区域，结果与串行一致）
+            {
+                let f_block_len = FFN_SPMV_TILE * c; // 每 f_block 的 tiled 区域长
+                let f_blocks = fh / FFN_SPMV_TILE;
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(f_blocks.max(1));
+                if threads > 1 {
+                    let blocks_per = f_blocks.div_ceil(threads);
+                    std::thread::scope(|scope| {
+                        for (chunk_idx, fbs) in
+                            tiled.chunks_mut(blocks_per * f_block_len).enumerate()
+                        {
+                            let fb0 = chunk_idx * blocks_per;
+                            let oriented = &oriented;
+                            scope.spawn(move || {
+                                for (fb_local, fbs) in fbs.chunks_mut(f_block_len).enumerate() {
+                                    let f_block = fb0 + fb_local;
+                                    for (fl, f) in (f_block * FFN_SPMV_TILE
+                                        ..(f_block + 1) * FFN_SPMV_TILE)
+                                        .enumerate()
+                                    {
+                                        for cc in 0..c {
+                                            let c_block = cc / FFN_SPMV_C_TILE;
+                                            let c_local = cc % FFN_SPMV_C_TILE;
+                                            fbs[(c_block * FFN_SPMV_TILE + fl) * FFN_SPMV_C_TILE
+                                                + c_local] = oriented[cc * fh + f];
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
                 } else {
-                    let t = st.tensor(&key)?;
-                    let shape = t.shape().to_vec();
-                    (tensor_to_f32(&t), shape)
-                };
-                // 定向到 [c, fh]（与 load_linear_f16 一致，解码 gemv 按 [C, fh] 使用）。
-                let oriented = if shape[0] == c && shape[1] == fh {
-                    data
-                } else if shape[0] == fh && shape[1] == c {
-                    transpose(&data, fh, c)
-                } else {
-                    panic!("{key}: unexpected shape {shape:?}, want [{c},{fh}] or [{fh},{c}]")
-                };
-                let c_blocks = c / FFN_SPMV_C_TILE;
-                assert_eq!(c % FFN_SPMV_C_TILE, 0, "{key}: C 需为 C_TILE 整数倍");
-                assert_eq!(fh % FFN_SPMV_TILE, 0, "{key}: fh 需为 TILE 整数倍");
-                let mut tiled = vec![0.0f32; fh * c];
-                for f in 0..fh {
-                    let f_block = f / FFN_SPMV_TILE;
-                    let f_local = f % FFN_SPMV_TILE;
-                    for cc in 0..c {
-                        let c_block = cc / FFN_SPMV_C_TILE;
-                        let c_local = cc % FFN_SPMV_C_TILE;
-                        tiled[((f_block * c_blocks + c_block) * FFN_SPMV_TILE) * FFN_SPMV_C_TILE
-                            + f_local * FFN_SPMV_C_TILE
-                            + c_local] = oriented[cc * fh + f];
+                    for f in 0..fh {
+                        let f_block = f / FFN_SPMV_TILE;
+                        let f_local = f % FFN_SPMV_TILE;
+                        for cc in 0..c {
+                            let c_block = cc / FFN_SPMV_C_TILE;
+                            let c_local = cc % FFN_SPMV_C_TILE;
+                            tiled[((f_block * c_blocks + c_block) * FFN_SPMV_TILE)
+                                * FFN_SPMV_C_TILE
+                                + f_local * FFN_SPMV_C_TILE
+                                + c_local] = oriented[cc * fh + f];
+                        }
                     }
                 }
-                let tg = backend.create_tensor(tiled.len(), TensorDtype::F16)?;
-                backend.upload(tg, &tiled)?;
-                Ok(tg)
-            };
+            }
+            let tg = backend.create_tensor(tiled.len(), TensorDtype::F16)?;
+            backend.upload(tg, &tiled)?;
+            Ok((Some(tg), dense16))
+        };
         // 低秩权重：gemv 需要 [out, in] 行主序。
         // 各模型原始布局不同（g1h=[out,in]、g1d=[in,out]），按实际形状自适应转置。
         let load_lowrank = |backend: &mut dyn ComputeBackend,
@@ -3475,12 +4152,13 @@ impl GpuLayer {
             cfg.ffn_hidden,
         )?;
         // 稀疏 FFN 平铺权重（fp16，CUDA 稀疏内核用）：两种量化均构建，解码按 r2 非零列只读。
-        let ffn_value_tiled = Some(load_ffn_value_tiled(
+        // `FFN_VALUE_GEMM`（默认开）时返回 (None, dense16)——改用稠密张量核 GEMM。
+        let (ffn_value_tiled, ffn_value_dense16) = load_ffn_value_tiled(
             backend,
             format!("blocks.{idx}.ffn.value.weight"),
             c,
             cfg.ffn_hidden,
-        )?);
+        )?;
         let (receptance_a8, receptance_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.att.receptance.weight"),
@@ -3568,6 +4246,7 @@ impl GpuLayer {
             ffn_key_w16,
             ffn_value_w16,
             ffn_value_tiled,
+            ffn_value_dense16,
             ffn_key_a8,
             ffn_value_a8,
             att_output_a8,
@@ -3649,6 +4328,7 @@ impl GpuLayer {
             &mut self.ffn_key_w16,
             &mut self.ffn_value_w16,
             &mut self.ffn_value_tiled,
+            &mut self.ffn_value_dense16,
         ] {
             if let Some(t) = t.as_mut() {
                 backend.drop_host(*t);
@@ -3673,7 +4353,7 @@ impl GpuState {
         let bsz = batch.max(1);
         let tmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
         backend.upload(tmix_x, &vec![0.0; c * bsz])?;
-        let tmix_rnn = backend.create_tensor(h * n * n * bsz, TensorDtype::F32)?;
+        let tmix_rnn = backend.create_tensor(h * n * n * bsz, wkv_state_dtype())?;
         backend.upload(tmix_rnn, &vec![0.0; h * n * n * bsz])?;
         let cmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
         backend.upload(cmix_x, &vec![0.0; c * bsz])?;
@@ -3899,9 +4579,9 @@ impl RnnInput {
 
 /// GPU 采样参数（penalty / temperature / top-k / top-p）。
 /// 传给 `Bundle::infer_sample*`，在 GPU 上对 logits 过滤后按概率采样。
-/// 惩罚公式与 OpenAI / vLLM / llama.cpp 主流一致（作用于 softmax 前的 logits）：
-///   repetition_penalty（缩放，1.0=禁用）、frequency_penalty（次数偏移，0.0=禁用）、
-///   presence_penalty（存在偏移，0.0=禁用）。
+/// 惩罚公式与客户端池 / ai00-server 对齐（作用于 softmax 前的 logits）：
+///   repetition_penalty（缩放，1.0=禁用）、
+///   presence_penalty + frequency_penalty × cnt^penalty_decay（0.0=禁用）。
 #[derive(Debug, Clone, Copy)]
 pub struct SamplerParams {
     /// 温度 >0；logits 除以 temperature 后做 softmax。0 或负视为 1（不缩放）。
@@ -3914,10 +4594,14 @@ pub struct SamplerParams {
     pub seed: u32,
     /// repetition_penalty：对历史中出现的 token，logit>0 时 /=rp，logit<0 时 *=rp。1.0 表示禁用。
     pub repetition_penalty: f32,
-    /// frequency_penalty：logit 减去 fp × 出现次数。0.0 表示禁用。
+    /// frequency_penalty：logit 减去 fp × 出现次数^penalty_decay。0.0 表示禁用。
     pub frequency_penalty: f32,
     /// presence_penalty：出现过的 token 一律 logit 减去 pp。0.0 表示禁用。
     pub presence_penalty: f32,
+    /// frequency_penalty 的次数衰减指数：`cnt^decay`。1.0 = 现行线性行为
+    /// （单流 kernel 与历史调用方语义不变）；<1.0 = 高频 token 惩罚次线性增长
+    /// （客户端池默认 0.99654026）。
+    pub penalty_decay: f32,
 }
 
 impl Default for SamplerParams {
@@ -3930,6 +4614,7 @@ impl Default for SamplerParams {
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            penalty_decay: 1.0,
         }
     }
 }
@@ -4068,19 +4753,43 @@ impl State {
         if slot >= self.batch {
             return Err(format!("slot_back: slot {slot} >= batch {}", self.batch).into());
         }
-        let per_layer = c + h * n * n + c;
-        let mut out = Vec::with_capacity(self.layers.len() * per_layer + c);
+        // 只下载该 slot 的行段（整表下载在 batch=16 时 ~260MB，单行 ~15MB）。
+        let rnn = h * n * n;
+        let mut out = Vec::with_capacity(self.layers.len() * (2 * c + rnn) + c);
         for s in &self.layers {
-            let x = backend.download(s.tmix_x)?;
-            out.extend_from_slice(&x[slot * c..slot * c + c]);
-            let rnn = backend.download(s.tmix_rnn)?;
-            out.extend_from_slice(&rnn[slot * h * n * n..slot * h * n * n + h * n * n]);
-            let cx = backend.download(s.cmix_x)?;
-            out.extend_from_slice(&cx[slot * c..slot * c + c]);
+            out.extend_from_slice(&backend.download_part(s.tmix_x, slot * c, c)?);
+            out.extend_from_slice(&backend.download_part(s.tmix_rnn, slot * rnn, rnn)?);
+            out.extend_from_slice(&backend.download_part(s.cmix_x, slot * c, c)?);
         }
-        let vf = backend.download(self.v_first)?;
-        out.extend_from_slice(&vf[slot * c..slot * c + c]);
+        out.extend_from_slice(&backend.download_part(self.v_first, slot * c, c)?);
         Ok(out)
+    }
+
+    /// 设备内单 slot 行迁移：把 slot `from` 的全部状态行拷到 slot `to`
+    /// （连续批调度的槽位紧凑化用——全程设备内拷贝，不经过主机）。
+    pub fn slot_move(
+        &self,
+        backend: &mut dyn ComputeBackend,
+        from: usize,
+        to: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if from >= self.batch || to >= self.batch {
+            return Err(format!("slot_move: {from}->{to} 超出 batch {}", self.batch).into());
+        }
+        if from == to {
+            return Ok(());
+        }
+        let rnn = h * n * n;
+        for s in &self.layers {
+            backend.copy_range(s.tmix_x, from * c, s.tmix_x, to * c, c)?;
+            backend.copy_range(s.tmix_rnn, from * rnn, s.tmix_rnn, to * rnn, rnn)?;
+            backend.copy_range(s.cmix_x, from * c, s.cmix_x, to * c, c)?;
+        }
+        backend.copy_range(self.v_first, from * c, self.v_first, to * c, c)?;
+        Ok(())
     }
 
     /// 单 slot 状态回灌（batch 布局）：把单序列布局数据写入指定 slot 段。
@@ -4360,6 +5069,31 @@ fn tensor_to_f32(data: &TensorView) -> Vec<f32> {
 
 /// 矩阵转置: [rows, cols] → [cols, rows]（行主序）
 fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    // 加载关键路径：大矩阵转置按行分块多线程（各输出行写不相交区域）
+    if rows * cols >= 1 << 22 {
+        let mut out = vec![0.0f32; rows * cols];
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(cols.max(1));
+        if threads > 1 {
+            let rows_per = cols.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for (chunk_idx, rows_out) in out.chunks_mut(rows_per * rows).enumerate() {
+                    let c_start = chunk_idx * rows_per;
+                    scope.spawn(move || {
+                        for (i, col) in rows_out.chunks_mut(rows).enumerate() {
+                            let cc = c_start + i;
+                            for r in 0..rows {
+                                col[r] = data[r * cols + cc];
+                            }
+                        }
+                    });
+                }
+            });
+            return out;
+        }
+    }
     let mut out = vec![0.0; data.len()];
     for r in 0..rows {
         for c in 0..cols {
@@ -4375,21 +5109,43 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 fn dequant_int8(idx: &[u32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
     let kg = k / 128;
     let mut w = vec![0.0f32; m * k];
-    for r in 0..m {
-        let row = &mut w[r * k..(r + 1) * k];
-        for (g, chunk) in row.chunks_mut(128).enumerate() {
-            let szv = sz[r * kg + g];
-            let scale = f16::from_bits((szv & 0xFFFF) as u16).to_f32();
-            let zero = f16::from_bits((szv >> 16) as u16).to_f32();
-            for (j, wv) in chunk.iter_mut().enumerate() {
-                let ki = g * 128 + j;
-                let pack = idx[r * (k / 4) + ki / 4];
-                let q = ((pack >> ((ki % 4) * 8)) & 0xFF) as f32;
-                *wv = scale * q + zero;
-            }
+    // 加载是启动关键路径：按行分组多线程反量化（各行写不相交区域，结果与单线程一致）
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(m.max(1));
+    if threads <= 1 || m < 8 {
+        for r in 0..m {
+            dequant_int8_row(idx, sz, kg, k, r, &mut w[r * k..(r + 1) * k]);
+        }
+        return w;
+    }
+    let rows_per = m.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk_idx, rows) in w.chunks_mut(rows_per * k).enumerate() {
+            let r_start = chunk_idx * rows_per;
+            scope.spawn(move || {
+                for (i, row) in rows.chunks_mut(k).enumerate() {
+                    dequant_int8_row(idx, sz, kg, k, r_start + i, row);
+                }
+            });
+        }
+    });
+    w
+}
+
+fn dequant_int8_row(idx: &[u32], sz: &[u32], kg: usize, k: usize, r: usize, row: &mut [f32]) {
+    for (g, chunk) in row.chunks_mut(128).enumerate() {
+        let szv = sz[r * kg + g];
+        let scale = f16::from_bits((szv & 0xFFFF) as u16).to_f32();
+        let zero = f16::from_bits((szv >> 16) as u16).to_f32();
+        for (j, wv) in chunk.iter_mut().enumerate() {
+            let ki = g * 128 + j;
+            let pack = idx[r * (k / 4) + ki / 4];
+            let q = ((pack >> ((ki % 4) * 8)) & 0xFF) as f32;
+            *wv = scale * q + zero;
         }
     }
-    w
 }
 
 /// 向上取整到 a 的倍数（tensor-core GEMM 维度对齐用）
