@@ -1345,34 +1345,47 @@ impl Runtime {
     }
 
     /// 激活对称 int8 量化（`quant_x_i8.comp`）：x[b,k] f32 → xq[b,k/4] u32 + xaux[b,k/128] vec4。
-    /// spec = [K, BATCH]；dispatch = (K/128, ceil(batch/8), 1)，block = 256。
+    /// `gate` 为 `Some` 时 A 侧先乘上该 fp16 门控（`att.output` 的 `y_norm · g`）。
+    /// spec = [K, BATCH, HAS_G]；dispatch = (K/128, ceil(batch/8), 1)，block = 256。
     pub fn quant_x_i8(
         &mut self,
         x: &GpuTensor,
+        gate: Option<&GpuTensor16>,
         xq: &GpuTensorU32,
         xaux: &GpuTensor,
         k: usize,
         batch: usize,
     ) -> R<()> {
         debug_assert_eq!(k % 128, 0, "quant_x_i8: k 需为 128 整除");
-        let spec = [k as u32, batch as u32];
-        let params = [x.device.address, xq.device.address, xaux.device.address];
+        let spec = [k as u32, batch as u32, u32::from(gate.is_some())];
+        // 无门控时把 `x` 自身填进门控槽位（buffer_reference 不能是空指针；HAS_G=0 时不读）。
+        let gaddr = gate.map(|g| g.device.address).unwrap_or(x.device.address);
+        let params = [
+            x.device.address,
+            gaddr,
+            xq.device.address,
+            xaux.device.address,
+        ];
+        let mut reads = vec![x.device.buffer];
+        if let Some(gt) = gate {
+            reads.push(gt.device.buffer);
+        }
         self.record_kernel(
             "shaders/spv/quant_x_i8.spv",
             &spec,
             &params,
             ((k / 128) as u32, batch.div_ceil(8) as u32, 1),
-            &[x.device.buffer],
+            &reads,
             &[xq.device.buffer, xaux.device.buffer],
         )?;
         Ok(())
     }
 
-    /// W8A8 int8 张量核 GEMM（`gemm_imma_relu2.comp`）：`y = relu²(xq @ W^T)`，
-    /// 每 block BM=128 行 × BN=8 槽，每 k-tile（= 一个量化组）flush 一次。
-    /// spec = [M, K, BATCH]；dispatch = (M/128, 1, 1)，block = 256。
+    /// W8A8 int8 张量核 GEMM（`gemm_imma.comp`）：`y = op(xq @ W^T)`，每 block `IM_BM` 行
+    /// × BN=8 槽，每 k-tile（= 一个量化组）flush 一次。`op`：0=relu²重写、1=累加、2=重写。
+    /// spec = [M, K, BATCH, OP]；dispatch = (M/bm, 1, 1)，block = 2·bm。
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_imma_relu2(
+    pub fn gemm_imma(
         &mut self,
         a: &GpuTensorInt8,
         xq: &GpuTensorU32,
@@ -1381,11 +1394,13 @@ impl Runtime {
         m: usize,
         k: usize,
         batch: usize,
+        op: u32,
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        debug_assert_eq!(m % 128, 0, "gemm_imma_relu2: M 需为 128 整除");
-        let spec = [m as u32, k as u32, batch as u32];
+        let bm = Self::imma_bm(m);
+        debug_assert_eq!(m % bm, 0, "gemm_imma: M 需为 {bm} 整除");
+        let spec = [m as u32, k as u32, batch as u32, op];
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -1393,11 +1408,16 @@ impl Runtime {
             xaux.device.address,
             y.device.address,
         ];
+        let spv = if bm == 64 {
+            "shaders/spv/gemm_imma_bm64.spv"
+        } else {
+            "shaders/spv/gemm_imma_bm128.spv"
+        };
         self.record_kernel(
-            "shaders/spv/gemm_imma_relu2.spv",
+            spv,
             &spec,
             &params,
-            ((m / 128) as u32, 1, 1),
+            ((m / bm) as u32, 1, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
@@ -1409,10 +1429,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// `gemm_imma` 的 BM 选择：默认 64（小 batch 时 `grid = M/BM` 是唯一加块手段，
+    /// 与 CUDA `IMMA_BM_SMALL` 同源）；`VK_IMMA_BM=128` 可切大 tile 做 A/B。
+    fn imma_bm(m: usize) -> usize {
+        let want = std::env::var("VK_IMMA_BM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+        if want == 128 && m.is_multiple_of(128) {
+            128
+        } else {
+            64
+        }
+    }
+
     /// W8A8（int8 激活 + int8 权重）张量核路径是否可用。
     /// 门槛：① `shaderIntegerDotProduct`（Vulkan 1.3 core feature）已请求；
     /// ② 设备报告过 **16×8×32 SINT8×SINT8→SINT32** 的 cooperative matrix 配置
-    /// （即 `gemm_imma_relu2.comp` 里写死的那个 tile 形状；不满足则该 shader 的
+    /// （即 `gemm_imma.comp` 里写死的那个 tile 形状；不满足则该 shader 的
     /// coopmat 类型无法在设备上物化）。
     pub fn supports_int8_imma(&self) -> bool {
         self.app.properties.integer_dot_product

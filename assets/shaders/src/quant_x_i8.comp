@@ -3,12 +3,17 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // 激活对称 int8 量化（W8A8 的 A 侧）：fp32 x[b,k] → int8 xq[b, k/4]（4 个 int8 打包进 1 个 uint32）
 //                                    + 每组统计 xaux[b, K/128] = vec4(sx, 128*sx*cs, rs, 0)
 //
 // 粒度 **per-(token, k 组)**、组宽 128 —— 与权重 `sz[m, k/128]` 的分组同构，于是 IMMA 的
-// 「每组 flush」天然对齐（与 CUDA `quant_x_i8` 语义逐项对齐，见 backend_cuda.rs:5186）。
+// 「每组 flush」天然对齐（与 CUDA `quant_x_i8` 语义逐项对齐，见 backend_cuda.rs:5203）。
+//
+// 门控（`HAS_G` 特化常量 2）：`att.output` 的 A 侧是 `y_norm · g`（g 为 fp16 门控），
+// 在这里顺手乘掉，省一趟独立 elementwise —— 与 CUDA 把 `gd` 直接交给 `quant_x_i8` 一致。
 //
 // 三项的用途（与 CUDA 侧注释同源）：
 //   sx        = amax/127：把 int32 的 IMMA 结果还原回 fp32 的尺度；
@@ -21,16 +26,19 @@
 
 layout(constant_id = 0) const uint K = 2560;      // 收缩维（需 128 整除）
 layout(constant_id = 1) const uint BATCH = 1;     // 实际槽数（尾组守卫）
+layout(constant_id = 2) const uint HAS_G = 0;     // 1 = A 侧先乘上 fp16 门控 g
 
 const uint BLOCK_SIZE = 256;                       // 8 warp
 const uint GROUP = 128;                            // 量化组宽（须与权重分组一致）
 
 layout(buffer_reference) buffer InX   { float data[]; };
+layout(buffer_reference) buffer InG   { float16_t data[]; };
 layout(buffer_reference) buffer OutQ  { uint data[]; };
 layout(buffer_reference) buffer OutAux { vec4 data[]; };
 
 layout(set = 0, binding = 0, std430) uniform Params {
     InX    in_x;
+    InG    in_g;
     OutQ   out_q;
     OutAux out_aux;
 } params;
@@ -54,10 +62,16 @@ void main() {
     const uint G  = K >> 7;
     const uint k0 = (g << 7u) + (lane << 2u);   // 本 lane 负责的 4 个连续 k
 
-    const float v0 = params.in_x.data[b * K + k0];
-    const float v1 = params.in_x.data[b * K + k0 + 1u];
-    const float v2 = params.in_x.data[b * K + k0 + 2u];
-    const float v3 = params.in_x.data[b * K + k0 + 3u];
+    float v0 = params.in_x.data[b * K + k0];
+    float v1 = params.in_x.data[b * K + k0 + 1u];
+    float v2 = params.in_x.data[b * K + k0 + 2u];
+    float v3 = params.in_x.data[b * K + k0 + 3u];
+    if (HAS_G == 1u) {
+        v0 *= float(params.in_g.data[b * K + k0]);
+        v1 *= float(params.in_g.data[b * K + k0 + 1u]);
+        v2 *= float(params.in_g.data[b * K + k0 + 2u]);
+        v3 *= float(params.in_g.data[b * K + k0 + 3u]);
+    }
 
     // 组内 amax → 对称尺度（整组共享，避免逐线程尺度破坏 IMMA 的 k 分组语义）
     float amax = max(max(abs(v0), abs(v1)), max(abs(v2), abs(v3)));

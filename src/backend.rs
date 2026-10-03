@@ -429,9 +429,12 @@ pub trait ComputeBackend {
     }
 
     /// 激活对称 int8 量化（见 `quant_x_i8.comp`）：x[k,batch] f32 → xq（int8 打包）+ xaux。
+    /// `gate` 非零时 A 侧先乘上该 fp16 门控（`att.output` 的 `y_norm · g`）。
+    #[allow(clippy::too_many_arguments)]
     fn quant_x_i8(
         &mut self,
         _x: TensorId,
+        _gate: Option<TensorId>,
         _xq: TensorId,
         _xaux: TensorId,
         _k: usize,
@@ -440,9 +443,10 @@ pub trait ComputeBackend {
         Err("quant_x_i8: backend not supported".into())
     }
 
-    /// W8A8 int8 张量核 GEMM：`y = relu²(xq @ W^T)`（见 `gemm_imma_relu2.comp`）。
+    /// W8A8 int8 张量核 GEMM：`y = op(xq @ W^T)`（见 `gemm_imma.comp`）。
+    /// `op`：0 = relu² 覆盖写、1 = 累加到 y、2 = 覆盖写。
     #[allow(clippy::too_many_arguments)]
-    fn gemm_imma_relu2(
+    fn gemm_imma(
         &mut self,
         _a: &Int8Handle,
         _xq: TensorId,
@@ -451,8 +455,9 @@ pub trait ComputeBackend {
         _m: usize,
         _k: usize,
         _batch: usize,
+        _op: u32,
     ) -> R<()> {
-        Err("gemm_imma_relu2: backend not supported".into())
+        Err("gemm_imma: backend not supported".into())
     }
 
     /// y += (x .* g) @ A（fp16 权重，f32 累加）——att.output 用。
@@ -1909,19 +1914,26 @@ impl ComputeBackend for VulkanBackend {
     fn quant_x_i8(
         &mut self,
         x: TensorId,
+        gate: Option<TensorId>,
         xq: TensorId,
         xaux: TensorId,
         k: usize,
         batch: usize,
     ) -> R<()> {
         let x_g = self.get_f32(x, "quant_x_i8")?;
+        // 无门控时由 kernel 的 HAS_G 特化常量关掉（门控槽位填 x 自身，不能是空指针）。
+        let g_g = match gate {
+            Some(t) => Some(self.get_f16(t, "quant_x_i8")?),
+            None => None,
+        };
         let xq_g = self.get_u32(xq, "quant_x_i8")?;
         let aux_g = self.get_f32(xaux, "quant_x_i8")?;
-        self.rt.quant_x_i8(&x_g, &xq_g, &aux_g, k, batch)
+        self.rt
+            .quant_x_i8(&x_g, g_g.as_ref(), &xq_g, &aux_g, k, batch)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gemm_imma_relu2(
+    fn gemm_imma(
         &mut self,
         a: &Int8Handle,
         xq: TensorId,
@@ -1930,14 +1942,15 @@ impl ComputeBackend for VulkanBackend {
         m: usize,
         k: usize,
         batch: usize,
+        op: u32,
     ) -> R<()> {
-        let a_g = self.int8_ref(a, "gemm_imma_relu2")?;
-        let xq_g = self.get_u32(xq, "gemm_imma_relu2")?;
-        let aux_g = self.get_f32(xaux, "gemm_imma_relu2")?;
-        let mut y_o = self.take_f32(y, "gemm_imma_relu2")?;
+        let a_g = self.int8_ref(a, "gemm_imma")?;
+        let xq_g = self.get_u32(xq, "gemm_imma")?;
+        let aux_g = self.get_f32(xaux, "gemm_imma")?;
+        let mut y_o = self.take_f32(y, "gemm_imma")?;
         let res = self
             .rt
-            .gemm_imma_relu2(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch);
+            .gemm_imma(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch, op);
         self.put_f32(y, y_o);
         res
     }

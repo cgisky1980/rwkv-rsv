@@ -1489,16 +1489,30 @@ impl GpuModel {
             LN_EPS,
             batch,
         )?;
+        self.head_batch(&bb, c, vocab, batch)?;
+        self.backend.end_batch()?;
+        Ok(bb)
+    }
+
+    /// ln_out + head（批量）：`logits = x_norm @ head^T`，覆盖写。
+    /// int8 权重 + 形状合适时走 W8A8 张量核（head 的 M=vocab 很大 ⇒ 块数充足）。
+    fn head_batch(&mut self, bb: &WorkBuffers, c: usize, vocab: usize, batch: usize) -> R<()> {
         if let Some(a8) = &self.head_a8 {
-            self.backend
-                .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
+            if Self::imma_op_on("head") && self.imma_ok(vocab, c, batch) {
+                self.backend
+                    .quant_x_i8(bb.x_norm, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                self.backend
+                    .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.logits, vocab, c, batch, 2)?;
+            } else {
+                self.backend
+                    .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
+            }
         } else {
             let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
             self.backend
                 .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
         }
-        self.backend.end_batch()?;
-        Ok(bb)
+        Ok(())
     }
 
     /// 诊断 / 测试：批量单步前向的 logits（[batch, vocab]，slot 主序）。
@@ -1971,16 +1985,24 @@ impl GpuModel {
         true
     }
 
-    /// W8A8 int8 张量核（`gemm_imma_relu2.comp`）的门控：设备能力 + 形状约束。
-    /// 形状约束来自 shader 里写死的 tile 布局（BM=128 行、BN=8 槽、BK=128=量化组宽）。
-    /// `VK_IMMA=0` 可强制回退到 SIMT 反量化路径（做 A/B 用）。
-    fn layer_imma_ok(&self, layer: usize, fh: usize, c: usize, batch: usize) -> bool {
+    /// W8A8 int8 张量核（`gemm_imma.comp`）的门控：设备能力 + 形状约束。
+    /// 形状约束来自 shader 里写死的 tile 布局（BM = 64/128 行、BN=8 槽、BK=128=量化组宽）。
+    /// `VK_IMMA=0` 可强制回退到 SIMT 反量化路径（做 A/B 用；`VK_IMMA_BM=128` 切大 tile）。
+    fn imma_ok(&self, m: usize, k: usize, batch: usize) -> bool {
         std::env::var("VK_IMMA").map(|v| v != "0").unwrap_or(true)
             && self.backend.supports_int8_imma()
-            && self.layers[layer].ffn_key_a8.is_some()
-            && fh.is_multiple_of(128)
-            && c.is_multiple_of(128)
+            && m.is_multiple_of(64)
+            && k.is_multiple_of(128)
             && (1..=8).contains(&batch)
+    }
+
+    /// `VK_IMMA_OPS`：逗号分隔的白名单（`key,out,val,head`），默认全开。
+    /// 用于按算子二分（排查数值/竞态问题时不至于一次关掉整条路径）。
+    fn imma_op_on(op: &str) -> bool {
+        match std::env::var("VK_IMMA_OPS") {
+            Ok(v) => v.split(',').any(|s| s.trim() == op),
+            Err(_) => true,
+        }
     }
 
     /// batch 版单层前向：全部 kernel 走 batch 变体（B slot 共享权重一次读）。
@@ -2183,8 +2205,16 @@ impl GpuModel {
 
         // x += (y_norm .* g) @ output_w（gemv_variant 已支持 batch 维）。
         if let Some(a8) = &self.layers[i].att_output_a8 {
-            self.backend
-                .gemv_int8_mul_add(a8, bb.y_norm, bb.g, bb.x, c, c, batch)?;
+            // ★ W8A8 张量核：门控 `·g` 由 `quant_x_i8`（HAS_G）顺手乘掉，GEMM 走累加 op。
+            if Self::imma_op_on("out") && self.imma_ok(c, c, batch) {
+                self.backend
+                    .quant_x_i8(bb.y_norm, Some(bb.g), bb.xb_q, bb.xb_aux, c, batch)?;
+                self.backend
+                    .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.x, c, c, batch, 1)?;
+            } else {
+                self.backend
+                    .gemv_int8_mul_add(a8, bb.y_norm, bb.g, bb.x, c, c, batch)?;
+            }
         } else {
             let w16 = *self.layers[i]
                 .output_w16
@@ -2214,13 +2244,15 @@ impl GpuModel {
         // 的主要成本；而 CUDA 的批量路径正是 `quant_x_i8` + `imma_gemm_batch`。数值上激活
         // 从 f32 降到 int8（与 CUDA 同口径），故结果与 SIMT 路径**不完全逐位相同**。
         // 门控：`VK_IMMA=0` 可关；形状需 M%128、K%128 整除且 batch ≤ 8（BN=8）。
-        let use_imma = self.layer_imma_ok(i, fh, c, batch);
+        let use_imma = Self::imma_op_on("key")
+            && self.layers[i].ffn_key_a8.is_some()
+            && self.imma_ok(fh, c, batch);
         if use_imma {
             let a8 = self.layers[i].ffn_key_a8.as_ref().unwrap();
             self.backend
-                .quant_x_i8(bb.xb, bb.xb_q, bb.xb_aux, c, batch)?;
+                .quant_x_i8(bb.xb, None, bb.xb_q, bb.xb_aux, c, batch)?;
             self.backend
-                .gemm_imma_relu2(a8, bb.xb_q, bb.xb_aux, bb.r2, fh, c, batch)?;
+                .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.r2, fh, c, batch, 0)?;
         } else if let Some(a8) = &self.layers[i].ffn_key_a8 {
             self.backend
                 .gemv_int8_relu2(a8, bb.xb, bb.r2, fh, c, batch)?;
@@ -2259,6 +2291,16 @@ impl GpuModel {
                 self.backend
                     .ffn_value_gemm_batch(w16, bb.r2, bb.x, c, fh, batch)?;
             }
+        } else if Self::imma_op_on("val")
+            && self.layers[i].ffn_value_a8.is_some()
+            && self.imma_ok(c, fh, batch)
+        {
+            // ★ W8A8 张量核：`x += r2 @ Wv^T`（累加 op）。
+            let a8 = self.layers[i].ffn_value_a8.as_ref().unwrap();
+            self.backend
+                .quant_x_i8(bb.r2, None, bb.xb_q, bb.xb_aux, fh, batch)?;
+            self.backend
+                .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.x, c, fh, batch, 1)?;
         } else {
             let sparse_ok =
                 self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
@@ -2325,15 +2367,8 @@ impl GpuModel {
             LN_EPS,
             batch,
         )?;
-        // head：logits [batch, vocab]（gemv_int8_plain/gemv_f16 已支持 batch 维）。
-        if let Some(a8) = &self.head_a8 {
-            self.backend
-                .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
-        } else {
-            let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
-            self.backend
-                .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
-        }
+        // head：logits [batch, vocab]（见 `head_batch`）。
+        self.head_batch(bb, c, vocab, batch)?;
         // batch 采样（token 写回 current_token[b] 的**设备缓冲**，下一轮 gather 自动跟随）。
         // hist = token_seq（[batch, n] 布局，前 round 个已生成 token 在各 slot 段首；
         // 每 slot 实际历史长度 = sampler[7] = round，stride 恒为 n）。
@@ -5005,15 +5040,16 @@ impl WorkBuffers {
             a_mid: mk(&mut *backend, cfg.a_mid)?,
             g_mid: mk(&mut *backend, cfg.g_mid)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
-            // W8A8 路径：固定 8 槽容量（IMMA 的 BN=8 一次覆盖全部槽）
+            // W8A8 路径：固定 8 槽容量（IMMA 的 BN=8 一次覆盖全部槽），
+            // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
             xb_q: {
-                let n = 8 * (c / 4);
+                let n = 8 * (c.max(cfg.ffn_hidden) / 4);
                 let t = backend.create_tensor(n, TensorDtype::U32)?;
                 backend.upload_u32(t, &vec![0u32; n])?;
                 t
             },
             xb_aux: {
-                let n = 8 * (c / 128) * 4;
+                let n = 8 * (c.max(cfg.ffn_hidden) / 128) * 4;
                 let t = backend.create_tensor(n, TensorDtype::F32)?;
                 backend.upload(t, &vec![0.0f32; n])?;
                 t

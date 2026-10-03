@@ -408,8 +408,9 @@ fn main() {
         "quant_x_i8" => "src/quant_x_i8.comp" => {
             TYPE => [none("")],
         },
-        "gemm_imma_relu2" => "src/gemm_imma_relu2.comp" => {
-            TYPE => [none("")],
+        // ★ IM_BM 决定 `local_size_x`（block = 2·BM），必须走构建期 define ⇒ 两个几何各一份 spv。
+        "gemm_imma" => "src/gemm_imma.comp" => {
+            IM_BM => [def(64, "bm64"), def(128, "bm128")],
         },
     };
 
