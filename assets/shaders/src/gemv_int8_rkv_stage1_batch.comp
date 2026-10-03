@@ -50,6 +50,10 @@ layout(constant_id = 14) const uint BATCH = 1;
 // `RKV_OFF=1`：只跑 mid 投影臂（r/k/v 已改走 `gemm_imma` 张量核路径）。
 // 此时 `I8_WG = 0` ⇒ 上面的 int8 分支整体被跳过，`mid_idx = flat_idx`。
 layout(constant_id = 15) const uint RKV_OFF = 0;
+// 受控消融（诊断用，`RKV_ABLATE` 环境变量注入；结果不对，只用于 **计时归因**）：
+//   0 = 全量；1 = 不读权重（w 置常数）；2 = 不读 x（xv 置常数）；
+//   3 = 整个 k 循环都跳过（只留归约）；4 = 只归约「不写回」
+layout(constant_id = 16) const uint ABLATE = 0;
 
 shared float s_dot[ROWS][BGRP][NUM_SUBGROUPS];
 shared float s_mid[BGRP][NUM_SUBGROUPS];
@@ -137,13 +141,13 @@ void main() {
         }
 
         [[unroll]]
-        for (uint k = index; k < KV; k += BLOCK_SIZE) {
+        for (uint k = index; k < KV && ABLATE != 3u; k += BLOCK_SIZE) {
             const uint g = k / 32;
             // 权重（每行 1 个 uint32 = 4 个 uint8）读一次、解一次，复用给全部 BGRP 个槽。
             float w[ROWS][4];
             [[unroll]]
             for (uint r = 0; r < ROWS; r++) {
-                const uint ip = widx.data[(row_base + r) * KV + k];
+                const uint ip = (ABLATE == 1u) ? 0x7Fu : widx.data[(row_base + r) * KV + k];
                 const float sc = s_scale[r][g];
                 const float zr = s_zero[r][g];
                 w[r][0] = sc * float(ip & 0xFFu)           + zr;
@@ -154,7 +158,8 @@ void main() {
             [[unroll]]
             for (uint s = 0; s < BGRP; s++) {
                 if (s < slot_cnt) {
-                    const vec4 xv = xin.data[(slot0 + s) * XSLOT + k];
+                    const vec4 xv = (ABLATE == 2u) ? vec4(1.0)
+                                                   : xin.data[(slot0 + s) * XSLOT + k];
                     [[unroll]]
                     for (uint r = 0; r < ROWS; r++) {
                         acc[r][s] += w[r][0] * xv.x + w[r][1] * xv.y

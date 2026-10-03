@@ -3665,6 +3665,12 @@ impl Runtime {
             0,
             bgrp as u32,  // 13
             batch as u32, // 14
+            0,            // 15 = RKV_OFF
+            // 16 = ABLATE（诊断消融，见 shader 顶部）
+            std::env::var("RKV_ABLATE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
         ];
         let params = [
             r_a8.idx.device.address,
@@ -4112,6 +4118,14 @@ fn gemv_rows_batch(m: usize, k: usize) -> usize {
 /// 否则取 min(8, batch)——一个 workgroup 同时算 8 个槽，权重只读一遍。
 /// CUDA 侧的对应参数是 `gemv_variant_mb16` 的 `ROWS=4/BGRP=8/128 线程`。
 fn gemv_bgrp_for(batch: usize) -> usize {
+    // `GEMV_BGRP=<n>`：诊断用强制值（BGRP 从未在 batch≥16 做过 A/B）。
+    if let Some(v) = std::env::var("GEMV_BGRP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=32).contains(v))
+    {
+        return v;
+    }
     match batch {
         0 | 1 => 1,
         b => b.min(8),
