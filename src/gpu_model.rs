@@ -2005,7 +2005,8 @@ impl GpuModel {
             && self.backend.supports_int8_imma()
             && m.is_multiple_of(64)
             && k.is_multiple_of(128)
-            && (1..=8).contains(&batch)
+            // 每 block 覆盖 `8·NST ≤ 64` 个槽（构建期只编了 NST ∈ {1,2,4,8}）
+            && (1..=64).contains(&batch)
     }
 
     /// `VK_IMMA_OPS`：逗号分隔的白名单（`key,out,val,head`），默认全开。
@@ -5079,22 +5080,25 @@ impl WorkBuffers {
             a_mid: mk(&mut *backend, cfg.a_mid)?,
             g_mid: mk(&mut *backend, cfg.g_mid)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
-            // W8A8 路径：固定 8 槽容量（IMMA 的 BN=8 一次覆盖全部槽），
+            // W8A8 路径：`bsz` 槽容量（IMMA 一次覆盖 `8·NST` 槽，NST≤8 ⇒ 最多 64 槽），
             // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
+            // ⚠️ 容量必须按 **batch** 算：只按 8 槽分配时 batch≥16 会越界写（实测 DEVICE_LOST）。
             xb_q: {
-                let n = 8 * (c.max(cfg.ffn_hidden) / 4);
+                let n = bsz.min(64) * (c.max(cfg.ffn_hidden) / 4);
                 let t = backend.create_tensor(n, TensorDtype::U32)?;
                 backend.upload_u32(t, &vec![0u32; n])?;
                 t
             },
             xb_aux: {
-                let n = 8 * (c.max(cfg.ffn_hidden) / 128) * 4;
+                let n = bsz.min(64) * (c.max(cfg.ffn_hidden) / 128) * 4;
                 let t = backend.create_tensor(n, TensorDtype::F32)?;
                 backend.upload(t, &vec![0.0f32; n])?;
                 t
             },
-            // split-K 部分和：8(KS 上限) × 8(槽上限) × max(c, fh, vocab)
-            imma_partial: mk(&mut *backend, 8 * 8 * c.max(cfg.ffn_hidden).max(vocab))?,
+            // split-K 部分和：8(KS 上限) × batch(≤64) × max(c, fh)。
+            // 不含 `vocab`：head 的 M 很大 ⇒ 块数充足 ⇒ `imma_ksplit` 恒取 1；万一被
+            // `VK_IMMA_KSPLIT` 强制，`imma_ksplit` 也会按容量自行缩回去。
+            imma_partial: mk(&mut *backend, 8 * bsz.min(64) * c.max(cfg.ffn_hidden))?,
             logits: mk(&mut *backend, vocab)?,
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,

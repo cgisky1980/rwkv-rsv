@@ -135,18 +135,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let xt = mk_f32(&mut *b, batch * k)?;
     b.upload(xt, &x)?;
-    let xq = mk_u32(&mut *b, 8 * (k / 4))?;
-    let xaux = mk_f32(&mut *b, 8 * g * 4)?;
-    let y0 = (0..8 * m)
+    let xq = mk_u32(&mut *b, batch * (k / 4))?;
+    let xaux = mk_f32(&mut *b, batch * g * 4)?;
+    let y0 = (0..batch * m)
         .map(|i| (i % 7) as f32 * 0.25 - 0.5)
         .collect::<Vec<f32>>();
 
-    let partial = mk_f32(&mut *b, 8 * 8 * m)?;
+    let partial = mk_f32(&mut *b, 8 * batch * m)?;
     let q = quantize(&x, k, batch);
 
     let mut runs: Vec<Vec<f32>> = Vec::new();
     for _ in 0..reps {
-        let y = mk_f32(&mut *b, 8 * m)?;
+        let y = mk_f32(&mut *b, batch * m)?;
         b.upload(y, &y0)?;
         b.begin_batch()?;
         b.quant_x_i8(xt, None, xq, xaux, k, batch)?;

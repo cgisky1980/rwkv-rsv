@@ -1405,17 +1405,9 @@ impl Runtime {
         debug_assert_eq!(a.k, k);
         let bm = Self::imma_bm(m);
         debug_assert_eq!(m % bm, 0, "gemm_imma: M 需为 {bm} 整除");
-        let ks = Self::imma_ksplit(m, k, bm);
-        debug_assert!(
-            ks == 1 || partial.len >= ks * batch * m,
-            "gemm_imma: partial 缓冲不足（ks={ks} m={m} batch={batch} len={}）",
-            partial.len
-        );
-        let spv = if bm == 64 {
-            "shaders/spv/gemm_imma_bm64.spv"
-        } else {
-            "shaders/spv/gemm_imma_bm128.spv"
-        };
+        let nst = Self::imma_nst(batch);
+        let ks = Self::imma_ksplit(m, k, bm, partial.len, batch);
+        let spv = format!("shaders/spv/gemm_imma_bm{bm}_nst{nst}.spv");
         // ks == 1：直接写 y、由 kernel 施加 op；ks > 1：写 partial、由归约内核施加 op。
         let out: &GpuTensor = if ks == 1 { y } else { partial };
         let spec = [m as u32, k as u32, batch as u32, op, ks as u32];
@@ -1427,10 +1419,10 @@ impl Runtime {
             out.device.address,
         ];
         self.record_kernel(
-            spv,
+            &spv,
             &spec,
             &params,
-            ((m / bm) as u32, ks as u32, 1),
+            ((m / bm) as u32, ks as u32, batch.div_ceil(8 * nst) as u32),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
@@ -1469,6 +1461,25 @@ impl Runtime {
         }
     }
 
+    /// `gemm_imma` 的每 block 槽组数 `NST`：让**权重对任意 batch 都只读一遍**。
+    ///
+    /// **动机（2026-10-04 实测）**：只覆盖 `BN=8` 个槽时，`batch > 8` 要另起一批 block，
+    /// 权重被 `batch/8` 重读 ⇒ 聚合吞吐几乎不随 batch 涨（Vulkan B=8 313.6 → B=16 338.9 tok/s，
+    /// 而 CUDA 426 → 766 → 1296 → 1898 近似线性）。kernel 里在 block 内循环 NST 组槽、
+    /// 复用同一份 smem 权重，即可把重读次数压到 1。
+    ///
+    /// 取「≥ ceil(batch/8) 的最小 2 的幂」（构建期只编了 1/2/4/8 四档），上限 8 ⇒ batch ≤ 64。
+    fn imma_nst(batch: usize) -> usize {
+        let want = batch.div_ceil(8).next_power_of_two();
+        match std::env::var("VK_IMMA_NST")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(v) => v.clamp(1, 8),
+            None => want.clamp(1, 8),
+        }
+    }
+
     /// `gemm_imma` 的 split-K 分块数（`VK_IMMA_KSPLIT` 可强制、`=0` 关闭）。
     ///
     /// **依据**：本 kernel 每 block 吞吐被钉死（CUDA 实测 ~90 GMAC/s/block），而聚合吞吐
@@ -1478,7 +1489,9 @@ impl Runtime {
     ///
     /// 规则：把总块数抬到 `VK_IMMA_KSPLIT_TARGET`（默认 400 ≈ 6×SM 数），分块数上限
     /// `VK_IMMA_KSPLIT_MAX`（默认 8），并要求 `(K/128) % ks == 0`（段按量化组对齐）。
-    fn imma_ksplit(m: usize, k: usize, bm: usize) -> usize {
+    /// 额外约束：部分和缓冲容量 `cap`（`[KS][batch][M]` f32）装不下就往下缩 —— 保险起见
+    /// 由 runtime 按实际容量收口，避免探针/异常形状下越界写。
+    fn imma_ksplit(m: usize, k: usize, bm: usize, cap: usize, batch: usize) -> usize {
         let max_ks: usize = std::env::var("VK_IMMA_KSPLIT_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1503,7 +1516,11 @@ impl Runtime {
                 }
             }
         };
-        while ks > 1 && (!ktiles.is_multiple_of(ks) || k / ks < 128) {
+        while ks > 1
+            && (!ktiles.is_multiple_of(ks)
+                || k / ks < 128
+                || ks.saturating_mul(batch).saturating_mul(m) > cap)
+        {
             ks -= 1;
         }
         ks
