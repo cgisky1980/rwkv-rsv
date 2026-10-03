@@ -1758,7 +1758,7 @@ impl CudaBackend {
         let want = std::env::var("KAW")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| if batch <= 8 { 16 } else { 4 });
+            .unwrap_or(if batch <= 8 { 16 } else { 4 });
         want.clamp(min_kaw, 32)
     }
 
@@ -9369,6 +9369,7 @@ impl ComputeBackend for CudaBackend {
         hist: TensorId,
         batch: usize,
         hist_stride: usize,
+        _sampler_row: usize,
     ) -> R<()> {
         let logits_d = self.f32_ptr(logits, "sample_into_host_seeded_batch")?;
         let token_d = self.f32_ptr(token, "sample_into_host_seeded_batch")?;
@@ -10320,6 +10321,22 @@ impl ComputeBackend for CudaBackend {
         true
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
+    fn supports_lowrank_gemm_batch(&self) -> bool {
+        true
+    }
+
+    fn supports_ffn_value_gemm_batch(&self) -> bool {
+        true
+    }
+
+    fn supports_f16_wkv_state(&self) -> bool {
+        true
+    }
+
     /// `ffn_value_imma_batch` 的形状门控：`imma_gemm_batch` 要求
     /// `k = fh` 是量化分组 128 的倍数，且 m = c 是 mma 行块 8 的倍数。
     fn supports_ffn_value_imma(&self, c: usize, fh: usize, batch: usize) -> bool {
@@ -10378,7 +10395,7 @@ impl ComputeBackend for CudaBackend {
         if !history.is_empty() {
             self.upload_u32(hist, history)?;
         }
-        self.sample_into_host_seeded(logits, token, n, temp, mask, counter, sampler, hist)
+        self.sample_into_host_seeded(logits, token, n, temp, mask, counter, sampler, hist, 0)
     }
     fn clear_cache(&mut self) {
         // CUDA kernel 与缓冲地址/形状无关（地址全部为启动参数，PTX 由静态源码
@@ -11189,6 +11206,7 @@ impl ComputeBackend for CudaBackend {
         counter: TensorId,
         sampler: TensorId,
         hist: TensorId,
+        _sampler_row: usize,
     ) -> R<()> {
         let logits_d = self.f32_ptr(logits, "sample_into_host_seeded")?;
         let token_d = self.f32_ptr(token, "sample_into_host_seeded")?;
@@ -11864,7 +11882,7 @@ mod tests {
         b.upload(sampler_t, &sampler_data).unwrap();
 
         b.sample_into_host_seeded_batch(
-            logits_t, token_t, n, temp_t, mask_t, counter_t, sampler_t, hist_t, batch, 1,
+            logits_t, token_t, n, temp_t, mask_t, counter_t, sampler_t, hist_t, batch, 1, 0,
         )
         .expect("sample_batch");
         let got = b.download(token_t).unwrap();

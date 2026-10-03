@@ -255,8 +255,14 @@ fn run_case(
         }
     };
 
+    // ★ 必须用 begin_batch/end_batch 包住调用：Vulkan 的 `record_kernel` 只把 dispatch
+    // 记进持久 command buffer，**不提交**（`end_batch` 才 submit + wait_idle）。
+    // 旧版本漏了这一步 ⇒ 内核从未真正执行，测到的是纯 host 记录时间
+    // （`add`(27MB 权重) 报 0.0053 ms/call = 5100 GB/s，物理不可能）。
     for _ in 0..warmup {
+        b.begin_batch()?;
         call(b)?;
+        b.end_batch()?;
     }
     // 预热后同步一次，避免把首次编译/首次 launch 的开销计入。
     let _ = b.download(y)?;
@@ -265,11 +271,12 @@ fn run_case(
     let mut best = f64::INFINITY;
     let mut worst = 0.0f64;
     for _ in 0..repeats {
+        b.begin_batch()?;
         let t0 = Instant::now();
         for _ in 0..iters {
             call(b)?;
         }
-        let _ = b.download(y)?; // 每轮唯一一次同步
+        b.end_batch()?; // submit + wait_idle：把 GPU 执行时间算进来
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         best = best.min(ms);
         worst = worst.max(ms);

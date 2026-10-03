@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use crate::runtime::{GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime};
+use crate::runtime::{
+    GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32,
+};
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -505,6 +507,34 @@ pub trait ComputeBackend {
         false
     }
 
+    /// 该后端是否支持 batch 并发解码路径（单实例多序列）。默认 false。
+    /// 供模型层门控：`GpuModel::supports_batch_decode()` 需同时满足「模型 int8」与
+    /// 「后端实现了 `*_batch` 算子」，避免「报支持、运行期 Err」。
+    fn supports_batch_decode(&self) -> bool {
+        false
+    }
+
+    /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核两级融合，CUDA 专有）。
+    /// false 时 batch 低秩链走 `gemv_int8_rkv_stage1_batch` + `gemv_lowrank_chain4_batch`
+    /// 的 SIMT 路径（Vulkan）。
+    fn supports_lowrank_gemm_batch(&self) -> bool {
+        false
+    }
+
+    /// 该后端是否支持 `ffn_value_gemm_batch`（fp16 张量核稠密 FFN，CUDA 专有）。
+    /// false 时 batch FFN 走稀疏 / `gemv_int8_add` 路径（Vulkan）。
+    fn supports_ffn_value_gemm_batch(&self) -> bool {
+        false
+    }
+
+    /// 该后端的状态内核是否支持 **fp16 存储**的 WKV 状态（`tmix_rnn`）。
+    /// CUDA 支持（`WKV_S16` 变体，三处状态内核同 dtype）；Vulkan 的 GLSL 状态内核
+    /// （`fuse_ka_dplr_norm` / `dplr_seq` / `dplr_seq_batch`）的 `BufS` 为 f32 专用
+    /// → 返回 false，建 state 时回退 f32，否则算子会拿到 fp16 张量并报类型错误。
+    fn supports_f16_wkv_state(&self) -> bool {
+        false
+    }
+
     /// 该 backend 是否支持 `ffn_value_imma_batch` 的给定形状（默认否）。
     /// 门控放在 backend 里而不是调用点，避免调用点硬编码 `quant_x_i8` 的 128 分组约束。
     fn supports_ffn_value_imma(&self, _c: usize, _fh: usize, _batch: usize) -> bool {
@@ -745,6 +775,7 @@ pub trait ComputeBackend {
     /// batch 版采样：logits/temp/mask/counter 为 [batch, n]，token 为 [batch]，
     /// sampler 为 [batch, 10]（每 slot 独立参数），hist 为 [batch, hist_stride]
     /// （每 slot 实际历史长度取自 sampler[7]，须 ≤ hist_stride）。
+    /// `sampler_row`：多轮自循环里该轮读 sampler 的第几行（每行 `10*batch` 个 f32）。
     #[allow(clippy::too_many_arguments)]
     fn sample_into_host_seeded_batch(
         &mut self,
@@ -758,6 +789,7 @@ pub trait ComputeBackend {
         _hist: TensorId,
         _batch: usize,
         _hist_stride: usize,
+        _sampler_row: usize,
     ) -> R<()> {
         Err("sample_into_host_seeded_batch not supported by this backend".into())
     }
@@ -1110,6 +1142,8 @@ pub trait ComputeBackend {
     ) -> R<()>;
     /// GPU 采样（self-loop 批量版）：结果写回 token 的 host-visible 缓冲。
     /// temp/mask/sampler/hist 为 F32，counter 为 U32，均由调用方预建。
+    /// `sampler_row`：多轮自循环里该轮读 sampler 的第几行（每行 10 个 f32）。
+    /// CUDA 忽略（每轮把参数异步覆盖到同一 device 缓冲）；Vulkan 按行索引 host 缓冲。
     #[allow(clippy::too_many_arguments)]
     fn sample_into_host_seeded(
         &mut self,
@@ -1121,6 +1155,7 @@ pub trait ComputeBackend {
         counter: TensorId,
         sampler: TensorId,
         hist: TensorId,
+        sampler_row: usize,
     ) -> R<()>;
     /// 把 host-visible 缓冲 in_tok[0] 追加到 out_seq[cnt]，cnt 自增（self-loop 记录用）。
     fn record_token(&mut self, in_tok: TensorId, out_seq: TensorId, cnt: TensorId) -> R<()>;
@@ -1328,6 +1363,67 @@ impl ComputeBackend for VulkanBackend {
         match self.tensors.get(&t).ok_or("download_u32: unknown tensor")? {
             VulkanTensor::U32(g) => self.rt.download_u32(g, len),
             _ => Err("download_u32: t must be u32".into()),
+        }
+    }
+
+    fn upload_part(&self, t: TensorId, offset: usize, data: &[f32]) -> R<()> {
+        match self.tensors.get(&t).ok_or("upload_part: unknown tensor")? {
+            VulkanTensor::F32(g) => self.rt.upload_part(g, offset, data),
+            VulkanTensor::F16(g) => self.rt.upload_part_f16(g, offset, data),
+            VulkanTensor::U32(_) => Err("upload_part: u32 tensor unsupported".into()),
+        }
+    }
+
+    fn download_part(&self, t: TensorId, offset: usize, len: usize) -> R<Vec<f32>> {
+        match self
+            .tensors
+            .get(&t)
+            .ok_or("download_part: unknown tensor")?
+        {
+            VulkanTensor::F32(g) => self.rt.download_part(g, offset, len),
+            VulkanTensor::F16(g) => self.rt.download_part_f16(g, offset, len),
+            VulkanTensor::U32(_) => Err("download_part: u32 tensor unsupported".into()),
+        }
+    }
+
+    fn copy_range(
+        &mut self,
+        src: TensorId,
+        src_off: usize,
+        dst: TensorId,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        // 取出 dst（可变借用），src 只读；同 dtype 约束由运行期自然报错。
+        match self.tensors.remove(&dst).ok_or("copy_range: unknown dst")? {
+            VulkanTensor::F32(mut d) => {
+                let s = match self.tensors.get(&src).ok_or("copy_range: unknown src")? {
+                    VulkanTensor::F32(g) => g.clone(),
+                    _ => {
+                        self.put_f32(dst, d);
+                        return Err("copy_range: src/dst dtype mismatch".into());
+                    }
+                };
+                let res = self.rt.copy_range(&s, src_off, &mut d, dst_off, len);
+                self.put_f32(dst, d);
+                res
+            }
+            VulkanTensor::F16(mut d) => {
+                let s = match self.tensors.get(&src).ok_or("copy_range: unknown src")? {
+                    VulkanTensor::F16(g) => g.clone(),
+                    _ => {
+                        self.put_f16(dst, d);
+                        return Err("copy_range: src/dst dtype mismatch".into());
+                    }
+                };
+                let res = self.rt.copy_range_f16(&s, src_off, &mut d, dst_off, len);
+                self.put_f16(dst, d);
+                res
+            }
+            other => {
+                self.tensors.insert(dst, other);
+                Err("copy_range: u32 tensor unsupported".into())
+            }
         }
     }
 
@@ -1857,6 +1953,10 @@ impl ComputeBackend for VulkanBackend {
         self.rt.supports_sparse_ffn()
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
     fn gemv_int8_add(
         &mut self,
         a: &Int8Handle,
@@ -2337,6 +2437,508 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
+    // ===== batch 并发（单实例多序列）算子：转调 Runtime 的批量变体 =====
+
+    fn gather_rows_device_f16(
+        &mut self,
+        src: TensorId,
+        dst: TensorId,
+        tok: TensorId,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        const BLOCK: usize = 256;
+        let mut dst_o = self.take_f32(dst, "gather_rows_device_f16")?;
+        let src_g = self.get_f16(src, "gather_rows_device_f16")?;
+        // tok 可为 F32（位模式存 uint）或 U32；与单流路径一致走 **host 可见缓冲**
+        // （CPU 预置 seed / shader 采样写回都落在 host 侧）。
+        let (tok_addr, tok_buf) = match self
+            .tensors
+            .get(&tok)
+            .ok_or("gather_rows_device_f16: unknown tok")?
+        {
+            VulkanTensor::F32(g) => {
+                let h = g
+                    .host
+                    .as_ref()
+                    .ok_or("gather_rows_device_f16: tok host dropped")?;
+                (h.address, h.buffer)
+            }
+            VulkanTensor::U32(g) => {
+                let h = g
+                    .host
+                    .as_ref()
+                    .ok_or("gather_rows_device_f16: tok host dropped")?;
+                (h.address, h.buffer)
+            }
+            VulkanTensor::F16(_) => {
+                self.put_f32(dst, dst_o);
+                return Err("gather_rows_device_f16: tok must be f32 or u32".into());
+            }
+        };
+        let res = self.rt.gather_rows_device_f16_batch(
+            &src_g,
+            &mut dst_o,
+            tok_addr,
+            &tok_buf,
+            c,
+            batch,
+            BLOCK as u32,
+        );
+        self.put_f32(dst, dst_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seq_shift_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        tm: TensorId,
+        y: TensorId,
+        c: usize,
+        t: usize,
+        stride_x: usize,
+        stride_y: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut y_o = self.take_f32(y, "seq_shift_batch")?;
+        let res = {
+            let x_g = self.get_f32(x, "seq_shift_batch")?;
+            let s_g = self.get_f32(state, "seq_shift_batch")?;
+            let tm_g = self.get_f32(tm, "seq_shift_batch")?;
+            self.rt
+                .seq_shift_batch(&x_g, &s_g, &tm_g, &mut y_o, c, t, stride_x, stride_y, batch)
+        };
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn copy_token_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        lens: TensorId,
+        c: usize,
+        t: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut s_o = self.take_f32(state, "copy_token_batch")?;
+        let res = {
+            let x_g = self.get_f32(x, "copy_token_batch")?;
+            let lens_g = self.get_u32(lens, "copy_token_batch")?;
+            self.rt
+                .copy_token_batch(&x_g, &mut s_o, &lens_g, c, t, batch)
+        };
+        self.put_f32(state, s_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dplr_seq_batch(
+        &mut self,
+        s: TensorId,
+        r: TensorId,
+        w: TensorId,
+        k: TensorId,
+        v: TensorId,
+        a: TensorId,
+        b: TensorId,
+        y: TensorId,
+        lens: TensorId,
+        h: usize,
+        n: usize,
+        t: usize,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut s_o = self.take_f32(s, "dplr_seq_batch")?;
+        let mut y_o = self.take_f32(y, "dplr_seq_batch")?;
+        let res = {
+            let r_g = self.get_f32(r, "dplr_seq_batch")?;
+            let w_g = self.get_f32(w, "dplr_seq_batch")?;
+            let k_g = self.get_f32(k, "dplr_seq_batch")?;
+            let v_g = self.get_f32(v, "dplr_seq_batch")?;
+            let a_g = self.get_f32(a, "dplr_seq_batch")?;
+            let b_g = self.get_f32(b, "dplr_seq_batch")?;
+            let lens_g = self.get_u32(lens, "dplr_seq_batch")?;
+            self.rt.dplr_seq_batch(
+                &mut s_o, &r_g, &w_g, &k_g, &v_g, &a_g, &b_g, &mut y_o, &lens_g, h, n, t, c, batch,
+            )
+        };
+        self.put_f32(s, s_o);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn segmean(
+        &mut self,
+        x: TensorId,
+        out: TensorId,
+        lens: TensorId,
+        c: usize,
+        t_pad: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut out_o = self.take_f32(out, "segmean")?;
+        let res = {
+            let x_g = self.get_f32(x, "segmean")?;
+            let lens_g = self.get_u32(lens, "segmean")?;
+            self.rt.segmean(&x_g, &mut out_o, &lens_g, c, t_pad, batch)
+        };
+        self.put_f32(out, out_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn norm_lerp6_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        xr: TensorId,
+        xw: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        or: TensorId,
+        ow: TensorId,
+        ok: TensorId,
+        ov: TensorId,
+        oa: TensorId,
+        og: TensorId,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let mut s_o = self.take_f32(state, "norm_lerp6_batch")?;
+        let mut or_o = self.take_f32(or, "norm_lerp6_batch")?;
+        let mut ow_o = self.take_f32(ow, "norm_lerp6_batch")?;
+        let mut ok_o = self.take_f32(ok, "norm_lerp6_batch")?;
+        let mut ov_o = self.take_f32(ov, "norm_lerp6_batch")?;
+        let mut oa_o = self.take_f32(oa, "norm_lerp6_batch")?;
+        let mut og_o = self.take_f32(og, "norm_lerp6_batch")?;
+        let res = {
+            let x_g = self.get_f32(x, "norm_lerp6_batch")?;
+            let gamma_g = self.get_f32(gamma, "norm_lerp6_batch")?;
+            let beta_g = self.get_f32(beta, "norm_lerp6_batch")?;
+            let xr_g = self.get_f32(xr, "norm_lerp6_batch")?;
+            let xw_g = self.get_f32(xw, "norm_lerp6_batch")?;
+            let xk_g = self.get_f32(xk, "norm_lerp6_batch")?;
+            let xv_g = self.get_f32(xv, "norm_lerp6_batch")?;
+            let xa_g = self.get_f32(xa, "norm_lerp6_batch")?;
+            let xg_g = self.get_f32(xg, "norm_lerp6_batch")?;
+            self.rt.norm_lerp6_batch(
+                &x_g, &mut s_o, &gamma_g, &beta_g, &xr_g, &xw_g, &xk_g, &xv_g, &xa_g, &xg_g,
+                &mut or_o, &mut ow_o, &mut ok_o, &mut ov_o, &mut oa_o, &mut og_o, c, eps, batch,
+            )
+        };
+        self.put_f32(state, s_o);
+        self.put_f32(or, or_o);
+        self.put_f32(ow, ow_o);
+        self.put_f32(ok, ok_o);
+        self.put_f32(ov, ov_o);
+        self.put_f32(oa, oa_o);
+        self.put_f32(og, og_o);
+        res
+    }
+
+    fn cmix_norm_lerp_batch(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        coeff: TensorId,
+        out_xb: TensorId,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let mut s_o = self.take_f32(state, "cmix_norm_lerp_batch")?;
+        let mut xb_o = self.take_f32(out_xb, "cmix_norm_lerp_batch")?;
+        let res = {
+            let x_g = self.get_f32(x, "cmix_norm_lerp_batch")?;
+            let gamma_g = self.get_f32(gamma, "cmix_norm_lerp_batch")?;
+            let beta_g = self.get_f32(beta, "cmix_norm_lerp_batch")?;
+            let coeff_g = self.get_f32(coeff, "cmix_norm_lerp_batch")?;
+            self.rt.cmix_norm_lerp_batch(
+                &x_g, &mut s_o, &gamma_g, &beta_g, &coeff_g, &mut xb_o, c, eps, batch,
+            )
+        };
+        self.put_f32(state, s_o);
+        self.put_f32(out_xb, xb_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_rkv_stage1_batch(
+        &mut self,
+        r: &Int8Handle,
+        k: &Int8Handle,
+        v: &Int8Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut or_o = self.take_f32(out_r, "gemv_int8_rkv_stage1_batch")?;
+        let mut ok_o = self.take_f32(out_k, "gemv_int8_rkv_stage1_batch")?;
+        let mut ov_o = self.take_f16(out_v, "gemv_int8_rkv_stage1_batch")?;
+        let mut ovm_o = self.take_f32(out_vm, "gemv_int8_rkv_stage1_batch")?;
+        let mut owm_o = self.take_f32(out_wm, "gemv_int8_rkv_stage1_batch")?;
+        let mut oam_o = self.take_f32(out_am, "gemv_int8_rkv_stage1_batch")?;
+        let mut ogm_o = self.take_f32(out_gm, "gemv_int8_rkv_stage1_batch")?;
+        let res = {
+            let ra8 = self.int8_ref(r, "gemv_int8_rkv_stage1_batch")?;
+            let ka8 = self.int8_ref(k, "gemv_int8_rkv_stage1_batch")?;
+            let va8 = self.int8_ref(v, "gemv_int8_rkv_stage1_batch")?;
+            let v1_g = self.get_f32(v1, "gemv_int8_rkv_stage1_batch")?;
+            let w1_g = self.get_f32(w1, "gemv_int8_rkv_stage1_batch")?;
+            let a1_g = self.get_f32(a1, "gemv_int8_rkv_stage1_batch")?;
+            let g1_g = self.get_f32(g1, "gemv_int8_rkv_stage1_batch")?;
+            let xr_g = self.get_f32(xr, "gemv_int8_rkv_stage1_batch")?;
+            let xk_g = self.get_f32(xk, "gemv_int8_rkv_stage1_batch")?;
+            let xv_g = self.get_f32(xv, "gemv_int8_rkv_stage1_batch")?;
+            let xw_g = self.get_f32(xw, "gemv_int8_rkv_stage1_batch")?;
+            let xa_g = self.get_f32(xa, "gemv_int8_rkv_stage1_batch")?;
+            let xg_g = self.get_f32(xg, "gemv_int8_rkv_stage1_batch")?;
+            self.rt.gemv_int8_rkv_stage1_batch(
+                &ra8, &ka8, &va8, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
+                &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
+                &mut ogm_o, c, vm, wm, am, gm, batch,
+            )
+        };
+        self.put_f32(out_r, or_o);
+        self.put_f32(out_k, ok_o);
+        self.put_f16(out_v, ov_o);
+        self.put_f32(out_vm, ovm_o);
+        self.put_f32(out_wm, owm_o);
+        self.put_f32(out_am, oam_o);
+        self.put_f32(out_gm, ogm_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowrank_chain4_batch(
+        &mut self,
+        w2: TensorId,
+        a2: TensorId,
+        v2: TensorId,
+        g2: TensorId,
+        w_mid: TensorId,
+        a_mid: TensorId,
+        v_mid: TensorId,
+        g_mid: TensorId,
+        w0: TensorId,
+        a0: TensorId,
+        v0: TensorId,
+        scale: TensorId,
+        v_first: TensorId,
+        out_w: TensorId,
+        out_a: TensorId,
+        out_v: TensorId,
+        out_g: TensorId,
+        m: usize,
+        kw: usize,
+        ka: usize,
+        kv: usize,
+        kg: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut ow_o = self.take_f16(out_w, "gemv_lowrank_chain4_batch")?;
+        let mut oa_o = self.take_f16(out_a, "gemv_lowrank_chain4_batch")?;
+        let mut ov_o = self.take_f16(out_v, "gemv_lowrank_chain4_batch")?;
+        let mut og_o = self.take_f16(out_g, "gemv_lowrank_chain4_batch")?;
+        let res = {
+            let w2_g = self.get_f32(w2, "gemv_lowrank_chain4_batch")?;
+            let a2_g = self.get_f32(a2, "gemv_lowrank_chain4_batch")?;
+            let v2_g = self.get_f32(v2, "gemv_lowrank_chain4_batch")?;
+            let g2_g = self.get_f32(g2, "gemv_lowrank_chain4_batch")?;
+            let wm_g = self.get_f32(w_mid, "gemv_lowrank_chain4_batch")?;
+            let am_g = self.get_f32(a_mid, "gemv_lowrank_chain4_batch")?;
+            let vm_g = self.get_f32(v_mid, "gemv_lowrank_chain4_batch")?;
+            let gm_g = self.get_f32(g_mid, "gemv_lowrank_chain4_batch")?;
+            let w0_g = self.get_f32(w0, "gemv_lowrank_chain4_batch")?;
+            let a0_g = self.get_f32(a0, "gemv_lowrank_chain4_batch")?;
+            let v0_g = self.get_f32(v0, "gemv_lowrank_chain4_batch")?;
+            let sc_g = self.get_f32(scale, "gemv_lowrank_chain4_batch")?;
+            let vf_g = self.get_f16(v_first, "gemv_lowrank_chain4_batch")?;
+            self.rt.gemv_lowrank_chain4_batch(
+                &w2_g, &a2_g, &v2_g, &g2_g, &wm_g, &am_g, &vm_g, &gm_g, &w0_g, &a0_g, &v0_g, &sc_g,
+                &vf_g, &mut ow_o, &mut oa_o, &mut ov_o, &mut og_o, m, kw, ka, kv, kg, batch,
+            )
+        };
+        self.put_f16(out_w, ow_o);
+        self.put_f16(out_a, oa_o);
+        self.put_f16(out_v, ov_o);
+        self.put_f16(out_g, og_o);
+        res
+    }
+
+    fn ffn_value_sparse_add_batch(
+        &mut self,
+        value_tiled: TensorId,
+        r2: TensorId,
+        x: TensorId,
+        c: usize,
+        fh: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut x_o = self.take_f32(x, "ffn_value_sparse_add_batch")?;
+        let res = {
+            let vt_g = self.get_f16(value_tiled, "ffn_value_sparse_add_batch")?;
+            let r2_g = self.get_f32(r2, "ffn_value_sparse_add_batch")?;
+            self.rt
+                .ffn_value_sparse_add_batch(&vt_g, &r2_g, &mut x_o, c, fh, batch)
+        };
+        self.put_f32(x, x_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_into_host_seeded_batch(
+        &mut self,
+        logits: TensorId,
+        token: TensorId,
+        n: usize,
+        temp: TensorId,
+        mask: TensorId,
+        counter: TensorId,
+        sampler: TensorId,
+        hist: TensorId,
+        batch: usize,
+        hist_stride: usize,
+        sampler_row: usize,
+    ) -> R<()> {
+        let logits_g = self.get_f32(logits, "sample_into_host_seeded_batch")?;
+        let tok_g = self.get_f32(token, "sample_into_host_seeded_batch")?;
+        let temp_g = self.get_f32(temp, "sample_into_host_seeded_batch")?;
+        let mask_g = self.get_f32(mask, "sample_into_host_seeded_batch")?;
+        let counter_g = self.get_u32(counter, "sample_into_host_seeded_batch")?;
+        let sampler_g = self.get_f32(sampler, "sample_into_host_seeded_batch")?;
+        let hist_g = self.get_f32(hist, "sample_into_host_seeded_batch")?;
+        // ★ **一次 dispatch 覆盖全部 slot**（slot 走 grid.y）——逐槽 dispatch 会被
+        // buffer 级 barrier 串行化（见 `Runtime::record_sample` 注释）。
+        // token 写回 host 可见缓冲（与单流路径一致，供下一轮 gather 读取）。
+        let tok_host = tok_g
+            .host
+            .as_ref()
+            .ok_or("sample_into_host_seeded_batch: token host dropped")?;
+        self.rt.record_sample(
+            &logits_g,
+            tok_host.address,
+            &tok_host.buffer,
+            &temp_g,
+            &mask_g,
+            &counter_g,
+            &sampler_g,
+            sampler_row,
+            batch,
+            hist_g.device.address,
+            &hist_g.device.buffer,
+            n,
+            hist_stride,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fuse_ka_dplr_norm_batch(
+        &mut self,
+        s: TensorId,
+        k: TensorId,
+        k_k: TensorId,
+        a: TensorId,
+        k_a: TensorId,
+        r: TensorId,
+        v: TensorId,
+        w: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        r_k: TensorId,
+        k_mod: TensorId,
+        y: TensorId,
+        y_norm: TensorId,
+        h: usize,
+        n: usize,
+        eps: f32,
+        gn_eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let mut s_o = self.take_f32(s, "fuse_ka_dplr_norm_batch")?;
+        let mut km_o = self.take_f32(k_mod, "fuse_ka_dplr_norm_batch")?;
+        let mut y_o = self.take_f32(y, "fuse_ka_dplr_norm_batch")?;
+        let mut yn_o = self.take_f32(y_norm, "fuse_ka_dplr_norm_batch")?;
+        let res = {
+            let k_g = self.get_f32(k, "fuse_ka_dplr_norm_batch")?;
+            let k_k_g = self.get_f32(k_k, "fuse_ka_dplr_norm_batch")?;
+            let a_g = self.get_f16(a, "fuse_ka_dplr_norm_batch")?;
+            let k_a_g = self.get_f32(k_a, "fuse_ka_dplr_norm_batch")?;
+            let r_g = self.get_f32(r, "fuse_ka_dplr_norm_batch")?;
+            let v_g = self.get_f16(v, "fuse_ka_dplr_norm_batch")?;
+            let w_g = self.get_f16(w, "fuse_ka_dplr_norm_batch")?;
+            let gamma_g = self.get_f32(gamma, "fuse_ka_dplr_norm_batch")?;
+            let beta_g = self.get_f32(beta, "fuse_ka_dplr_norm_batch")?;
+            let r_k_g = self.get_f32(r_k, "fuse_ka_dplr_norm_batch")?;
+            self.rt.fuse_ka_dplr_norm_batch(
+                &mut s_o, &k_g, &k_k_g, &a_g, &k_a_g, &r_g, &v_g, &w_g, &gamma_g, &beta_g, &r_k_g,
+                &mut km_o, &mut y_o, &mut yn_o, h, n, eps, gn_eps, batch,
+            )
+        };
+        self.put_f32(s, s_o);
+        self.put_f32(k_mod, km_o);
+        self.put_f32(y, y_o);
+        self.put_f32(y_norm, yn_o);
+        res
+    }
+
+    fn record_tokens(
+        &mut self,
+        in_tok: TensorId,
+        out_seq: TensorId,
+        cnt: TensorId,
+        stride: usize,
+        batch: usize,
+    ) -> R<()> {
+        let in_tok_g = self.get_f32(in_tok, "record_tokens")?;
+        let out_g = self.get_f32(out_seq, "record_tokens")?;
+        let mut cnt_o = self.take_f32(cnt, "record_tokens")?;
+        let res = (|| -> R<()> {
+            let h = in_tok_g
+                .host
+                .as_ref()
+                .ok_or("record_tokens: in_tok host dropped")?;
+            for slot in 0..batch {
+                self.rt
+                    .record_token_slot(h.address, &h.buffer, &out_g, &mut cnt_o, stride, slot)?;
+            }
+            Ok(())
+        })();
+        self.put_f32(cnt, cnt_o);
+        res
+    }
+
     fn store_sampler_host(
         &self,
         sampler: TensorId,
@@ -2363,6 +2965,86 @@ impl ComputeBackend for VulkanBackend {
         )
     }
 
+    /// Vulkan 版「异步」采样参数写入：直接写 sampler 的 host 映射区第 `row` 行
+    /// （纯 CPU memcpy，无 device 拷贝、无 host↔GPU 同步）。
+    /// 「整段 n 轮单次提交」的自循环里，第 r 轮采样读第 r 行——这就是 CUDA graph +
+    /// pinned 异步拷贝在 Vulkan 上的等价手段，且更省（连拷贝都省了）。
+    #[allow(clippy::too_many_arguments)]
+    fn store_sampler_async(
+        &self,
+        sampler: TensorId,
+        row: usize,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u32,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        hist_len: u32,
+    ) -> R<()> {
+        let s = self.get_f32(sampler, "store_sampler_async")?;
+        let data = [
+            temperature,
+            f32::from_bits(top_k),
+            top_p,
+            f32::from_bits(seed),
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            f32::from_bits(hist_len),
+            1.0, // penalty_decay（单流自循环不用衰减；index 8）
+            0.0, // 保留（index 9，对齐 40 字节行）
+        ];
+        self.rt
+            .store_sampler_row(&s, row, SAMPLER_ROW_F32 as usize, &data)
+    }
+
+    fn sampler_async_rows(&self) -> usize {
+        // Vulkan 的行容量由 sampler 张量自身尺寸决定（`10*batch*n`），此处只需保证
+        // 「最终 use_async 判定为真」；真正的越界由 `store_sampler_row` 按张量长度校验。
+        usize::MAX / 64
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_sampler_async_batch(
+        &self,
+        sampler: TensorId,
+        row: usize,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seeds: &[u32],
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        hist_len: u32,
+        penalty_decay: f32,
+    ) -> R<()> {
+        let batch = seeds.len();
+        if batch == 0 {
+            return Ok(());
+        }
+        let s = self.get_f32(sampler, "store_sampler_async_batch")?;
+        let mut data = Vec::with_capacity(batch * SAMPLER_ROW_F32 as usize);
+        for &seed in seeds {
+            data.extend_from_slice(&[
+                temperature,
+                f32::from_bits(top_k),
+                top_p,
+                f32::from_bits(seed),
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                f32::from_bits(hist_len),
+                penalty_decay,
+                0.0,
+            ]);
+        }
+        self.rt
+            .store_sampler_row(&s, row, batch * SAMPLER_ROW_F32 as usize, &data)
+    }
+
     fn sample_into_host_seeded(
         &mut self,
         logits: TensorId,
@@ -2373,6 +3055,7 @@ impl ComputeBackend for VulkanBackend {
         counter: TensorId,
         sampler: TensorId,
         hist: TensorId,
+        sampler_row: usize,
     ) -> R<()> {
         let logits_g = self.get_f32(logits, "sample_into_host_seeded")?;
         let tok_g = self.get_f32(token, "sample_into_host_seeded")?;
@@ -2386,7 +3069,15 @@ impl ComputeBackend for VulkanBackend {
         let sampler_g = self.get_f32(sampler, "sample_into_host_seeded")?;
         let hist_g = self.get_f32(hist, "sample_into_host_seeded")?;
         self.rt.sample_into_host_seeded(
-            &logits_g, tok_host, n, &temp_g, &mask_g, &counter_g, &sampler_g, &hist_g,
+            &logits_g,
+            tok_host,
+            n,
+            &temp_g,
+            &mask_g,
+            &counter_g,
+            &sampler_g,
+            &hist_g,
+            sampler_row,
         )
     }
 

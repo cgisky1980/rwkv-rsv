@@ -1,0 +1,131 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// DPLR 状态更新（batch 并发版）：每个 workgroup 处理一个 (slot, head)，
+// S 在寄存器中跨 token 传递，每 slot 按 `lens[slot]` 截断（padding 段不进状态）。
+//
+//   S[i,j] = S[i,j]*w[j] + sa[i]*b[j] + v[i]*k[j]   （sa[i] = sum_j S[i,j]*a[j]）
+//   y[i]  += S[i,j] * r[j]
+//
+// 布局：
+//   s     : [batch, H, N, N]（slot 主序；状态存储 dtype = f32，与 Vulkan 单序列
+//           `dplr_seq.comp` / `fuse_ka_dplr_norm.comp` 的 BufS 一致）
+//   r/w/k/v/a/b/y : [batch, T, C]，C = H*N，token 步长 C
+//   lens  : [batch] uint（实际 token 数，>=1）
+// 语义与 CUDA `rwkv_dplr_seq_batch` 一致。
+//
+// dispatch: (H, batch, 1)
+
+layout(constant_id = 0) const uint H = 1;
+layout(constant_id = 1) const uint N = 64;
+layout(constant_id = 2) const uint T = 1;
+
+layout(constant_id = 3) const uint STRIDE_S_X = 1;    // j axis of S
+layout(constant_id = 4) const uint STRIDE_S_Y = 64;   // i axis of S
+layout(constant_id = 5) const uint STRIDE_S_Z = 4096; // head axis of S (N*N)
+
+layout(constant_id = 6) const uint STRIDE_V_X = 1;    // i axis within head
+layout(constant_id = 7) const uint STRIDE_V_Y = 64;   // head axis of r/w/k/v/a/b/y
+layout(constant_id = 8) const uint STRIDE_V_Z = 4096; // token stride of r/w/k/v/a/b/y (C)
+
+const uint BLOCK_SIZE = 64; // == N
+
+shared float sh_a[BLOCK_SIZE];
+shared float sh_w[BLOCK_SIZE];
+shared float sh_b[BLOCK_SIZE];
+shared float sh_k[BLOCK_SIZE];
+shared float sh_r[BLOCK_SIZE];
+
+layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+layout(buffer_reference) buffer BufR  { float data[]; }  buf_r;
+layout(buffer_reference) buffer BufW  { float data[]; }  buf_w;
+layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;
+layout(buffer_reference) buffer BufV  { float data[]; }  buf_v;
+layout(buffer_reference) buffer BufA  { float data[]; }  buf_a;
+layout(buffer_reference) buffer BufB  { float data[]; }  buf_b;
+layout(buffer_reference) buffer BufY  { float data[]; }  buf_y;
+layout(buffer_reference) buffer Lens  { uint  data[]; }  lens;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufS  buf_s;
+    BufR  buf_r;
+    BufW  buf_w;
+    BufK  buf_k;
+    BufV  buf_v;
+    BufA  buf_a;
+    BufB  buf_b;
+    BufY  buf_y;
+    Lens  lens;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint i    = gl_LocalInvocationID.x;
+
+    if (i >= N) {
+        return;
+    }
+
+    BufS buf_s = params.buf_s;
+    BufR buf_r = params.buf_r;
+    BufW buf_w = params.buf_w;
+    BufK buf_k = params.buf_k;
+    BufV buf_v = params.buf_v;
+    BufA buf_a = params.buf_a;
+    BufB buf_b = params.buf_b;
+    BufY buf_y = params.buf_y;
+
+    const uint s_base   = slot * H * STRIDE_S_Z + head * STRIDE_S_Z;
+    const uint v_base   = slot * T * STRIDE_V_Z + head * STRIDE_V_Y;
+    const uint slot_tok = slot * T;
+
+    float sreg[BLOCK_SIZE];
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        sreg[j] = buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X];
+    }
+
+    const uint len = min(params.lens.data[slot], T);
+    for (uint t = 0; t < len; ++t) {
+        const uint e = v_base + i * STRIDE_V_X + t * STRIDE_V_Z;
+
+        sh_a[i] = buf_a.data[e];
+        sh_w[i] = buf_w.data[e];
+        sh_b[i] = buf_b.data[e];
+        sh_k[i] = buf_k.data[e];
+        sh_r[i] = buf_r.data[e];
+        barrier();
+
+        const float vv = buf_v.data[e];
+
+        float sa = 0.0;
+        [[unroll]]
+        for (uint j = 0; j < N; ++j) {
+            sa += sh_a[j] * sreg[j];
+        }
+
+        float y = 0.0;
+        [[unroll]]
+        for (uint j = 0; j < N; ++j) {
+            sreg[j] = sreg[j] * sh_w[j] + sh_k[j] * vv + sa * sh_b[j];
+            y += sreg[j] * sh_r[j];
+        }
+        buf_y.data[e] = y;
+
+        barrier();
+    }
+
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X] = sreg[j];
+    }
+}

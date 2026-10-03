@@ -19,9 +19,16 @@ layout(set = 0, binding = 0, std430) uniform Params {
     Cnt cnt;
 } params;
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// workgroup X = spec 常量（runtime 传设备 subgroup_size）。
+// 本 shader 不用 subgroup 指令，但 `create_kernel` 对所有 pipeline 统一设置
+// `requiredSubgroupSize` + `REQUIRE_FULL_SUBGROUPS`；此时规范要求
+// local_size_x % requiredSubgroupSize == 0（VUID-VkPipelineShaderStageCreateInfo-pNext-02757）。
+// 固定写 1 会造出**非法 pipeline**，dispatch 直接 ERROR_DEVICE_LOST（2026-10-03 实录）。
+layout(constant_id = 0) const uint WG_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
+    if (gl_LocalInvocationIndex != 0u) return;
     uint i = atomicAdd(params.cnt.data[0], 1u);
     params.out_seq.data[i] = params.in_tok.data[0];
 }

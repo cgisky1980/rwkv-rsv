@@ -1,0 +1,174 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合 4 条低秩链第二级（batch 并发版）：w2/a2/g2/v2 → 1 次 dispatch。
+// **subgroup-per-row**：每 subgroup 一个输出行，每 workgroup NUM_SUBGROUPS 行。
+//   行映射锚点：row = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID
+//                slot0 = gl_WorkGroupID.y * BGRP（本 workgroup 覆盖 BGRP 个槽）
+//   每个 (行, 槽) 的 k 累加顺序与旧版一致，故结果逐位相同。
+// dispatch (M / NUM_SUBGROUPS, ceil(batch/BGRP), 1)。
+//
+// ★ BGRP（2026-10-03）：W2/A2/V2/G2 共 M×(96+96+64+320)×4B = 5.9MB，旧版 slot 走 grid.y
+//   ⇒ 同一份权重被 8 个槽各读一遍（47MB/层、整步 1.46GB ≈ 2.6ms，纯带宽）。本版每个
+//   workgroup 同时算 BGRP 个槽：权重每 k 只读一次、在寄存器里复用给 BGRP 个槽。
+//
+//   w：out = exp(scale * sigmoid(xw @ W2 + w0))                    [K_W, scale, w0]
+//   a：out = sigmoid(xa @ A2 + a0)                                 [K_A, a0]
+//   v：out = v + sigmoid(xv @ V2 + v0) * (v_first - v)（原地写 v） [K_V, v0, v_first]
+//   g：out = sigmoid(xg) @ G2                                      [K_G]
+//
+// per-slot：xw/xa/xv/xg 为 [batch, K_*]，out_w/a/v/g 与 v_first 为 [batch, M]；
+// W2/A2/V2/G2 与 w0/a0/v0/scale 跨 slot 共享。
+
+layout(constant_id = 0) const uint M   = 4096;  // 输出维度（C）
+layout(constant_id = 1) const uint K_W = 96;
+layout(constant_id = 2) const uint K_A = 96;
+layout(constant_id = 3) const uint K_V = 64;
+layout(constant_id = 4) const uint K_G = 320;
+
+const uint BLOCK_SIZE    = 256;
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+
+// 每 workgroup 同时处理的槽数（constant_id 13/14，同 gemv_int8.comp）。
+layout(constant_id = 13) const uint BGRP = 1;
+layout(constant_id = 14) const uint BATCH = 1;
+
+layout(buffer_reference) buffer InW2 { float data[]; };
+layout(buffer_reference) buffer InA2 { float data[]; };
+layout(buffer_reference) buffer InV2 { float data[]; };
+layout(buffer_reference) buffer InG2 { float data[]; };
+layout(buffer_reference) buffer InXW { float data[]; };
+layout(buffer_reference) buffer InXA { float data[]; };
+layout(buffer_reference) buffer InXV { float data[]; };
+layout(buffer_reference) buffer InXG { float data[]; };
+layout(buffer_reference) buffer InW0 { float data[]; };
+layout(buffer_reference) buffer InA0 { float data[]; };
+layout(buffer_reference) buffer InV0 { float data[]; };
+layout(buffer_reference) buffer InScale { float data[]; };
+layout(buffer_reference) buffer InVFirst { float16_t data[]; };
+layout(buffer_reference) buffer OutW { float16_t data[]; };
+layout(buffer_reference) buffer OutA { float16_t data[]; };
+layout(buffer_reference) buffer OutV { float16_t data[]; };
+layout(buffer_reference) buffer OutG { float16_t data[]; };
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InW2     in_w2;
+    InA2     in_a2;
+    InV2     in_v2;
+    InG2     in_g2;
+    InXW     in_xw;
+    InXA     in_xa;
+    InXV     in_xv;
+    InXG     in_xg;
+    InW0     in_w0;
+    InA0     in_a0;
+    InV0     in_v0;
+    InScale  in_scale;
+    InVFirst in_v_first;
+    OutW     out_w;
+    OutA     out_a;
+    OutV     out_v;
+    OutG     out_g;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    const uint row    = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID;
+    const uint slot0  = gl_WorkGroupID.y * BGRP;
+    const uint slot_cnt = min(BGRP, BATCH - slot0);  // 尾块守卫
+    const uint lane = gl_SubgroupInvocationID;
+
+    InW2     in_w2     = params.in_w2;
+    InA2     in_a2     = params.in_a2;
+    InV2     in_v2     = params.in_v2;
+    InG2     in_g2     = params.in_g2;
+    InXW     in_xw     = params.in_xw;
+    InXA     in_xa     = params.in_xa;
+    InXV     in_xv     = params.in_xv;
+    InXG     in_xg     = params.in_xg;
+    InW0     in_w0     = params.in_w0;
+    InA0     in_a0     = params.in_a0;
+    InV0     in_v0     = params.in_v0;
+    InScale  in_scale  = params.in_scale;
+    InVFirst in_v_first = params.in_v_first;
+    OutW     out_w     = params.out_w;
+    OutA     out_a     = params.out_a;
+    OutV     out_v     = params.out_v;
+    OutG     out_g     = params.out_g;
+
+    // 跨槽共享的标量（w0/a0/v0/scale 只与行有关，提前读一次）
+    const float sc  = in_scale.data[0];
+    const float w0r = in_w0.data[row];
+    const float a0r = in_a0.data[row];
+    const float v0r = in_v0.data[row];
+
+    // ★ 权重（只与行、k 有关）每 k 只读一次，在寄存器里复用给全部 BGRP 个槽。
+    float lw[BGRP], la[BGRP], lv[BGRP], lg[BGRP];
+    [[unroll]]
+    for (uint s = 0; s < BGRP; s++) { lw[s] = 0.0; la[s] = 0.0; lv[s] = 0.0; lg[s] = 0.0; }
+
+    [[unroll]]
+    for (uint k = lane; k < K_W; k += SUBGROUP_SIZE) {
+        const float wk = in_w2.data[row * K_W + k];
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            if (s < slot_cnt) lw[s] += in_xw.data[(slot0 + s) * K_W + k] * wk;
+        }
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_A; k += SUBGROUP_SIZE) {
+        const float ak = in_a2.data[row * K_A + k];
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            if (s < slot_cnt) la[s] += in_xa.data[(slot0 + s) * K_A + k] * ak;
+        }
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_V; k += SUBGROUP_SIZE) {
+        const float vk = in_v2.data[row * K_V + k];
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            if (s < slot_cnt) lv[s] += in_xv.data[(slot0 + s) * K_V + k] * vk;
+        }
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_G; k += SUBGROUP_SIZE) {
+        const float gk = in_g2.data[row * K_G + k];
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            if (s < slot_cnt) lg[s] += sigmoid(in_xg.data[(slot0 + s) * K_G + k]) * gk;
+        }
+    }
+
+    [[unroll]]
+    for (uint s = 0; s < BGRP; s++) {
+        if (s < slot_cnt) {
+            const float sw = subgroupAdd(lw[s]);
+            const float sa = subgroupAdd(la[s]);
+            const float sv = subgroupAdd(lv[s]);
+            const float sg = subgroupAdd(lg[s]);
+            if (lane == 0u) {
+                const uint mslot = (slot0 + s) * M;
+                out_w.data[mslot + row] = float16_t(exp(sc * sigmoid(sw + w0r)));
+                out_a.data[mslot + row] = float16_t(sigmoid(sa + a0r));
+                const float vcur = float(out_v.data[mslot + row]);
+                out_v.data[mslot + row] = float16_t(
+                    vcur + sigmoid(sv + v0r) * (float(in_v_first.data[mslot + row]) - vcur));
+                out_g.data[mslot + row] = float16_t(sg);
+            }
+        }
+    }
+}

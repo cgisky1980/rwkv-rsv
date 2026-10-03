@@ -7,17 +7,18 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // 参数化 embedding gather（fp16 源）：从 src 表 [VOCAB, C]（fp16）按 token 索引读一行，
-// 转换为 fp32 写入 dst [C]。与 gather_row.comp 相同，只是源为 fp16 以减半显存。
-// 索引来自 GPU buffer（tok[0]，f32 位模式存 uint），循环体不依赖具体 token 值，
+// 转换为 fp32 写入 dst。与 gather_row.comp 相同，只是源为 fp16 以减半显存。
+// 索引来自 GPU buffer（tok[b]，f32 位模式存 uint），循环体不依赖具体 token 值，
 // 为 GPU self-loop（批量提交、无 CPU 每 token 交换）铺路。
 //
-// dispatch (ceil(C/256), 1, 1)。
+// batch 并发版：dispatch (ceil(C/256), batch, 1) —— slot = gl_WorkGroupID.y，
+// 读 tok[slot]、写 dst[slot*C + i]。batch=1 时行为与旧版逐位一致。
 
 layout(constant_id = 0) const uint C = 2560; // 行宽（通道数）
 
-layout(buffer_reference) buffer InTok  { float data[]; } in_tok;       // [1] 当前 token 索引
+layout(buffer_reference) buffer InTok  { float data[]; } in_tok;       // [batch] 当前 token 索引
 layout(buffer_reference) buffer InSrc  { float16_t data[]; } in_src;   // [VOCAB, C] fp16 embedding
-layout(buffer_reference) buffer OutDst { float data[]; } out_dst;      // [C] fp32
+layout(buffer_reference) buffer OutDst { float data[]; } out_dst;      // [batch, C] fp32
 
 layout(set = 0, binding = 0, std430) uniform Params {
     InTok  in_tok;
@@ -29,10 +30,12 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     const uint index = gl_LocalInvocationIndex;
-    const uint idx   = floatBitsToUint(params.in_tok.data[0]);
+    const uint slot  = gl_WorkGroupID.y;
+    const uint idx   = floatBitsToUint(params.in_tok.data[slot]);
     const uint base  = idx * C;
+    const uint dst   = slot * C;
     [[unroll]]
     for (uint i = index; i < C; i += 256) {
-        params.out_dst.data[i] = float(params.in_src.data[base + i]);
+        params.out_dst.data[dst + i] = float(params.in_src.data[base + i]);
     }
 }

@@ -888,26 +888,45 @@ impl GpuModel {
         self.backend
             .store_token_host(self.bufs.current_token, seed)?;
 
+        // 每轮采样参数写「第 round 行」：Vulkan = 纯 CPU 写 host 行（零拷贝零同步）；
+        // CUDA = pinned 异步拷贝到同一 device 缓冲（流序）。行容量不足时回退同步写入。
+        let use_async = n <= self.backend.sampler_async_rows();
+        let put_sampler_first = |m: &mut Self| -> R<()> {
+            if use_async {
+                m.backend.store_sampler_async(
+                    b.sampler,
+                    0,
+                    sp.temperature,
+                    sp.top_k,
+                    sp.top_p,
+                    seed,
+                    sp.repetition_penalty,
+                    sp.frequency_penalty,
+                    sp.presence_penalty,
+                    0,
+                )
+            } else {
+                m.backend.store_sampler_host(
+                    b.sampler,
+                    sp.temperature,
+                    sp.top_k,
+                    sp.top_p,
+                    seed,
+                    sp.repetition_penalty,
+                    sp.frequency_penalty,
+                    sp.presence_penalty,
+                    0,
+                )
+            }
+        };
         // 预置 round 0 的 sampler（graph 捕获时 sample kernel 从 sampler 缓冲读参数）
-        self.backend.store_sampler_host(
-            b.sampler,
-            sp.temperature,
-            sp.top_k,
-            sp.top_p,
-            seed,
-            sp.repetition_penalty,
-            sp.frequency_penalty,
-            sp.presence_penalty,
-            0,
-        )?;
+        put_sampler_first(self)?;
 
         if self.backend.supports_graph_capture() {
             // CUDA graph：捕获一轮完整前向（gather→层→ln+head→GPU采样→record_token），
             // 之后每 token 重放，消除 258 次/层的 cuLaunchKernel 启动开销。
             // **每个形状只捕获一次**，此后跨 submit 永久重放（原先每段重捕获）。
             // 每轮重放前更新 seed/hist_len，sample kernel 在重放时读取最新设备参数。
-            // 逐轮更新走 pinned 异步上传（流序，零 host 同步）——同步版每轮
-            // cuStreamSynchronize 会把整段 selfloop 退化成逐轮 CPU⟷GPU 往返。
             let key = b.key();
             let graph_ok = self.ensure_selfloop_graph(key, |m| {
                 m.sample_selfloop_step(
@@ -921,9 +940,9 @@ impl GpuModel {
                     b.sampler,
                     b.token_seq,
                     b.seq_cnt,
+                    0,
                 )
             });
-            let use_async = n <= self.backend.sampler_async_rows();
             for round in 0..n {
                 state.v_first_set = false;
                 if use_async {
@@ -967,24 +986,41 @@ impl GpuModel {
                         b.sampler,
                         b.token_seq,
                         b.seq_cnt,
+                        round,
                     )?;
                 }
             }
         } else {
             // Vulkan：无 graph 捕获，把 n 轮完整前向逐 token 记录进同一批次；
-            // 每轮用 store_sampler_host 更新 seed/hist_len（sample kernel 执行时读取最新参数）。
+            // 每轮写入各自的采样行（第 round 行），sample kernel 执行时读取该行参数。
+            // 整段一次 submit = CUDA graph 的等价物（且省掉逐轮 replay 与拷贝）。
             for round in 0..n {
-                self.backend.store_sampler_host(
-                    b.sampler,
-                    sp.temperature,
-                    sp.top_k,
-                    sp.top_p,
-                    seed + round as u32,
-                    sp.repetition_penalty,
-                    sp.frequency_penalty,
-                    sp.presence_penalty,
-                    round as u32,
-                )?;
+                if use_async {
+                    self.backend.store_sampler_async(
+                        b.sampler,
+                        round,
+                        sp.temperature,
+                        sp.top_k,
+                        sp.top_p,
+                        seed + round as u32,
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        round as u32,
+                    )?;
+                } else {
+                    self.backend.store_sampler_host(
+                        b.sampler,
+                        sp.temperature,
+                        sp.top_k,
+                        sp.top_p,
+                        seed + round as u32,
+                        sp.repetition_penalty,
+                        sp.frequency_penalty,
+                        sp.presence_penalty,
+                        round as u32,
+                    )?;
+                }
                 self.sample_selfloop_step(
                     state,
                     c,
@@ -996,6 +1032,7 @@ impl GpuModel {
                     b.sampler,
                     b.token_seq,
                     b.seq_cnt,
+                    round,
                 )?;
             }
         }
@@ -1047,12 +1084,16 @@ impl GpuModel {
         self.backend.upload_u32_part(t, offset, data)
     }
 
-    /// 该模型是否支持 batch 并发解码路径（要求 r/k/v 为 int8 量化权重——
-    /// batch 层 kernel 仅有 int8 变体；fp16 模型须回退逐槽单序列路径）。
+    /// 该模型是否支持 batch 并发解码路径。两个条件同时满足：
+    /// 1. r/k/v 为 int8 量化权重（batch 层 kernel 仅有 int8 变体；fp16 模型回退逐槽单序列）；
+    /// 2. 后端实现了 `*_batch` 算子（`ComputeBackend::supports_batch_decode`）。
+    ///
+    /// 缺条件 2 时若仍返回 true，调用方会选批量路径并在运行期拿到 Err（历史门控 bug）。
     pub fn supports_batch_decode(&self) -> bool {
-        self.layers.first().is_some_and(|l| {
-            l.receptance_a8.is_some() && l.key_a8.is_some() && l.value_a8.is_some()
-        })
+        self.backend.supports_batch_decode()
+            && self.layers.first().is_some_and(|l| {
+                l.receptance_a8.is_some() && l.key_a8.is_some() && l.value_a8.is_some()
+            })
     }
 
     /// 释放外部缓冲（`alloc_u32` 的配对操作）。
@@ -1372,6 +1413,7 @@ impl GpuModel {
             hist,
             batch,
             hist_stride,
+            0,
         )?;
         let raw = self.backend.download(self.bufs_current_token_of(&bb))?;
         self.backend.end_batch()?;
@@ -1868,7 +1910,13 @@ impl GpuModel {
         let counter = self
             .backend
             .create_tensor(vocab * batch, TensorDtype::U32)?;
-        let sampler = self.backend.create_tensor(10 * batch, TensorDtype::F32)?;
+        // sampler 按「每轮一行」分配（单流 10 / 批量 10*batch）：Vulkan 的整段单次提交
+        // 自循环里每轮读各自的行（seed/hist_len 逐轮不同），零拷贝零同步。
+        // CUDA 只用第 0 行（逐轮异步覆盖同一 device 缓冲），多分配的余量无副作用。
+        let sampler = self.backend.create_tensor(
+            crate::runtime::SAMPLER_ROW_F32 as usize * batch * n,
+            TensorDtype::F32,
+        )?;
         let token_seq = self.backend.create_tensor(n * batch, TensorDtype::F32)?;
         let seq_cnt = self.backend.create_tensor(batch, TensorDtype::F32)?;
         let bufs = SelfloopBufs {
@@ -1978,6 +2026,7 @@ impl GpuModel {
         let lowrank_gemm = batch >= 16
             && c.is_multiple_of(64)
             && [wmp, amp, vmp, gmp].iter().all(|p| p.is_multiple_of(64))
+            && self.backend.supports_lowrank_gemm_batch()
             && std::env::var("LOWRANK_GEMM")
                 .map(|v| v != "0")
                 .unwrap_or(true)
@@ -2162,6 +2211,7 @@ impl GpuModel {
             && fh.is_multiple_of(64)
             && c.is_multiple_of(16)
             && self.layers[i].ffn_value_dense16.is_some()
+            && self.backend.supports_ffn_value_gemm_batch()
             && std::env::var("FFN_VALUE_GEMM")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -2221,6 +2271,7 @@ impl GpuModel {
         token_seq: TensorId,
         seq_cnt: TensorId,
         seq_stride: usize,
+        sampler_row: usize,
     ) -> R<()> {
         use crate::model::LN_EPS;
         let (c, h, ns, vocab) = (
@@ -2254,7 +2305,7 @@ impl GpuModel {
             self.backend
                 .gemv_f16(w16, bb.x_norm, bb.logits, vocab, c, batch)?;
         }
-        // batch 采样（token 写回 current_token[b]，下一轮 gather 自动跟随）。
+        // batch 采样（token 写回 current_token[b] 的**设备缓冲**，下一轮 gather 自动跟随）。
         // hist = token_seq（[batch, n] 布局，前 round 个已生成 token 在各 slot 段首；
         // 每 slot 实际历史长度 = sampler[7] = round，stride 恒为 n）。
         self.backend.sample_into_host_seeded_batch(
@@ -2268,6 +2319,7 @@ impl GpuModel {
             token_seq,
             batch,
             seq_stride,
+            sampler_row,
         )?;
         self.backend
             .record_tokens(bb.current_token, token_seq, seq_cnt, seq_stride, batch)
@@ -2299,13 +2351,15 @@ impl GpuModel {
             )
             .into());
         }
-        // batch 路径依赖 CUDA 专有的 batch kernel 变体（Vulkan 未实现）——保留原语义。
-        // 例外：SKIP_GRAPH 是逐 kernel 剖析/排障用的非图路径，须允许它在
-        // RWKV_GRAPH=0（supports_graph_capture()==false）下继续走通。
-        let skip_graph = std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty());
-        if !skip_graph && !self.backend.supports_graph_capture() {
+        // batch 自循环需要「单步 kernel 序列固定」的能力：
+        //   - CUDA：graph 捕获/重放（每轮 replay，seed 经 pinned 异步更新）；
+        //   - Vulkan：无 graph，改为把整段 n 轮记录进同一批次后一次 submit（等价物，
+        //     见 `submit_sample_selfloop` 的非 graph 分支）；每轮采样参数写各自的行。
+        // 两者都以 `supports_batch_decode()`（后端实现了 `*_batch` 算子）为前提。
+        if !self.backend.supports_batch_decode() {
             return Err(
-                "submit_sample_selfloop_batch: 后端不支持 graph 捕获（batch 路径仅 CUDA）".into(),
+                "submit_sample_selfloop_batch: 后端未实现 batch 并发算子（supports_batch_decode=false）"
+                    .into(),
             );
         }
 
@@ -2343,7 +2397,11 @@ impl GpuModel {
 
         self.backend.begin_batch()?;
         let key = b.key();
-        let graph_ok = !skip_graph
+        // graph 捕获只在支持的后端（CUDA）尝试；Vulkan 走下面的「逐轮直接记录」分支
+        // （整段 n 轮同批、一次 submit）。SKIP_GRAPH 仍可强制降级（逐 kernel 剖析用）。
+        let skip_graph = std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty());
+        let graph_ok = self.backend.supports_graph_capture()
+            && !skip_graph
             && self.ensure_selfloop_graph(key, |m| {
                 m.sample_selfloop_step_batch(
                     state,
@@ -2356,11 +2414,13 @@ impl GpuModel {
                     b.token_seq,
                     b.seq_cnt,
                     n,
+                    0,
                 )
             });
-        // 逐轮：更新本轮的 seed/hist_len，然后执行（重放图，或降级直接提交本步 kernel）。
-        // 异步更新只在重放路径用（降级路径本来就每轮同步上传 sampler）。
-        let use_async = graph_ok && n <= self.backend.sampler_async_rows() / batch.max(1);
+        // 逐轮：写入本轮的 seed/hist_len 行，然后执行（重放图，或直接记录本步 kernel）。
+        // Vulkan 的行写入是纯 CPU memcpy（第 round 行），CUDA 是 pinned 异步拷贝到同一
+        // device 缓冲——两者都零 host↔GPU 同步。
+        let use_async = n <= self.backend.sampler_async_rows() / batch.max(1);
         for round in 0..n {
             state.v_first_set = false;
             let seeds_r: Vec<u32> = seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
@@ -2399,7 +2459,8 @@ impl GpuModel {
             if graph_ok {
                 self.backend.selfloop_graph_replay(key)?;
             } else {
-                // 降级：无图（SKIP_GRAPH 调试开关 / 不支持 / 捕获失败），逐轮直接提交。
+                // 无图（SKIP_GRAPH / 后端不支持 / 捕获失败）：逐轮直接记录本步 kernel。
+                // 同一 begin/end batch 内记录 n 轮 = Vulkan 的整段一次 submit。
                 self.sample_selfloop_step_batch(
                     state,
                     batch,
@@ -2411,6 +2472,7 @@ impl GpuModel {
                     b.token_seq,
                     b.seq_cnt,
                     n,
+                    round,
                 )?;
             }
         }
@@ -2557,6 +2619,7 @@ impl GpuModel {
 
     /// 采样 self-loop 单步：gather → 全部层 → ln_out+head → GPU 采样 → record_token。
     /// 供 CUDA graph 捕获/重放使用（kernel 序列固定，seed/hist_len 经 sampler 缓冲逐轮更新）。
+    /// `sampler_row`：该轮读 sampler 的第几行（Vulkan 按行取参数；CUDA 忽略）。
     #[allow(clippy::too_many_arguments)]
     fn sample_selfloop_step(
         &mut self,
@@ -2570,6 +2633,7 @@ impl GpuModel {
         sampler: TensorId,
         token_seq: TensorId,
         seq_cnt: TensorId,
+        sampler_row: usize,
     ) -> R<()> {
         use crate::model::LN_EPS;
         state.v_first_set = false;
@@ -2598,6 +2662,7 @@ impl GpuModel {
             counter,
             sampler,
             token_seq, // 前 round 个已生成 token 作为惩罚历史
+            sampler_row,
         )?;
         self.backend
             .record_token(self.bufs.current_token, token_seq, seq_cnt)
@@ -4353,7 +4418,14 @@ impl GpuState {
         let bsz = batch.max(1);
         let tmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
         backend.upload(tmix_x, &vec![0.0; c * bsz])?;
-        let tmix_rnn = backend.create_tensor(h * n * n * bsz, wkv_state_dtype())?;
+        // 状态 dtype：后端支持 fp16 存储才用 fp16（CUDA）；Vulkan 的 GLSL 状态内核为
+        // f32 专用，强制回退 f32（否则 `fuse_ka_dplr_norm`/`dplr_seq` 会拿到 fp16 张量报错）。
+        let state_dtype = if backend.supports_f16_wkv_state() {
+            wkv_state_dtype()
+        } else {
+            TensorDtype::F32
+        };
+        let tmix_rnn = backend.create_tensor(h * n * n * bsz, state_dtype)?;
         backend.upload(tmix_rnn, &vec![0.0; h * n * n * bsz])?;
         let cmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
         backend.upload(cmix_x, &vec![0.0; c * bsz])?;

@@ -42,14 +42,26 @@ layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
 const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
 const uint KV               = K / 4;    // 4 个 uint8 权重打包为 1 个 uint32
 const uint KG               = K / 128;  // 每行 group 数（group=128）
-const uint ROWS             = 4;        // 每个 workgroup 处理的行数（M % ROWS == 0）
+// ROWS：每个 workgroup 处理的行数（M % ROWS == 0）。做成特化常量是为了**小 M 时换并行度**：
+// M=2560（ffn.value）在 ROWS=4 下只有 640 个 workgroup（63 个 SM 分不到 10 个/SM），
+// 权重读取总量不变，但延迟掩盖不足；ROWS=2 把 workgroup 数翻倍、累加器减半。
+layout(constant_id = 12) const uint ROWS = 4;
 const uint ROW_IDX          = STRIDE_A_Y / 4;  // 行步长（uint32 idx 单位）
+
+// ★ BGRP：单个 workgroup 同时处理的槽数（batch 维）。权重 A 跨槽共享（STRIDE_A_Z=0），
+// 若一格只算一个槽（BGRP=1，旧行为），B 组 workgroup 会把同一份权重各读一遍 ⇒ 零摊薄
+// （实测 B=8 时 relu2 权重读取量 = 8×，直接压满显存带宽）。BGRP>1 时权重每 k 迭代
+// 只读一次、在寄存器里复用给 BGRP 个槽，激活 x 仍按槽读（x 小得多）。
+// 对应 dispatch：grid = (M/ROWS, ceil(BATCH/BGRP), 1)。
+layout(constant_id = 13) const uint BGRP = 1;
+// 实际 batch（用于尾块守卫；BATCH 不整除 BGRP 时最后一个 workgroup 只处理 slot_cnt 个槽）。
+layout(constant_id = 14) const uint BATCH = 1;
 
 const uvec2 STRIDE_B        = uvec2(STRIDE_B_X, STRIDE_B_Y);
 const uvec2 STRIDE_X        = uvec2(STRIDE_X_X, STRIDE_X_Y);
 const uvec2 STRIDE_Y        = uvec2(STRIDE_Y_X, STRIDE_Y_Y);
 
-shared float sketch_dot[ROWS][NUM_SUBGROUPS];
+shared float sketch_dot[ROWS][BGRP][NUM_SUBGROUPS];
 // 本组 4 行的 scale/zero（解包为 f32 对）
 shared float s_scale[ROWS][KG];
 shared float s_zero[ROWS][KG];
@@ -71,9 +83,11 @@ layout(set = 0, binding = 0, std430) uniform Params {
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-    const uint batch                    = gl_WorkGroupID.y;
     const uint wg_row                   = gl_WorkGroupID.x;
     const uint first_row                = wg_row * ROWS;
+    const uint slot0                    = gl_WorkGroupID.y * BGRP;
+    // 尾块守卫：最后一个 grid.y 可能不足 BGRP 个槽（BATCH 不整除 BGRP 时）。
+    const uint slot_cnt                 = min(BGRP, BATCH - slot0);
     const uint index                    = gl_LocalInvocationIndex;
     const uint subgroup_id              = gl_SubgroupID;
     const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
@@ -84,8 +98,8 @@ void main() {
     InputX   input_x                    = params.input_x;
     Output   output_y                   = params.output_y;
 
-    const uint a_base = batch * (STRIDE_A_Z / 4) + first_row * ROW_IDX;
-    const uint x_base = batch * (STRIDE_X.y / 4);
+    // 权重跨槽共享（STRIDE_A_Z 恒为 0，见 runtime::gemv_spec），故 a_base 不含槽偏移。
+    const uint a_base = first_row * ROW_IDX;
 
     // Phase 0: 协作加载本组 ROWS 行的 scale/zero 到 shared。
     if (index < ROWS * 16) {
@@ -101,37 +115,56 @@ void main() {
     }
     barrier();
 
-    // Phase 1: 为 ROWS 行各维护独立累加器，同一 K 循环内并行读 ROWS 行权重 + 复用 X。
-    // 每次迭代每行读 1 个 uint32（4 个 uint8 权重）+ 1 个 vec4（4 个 f32）X。
-    float acc[ROWS];
-    for (uint r = 0; r < ROWS; r++) acc[r] = 0.0;
+    // Phase 1: 为 ROWS 行 × BGRP 个槽各维护独立累加器。权重按 (行, k) 只读一次，
+    // 在寄存器里复用给本组全部 BGRP 个槽；激活 x 按槽取段（每槽每 k 读 1 个 vec4）。
+    float acc[ROWS][BGRP];
+    [[unroll]]
+    for (uint r = 0; r < ROWS; r++) {
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) acc[r][s] = 0.0;
+    }
 
     [[unroll]]
     for (uint k = index; k < KV; k += BLOCK_SIZE) {
-        vec4 xv = input_x.data[x_base + k];
         const uint g = k / 32;   // 每 group 128 权重 = 32 个 uint32
+        // ★ 反量化只做一次（与槽无关）：权重每 k 迭代读一次、解一次，得到的 4 个 f32
+        // 反量化权重在寄存器里复用给全部 BGRP 个槽。若把解包/反量化放进槽循环，
+        // 每个权重会被解 BGRP 次（实测 add 在 B=8 时几乎无收益，即此因）。
+        float w[ROWS][4];
         [[unroll]]
         for (uint r = 0; r < ROWS; r++) {
-            const uint ipack = input_idx.data[a_base + r * ROW_IDX + k];
+            const uint ip = input_idx.data[a_base + r * ROW_IDX + k];
             const float sc = s_scale[r][g];
             const float zr = s_zero[r][g];
-            const float b0 = float(ipack & 0xFFu);
-            const float b1 = float((ipack >> 8) & 0xFFu);
-            const float b2 = float((ipack >> 16) & 0xFFu);
-            const float b3 = float(ipack >> 24);
-            acc[r] += (sc * b0 + zr) * xv.x
-                    + (sc * b1 + zr) * xv.y
-                    + (sc * b2 + zr) * xv.z
-                    + (sc * b3 + zr) * xv.w;
+            w[r][0] = sc * float(ip & 0xFFu) + zr;
+            w[r][1] = sc * float((ip >> 8) & 0xFFu) + zr;
+            w[r][2] = sc * float((ip >> 16) & 0xFFu) + zr;
+            w[r][3] = sc * float(ip >> 24) + zr;
+        }
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            if (s < slot_cnt) {
+                const vec4 xv = input_x.data[(slot0 + s) * (STRIDE_X.y / 4) + k];
+                [[unroll]]
+                for (uint r = 0; r < ROWS; r++) {
+                    acc[r][s] += w[r][0] * xv.x
+                               + w[r][1] * xv.y
+                               + w[r][2] * xv.z
+                               + w[r][3] * xv.w;
+                }
+            }
         }
     }
 
-    // Subgroup-level reduction
+    // Subgroup-level reduction（ROWS × BGRP 个累加器）
     [[unroll]]
     for (uint r = 0; r < ROWS; r++) {
-        float v = subgroupAdd(acc[r]);
-        if (subgroup_invocation_id == 0) {
-            sketch_dot[r][subgroup_id] = v;
+        [[unroll]]
+        for (uint s = 0; s < BGRP; s++) {
+            const float v = subgroupAdd(acc[r][s]);
+            if (subgroup_invocation_id == 0) {
+                sketch_dot[r][s][subgroup_id] = v;
+            }
         }
     }
     barrier();
@@ -139,22 +172,27 @@ void main() {
     // Cross-subgroup reduction
     [[unroll]]
     for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
-        [[unroll]]
-        for (uint r = 0; r < ROWS; r++) {
-            if (index < step) {
-                sketch_dot[r][index] += sketch_dot[r][index + step];
+        if (index < step) {
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                [[unroll]]
+                for (uint s = 0; s < BGRP; s++) {
+                    sketch_dot[r][s][index] += sketch_dot[r][s][index + step];
+                }
             }
         }
         barrier();
     }
 
-    if (index == 0) {
-        [[unroll]]
-        for (uint r = 0; r < ROWS; r++) {
-            float result = sketch_dot[r][0];
+    if (index < ROWS * BGRP) {
+        const uint r = index / BGRP;
+        const uint s = index % BGRP;
+        if (s < slot_cnt) {
+            const uint slot = slot0 + s;
+            float result = sketch_dot[r][s][0];
 
 #if defined(AFFINE)
-            result = result + float(input_b.data[batch * STRIDE_B.y + (first_row + r) * STRIDE_B.x]);
+            result = result + float(input_b.data[slot * STRIDE_B.y + (first_row + r) * STRIDE_B.x]);
 #endif
 
 #if defined(ACTIVATION)
@@ -167,7 +205,7 @@ void main() {
 #endif
 #endif
 
-            output_y.data[batch * STRIDE_Y.y + (first_row + r) * STRIDE_Y.x] = result;
+            output_y.data[slot * STRIDE_Y.y + (first_row + r) * STRIDE_Y.x] = result;
         }
     }
 }

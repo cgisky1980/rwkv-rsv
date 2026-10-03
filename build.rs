@@ -259,9 +259,16 @@ fn main() {
         },
         "gemv_int8" => "src/gemv_int8.comp" => {
             ACTIVATION => [none(""), def(1, "relu2")],
+            // AFFINE=1：结果 = 残差 + x@A（供 ffn.value 的残差累加用）。
+            // 复用本文件（已验证的 5 参 Params + 归约路径），取代原
+            // `gemv_int8_add.comp` 的 MUL=0 变体——后者在 batch 维 grid.y≥3 时
+            // 触发 ERROR_DEVICE_LOST（2026-10-03 实录，见实施记录）。
+            AFFINE => [none(""), def(1, "affine")],
         },
+        // 只保留 MUL=1（att.output 的「x.*g 折叠 + 残差累加」）。MUL=0 变体
+        //（ffn.value 残差）已由 `gemv_int8_affine.spv` 取代——见 build.rs 上方注释。
         "gemv_int8_add" => "src/gemv_int8_add.comp" => {
-            MUL => [def(0, ""), def(1, "mul")],
+            MUL => [def(1, "mul")],
         },
         "ffn_value_sparse_add" => "src/ffn_value_sparse_add.comp" => {
             TYPE => [none("")],
@@ -366,6 +373,34 @@ fn main() {
             TYPE => [none("")],
         },
         "record_token" => "src/record_token.comp" => {
+            TYPE => [none("")],
+        },
+        // —— batch 并发（单实例多序列）批量变体 ——
+        "seq_shift_batch" => "src/seq_shift_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "copy_token_batch" => "src/copy_token_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "dplr_seq_batch" => "src/dplr_seq_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "segmean" => "src/segmean.comp" => {
+            TYPE => [none("")],
+        },
+        "norm_lerp6_batch" => "src/norm_lerp6_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "cmix_norm_lerp_batch" => "src/cmix_norm_lerp_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "gemv_int8_rkv_stage1_batch" => "src/gemv_int8_rkv_stage1_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "gemv_lowrank_chain4_batch" => "src/gemv_lowrank_chain4_batch.comp" => {
+            TYPE => [none("")],
+        },
+        "ffn_value_sparse_add_batch" => "src/ffn_value_sparse_add_batch.comp" => {
             TYPE => [none("")],
         },
     };

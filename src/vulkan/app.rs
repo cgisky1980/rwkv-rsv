@@ -585,6 +585,7 @@ impl App {
     /// - Vulkan drivers are properly installed on the system
     /// - The system has a compatible GPU with required Vulkan extensions
     unsafe fn new_unsafe() -> Result<Self, Box<dyn Error>> {
+        let validation_enabled = VALIDATION_ENABLED || std::env::var("VK_VALIDATION").is_ok();
         let loader = LibloadingLoader::new(LIBRARY)?;
         let entry = Entry::new(loader).map_err(|_| "failed to load vulkan")?;
         log::info!("{}", entry.version()?);
@@ -594,11 +595,11 @@ impl App {
             .iter()
             .map(|properties| properties.layer_name)
             .collect();
-        if VALIDATION_ENABLED && !layers.contains(&VALIDATION_LAYER) {
+        if validation_enabled && !layers.contains(&VALIDATION_LAYER) {
             return Err("validation layer not found".into());
         }
 
-        let layers = match VALIDATION_ENABLED {
+        let layers = match validation_enabled {
             true => vec![VALIDATION_LAYER],
             false => vec![],
         };
@@ -699,12 +700,33 @@ impl App {
             })
             .ok_or("cannot find physical device")?;
 
-        let cooperative_matrix = instance
-            .get_physical_device_cooperative_matrix_properties_khr(device)?
+        // 诊断：张量核（cooperative matrix）可用性——决定批量 GEMM 能否脱离 SIMT 档位。
+        let cm_raw = instance
+            .get_physical_device_cooperative_matrix_properties_khr(device)
+            .unwrap_or_default();
+        log::info!("\tcooperative matrix 配置 {} 项：", cm_raw.len());
+        for p in &cm_raw {
+            log::info!(
+                "\t\tm{} n{} k{} a={:?} b={:?} c={:?} o={:?} scope={:?}",
+                p.m_size,
+                p.n_size,
+                p.k_size,
+                p.a_type,
+                p.b_type,
+                p.c_type,
+                p.result_type,
+                p.scope
+            );
+        }
+        let cooperative_matrix = cm_raw
             .into_iter()
             .filter(|p| p.scope == vk::ScopeKHR::SUBGROUP)
             .filter_map(|p| p.try_into().ok())
             .collect_vec();
+        log::info!(
+            "\t可用（已过滤）cooperative matrix 配置 {} 项",
+            cooperative_matrix.len()
+        );
 
         let mut vk13 = vk::PhysicalDeviceVulkan13Properties::builder();
         let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::builder();
@@ -1977,6 +1999,30 @@ impl<T: super::num::Scalar> Tensor<T> {
     #[inline]
     pub fn copy_to(&self, data: &mut [T]) -> Result<Self, TensorError> {
         unsafe { self.copy_to_unsafe(data) }
+    }
+
+    /// 从张量 [offset, offset+len) 段读取数据（`offset` 为元素偏移）。
+    /// 用于 batch 状态的单 slot 部分下载（整表读取在 batch 大时代价过高）。
+    #[inline]
+    pub fn copy_to_at(&self, data: &mut [T], offset: usize) -> Result<Self, TensorError> {
+        unsafe { self.copy_to_at_unsafe(data, offset) }
+    }
+
+    unsafe fn copy_to_at_unsafe(&self, data: &mut [T], offset: usize) -> Result<Self, TensorError> {
+        let size = size_of_val(data);
+        let off_bytes = offset * size_of::<T>();
+        if self.size < size + off_bytes {
+            return Err(TensorError::Size(self.size, size, off_bytes));
+        }
+        let ptr = self
+            .ptr
+            .lock()
+            .map_err(|_| TensorError::Lock)?
+            .ok_or(TensorError::Unmapped)?
+            .add(off_bytes);
+        let dst = NonNull::from_ref(data).cast();
+        ptr.copy_to_nonoverlapping(dst, size);
+        Ok(self.clone())
     }
 
     /// Clears the tensor's memory by setting all bytes to zero.

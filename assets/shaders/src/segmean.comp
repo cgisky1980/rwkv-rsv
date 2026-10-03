@@ -1,0 +1,42 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// segmean：分段均值——x [batch, T_pad, C] 每 slot 对前 `lens[slot]` 行求均值 → out [batch, C]
+//（pad 行不计入）。批量 mean-hidden 特征提取用（语义对齐单序列 forward_seq_mean_hidden 的
+// T 维均值，仅累加顺序不同）。与 CUDA `rwkv_segmean` 一致。
+//
+// dispatch: (ceil(C/BLOCK_SIZE), batch, 1)
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint T = 1;
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer InX  { float data[]; } in_x;
+layout(buffer_reference) buffer OutY { float data[]; } out_y;
+layout(buffer_reference) buffer Lens { uint  data[]; } lens;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InX  in_x;
+    OutY out_y;
+    Lens lens;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint slot  = gl_WorkGroupID.y;
+    if (index >= C) {
+        return;
+    }
+    const uint len = max(min(params.lens.data[slot], T), 1u);
+    float acc = 0.0;
+    for (uint t = 0; t < len; ++t) {
+        acc += params.in_x.data[(slot * T + t) * C + index];
+    }
+    params.out_y.data[slot * C + index] = acc / float(len);
+}

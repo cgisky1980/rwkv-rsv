@@ -10,12 +10,16 @@ use std::error::Error;
 use half::f16;
 use vulkanalia::prelude::v1_4::*;
 
-use crate::vulkan::app::{App, Kernel, QUERY_POOL_SIZE, Tensor, Uniform};
+use crate::vulkan::app::{App, CommandBuffer, Kernel, QUERY_POOL_SIZE, Tensor, Uniform};
 use crate::vulkan::asset;
 use crate::vulkan::layout::Layout;
 
 /// 统一错误类型
 pub type R<T> = Result<T, Box<dyn Error>>;
+
+/// 采样参数每行元素数（单流自循环；批量自循环为 `10 * batch`）。
+/// sample.comp 只读 [0..7]，第 8/9 项为 penalty_decay 与保留位（对齐 40 字节行）。
+pub const SAMPLER_ROW_F32: u64 = 10;
 
 /// GPU 端张量：包含 host 可见缓冲（用于上传/下载）和 device local 缓冲（用于计算）。
 /// `host` 为 Option：权重上传完成后可调用 `drop_host` 释放 host 缓冲，节省系统内存。
@@ -63,6 +67,12 @@ pub struct Runtime {
     //   持久 compute command buffer，整段 forward 记录所有 dispatch + device→device 拷贝，
     //   一次性 submit + wait，替代每算子一次的 submit+wait_idle 串行同步。
     cmd: vk::CommandBuffer,
+    /// `cmd` 的**所有者**（Arc 包装）。必须与 `cmd` 同生命周期持有：
+    /// `CommandBuffer::drop` 会 `vkFreeCommandBuffers`，若只存裸句柄而让包装器在
+    /// `Runtime::new` 末尾被 drop，持久 command buffer 会被立即释放（校验层报
+    /// `vkResetCommandBuffer(): Couldn't find VkCommandBuffer Object`；release 下则表现为
+    /// 命令缓冲被其它 `copy_buffer` 的临时分配回收/复位 → 记录内容丢失/`ERROR_DEVICE_LOST`）。
+    _cmd_owner: CommandBuffer,
     /// 是否正在批处理记录中（begin_batch opened，未 end_batch）。
     /// 只有 recording 时才允许记录 dispatch / 拷贝。
     recording: bool,
@@ -144,6 +154,7 @@ impl Runtime {
         Ok(Self {
             app,
             cmd,
+            _cmd_owner: cmd_buf,
             recording: false,
             pending: Vec::new(),
             cache: HashMap::new(),
@@ -313,6 +324,209 @@ impl Runtime {
             self.app.device.queue_wait_idle(self.app.compute.queue)?;
         }
         Ok(())
+    }
+
+    /// 记录并执行 buffer 定长区间拷贝（standalone：临时 command buffer + 等待）。
+    /// `src_off`/`dst_off`/`len` 均为**元素**偏移/长度。
+    /// 用于 `upload_part`/`download_part`（host staging ↔ device）。
+    fn copy_range_standalone<T: crate::vulkan::num::Scalar>(
+        &self,
+        src: &Tensor<T>,
+        src_off: usize,
+        dst: &Tensor<T>,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let elem = std::mem::size_of::<T>() as u64;
+        let cmd_buf = self.app.allocate_compute_command_buffers(1)?;
+        let cmd = cmd_buf[0];
+        unsafe {
+            self.app
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.app
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+            dst.cmd_copy_from_range(
+                cmd,
+                src,
+                dst_off as u64 * elem,
+                src_off as u64 * elem,
+                len as u64 * elem,
+            );
+            self.app.device.end_command_buffer(cmd)?;
+            let buffers = [cmd];
+            let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
+            let submits = [submit.build()];
+            self.app
+                .device
+                .queue_submit(self.app.compute.queue, &submits, vk::Fence::null())?;
+            self.app.device.queue_wait_idle(self.app.compute.queue)?;
+        }
+        Ok(())
+    }
+
+    /// 定长区间拷贝（device→device），记录进当前批处理 command buffer（无 host 往返）。
+    /// `src_off`/`dst_off`/`len` 均为元素偏移/长度。须在 `begin_batch` 内调用。
+    fn record_copy_range<T: crate::vulkan::num::Scalar>(
+        &mut self,
+        src: &Tensor<T>,
+        src_off: usize,
+        dst: &Tensor<T>,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.record_barriers(&[src.buffer], &[dst.buffer])?;
+        let elem = std::mem::size_of::<T>() as u64;
+        unsafe {
+            dst.cmd_copy_from_range(
+                self.cmd,
+                src,
+                dst_off as u64 * elem,
+                src_off as u64 * elem,
+                len as u64 * elem,
+            );
+        }
+        self.mark_written(&[dst.buffer]);
+        Ok(())
+    }
+
+    // ===== 部分上传/下载（batch State 的单 slot 段）=====
+
+    /// 部分上传（f32 张量）：只写 [offset, offset+data.len()) 段（元素偏移），其余不动。
+    pub fn upload_part(&self, tensor: &GpuTensor, offset: usize, data: &[f32]) -> R<()> {
+        let host = tensor.host.as_ref().ok_or("upload_part: host dropped")?;
+        if offset + data.len() > tensor.len {
+            return Err(format!(
+                "upload_part: range {}..{} exceeds len {}",
+                offset,
+                offset + data.len(),
+                tensor.len
+            )
+            .into());
+        }
+        host.copy_from(data, offset)?;
+        self.copy_range_standalone(host, offset, &tensor.device, offset, data.len())
+    }
+
+    /// 部分上传（fp16 张量）：data 为 f32，写入 [offset, offset+len) 段（元素偏移）。
+    pub fn upload_part_f16(&self, tensor: &GpuTensor16, offset: usize, data: &[f32]) -> R<()> {
+        let host = tensor
+            .host
+            .as_ref()
+            .ok_or("upload_part_f16: host dropped")?;
+        if offset + data.len() > tensor.len {
+            return Err(format!(
+                "upload_part_f16: range {}..{} exceeds len {}",
+                offset,
+                offset + data.len(),
+                tensor.len
+            )
+            .into());
+        }
+        let f16s: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
+        host.copy_from(&f16s, offset)?;
+        self.copy_range_standalone(host, offset, &tensor.device, offset, data.len())
+    }
+
+    /// 部分下载（f32 张量）：只取 [offset, offset+len) 段（元素偏移）。
+    pub fn download_part(&self, tensor: &GpuTensor, offset: usize, len: usize) -> R<Vec<f32>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let host = tensor.host.as_ref().ok_or("download_part: host dropped")?;
+        if offset + len > tensor.len {
+            return Err(format!("download_part: {offset}+{len} exceeds len {}", tensor.len).into());
+        }
+        self.copy_range_standalone(&tensor.device, offset, host, offset, len)?;
+        let mut data = vec![0.0f32; len];
+        host.copy_to_at(&mut data, offset)?;
+        Ok(data)
+    }
+
+    /// 部分下载（fp16 张量）：返回 f32（元素偏移）。
+    pub fn download_part_f16(
+        &self,
+        tensor: &GpuTensor16,
+        offset: usize,
+        len: usize,
+    ) -> R<Vec<f32>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let host = tensor
+            .host
+            .as_ref()
+            .ok_or("download_part_f16: host dropped")?;
+        if offset + len > tensor.len {
+            return Err(format!(
+                "download_part_f16: {offset}+{len} exceeds len {}",
+                tensor.len
+            )
+            .into());
+        }
+        self.copy_range_standalone(&tensor.device, offset, host, offset, len)?;
+        let mut f16s = vec![f16::from_f32(0.0); len];
+        host.copy_to_at(&mut f16s, offset)?;
+        Ok(f16s.iter().map(|x| x.to_f32()).collect())
+    }
+
+    /// 设备内定长区间拷贝（f32）：在批处理内记录（无 host 往返）；批外则 standalone。
+    pub fn copy_range(
+        &mut self,
+        src: &GpuTensor,
+        src_off: usize,
+        dst: &mut GpuTensor,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if src_off + len > src.len || dst_off + len > dst.len {
+            return Err(format!(
+                "copy_range(f32): {src_off}+{len} / {dst_off}+{len} 超出 {}/{}",
+                src.len, dst.len
+            )
+            .into());
+        }
+        if self.recording {
+            self.record_copy_range(&src.device, src_off, &dst.device, dst_off, len)
+        } else {
+            self.copy_range_standalone(&src.device, src_off, &dst.device, dst_off, len)
+        }
+    }
+
+    /// 设备内定长区间拷贝（fp16）。
+    pub fn copy_range_f16(
+        &mut self,
+        src: &GpuTensor16,
+        src_off: usize,
+        dst: &mut GpuTensor16,
+        dst_off: usize,
+        len: usize,
+    ) -> R<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if src_off + len > src.len || dst_off + len > dst.len {
+            return Err(format!(
+                "copy_range(f16): {src_off}+{len} / {dst_off}+{len} 超出 {}/{}",
+                src.len, dst.len
+            )
+            .into());
+        }
+        if self.recording {
+            self.record_copy_range(&src.device, src_off, &dst.device, dst_off, len)
+        } else {
+            self.copy_range_standalone(&src.device, src_off, &dst.device, dst_off, len)
+        }
     }
 
     /// 开启一次批处理记录：reset 并 begin 持久 command buffer，清空待提交资源
@@ -877,8 +1091,9 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_for(m);
-        let spec = gemv_spec(&self.app, m, k, rows);
+        let rows = gemv_rows_batch(m);
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -890,7 +1105,7 @@ impl Runtime {
             "shaders/spv/gemv_int8_relu2.spv",
             &spec,
             &params,
-            ((m / rows) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch.div_ceil(bgrp) as u32, 1),
             &[a.idx.device.buffer, a.sz.device.buffer, x.device.buffer],
             &[y.device.buffer],
         )?;
@@ -912,8 +1127,9 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_for(m);
-        let spec = gemv_spec(&self.app, m, k, rows);
+        let rows = gemv_rows_batch(m);
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -925,7 +1141,7 @@ impl Runtime {
             "shaders/spv/gemv_int8.spv",
             &spec,
             &params,
-            ((m / rows) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch.div_ceil(bgrp) as u32, 1),
             &[a.idx.device.buffer, a.sz.device.buffer, x.device.buffer],
             &[y.device.buffer],
         )?;
@@ -947,8 +1163,9 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_for(m);
-        let spec = gemv_spec(&self.app, m, k, rows);
+        let rows = gemv_rows_batch(m);
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
             a.idx.device.address,
             a.sz.device.address,
@@ -961,7 +1178,7 @@ impl Runtime {
             "shaders/spv/gemv_int8_add_mul.spv",
             &spec,
             &params,
-            ((m / rows) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch.div_ceil(bgrp) as u32, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
@@ -987,26 +1204,33 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_for(m);
-        let spec = gemv_spec(&self.app, m, k, rows);
+        let rows = gemv_rows_batch(m);
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
+        // ★ 复用 `gemv_int8.comp` 的 AFFINE 变体（5 参 Params，与 head/plain 同一条
+        // 已验证路径）实现「y = 残差 + x@A」：`input_b` 即残差目标 y。
+        // 原 `gemv_int8_add.spv`（MUL=0）在 batch 并发（grid.y ≥ 3）下必触发
+        // `ERROR_DEVICE_LOST`，且与 plain 版索引逐位相同、buffer 长度校验无误、
+        // 去掉 acc 读取后语义等价——属该 .spv 自身的问题，故弃用（2026-10-03）。
+        // AFFINE 读 `input_b.data[batch * STRIDE_B.y + row * STRIDE_B.x]`，
+        // STRIDE_B = (1, m)，正好是 [batch, m] 布局的 y。
         let params = [
             a.idx.device.address,
             a.sz.device.address,
-            x.device.address,
-            0,
             y.device.address,
+            x.device.address,
             y.device.address,
         ];
         self.record_kernel(
-            "shaders/spv/gemv_int8_add.spv",
+            "shaders/spv/gemv_int8_affine.spv",
             &spec,
             &params,
-            ((m / rows) as u32, batch as u32, 1),
+            ((m / rows) as u32, batch.div_ceil(bgrp) as u32, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
-                x.device.buffer,
                 y.device.buffer,
+                x.device.buffer,
             ],
             &[y.device.buffer],
         )?;
@@ -1213,15 +1437,20 @@ impl Runtime {
             &mask,
             &counter,
             &sampler,
+            0, // sampler_row
+            1, // 单槽
             hist.device.address,
             &hist.device.buffer,
             n,
+            n, // hist_stride（单槽时无效）
         )
     }
 
     /// GPU 采样（self-loop 批量版）：采样结果直接写回 host-visible 缓冲（token_host）。
     /// 复用调用方预建的 temp/mask/counter/sampler 缓冲（存活到 batch 提交后），供单 batch 内
-    /// 连续多轮采样使用；sampler 的 seed 与 hist_len 由调用方每轮用 `store_sampler_host` 更新。
+    /// 连续多轮采样使用；sampler 的 seed 与 hist_len 由调用方每轮更新。
+    /// `sampler_row`：第几轮（每轮一行 10 个 f32）——Vulkan 的「整段单次提交」自循环里，
+    /// 每轮采样读各自的行（第 `row` 行），故同一缓冲可承载整段各轮的参数，零拷贝零同步。
     /// `hist` 为历史 token 缓冲（self-loop 中即累积的 token_seq）。
     #[allow(clippy::too_many_arguments)] // 各缓冲引用扁平透传 record_sample，保持结构清晰
     pub fn sample_into_host_seeded(
@@ -1234,6 +1463,7 @@ impl Runtime {
         counter: &GpuTensorU32,
         sampler: &GpuTensor,
         hist: &GpuTensor,
+        sampler_row: usize,
     ) -> R<()> {
         self.record_sample(
             logits,
@@ -1243,15 +1473,27 @@ impl Runtime {
             mask,
             counter,
             sampler,
+            sampler_row,
+            1, // 单流：单槽
             hist.device.address,
             &hist.device.buffer,
             n,
+            n, // 单流 hist 步长 = n（[1, n] 布局）
         )
     }
 
     /// 记录一次采样 kernel（共享实现）。
+    /// **一次 dispatch 覆盖全部 slot**（`grid = (1, batch, 1)`，slot 走 `gl_WorkGroupID.y`）。
+    ///
+    /// 为什么不做「host 逐槽循环 dispatch」：Vulkan 的 buffer 级 barrier 以**整个 VkBuffer**
+    /// 为粒度，而各 slot 读写同一 temp/mask/counter 缓冲 ⇒ 相邻 slot 的 dispatch 之间必被
+    /// 插入屏障、**完全串行化**（B=8 实测采样占整步 40%）。CUDA 版一直是 `grid=(1,batch,1)`。
+    ///
+    /// - `token_addr`/`token_buf`：token 输出**基址**（shader 内按 `slot` 寻址）。
+    /// - `sampler_row`：本轮读 sampler 的第几行；行序 `(row * batch + slot)`。
+    /// - `hist_stride`：hist 缓冲每 slot 的步长（单流 = n）。
     #[allow(clippy::too_many_arguments)] // 各缓冲地址 + 长度，扁平透传 shader
-    fn record_sample(
+    pub fn record_sample(
         &mut self,
         logits: &GpuTensor,
         token_addr: u64,
@@ -1260,13 +1502,27 @@ impl Runtime {
         mask: &GpuTensor,
         counter: &GpuTensorU32,
         sampler: &GpuTensor,
+        sampler_row: usize,
+        batch: usize,
         hist_addr: u64,
         hist_buf: &vk::Buffer,
         n: usize,
+        hist_stride: usize,
     ) -> R<()> {
-        // sampler 由 CPU 直写 host-visible 缓冲，需 HOST_WRITE→SHADER_READ 屏障
-        self.host_write_to_shader_barrier(&sampler.device.buffer)?;
-        let spec = [n as u32];
+        // sampler 由 CPU 直写 host-visible 缓冲 → shader 通过 **host 缓冲的设备地址**读取
+        // （`store_sampler_host`/`store_sampler_async*`/`upload` 三条写入路径都填 host，
+        // 故统一读 host 地址对三者都正确）。需 HOST_WRITE→SHADER_READ 屏障。
+        let sampler_host = sampler
+            .host
+            .as_ref()
+            .ok_or("record_sample: sampler host dropped")?;
+        self.host_write_to_shader_barrier(&sampler_host.buffer)?;
+        let spec = [
+            n as u32,
+            hist_stride as u32,
+            sampler_row as u32,
+            batch.max(1) as u32,
+        ];
         let params = [
             logits.device.address,
             token_addr,
@@ -1274,16 +1530,16 @@ impl Runtime {
             mask.device.address,
             counter.device.address,
             hist_addr,
-            sampler.device.address,
+            sampler_host.address,
         ];
         self.record_kernel(
             "shaders/spv/sample.spv",
             &spec,
             &params,
-            (1, 1, 1),
+            (1, batch.max(1) as u32, 1),
             &[
                 logits.device.buffer,
-                sampler.device.buffer,
+                sampler_host.buffer,
                 *hist_buf,
                 temp.device.buffer,
                 mask.device.buffer,
@@ -1298,9 +1554,42 @@ impl Runtime {
         Ok(())
     }
 
+    /// 把采样参数行（10 个 f32）写入 sampler 的第 `row` 行（`row_len`：单流 10；批量 `10*batch`）。
+    /// 先写 host 映射区，再同步拷到 device 缓冲——shader 从 device 侧读取（与 `upload` 同语义，
+    /// 拷贝在本函数内完成并等待，故后续同一批的 dispatch 天然可见）。
+    pub fn store_sampler_row(
+        &self,
+        sampler: &GpuTensor,
+        row: usize,
+        row_len: usize,
+        values: &[f32],
+    ) -> R<()> {
+        if values.len() != row_len {
+            return Err(format!(
+                "store_sampler_row: values {} != row_len {row_len}",
+                values.len()
+            )
+            .into());
+        }
+        let host = sampler
+            .host
+            .as_ref()
+            .ok_or("store_sampler_row: host dropped")?;
+        let off = row * row_len;
+        if off + row_len > sampler.len {
+            return Err(format!(
+                "store_sampler_row: row {row} 超出容量（{off}+{row_len} > {}）",
+                sampler.len
+            )
+            .into());
+        }
+        host.copy_from(values, off)?;
+        Ok(())
+    }
+
     /// 把 host-visible 缓冲 in_tok[0]（token 索引，字节存 uint）追加到序列缓冲 out_seq[cnt]，
     /// 并将 cnt 自增。供 GPU self-loop 记录每轮生成的 token，便于一次性下载验证。
-    /// spec 恒空（不重建 pipeline）。dispatch (1,1,1)。
+    /// spec = [设备 subgroup_size]（作为 workgroup X，见 shader 内注释）。dispatch (1,1,1)。
     pub fn record_token(
         &mut self,
         in_tok: &Tensor<f32>,
@@ -1310,13 +1599,23 @@ impl Runtime {
         let params = [in_tok.address, out_seq.device.address, cnt.device.address];
         self.record_kernel(
             "shaders/spv/record_token.spv",
-            &[],
+            &[Self::device_subgroup_size(&self.app)],
             &params,
             (1, 1, 1),
             &[in_tok.buffer, cnt.device.buffer],
             &[out_seq.device.buffer, cnt.device.buffer],
         )?;
         Ok(())
+    }
+
+    /// 设备原生 subgroup size（0 时回退 32），须与 `App::create_kernel` 里
+    /// `requiredSubgroupSize` 的取值完全一致——否则 `record_token` 一类
+    /// 「workgroup X = subgroup size」的 shader 仍会踩 VUID-...-02757。
+    fn device_subgroup_size(app: &App) -> u32 {
+        match app.properties.subgroup_size {
+            0 => 32,
+            s => s,
+        }
     }
 
     /// 把 token 索引直接写入 host-visible 缓冲（tok.host，f32 位模式存 uint）。
@@ -2522,6 +2821,84 @@ impl Runtime {
         Ok(())
     }
 
+    /// batch 版融合 fuse_ka + dplr + group_norm + sum_rk_rk。复用同一 shader
+    /// （`fuse_ka_dplr_norm.comp` 的 per-slot 张量已按 `batch*(H*N)` / `batch*(H*N*N)`
+    /// 索引、权重段不含 slot），仅 dispatch 的 grid.z 由 1 换成 batch。
+    /// dispatch: (H, 1, batch)
+    #[allow(clippy::too_many_arguments)]
+    pub fn fuse_ka_dplr_norm_batch(
+        &mut self,
+        s: &mut GpuTensor,
+        k: &GpuTensor,
+        k_k: &GpuTensor,
+        a: &GpuTensor16,
+        k_a: &GpuTensor,
+        r: &GpuTensor,
+        v: &GpuTensor16,
+        w: &GpuTensor16,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        r_k: &GpuTensor,
+        k_mod: &mut GpuTensor,
+        y: &mut GpuTensor,
+        y_norm: &mut GpuTensor,
+        h: usize,
+        n: usize,
+        eps: f32,
+        gn_eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let spec = [
+            h as u32,
+            n as u32,
+            eps.to_bits(),
+            gn_eps.to_bits(),
+            self.app.properties.subgroup_size,
+        ];
+        let params = [
+            s.device.address,
+            k.device.address,
+            k_k.device.address,
+            a.device.address,
+            k_a.device.address,
+            r.device.address,
+            v.device.address,
+            w.device.address,
+            k_mod.device.address,
+            y.device.address,
+            gamma.device.address,
+            beta.device.address,
+            r_k.device.address,
+            y_norm.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/fuse_ka_dplr_norm.spv",
+            &spec,
+            &params,
+            (h as u32, 1, batch as u32),
+            &[
+                s.device.buffer,
+                k.device.buffer,
+                k_k.device.buffer,
+                a.device.buffer,
+                k_a.device.buffer,
+                r.device.buffer,
+                v.device.buffer,
+                w.device.buffer,
+                gamma.device.buffer,
+                beta.device.buffer,
+                r_k.device.buffer,
+            ],
+            &[
+                s.device.buffer,
+                k_mod.device.buffer,
+                y.device.buffer,
+                y_norm.device.buffer,
+            ],
+        )?;
+        Ok(())
+    }
+
     // ===== sum_rk_rk 归约算子 =====
     /// y += sum(r * k_mod * r_k, 按 head 归约) * v
     /// 替代原 download → CPU 循环 → upload 的 PCIe 往返。
@@ -2703,8 +3080,583 @@ impl Runtime {
         Ok(())
     }
 
-    // ===== L2 Norm 算子 =====
+    /// fp16 源的 embedding gather（batch 并发版）：tok 为 [batch]（**设备缓冲**，元素为
+    /// token 索引；f32/u32 视图皆可，shader 按位读取），每 slot 各取一行写入
+    /// dst [batch, C]（slot 主序）。dispatch: (ceil(C/256), batch, 1)。
+    /// batch=1 时与单 token 版逐位一致。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_rows_device_f16_batch(
+        &mut self,
+        src: &GpuTensor16,
+        dst: &mut GpuTensor,
+        tok_addr: u64,
+        tok_buf: &vk::Buffer,
+        c: usize,
+        batch: usize,
+        block: u32,
+    ) -> R<()> {
+        let spec = [c as u32];
+        let params = [tok_addr, src.device.address, dst.device.address];
+        // tok 在 host 侧：CPU 预置 seed 需 HOST_WRITE→SHADER_READ（shader 采样写回的情形
+        // 由 record_kernel 内的 RAW 屏障覆盖）。
+        self.host_write_to_shader_barrier(tok_buf)?;
+        self.record_kernel(
+            "shaders/spv/gather_row_f16.spv",
+            &spec,
+            &params,
+            (c.div_ceil(block as usize) as u32, batch as u32, 1),
+            &[*tok_buf, src.device.buffer],
+            &[dst.device.buffer],
+        )?;
+        Ok(())
+    }
 
+    // ===== batch 并发（单实例多序列）sequence-parallel 算子 =====
+    // 布局约定：per-slot 张量为 [batch, ...]（slot 主序）；权重/共享张量不含 slot。
+    // batch 维一律落在 `gl_WorkGroupID.y`。
+
+    /// batch 版 token shift：[batch, T, C]（slot 主序），t=0 读该 slot 的 state 段。
+    /// dispatch: (T, batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn seq_shift_batch(
+        &mut self,
+        x: &GpuTensor,
+        state: &GpuTensor,
+        tm: &GpuTensor,
+        y: &mut GpuTensor,
+        c: usize,
+        t: usize,
+        stride_x: usize,
+        stride_y: usize,
+        batch: usize,
+    ) -> R<()> {
+        let spec = seq_shift_spec(c, t, stride_x, stride_y);
+        let params = [
+            x.device.address,
+            state.device.address,
+            tm.device.address,
+            y.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/seq_shift_batch.spv",
+            &spec,
+            &params,
+            (t as u32, batch as u32, 1),
+            &[x.device.buffer, state.device.buffer, tm.device.buffer],
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版 copy_token：每 slot 把 x 的第 `lens[slot]-1` 行拷到 state 的该 slot 段。
+    /// x 为 [batch, T, C]，state 为 [batch, C]。dispatch: (ceil(C/256), batch, 1)
+    pub fn copy_token_batch(
+        &mut self,
+        x: &GpuTensor,
+        state: &mut GpuTensor,
+        lens: &GpuTensorU32,
+        c: usize,
+        t: usize,
+        batch: usize,
+    ) -> R<()> {
+        const BLOCK: usize = 256;
+        let spec = [c as u32, t as u32];
+        let params = [x.device.address, state.device.address, lens.device.address];
+        self.record_kernel(
+            "shaders/spv/copy_token_batch.spv",
+            &spec,
+            &params,
+            (c.div_ceil(BLOCK) as u32, batch as u32, 1),
+            &[x.device.buffer, lens.device.buffer],
+            &[state.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版 DPLR 状态更新：s 为 [batch, H, N, N]，r/w/k/v/a/b/y 为 [batch, T, C]，
+    /// `lens` 截断每 slot 的实际 token 数（padding 段不进状态）。
+    /// dispatch: (H, batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn dplr_seq_batch(
+        &mut self,
+        s: &mut GpuTensor,
+        r: &GpuTensor,
+        w: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        y: &mut GpuTensor,
+        lens: &GpuTensorU32,
+        h: usize,
+        n: usize,
+        t: usize,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        let spec = dplr_seq_spec(h, n, t, c);
+        let params = [
+            s.device.address,
+            r.device.address,
+            w.device.address,
+            k.device.address,
+            v.device.address,
+            a.device.address,
+            b.device.address,
+            y.device.address,
+            lens.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/dplr_seq_batch.spv",
+            &spec,
+            &params,
+            (h as u32, batch as u32, 1),
+            &[
+                s.device.buffer,
+                r.device.buffer,
+                w.device.buffer,
+                k.device.buffer,
+                v.device.buffer,
+                a.device.buffer,
+                b.device.buffer,
+                lens.device.buffer,
+            ],
+            &[s.device.buffer, y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// 分段均值：x [batch, T_pad, C] → out [batch, C]（每 slot 前 `lens[slot]` 行均值）。
+    /// dispatch: (ceil(C/256), batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn segmean(
+        &mut self,
+        x: &GpuTensor,
+        out: &mut GpuTensor,
+        lens: &GpuTensorU32,
+        c: usize,
+        t_pad: usize,
+        batch: usize,
+    ) -> R<()> {
+        const BLOCK: usize = 256;
+        let spec = [c as u32, t_pad as u32];
+        let params = [x.device.address, out.device.address, lens.device.address];
+        self.record_kernel(
+            "shaders/spv/segmean.spv",
+            &spec,
+            &params,
+            (c.div_ceil(BLOCK) as u32, batch as u32, 1),
+            &[x.device.buffer, lens.device.buffer],
+            &[out.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版深度融合 norm_lerp6：x/state/xr..xg/or_..og 均为 [batch, C]（slot 主序），
+    /// gamma/beta/x_*（系数）跨 slot 共享。归约按 slot 独立。dispatch: (ceil(C/256), batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn norm_lerp6_batch(
+        &mut self,
+        x: &GpuTensor,
+        state: &mut GpuTensor,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        x_r: &GpuTensor,
+        x_w: &GpuTensor,
+        x_k: &GpuTensor,
+        x_v: &GpuTensor,
+        x_a: &GpuTensor,
+        x_g: &GpuTensor,
+        o_r: &mut GpuTensor,
+        o_w: &mut GpuTensor,
+        o_k: &mut GpuTensor,
+        o_v: &mut GpuTensor,
+        o_a: &mut GpuTensor,
+        o_g: &mut GpuTensor,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let spec = [c as u32, eps.to_bits(), self.app.properties.subgroup_size];
+        let params = [
+            x.device.address,
+            state.device.address,
+            gamma.device.address,
+            beta.device.address,
+            x_r.device.address,
+            x_w.device.address,
+            x_k.device.address,
+            x_v.device.address,
+            x_a.device.address,
+            x_g.device.address,
+            o_r.device.address,
+            o_w.device.address,
+            o_k.device.address,
+            o_v.device.address,
+            o_a.device.address,
+            o_g.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/norm_lerp6_batch.spv",
+            &spec,
+            &params,
+            (c.div_ceil(NORM_LERP6_BLOCK) as u32, batch as u32, 1),
+            &[
+                x.device.buffer,
+                state.device.buffer,
+                gamma.device.buffer,
+                beta.device.buffer,
+                x_r.device.buffer,
+                x_w.device.buffer,
+                x_k.device.buffer,
+                x_v.device.buffer,
+                x_a.device.buffer,
+                x_g.device.buffer,
+            ],
+            &[
+                state.device.buffer,
+                o_r.device.buffer,
+                o_w.device.buffer,
+                o_k.device.buffer,
+                o_v.device.buffer,
+                o_a.device.buffer,
+                o_g.device.buffer,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版深度融合 cmix：x/state/out_xb 为 [batch, C]，gamma/beta/coeff 共享。
+    /// dispatch: (1, batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmix_norm_lerp_batch(
+        &mut self,
+        x: &GpuTensor,
+        state: &mut GpuTensor,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        coeff: &GpuTensor,
+        out_xb: &mut GpuTensor,
+        c: usize,
+        eps: f32,
+        batch: usize,
+    ) -> R<()> {
+        let spec = [c as u32, eps.to_bits(), self.app.properties.subgroup_size];
+        let params = [
+            x.device.address,
+            state.device.address,
+            gamma.device.address,
+            beta.device.address,
+            coeff.device.address,
+            out_xb.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/cmix_norm_lerp_batch.spv",
+            &spec,
+            &params,
+            (1, batch as u32, 1),
+            &[
+                x.device.buffer,
+                state.device.buffer,
+                gamma.device.buffer,
+                beta.device.buffer,
+                coeff.device.buffer,
+            ],
+            &[state.device.buffer, out_xb.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版 int8 r/k/v + 低秩一级投影融合。
+    /// x 输入与输出为 [batch, ...]（slot 主序）；int8 权重与 mid 权重跨 slot 共享。
+    /// dispatch: (C/4 + VM + WM + AM + GM, batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_int8_rkv_stage1_batch(
+        &mut self,
+        r_a8: &GpuTensorInt8,
+        k_a8: &GpuTensorInt8,
+        v_a8: &GpuTensorInt8,
+        v1: &GpuTensor,
+        w1: &GpuTensor,
+        a1: &GpuTensor,
+        g1: &GpuTensor,
+        xr: &GpuTensor,
+        xk: &GpuTensor,
+        xv: &GpuTensor,
+        xw: &GpuTensor,
+        xa: &GpuTensor,
+        xg: &GpuTensor,
+        out_r: &mut GpuTensor,
+        out_k: &mut GpuTensor,
+        out_v: &mut GpuTensor16,
+        out_vm: &mut GpuTensor,
+        out_wm: &mut GpuTensor,
+        out_am: &mut GpuTensor,
+        out_gm: &mut GpuTensor,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        // constant_id 0..5 + 13 (BGRP) + 14 (BATCH)：r/k/v 已拆到不同 workgroup，
+        // 权重按 BGRP 个槽单读（见 shader 顶部注释）。
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = [
+            c as u32,
+            vm as u32,
+            wm as u32,
+            am as u32,
+            gm as u32,
+            self.app.properties.subgroup_size,
+            0, // 6..12 未使用（shader 未声明对应 constant_id）
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            bgrp as u32,  // 13
+            batch as u32, // 14
+        ];
+        let params = [
+            r_a8.idx.device.address,
+            r_a8.sz.device.address,
+            k_a8.idx.device.address,
+            k_a8.sz.device.address,
+            v_a8.idx.device.address,
+            v_a8.sz.device.address,
+            v1.device.address,
+            w1.device.address,
+            a1.device.address,
+            g1.device.address,
+            xr.device.address,
+            xk.device.address,
+            xv.device.address,
+            xw.device.address,
+            xa.device.address,
+            xg.device.address,
+            out_r.device.address,
+            out_k.device.address,
+            out_v.device.address,
+            out_vm.device.address,
+            out_wm.device.address,
+            out_am.device.address,
+            out_gm.device.address,
+        ];
+        let reads = vec![
+            r_a8.idx.device.buffer,
+            r_a8.sz.device.buffer,
+            k_a8.idx.device.buffer,
+            k_a8.sz.device.buffer,
+            v_a8.idx.device.buffer,
+            v_a8.sz.device.buffer,
+            v1.device.buffer,
+            w1.device.buffer,
+            a1.device.buffer,
+            g1.device.buffer,
+            xr.device.buffer,
+            xk.device.buffer,
+            xv.device.buffer,
+            xw.device.buffer,
+            xa.device.buffer,
+            xg.device.buffer,
+        ];
+        let writes = vec![
+            out_r.device.buffer,
+            out_k.device.buffer,
+            out_v.device.buffer,
+            out_vm.device.buffer,
+            out_wm.device.buffer,
+            out_am.device.buffer,
+            out_gm.device.buffer,
+        ];
+        debug_assert!(
+            c.is_multiple_of(GEMV_ROWS),
+            "C must be divisible by GEMV_ROWS"
+        );
+        self.record_kernel(
+            "shaders/spv/gemv_int8_rkv_stage1_batch.spv",
+            &spec,
+            &params,
+            (
+                (3 * (c / GEMV_ROWS) + vm + wm + am + gm) as u32,
+                batch.div_ceil(bgrp) as u32,
+                1,
+            ),
+            &reads,
+            &writes,
+        )?;
+        Ok(())
+    }
+
+    /// batch 版低秩链第二级融合（w/a/v/g）：mid 输入与 v_first/输出为 [batch, ...]；权重共享。
+    /// dispatch: (M / rows_per_wg, batch, 1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_lowrank_chain4_batch(
+        &mut self,
+        w2: &GpuTensor,
+        a2: &GpuTensor,
+        v2: &GpuTensor,
+        g2: &GpuTensor,
+        w_mid: &GpuTensor,
+        a_mid: &GpuTensor,
+        v_mid: &GpuTensor,
+        g_mid: &GpuTensor,
+        w0: &GpuTensor,
+        a0: &GpuTensor,
+        v0: &GpuTensor,
+        scale: &GpuTensor,
+        v_first: &GpuTensor16,
+        out_w: &mut GpuTensor16,
+        out_a: &mut GpuTensor16,
+        out_v: &mut GpuTensor16,
+        out_g: &mut GpuTensor16,
+        m: usize,
+        kw: usize,
+        ka: usize,
+        kv: usize,
+        kg: usize,
+        batch: usize,
+    ) -> R<()> {
+        // constant_id 0..5 + 13 (BGRP) + 14 (BATCH)：权重按 BGRP 个槽单读。
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = [
+            m as u32,
+            kw as u32,
+            ka as u32,
+            kv as u32,
+            kg as u32,
+            self.app.properties.subgroup_size,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            bgrp as u32,  // 13
+            batch as u32, // 14
+        ];
+        let params = [
+            w2.device.address,
+            a2.device.address,
+            v2.device.address,
+            g2.device.address,
+            w_mid.device.address,
+            a_mid.device.address,
+            v_mid.device.address,
+            g_mid.device.address,
+            w0.device.address,
+            a0.device.address,
+            v0.device.address,
+            scale.device.address,
+            v_first.device.address,
+            out_w.device.address,
+            out_a.device.address,
+            out_v.device.address,
+            out_g.device.address,
+        ];
+        let reads = vec![
+            w2.device.buffer,
+            a2.device.buffer,
+            v2.device.buffer,
+            g2.device.buffer,
+            w_mid.device.buffer,
+            a_mid.device.buffer,
+            v_mid.device.buffer,
+            g_mid.device.buffer,
+            w0.device.buffer,
+            a0.device.buffer,
+            v0.device.buffer,
+            scale.device.buffer,
+            v_first.device.buffer,
+            out_v.device.buffer, // v 链原地写：既读又写
+        ];
+        let writes = vec![
+            out_w.device.buffer,
+            out_a.device.buffer,
+            out_v.device.buffer,
+            out_g.device.buffer,
+        ];
+        let rows_per_wg = 256 / self.app.properties.subgroup_size as usize;
+        assert!(
+            m.is_multiple_of(rows_per_wg),
+            "gemv_lowrank_chain4_batch: M={m} 不整除 rows_per_wg={rows_per_wg}"
+        );
+        self.record_kernel(
+            "shaders/spv/gemv_lowrank_chain4_batch.spv",
+            &spec,
+            &params,
+            ((m / rows_per_wg) as u32, batch.div_ceil(bgrp) as u32, 1),
+            &reads,
+            &writes,
+        )?;
+        Ok(())
+    }
+
+    /// batch 版稀疏 FFN value 投影：r2 为 [batch, fh]，x 为 [batch, C]；权重共享。
+    /// dispatch: (FH/TILE, C/C_TILE, batch)
+    pub fn ffn_value_sparse_add_batch(
+        &mut self,
+        value_tiled: &GpuTensor16,
+        r2: &GpuTensor,
+        x: &mut GpuTensor,
+        c: usize,
+        fh: usize,
+        batch: usize,
+    ) -> R<()> {
+        const TILE: usize = 128;
+        const C_TILE: usize = 256;
+        debug_assert_eq!(fh % TILE, 0, "fh 需为 TILE 整数倍");
+        debug_assert_eq!(c % C_TILE, 0, "c 需为 C_TILE 整数倍");
+        let spec = [c as u32, fh as u32, TILE as u32, C_TILE as u32];
+        let params = [
+            r2.device.address,
+            value_tiled.device.address,
+            x.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/ffn_value_sparse_add_batch.spv",
+            &spec,
+            &params,
+            ((fh / TILE) as u32, (c / C_TILE) as u32, batch as u32),
+            &[value_tiled.device.buffer, r2.device.buffer, x.device.buffer],
+            &[x.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// batch 版 record_tokens 的**单 slot 一次 dispatch**：复用已验证的 `record_token.spv`，
+    /// 通过地址偏移把该 slot 的 token/序列段/cnt 指给 shader。`batch` 个 slot 由调用方循环。
+    pub fn record_token_slot(
+        &mut self,
+        in_tok_addr: u64,
+        in_tok_buf: &vk::Buffer,
+        out_seq: &GpuTensor,
+        cnt: &mut GpuTensor,
+        stride: usize,
+        slot: usize,
+    ) -> R<()> {
+        const E: u64 = 4;
+        let params = [
+            in_tok_addr + slot as u64 * E,
+            out_seq.device.address + slot as u64 * stride as u64 * E,
+            cnt.device.address + slot as u64 * E,
+        ];
+        self.record_kernel(
+            "shaders/spv/record_token.spv",
+            &[Self::device_subgroup_size(&self.app)],
+            &params,
+            (1, 1, 1),
+            &[*in_tok_buf, cnt.device.buffer],
+            &[out_seq.device.buffer, cnt.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    // ===== L2 Norm 算子 =====
     /// 按 head 做 L2 normalize
     /// dispatch: (H, batch=1, 1)
     #[allow(dead_code)]
@@ -2755,13 +3707,34 @@ const NORM_LERP6_BLOCK: usize = 256;
 /// gemv specialization (constant_id 0-10, 11: SUBGROUP_SIZE)
 /// subgroup_size 为设备真实 subgroup（NVIDIA=32，AMD=64，Intel 可变），传入 gemv_f32io 家族
 /// shader 的 constant_id=11，保证 NUM_SUBGROUPS = BLOCK_SIZE/SUBGROUP_SIZE 跨硬件正确。
-fn gemv_spec(app: &App, m: usize, k: usize, rows: usize) -> [u32; 13] {
+///
+/// ★ STRIDE_A_Z = 0（权重跨 batch 共享）。dispatch 的 `grid.y` 是**槽位**维（batch decode），
+/// 同一份权重被 B 个 slot 复用；shader 里 `a_base = batch * STRIDE_A_Z + row * STRIDE_A_Y`，
+/// 若此处填 `m*k` 则 batch≥1 的 workgroup 会按「每槽一份权重」去读，越界 m*k 字节
+/// （head M=vocab 时单槽就偏 167MB）——实测在 Vulkan 上触发 `ERROR_DEVICE_LOST`
+/// （2026-10-03），且槽位 1..B-1 的 logits 用的是垃圾权重（数值退化）。
+/// 单 token 路径 batch 恒为 1（grid.y=1 → batch=0），故置 0 与旧值逐位等价。
+fn gemv_spec(app: &App, m: usize, k: usize, rows: usize) -> [u32; 15] {
+    gemv_spec_batch(app, m, k, rows, 1, 1)
+}
+
+/// `gemv_spec` 的批量变体，额外注入 BGRP（槽分组宽度）与 BATCH（尾块守卫用）。
+/// 仅 `gemv_int8.comp` 声明并使用了 constant_id 13/14；其余 shader 忽略多余条目
+/// （Vulkan 规定未在 shader 中声明的 constant_id 条目不影响流水线行为）。
+fn gemv_spec_batch(
+    app: &App,
+    m: usize,
+    k: usize,
+    rows: usize,
+    bgrp: usize,
+    batch: usize,
+) -> [u32; 15] {
     [
         m as u32,                     // 0: M (output dim)
         k as u32,                     // 1: K (input dim)
         1,                            // 2: STRIDE_A_X
         k as u32,                     // 3: STRIDE_A_Y
-        (m * k) as u32,               // 4: STRIDE_A_Z
+        0,                            // 4: STRIDE_A_Z（权重跨 batch 共享）
         1,                            // 5: STRIDE_B_X (bias)
         m as u32,                     // 6: STRIDE_B_Y
         1,                            // 7: STRIDE_X_X
@@ -2770,7 +3743,29 @@ fn gemv_spec(app: &App, m: usize, k: usize, rows: usize) -> [u32; 13] {
         m as u32,                     // 10: STRIDE_Y_Y
         app.properties.subgroup_size, // 11: SUBGROUP_SIZE（跨硬件自适应）
         rows as u32,                  // 12: ROWS（每 workgroup 行数，大 M 用大 ROWS）
+        bgrp as u32,                  // 13: BGRP（每 workgroup 同时处理的槽数）
+        batch as u32,                 // 14: BATCH（尾块守卫）
     ]
+}
+
+/// 批量 int8 GEMV（`gemv_int8.comp` / `gemv_int8_add.comp`）的每-workgroup 行数。
+/// 小 M（如 ffn.value 的 M=2560）在 ROWS=4 下只有 640 个 workgroup，远少于 68 个 SM
+/// 能同时驻留的数量，延迟掩盖不足；ROWS=2 把 workgroup 数翻倍（权重读取总量不变，
+/// 因为每个 workgroup 只读自己那几行）。大 M（ffn.key 的 10240、head 的 65536）
+/// 本来就有几千个 workgroup，保持 ROWS=4 以摊薄 x 的重读。
+fn gemv_rows_batch(m: usize) -> usize {
+    if m <= 4096 { 2 } else { 4 }
+}
+
+/// 批量 int8 GEMV 的槽分组宽度。
+/// batch ≤ 1 时退化为 1（单流无需摊薄，且避免多做 ROWS×(BGRP-1) 次归约）；
+/// 否则取 min(8, batch)——一个 workgroup 同时算 8 个槽，权重只读一遍。
+/// CUDA 侧的对应参数是 `gemv_variant_mb16` 的 `ROWS=4/BGRP=8/128 线程`。
+fn gemv_bgrp_for(batch: usize) -> usize {
+    match batch {
+        0 | 1 => 1,
+        b => b.min(8),
+    }
 }
 
 /// sequence-parallel gemv specialization（constant_id 0-10, 11: SUBGROUP_SIZE）

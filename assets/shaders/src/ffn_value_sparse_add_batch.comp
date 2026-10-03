@@ -1,0 +1,98 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_atomic_float : require
+
+// 稀疏 FFN value 投影（batch 并发版）：x[slot] += r2[slot] @ ffn_value（r2 约 96% 稀疏）。
+// 权重 `value_tiled` 跨 slot 共享（读一遍算 B 份）。
+//
+// 每个 workgroup 处理一个 (f_block, c_block, slot)：
+//   - f_block：TILE 个 f（该 slot 的 r2 一段）
+//   - c_block：C_TILE 个 c（该 slot 的 x 一段）
+//   - slot：gl_WorkGroupID.z
+// 语义与单序列版一致，仅 r2/x 带 `slot*len` 偏移。
+//
+// dispatch: (FH/TILE, C/C_TILE, batch)
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint FH = 10240;
+layout(constant_id = 2) const uint TILE = 128;
+layout(constant_id = 3) const uint C_TILE = 256;
+
+const uint BLOCK_SIZE = 128;   // == TILE
+
+shared float r2_slice[TILE];
+shared int   nnz_ids[TILE];
+shared int   nnz_count;
+
+layout(buffer_reference) buffer BufR2 { float data[]; } buf_r2;   // [batch, fh]
+layout(buffer_reference) buffer BufW  { uint  data[]; } buf_w;    // [fh*C] fp16 平铺（共享）
+layout(buffer_reference) buffer BufX  { float data[]; } buf_x;    // [batch, C]，就地原子累加
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufR2 buf_r2;
+    BufW  buf_w;
+    BufX  buf_x;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint f_block = gl_WorkGroupID.x;
+    const uint c_block = gl_WorkGroupID.y;
+    const uint slot    = gl_WorkGroupID.z;
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint start_f = f_block * TILE;
+
+    BufR2 buf_r2 = params.buf_r2;
+    BufW  buf_w  = params.buf_w;
+    BufX  buf_x  = params.buf_x;
+
+    const uint r2_base = slot * FH;
+    const uint x_base  = slot * C;
+
+    if (tid == 0) {
+        nnz_count = 0;
+    }
+    barrier();
+
+    if (tid < TILE) {
+        const float r2v = buf_r2.data[r2_base + start_f + tid];
+        r2_slice[tid] = r2v;
+        if (r2v != 0.0) {
+            const int pos = atomicAdd(nnz_count, 1);
+            nnz_ids[pos] = int(tid);
+        }
+    }
+    barrier();
+
+    const uint c_blocks   = C / C_TILE;
+    const uint tile_base  = ((f_block * c_blocks + c_block) * TILE) * C_TILE;
+    const uint c_local0   = tid * 2;
+    const uint c0         = c_block * C_TILE + c_local0;
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    const int num = nnz_count;
+    for (int i = 0; i < num; i += 2) {
+        const int f0 = nnz_ids[i];
+        const uint w_ofs = tile_base + uint(f0) * C_TILE + c_local0;
+        const float a0 = r2_slice[uint(f0)];
+        const vec2 wv0 = unpackFloat2x16(buf_w.data[w_ofs >> 1]);
+        acc0 += a0 * wv0.x;
+        acc1 += a0 * wv0.y;
+        if (i + 1 < num) {
+            const int f1 = nnz_ids[i + 1];
+            const uint w_ofs1 = tile_base + uint(f1) * C_TILE + c_local0;
+            const float a1 = r2_slice[uint(f1)];
+            const vec2 wv1 = unpackFloat2x16(buf_w.data[w_ofs1 >> 1]);
+            acc0 += a1 * wv1.x;
+            acc1 += a1 * wv1.y;
+        }
+    }
+
+    atomicAdd(buf_x.data[x_base + c0], acc0);
+    atomicAdd(buf_x.data[x_base + c0 + 1], acc1);
+}

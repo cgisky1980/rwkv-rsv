@@ -8,8 +8,14 @@
 
 // GPU 采样：penalty(repetition/frequency/presence) + temperature + top-k + top-p
 // 过滤后按概率采样，输出 token 索引。
-// 单 workgroup（dispatch (1,1,1)），BLOCK_SIZE=256 线程协作。
-// 相比把 65536 个 f32 logits（256KB）下载到 CPU 再采样，只在 GPU 完成并回传 4 字节索引。
+// **一个 workgroup 处理一个 slot**（`gl_WorkGroupID.y` = slot），整批 slot 一次 dispatch。
+//
+// ★ 为什么必须把 slot 放进 grid 维（2026-10-03）：
+//   旧版由 host 逐 slot 循环 dispatch（每个 `(1,1,1)`），而 Vulkan 的 buffer 级 barrier
+//   按「整个 VkBuffer」判依赖——各 slot 读写的是同一个 temp/mask/counter 缓冲 ⇒ 相邻
+//   slot 的 dispatch 之间被插入屏障、**完全串行化**：B=8 时采样占整步 40%（4.26ms/槽/步
+//   × 8）。CUDA 版 `rwkv_sample_batch` 一直是 `grid=(1, batch, 1)`，一次覆盖所有槽。
+//   本版语义与原逐槽版**逐位等价**（同一 slot 的输入/参数/随机数与原来完全一致）。
 //
 // 流程：
 //   1. 载入 logits
@@ -25,7 +31,7 @@
 //   frequency_penalty：logit -= freq * 出现次数（次数偏移，0.0=禁用）
 //   presence_penalty： 出现过的 token 一律 logit -= pres（存在偏移，0.0=禁用）
 //
-// 采样参数放在 sampler 缓冲（host-visible，CPU 直接写，8 元素）：
+// 采样参数放在 sampler 缓冲（host-visible，CPU 直接写，每行 10 元素）：
 //   [0] temperature（f32 位模式）
 //   [1] top_k（uint，0 = 禁用）
 //   [2] top_p（f32 位模式，1.0 = 禁用）
@@ -34,19 +40,29 @@
 //   [5] frequency_penalty（f32 位模式，0.0 = 禁用）
 //   [6] presence_penalty（f32 位模式，0.0 = 禁用）
 //   [7] hist_len（uint，历史 token 数，0 = 无惩罚）
+// 行序：`(SAMPLER_ROW * BATCH + slot)`（单流 BATCH=1 时退化为第 SAMPLER_ROW 行）。
 
-layout(constant_id = 0) const uint N = 65536;  // logits 长度（vocab）
+layout(constant_id = 0) const uint N = 65536;            // logits 长度（vocab）
+layout(constant_id = 1) const uint HIST_STRIDE = 65536;  // 每 slot 历史缓冲步长
+layout(constant_id = 2) const uint SAMPLER_ROW = 0;      // 本轮读 sampler 的第几行
+layout(constant_id = 3) const uint BATCH = 1;            // 槽位数（grid.y 维长度）
 
+// ★ workgroup 大小 = 采样内核占用率的唯一杠杆（2026-10-03 实测）：本内核是**纯流式扫描**
+// （每趟全词表 65536），靠内存级并行掩盖延迟；而 dispatch 是 (1, batch, 1)，B=8 时全卡
+// 只有 8 个 workgroup（8 个 SM）。BLOCK_SIZE=256 ⇒ 8 warp/SM（占用率 ~12%）⇒ 每趟全词表
+// 扫描被串行延迟拖到 0.16ms（1.6GB/s，仅为峰值 1/300）。CUDA 侧同源笔记：「不是带宽受限，
+// 而是每次迭代的成本（指令数 + 依赖链）受限」。这里直接加大 workgroup 换取更多 warp。
 const uint BLOCK_SIZE = 256;
 const uint MAX_TOP_P_ITERS = 512;  // top-p 累积迭代上限（防路径退化时死循环）
+const uint SAMP_STRIDE = 10;       // 每 slot 每轮 10 个 f32
 
 layout(buffer_reference) buffer InLogits { float data[]; };
 layout(buffer_reference) buffer OutToken { uint data[]; };
-layout(buffer_reference) buffer Temp { float data[]; };    // 工作区 [N]
-layout(buffer_reference) buffer Mask { uint data[]; };     // top-k / top-p 已选标记 [N]
-layout(buffer_reference) buffer Counter { uint data[]; };  // 历史 token 计数 [N]
-layout(buffer_reference) buffer Hist { uint data[]; };     // 历史 token 序列 [hist_len]
-layout(buffer_reference) buffer Sampler { uint data[]; };  // [temp, top_k, top_p, seed, rep, freq, pres, hist_len]
+layout(buffer_reference) buffer Temp { float data[]; };    // 工作区 [batch, N]
+layout(buffer_reference) buffer Mask { uint data[]; };     // top-k / top-p 已选标记 [batch, N]
+layout(buffer_reference) buffer Counter { uint data[]; };  // 历史 token 计数 [batch, N]
+layout(buffer_reference) buffer Hist { uint data[]; };     // 历史 token 序列 [batch, hist_stride]
+layout(buffer_reference) buffer Sampler { uint data[]; };  // [row, batch, 10]
 
 layout(set = 0, binding = 0, std430) uniform Params {
     InLogits in_logits;
@@ -58,13 +74,39 @@ layout(set = 0, binding = 0, std430) uniform Params {
     Sampler samp;
 } params;
 
+// ★ 必须显式声明 workgroup 大小：GLSL 缺省是 (1,1,1)，而本 shader 的归约/采样
+// 全部按 BLOCK_SIZE 个线程协作编写（`for (i = index; i < N; i += BLOCK_SIZE)` +
+// `shared_val[BLOCK_SIZE]` 树归约）。缺省值下只有 1 个线程运行 → 采样结果全错
+// （softmax 只覆盖 1/BLOCK_SIZE 元素，total 退化），且 `create_kernel` 统一设置的
+// `requiredSubgroupSize` + `REQUIRE_FULL_SUBGROUPS` 会因 1 % 32 != 0 造出**非法
+// pipeline** → dispatch 直接 ERROR_DEVICE_LOST（2026-10-03 实录）。
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
 shared float shared_val[BLOCK_SIZE];
 shared uint  shared_idx[BLOCK_SIZE];
+shared uint  s_hist[256]; // top-k 基数选择的分桶直方图（8 位一档）
+                          // ⚠️ 不能叫 `hist`：main() 里有同名的 `Hist hist` 局部
+                          // buffer reference，会把它遮蔽掉（glslang 直接报错）。
+shared uint  s_need;    // 基数选择：当前桶内要找的「从大到小第 need 名」
+shared uint  s_acc;     // 基数选择：已确定的 key 高位
+shared float s_threshold; // top-k 保留边界（第 K 大的 logits 值）
 shared float s_u;       // 采样的均匀随机数
 shared uint  s_b;       // 采样定位的块索引
 shared float s_base;    // 定位块之前的累积概率
 shared float g_cum;     // top-p 累积
 shared float g_cutoff;  // top-p 保留阈值
+
+/// 顺序保持的 float→uint 映射（基数选择用）：非负数把符号位置 1、负数按位取反，
+/// 使 uint 的大小顺序与 float 完全一致（含 -1e30 这类哨兵）。
+uint key_of(float v) {
+    const uint b = floatBitsToUint(v);
+    return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+
+/// `key_of` 的逆映射。
+float val_of_key(uint k) {
+    return uintBitsToFloat((k & 0x80000000u) != 0u ? (k & 0x7FFFFFFFu) : ~k);
+}
 
 // splitmix32：由 seed 生成 (0,1) 均匀随机数。
 float u01(uint s) {
@@ -78,13 +120,14 @@ float u01(uint s) {
 
 // 找 mask==0 的最大值（含索引），结果放 shared_val[0]/shared_idx[0]。
 // 平局取更小索引（与 CPU 严格大于 argmax 一致）。
-void reduce_max(uint index, Temp temp, Mask mask) {
+// `sbase` 为本 slot 在 temp/mask 中的起始下标（slot 主序，步长 N）。
+void reduce_max(uint index, uint sbase, Temp temp, Mask mask) {
     float lm = -1e30;
     uint  li = 0u;
     [[unroll]]
     for (uint i = index; i < N; i += BLOCK_SIZE) {
-        if (mask.data[i] == 0u && temp.data[i] > lm) {
-            lm = temp.data[i];
+        if (mask.data[sbase + i] == 0u && temp.data[sbase + i] > lm) {
+            lm = temp.data[sbase + i];
             li = i;
         }
     }
@@ -109,6 +152,7 @@ void reduce_max(uint index, Temp temp, Mask mask) {
 
 void main() {
     const uint index = gl_LocalInvocationIndex;
+    const uint slot  = gl_WorkGroupID.y;
 
     InLogits in_logits = params.in_logits;
     OutToken out_token = params.out_token;
@@ -116,14 +160,18 @@ void main() {
     Mask mask = params.mask;
     Sampler samp = params.samp;
 
-    const float temperature = uintBitsToFloat(samp.data[0]);
-    const uint  top_k       = samp.data[1];
-    const float top_p       = uintBitsToFloat(samp.data[2]);
-    const uint  seed        = samp.data[3];
-    const float rep         = uintBitsToFloat(samp.data[4]);
-    const float freq        = uintBitsToFloat(samp.data[5]);
-    const float pres        = uintBitsToFloat(samp.data[6]);
-    const uint  hist_len    = samp.data[7];
+    const uint sbase = slot * N;                                 // temp/mask/counter/logits 语段
+    const uint hbase = slot * HIST_STRIDE;                       // hist 语段
+    const uint sb    = (SAMPLER_ROW * BATCH + slot) * SAMP_STRIDE; // 本槽本轮参数行
+
+    const float temperature = uintBitsToFloat(samp.data[sb + 0u]);
+    const uint  top_k       = samp.data[sb + 1u];
+    const float top_p       = uintBitsToFloat(samp.data[sb + 2u]);
+    const uint  seed        = samp.data[sb + 3u];
+    const float rep         = uintBitsToFloat(samp.data[sb + 4u]);
+    const float freq        = uintBitsToFloat(samp.data[sb + 5u]);
+    const float pres        = uintBitsToFloat(samp.data[sb + 6u]);
+    const uint  hist_len    = samp.data[sb + 7u];
 
     Counter counter = params.counter;
     Hist hist = params.hist;
@@ -131,31 +179,33 @@ void main() {
     // ---------- 1. 载入 logits ----------
     [[unroll]]
     for (uint i = index; i < N; i += BLOCK_SIZE) {
-        temp.data[i] = in_logits.data[i];
+        temp.data[sbase + i] = in_logits.data[sbase + i];
     }
 
     // ---------- 2. 惩罚（repetition / frequency / presence） ----------
     if (hist_len > 0u && (rep != 1.0 || freq != 0.0 || pres != 0.0)) {
         // 清零直方图
-        for (uint i = index; i < N; i += BLOCK_SIZE) counter.data[i] = 0u;
+        for (uint i = index; i < N; i += BLOCK_SIZE) counter.data[sbase + i] = 0u;
         barrier();
-        // 统计历史 token 出现次数
+        // 统计历史 token 出现次数（越界 id 夹到词表末位，避免脏历史越界写）
         [[unroll]]
         for (uint h = index; h < hist_len; h += BLOCK_SIZE) {
-            atomicAdd(counter.data[hist.data[h]], 1u);
+            uint hh = hist.data[hbase + h];
+            if (hh >= N) hh = N - 1u;
+            atomicAdd(counter.data[sbase + hh], 1u);
         }
         barrier();
         // 按计数施加惩罚（作用于 softmax 前的 logits）
         [[unroll]]
         for (uint i = index; i < N; i += BLOCK_SIZE) {
-            const uint cnt = counter.data[i];
-            float l = temp.data[i];
+            const uint cnt = counter.data[sbase + i];
+            float l = temp.data[sbase + i];
             if (cnt > 0u) {
                 if (rep != 1.0) l = l > 0.0 ? l / rep : l * rep;
                 if (pres != 0.0) l -= pres;
             }
             if (freq != 0.0) l -= freq * float(cnt);
-            temp.data[i] = l;
+            temp.data[sbase + i] = l;
         }
         barrier();
     }
@@ -165,26 +215,72 @@ void main() {
     if (!(temperature > 0.0)) invT = 1.0;
     [[unroll]]
     for (uint i = index; i < N; i += BLOCK_SIZE) {
-        temp.data[i] *= invT;
+        temp.data[sbase + i] *= invT;
     }
 
-    // ---------- 4. top-k ----------
+    // ---------- 4. top-k：基数选择（4 趟 × 8 位）----------
+    // 旧版是「逐轮找最大 + 标记」的 O(top_k) 趟全词表扫描（top_k=50 ⇒ 100 趟），
+    // 实测 0.32ms/轮、单步 ~16ms（占整步近 1/3）；且它的 `threshold` 是**线程私有**变量、
+    // 只有 index==0 会更新 ⇒ 掩码其实只对 1/256 的词表元素生效（top-k 形同虚设）。
+    // 现改为按 uint key 从高位到低位「逐 8 位定桶」：4 趟扫描即得**第 K 大值的精确位模式**，
+    // 掩码并入下面的 softmax 一趟（`v < threshold ⇒ 0`），语义与 CUDA `rwkv_sample_batch`
+    // 的快速路径一致（保留全部 ≥ 第 K 大的元素）。
+    float threshold = -1e30;
     if (top_k > 0u && top_k < N) {
-        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[i] = 0u;
+        uint need = top_k;  // 当前桶内要找的「从大到小第 need 名」
+        uint acc  = 0u;     // 已确定的 key 高位（逐趟左移 8 位拼接）
+        // 第 0 趟：全部元素按最高 8 位分桶
+        if (index < 256u) s_hist[index] = 0u;
         barrier();
-        float threshold = -1e30;
-        for (uint round = 0u; round < top_k; round++) {
-            reduce_max(index, temp, mask);
-            if (index == 0u) {
-                threshold = shared_val[0];
-                mask.data[shared_idx[0]] = 1u;
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            atomicAdd(s_hist[key_of(temp.data[sbase + i]) >> 24u], 1u);
+        }
+        barrier();
+        if (index == 0u) {
+            uint cum = 0u;
+            uint sel = 0u;
+            for (int d = 255; d >= 0; --d) {
+                const uint c = s_hist[uint(d)];
+                if (cum + c >= need) { sel = uint(d); break; }
+                cum += c;
+            }
+            s_need = need - cum;
+            s_acc  = sel;
+        }
+        barrier();
+        need = s_need;
+        acc  = s_acc;
+        // 第 1..3 趟：只统计「高位前缀 == acc」的元素，继续按下一个 8 位分桶
+        [[unroll]]
+        for (uint p = 1u; p < 4u; p++) {
+            const uint shift = 24u - 8u * p;  // 16 / 8 / 0（shift+8 恒 < 32）
+            if (index < 256u) s_hist[index] = 0u;
+            barrier();
+            for (uint i = index; i < N; i += BLOCK_SIZE) {
+                const uint key = key_of(temp.data[sbase + i]);
+                if ((key >> (shift + 8u)) == acc) {
+                    atomicAdd(s_hist[(key >> shift) & 0xFFu], 1u);
+                }
             }
             barrier();
+            if (index == 0u) {
+                uint cum = 0u;
+                uint sel = 0u;
+                for (int d = 255; d >= 0; --d) {
+                    const uint c = s_hist[uint(d)];
+                    if (cum + c >= need) { sel = uint(d); break; }
+                    cum += c;
+                }
+                s_need = need - cum;
+                s_acc  = (acc << 8u) | sel;
+            }
+            barrier();
+            need = s_need;
+            acc  = s_acc;
         }
-        for (uint i = index; i < N; i += BLOCK_SIZE) {
-            if (temp.data[i] < threshold) temp.data[i] = -1e30;
-        }
+        if (index == 0u) s_threshold = val_of_key(acc);
         barrier();
+        threshold = s_threshold;
     }
 
     // ---------- 5. softmax ----------
@@ -192,7 +288,7 @@ void main() {
         // max 归约
         float lm = -1e30;
         [[unroll]]
-        for (uint i = index; i < N; i += BLOCK_SIZE) lm = max(lm, temp.data[i]);
+        for (uint i = index; i < N; i += BLOCK_SIZE) lm = max(lm, temp.data[sbase + i]);
         shared_val[index] = lm;
         barrier();
         [[unroll]]
@@ -202,12 +298,14 @@ void main() {
         }
         const float m = shared_val[0];
         barrier();
-        // exp + sum
+        // exp + sum（★ top-k 掩码并入本趟：`v < threshold ⇒ 0`，与旧版
+        // 「先写 -1e30 再 exp(-1e30-m)=0」逐位等价，省掉一整趟全词表读写）
         float s = 0.0;
         [[unroll]]
         for (uint i = index; i < N; i += BLOCK_SIZE) {
-            float v = exp(temp.data[i] - m);
-            temp.data[i] = v;
+            const float tv = temp.data[sbase + i];
+            const float v = (tv < threshold) ? 0.0 : exp(tv - m);
+            temp.data[sbase + i] = v;
             s += v;
         }
         shared_val[index] = s;
@@ -221,14 +319,14 @@ void main() {
         barrier();
         if (total > 0.0) {
             [[unroll]]
-            for (uint i = index; i < N; i += BLOCK_SIZE) temp.data[i] /= total;
+            for (uint i = index; i < N; i += BLOCK_SIZE) temp.data[sbase + i] /= total;
         }
         barrier();
     }
 
     // ---------- 6. top-p ----------
     if (top_p > 0.0 && top_p < 1.0) {
-        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[i] = 0u;
+        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[sbase + i] = 0u;
         barrier();
         if (index == 0u) {
             g_cum = 0.0;
@@ -236,9 +334,9 @@ void main() {
         }
         barrier();
         for (int cnt = 0; cnt < MAX_TOP_P_ITERS && g_cum < top_p; cnt++) {
-            reduce_max(index, temp, mask);
+            reduce_max(index, sbase, temp, mask);
             if (index == 0u) {
-                mask.data[shared_idx[0]] = 1u;
+                mask.data[sbase + shared_idx[0]] = 1u;
                 g_cum += shared_val[0];
                 g_cutoff = shared_val[0];
             }
@@ -247,18 +345,33 @@ void main() {
         barrier();
         [[unroll]]
         for (uint i = index; i < N; i += BLOCK_SIZE) {
-            if (temp.data[i] < g_cutoff) temp.data[i] = 0.0;
+            if (temp.data[sbase + i] < g_cutoff) temp.data[sbase + i] = 0.0;
         }
         barrier();
     }
 
     // ---------- 7. 采样 ----------
-    // 重新算 total（top-p 截断后）
-    float ts = 0.0;
-    [[unroll]]
-    for (uint i = index; i < N; i += BLOCK_SIZE) ts += temp.data[i];
-    shared_val[index] = ts;
+    // ★ 2026-10-03 重写（对齐 CUDA `rwkv_sample_batch` §9 的「并行定位」）：
+    //   旧版把「每线程区间和」做成**跨步**区间（thread j 负责 j, j+BS, j+2BS, …），
+    //   而定位阶段却把 `s_b` 当**连续块** [s_b*BS, (s_b+1)*BS) 去扫描 ⇒ 两者语义不匹配：
+    //   一旦在块内找不到穿越点，就写出 `s_b*BS`（块首）这个**垃圾索引**，且无任何提示。
+    //   旧版 top-k 掩码其实没生效（只在 1/256 元素上生效），概率铺满全词表时尚能蒙中；
+    //   修好 top-k 后分布集中到几十个元素，块内几乎必然找不到穿越点 ⇒ n=32 时整批 token
+    //   退化成 0（2026-10-03 实录）。现改为两段式**连续区间**定位：
+    //     ① 每线程一段连续区间 → s_b = 穿越点所在区间；
+    //     ② 全块再把该区间细分，thread0 只扫 ≤CH2 个元素定位精确 token。
+    //   同时把 total 改为由同一批连续区间和归约得到（与定位口径一致，省掉旧版单独一趟）。
+
+    // 每线程一段连续区间 [cb, ce)
+    const uint CH = (N + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    const uint cb = index * CH;
+    const uint ce = min(cb + CH, N);
+    float ps = 0.0;
+    for (uint i = cb; i < ce; i++) ps += temp.data[sbase + i];
+    shared_val[index] = ps;
     barrier();
+
+    // 区间和树归约 → total（top-p 截断后的总和）
     [[unroll]]
     for (uint step = BLOCK_SIZE >> 1; step > 0u; step >>= 1u) {
         if (index < step) shared_val[index] += shared_val[index + step];
@@ -271,43 +384,51 @@ void main() {
     }
     barrier();
 
-    // 每线程区间和（块 = BLOCK_SIZE 连续元素）
-    float ps = 0.0;
-    [[unroll]]
-    for (uint i = index; i < N; i += BLOCK_SIZE) ps += temp.data[i];
+    // 还原区间和（上面的归约覆盖了 shared_val），thread0 前缀和定位穿越区间
     shared_val[index] = ps;
     barrier();
-
-    // 线程0 前缀和定位 u 所在块
     if (index == 0u) {
         float acc = 0.0;
-        uint  b = BLOCK_SIZE;
+        uint  cross = BLOCK_SIZE - 1u;   // 兜底：最后一个区间
         float base = 0.0;
         for (uint j = 0u; j < BLOCK_SIZE; j++) {
-            const float v = shared_val[j];
-            if (b == BLOCK_SIZE && acc + v > s_u) {
-                b = j;
-                base = acc;
-            }
-            acc += v;
+            const float nxt = acc + shared_val[j];
+            if (nxt > s_u) { cross = j; base = acc; break; }
+            acc = nxt;
         }
-        s_b = b;
+        s_b = cross;
         s_base = base;
     }
     barrier();
 
-    // 块 b 内累积定位精确 token
-    if (index == s_b) {
+    // 穿越区间 [z0, z1) 内再由全块细分定位精确 token
+    const uint z0 = s_b * CH;
+    const uint z1 = min(z0 + CH, N);
+    const uint CH2 = (CH + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    const uint q0 = z0 + index * CH2;
+    const uint q1 = min(q0 + CH2, z1);
+    float qs = 0.0;
+    for (uint i = q0; i < q1; i++) qs += temp.data[sbase + i];
+    shared_val[index] = qs;
+    barrier();
+    if (index == 0u) {
         float acc = s_base;
-        uint  chosen = s_b * BLOCK_SIZE;
-        [[unroll]]
-        for (uint i = 0u; i < BLOCK_SIZE; i++) {
-            acc += temp.data[s_b * BLOCK_SIZE + i];
-            if (acc > s_u) {
-                chosen = s_b * BLOCK_SIZE + i;
+        uint  chosen = z1 - 1u;   // 兜底：区间末元素（u 落在区间内但舍入导致找不到时）
+        for (uint t = 0u; t < BLOCK_SIZE; t++) {
+            const float nxt = acc + shared_val[t];
+            if (nxt > s_u) {
+                const uint a0 = min(z0 + t * CH2, z1);
+                const uint a1 = min(a0 + CH2, z1);
+                chosen = a1 - 1u;
+                float a = acc;
+                for (uint i = a0; i < a1; i++) {
+                    a += temp.data[sbase + i];
+                    if (a > s_u) { chosen = i; break; }
+                }
                 break;
             }
+            acc = nxt;
         }
-        out_token.data[0] = chosen;
+        out_token.data[slot] = chosen;
     }
 }

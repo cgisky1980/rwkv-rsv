@@ -1,0 +1,41 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// copy_token_batch：每个 slot 把 x 的第 `lens[slot]-1` 行拷到 state 的该 slot 段。
+//   x     : [batch, T, C]（slot 主序）
+//   state : [batch, C]
+//   lens  : [batch] uint（实际 prompt 长度，>=1）
+// 语义与 CUDA `rwkv_copy_token_batch` 一致（batch prefill 的 tmix_x/cmix_x 收尾）。
+//
+// dispatch: (ceil(C/BLOCK_SIZE), batch, 1)
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint T = 1;
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer In   { float data[]; } in_x;
+layout(buffer_reference) buffer Out  { float data[]; } out_state;
+layout(buffer_reference) buffer Lens { uint  data[]; } lens;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    In   in_x;
+    Out  out_state;
+    Lens lens;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint slot  = gl_WorkGroupID.y;
+    if (index >= C) {
+        return;
+    }
+    const uint len  = params.lens.data[slot];
+    const uint last = (len == 0u) ? 0u : (len - 1u);
+    params.out_state.data[slot * C + index] = params.in_x.data[(slot * T + last) * C + index];
+}

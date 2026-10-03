@@ -1,0 +1,287 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 深度融合（int8 版，batch 并发）：gemv_int8 r/k/v（C×C，int8 量化权重，跨 slot 共享）
+// + lowrank_stage1（v1/w1/a1/g1 四个 mid 投影，fp32 权重，跨 slot 共享）。
+//   r/k/v = x{s} @ W^T          （s = r/k/v，x 为该 slot 的 [C] 激活）
+//   v_mid = xv @ V1；w_mid = tanh(xw @ W1)；a_mid = xa @ A1；g_mid = xg @ G1
+//
+// ★ 2026-10-03 重写：加 BGRP（槽分组，权重单读）。
+//   旧版 grid = (C/ROWS + VM+WM+AM+GM, batch, 1)：每个槽一组 workgroup，
+//   r/k/v 的三份 C×C int8 权重（20.3MB/层）被 8 个槽各读一遍 ⇒ 每层 162MB、
+//   整步 5.0GB（>9ms，压满带宽）。本版：
+//   ① **r/k/v 拆到不同 workgroup**（grid.x 三等分）——这样每个 workgroup 只持有一个矩阵的
+//      累加器 `acc[ROWS][BGRP]`；若三矩阵同块，累加器会变成 3×ROWS×BGRP = 96 个寄存器，
+//      CUDA 侧的原话是「旧版三矩阵同块 ⇒ BGRP 只能给到 2」。
+//   ② **BGRP 个槽在同一 workgroup 内并行**：权重每 k 迭代只读一次并在寄存器里复用，
+//      激活 x 仍按槽读（x 只有几十 KB，不构成瓶颈）。
+//   ③ mid 投影同理：一行 × BGRP 个槽，权重单读。
+//
+// dispatch (3*(C/ROWS) + VM + WM + AM + GM, ceil(batch/BGRP), 1)
+//
+// 数值：与旧版**逐位相同**——每个 (行, 槽) 的 k 累加顺序不变（k = index, index+BLOCK, …），
+// 子组内与跨子组归约的求和顺序也不变，只是「哪些槽落在同一个 workgroup」变了。
+
+layout(constant_id = 0) const uint C  = 2560; // 收缩维度
+layout(constant_id = 1) const uint VM = 64;   // v 链 mid 行数
+layout(constant_id = 2) const uint WM = 96;   // w 链 mid 行数
+layout(constant_id = 3) const uint AM = 96;   // a 链 mid 行数
+layout(constant_id = 4) const uint GM = 320;  // g 链 mid 行数
+
+const uint ROWS           = 4;
+const uint BLOCK_SIZE     = 128;
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV             = C / 4;
+const uint KG             = C / 128;
+const uint XSLOT          = C / 4;   // 每 slot 的 vec4 数（x 输入）
+
+// BGRP/BATCH：同 gemv_int8.comp（constant_id 13/14）。
+layout(constant_id = 13) const uint BGRP = 1;
+layout(constant_id = 14) const uint BATCH = 1;
+
+shared float s_dot[ROWS][BGRP][NUM_SUBGROUPS];
+shared float s_mid[BGRP][NUM_SUBGROUPS];
+shared float s_scale[ROWS][KG];
+shared float s_zero[ROWS][KG];
+
+layout(buffer_reference) buffer In8  { uint data[]; };      // int8 打包 idx（4×uint8/uint32）
+layout(buffer_reference) buffer InSZ { uint data[]; };      // scale|zero 打包（2×fp16/uint32）
+layout(buffer_reference) buffer BufF { float data[]; };     // fp32 [batch, *]
+layout(buffer_reference) buffer InX4 { vec4 data[]; };      // fp32 vec4 [batch, C]
+layout(buffer_reference) buffer OutF { float data[]; };     // fp32 [batch, *]
+layout(buffer_reference) buffer Out16 { float16_t data[]; };// fp16 [batch, C]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    In8  in_r_idx;
+    InSZ in_r_sz;
+    In8  in_k_idx;
+    InSZ in_k_sz;
+    In8  in_v_idx;
+    InSZ in_v_sz;
+    BufF in_v1;
+    BufF in_w1;
+    BufF in_a1;
+    BufF in_g1;
+    InX4 in_xr;
+    InX4 in_xk;
+    InX4 in_xv;
+    BufF in_xw;
+    BufF in_xa;
+    BufF in_xg;
+    OutF out_r;
+    OutF out_k;
+    Out16 out_v;
+    OutF out_vm;
+    OutF out_wm;
+    OutF out_am;
+    OutF out_gm;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint flat_idx     = gl_WorkGroupID.x;
+    const uint slot0        = gl_WorkGroupID.y * BGRP;
+    const uint slot_cnt     = min(BGRP, BATCH - slot0);   // 尾块守卫
+    const uint index        = gl_LocalInvocationIndex;
+    const uint subgroup_id  = gl_SubgroupID;
+    const uint sub_inv      = gl_SubgroupInvocationID;
+
+    const uint I8_WG = 3u * (C / ROWS);   // int8 臂的 workgroup 数
+
+    // ===== 分支 1：r/k/v（int8 权重，f32 输入）——每个 workgroup 只算一个矩阵 =====
+    if (flat_idx < I8_WG) {
+        const uint mat      = flat_idx / (C / ROWS);          // 0=r 1=k 2=v
+        const uint row_base = (flat_idx % (C / ROWS)) * ROWS;
+
+        In8  widx = params.in_r_idx;
+        InSZ wsz  = params.in_r_sz;
+        InX4 xin  = params.in_xr;
+        if (mat == 1u) {
+            widx = params.in_k_idx;
+            wsz  = params.in_k_sz;
+            xin  = params.in_xk;
+        } else if (mat == 2u) {
+            widx = params.in_v_idx;
+            wsz  = params.in_v_sz;
+            xin  = params.in_xv;
+        }
+
+        [[unroll]]
+        for (uint i = index; i < ROWS * KG; i += BLOCK_SIZE) {
+            const uint r = i / KG;
+            const uint g = i % KG;
+            const vec2 szv = unpackFloat2x16(wsz.data[(row_base + r) * KG + g]);
+            s_scale[r][g] = szv.x;
+            s_zero[r][g]  = szv.y;
+        }
+        barrier();
+
+        float acc[ROWS][BGRP];
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) acc[r][s] = 0.0;
+        }
+
+        [[unroll]]
+        for (uint k = index; k < KV; k += BLOCK_SIZE) {
+            const uint g = k / 32;
+            // 权重（每行 1 个 uint32 = 4 个 uint8）读一次、解一次，复用给全部 BGRP 个槽。
+            float w[ROWS][4];
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                const uint ip = widx.data[(row_base + r) * KV + k];
+                const float sc = s_scale[r][g];
+                const float zr = s_zero[r][g];
+                w[r][0] = sc * float(ip & 0xFFu)           + zr;
+                w[r][1] = sc * float((ip >>  8) & 0xFFu)   + zr;
+                w[r][2] = sc * float((ip >> 16) & 0xFFu)   + zr;
+                w[r][3] = sc * float(ip >> 24)             + zr;
+            }
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    const vec4 xv = xin.data[(slot0 + s) * XSLOT + k];
+                    [[unroll]]
+                    for (uint r = 0; r < ROWS; r++) {
+                        acc[r][s] += w[r][0] * xv.x + w[r][1] * xv.y
+                                   + w[r][2] * xv.z + w[r][3] * xv.w;
+                    }
+                }
+            }
+        }
+
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                const float v = subgroupAdd(acc[r][s]);
+                if (sub_inv == 0) s_dot[r][s][subgroup_id] = v;
+            }
+        }
+        barrier();
+        [[unroll]]
+        for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+            if (index < step) {
+                [[unroll]]
+                for (uint r = 0; r < ROWS; r++) {
+                    [[unroll]]
+                    for (uint s = 0; s < BGRP; s++) {
+                        s_dot[r][s][index] += s_dot[r][s][index + step];
+                    }
+                }
+            }
+            barrier();
+        }
+        if (index < ROWS * BGRP) {
+            const uint r = index / BGRP;
+            const uint s = index % BGRP;
+            if (s < slot_cnt) {
+                const float res = s_dot[r][s][0];
+                const uint row  = row_base + r;
+                const uint oslot = (slot0 + s) * C;
+                if (mat == 0u)      params.out_r.data[oslot + row] = res;
+                else if (mat == 1u) params.out_k.data[oslot + row] = res;
+                else                params.out_v.data[oslot + row] = float16_t(res);
+            }
+        }
+        return;
+    }
+
+    // ===== 分支 2：mid 投影（fp32 权重）——一行 × BGRP 个槽 =====
+    const uint mid_idx = flat_idx - I8_WG;
+    uint row = 0;
+    float accM[BGRP];
+    [[unroll]]
+    for (uint s = 0; s < BGRP; s++) accM[s] = 0.0;
+
+    if (mid_idx < VM) {
+        row = mid_idx;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            const float wk = params.in_v1.data[row * C + k];
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    accM[s] += wk * params.in_xv.data[(slot0 + s) * XSLOT + k / 4][k % 4];
+                }
+            }
+        }
+    } else if (mid_idx < VM + WM) {
+        row = mid_idx - VM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            const float wk = params.in_w1.data[row * C + k];
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    accM[s] += wk * params.in_xw.data[(slot0 + s) * C + k];
+                }
+            }
+        }
+    } else if (mid_idx < VM + WM + AM) {
+        row = mid_idx - VM - WM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            const float wk = params.in_a1.data[row * C + k];
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    accM[s] += wk * params.in_xa.data[(slot0 + s) * C + k];
+                }
+            }
+        }
+    } else {
+        row = mid_idx - VM - WM - AM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            const float wk = params.in_g1.data[row * C + k];
+            [[unroll]]
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    accM[s] += wk * params.in_xg.data[(slot0 + s) * C + k];
+                }
+            }
+        }
+    }
+
+    [[unroll]]
+    for (uint s = 0; s < BGRP; s++) {
+        const float v = subgroupAdd(accM[s]);
+        if (sub_inv == 0) s_mid[s][subgroup_id] = v;
+    }
+    barrier();
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < BGRP * step) {
+            const uint s = index / step;
+            const uint i = index % step;
+            s_mid[s][i] += s_mid[s][i + step];
+        }
+        barrier();
+    }
+    if (index < BGRP && index < slot_cnt) {
+        const float result = s_mid[index][0];
+        const uint slot = slot0 + index;
+        if (mid_idx < VM) {
+            params.out_vm.data[slot * VM + row] = result;
+        } else if (mid_idx < VM + WM) {
+            params.out_wm.data[slot * WM + row] = tanh(result);
+        } else if (mid_idx < VM + WM + AM) {
+            params.out_am.data[slot * AM + row] = result;
+        } else {
+            params.out_gm.data[slot * GM + row] = result;
+        }
+    }
+    return;
+}
