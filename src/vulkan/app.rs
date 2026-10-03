@@ -282,6 +282,9 @@ pub struct Properties {
     /// 设备是否支持 `VK_EXT_shader_atomic_float` 的 buffer 级 fp32 原子累加。
     /// 决定稀疏 FFN 稀疏内核是否可用（不支持则回退稠密 gemv）。
     pub atomic_float: bool,
+    /// 设备是否支持 `shaderIntegerDotProduct`（Vulkan 1.3 core feature，DP4A）。
+    /// 决定 int8×int8 点积 GEMM 是否可用（不支持则回退现 SIMT 反量化路径）。
+    pub integer_dot_product: bool,
 }
 
 impl std::fmt::Display for Properties {
@@ -728,6 +731,26 @@ impl App {
             cooperative_matrix.len()
         );
 
+        // int8 点积（DP4A）：`shaderIntegerDotProduct` 是 **Vulkan 1.3 core feature**，
+        // 必须显式请求才会暴露给 shader（本项目此前只开了 shader_int8）。
+        // 同时读 properties 看 4×8 位打包点积是否**硬件加速**——若干脆是软件展开，就没有收益。
+        let mut vk13_features = vk::PhysicalDeviceVulkan13Features::builder();
+        let mut features2 = vk::PhysicalDeviceFeatures2::builder().push_next(&mut vk13_features);
+        instance.get_physical_device_features2(device, &mut features2);
+        let integer_dot_product = vk13_features.build().shader_integer_dot_product == vk::TRUE;
+        let mut dot_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::builder();
+        let mut dot_properties2 =
+            vk::PhysicalDeviceProperties2::builder().push_next(&mut dot_props);
+        instance.get_physical_device_properties2(device, &mut dot_properties2);
+        let dot_props = dot_props.build();
+        log::info!(
+            "\tshaderIntegerDotProduct 支持={integer_dot_product}；\
+             4x8 打包点积硬件加速：signed={} unsigned={} mixed={}",
+            dot_props.integer_dot_product4x_8bit_packed_signed_accelerated == vk::TRUE,
+            dot_props.integer_dot_product4x_8bit_packed_unsigned_accelerated == vk::TRUE,
+            dot_props.integer_dot_product4x_8bit_packed_mixed_signedness_accelerated == vk::TRUE,
+        );
+
         let mut vk13 = vk::PhysicalDeviceVulkan13Properties::builder();
         let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::builder();
         let mut properties2 = vk::PhysicalDeviceProperties2::builder()
@@ -783,6 +806,7 @@ impl App {
             subgroup_size: subgroup_props.subgroup_size,
             vendor_id, // 使用之前捕获的 vendor_id
             atomic_float,
+            integer_dot_product,
         };
         log::info!("{properties}");
         log::info!("\tsubgroup size: {}", subgroup_props.subgroup_size);
@@ -815,11 +839,13 @@ impl App {
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true)
             .timeline_semaphore(true);
+        // shaderIntegerDotProduct 只在设备支持时请求（不支持时请求 true 会导致建 device 失败）。
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::builder()
             .maintenance4(true)
             .synchronization2(true)
             .compute_full_subgroups(true)
-            .subgroup_size_control(true);
+            .subgroup_size_control(true)
+            .shader_integer_dot_product(integer_dot_product);
         let mut features_cooperative_matrix =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::builder().cooperative_matrix(true);
         // 稀疏 FFN 稀疏内核：buffer 级 fp32 原子累加（仅当设备支持该扩展时启用）。

@@ -1,0 +1,172 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_cooperative_matrix : require
+
+// int8 张量核批量 GEMM（W8A8）：`r2 = relu²(x @ W^T)`
+//   - W：int8 非对称分组量化（组宽 128）：`w = s[m,g]·q_u + z[m,g]`，`q_u ∈ [0,255]`；
+//   - x：int8 对称分组量化（`quant_x_i8.comp`）：`x = sx[b,g]·q`，`q ∈ [-127,127]`，
+//        并给出每组的 `xaux = (sx, 128·sx·Σq, Σx, 0)`。
+//
+// ★ 与 CUDA `imma_gemm_batch`（backend_cuda.rs:5471）**同构**，是 Vulkan 侧脱离
+//   「逐权重 fp32 反量化」（O(M·K) 指令流）的路径：IMMA 只吃 s8 ⇒ 权重落 smem 时
+//   `byte ^ 0x80` 下移到有符号域，组末按
+//   `y += s[m,g]·(sx·S + 128·sx·Σq) + z[m,g]·Σx`（S = 张量核的 int32 结果）一次性还原。
+//   组宽 128 与量化组对齐 ⇒ **每个 k-tile 恰好是一组**，flush 天然落在 tile 末尾。
+//
+// 布局：block = 256（8 warp），BM = 128 行 × BN = 8 槽；每 warp 一个 16×8 int32 输出块
+// （coopmat m16n8k32：A = 行×K，B = K×槽）。grid = (M/BM, 1)。
+// 每 k-tile（BK = 128 = 1 组）：W/X 落 smem → 4 次 coopMatMulAdd → flush → 清零累加器。
+
+layout(constant_id = 0) const uint M     = 10240;  // 输出行数
+layout(constant_id = 1) const uint K     = 2560;   // 收缩维（须为 128 整除）
+layout(constant_id = 2) const uint BATCH = 8;      // 槽位数（BN = 8）
+
+const uint BM   = 128;      // 每 block 的输出行数
+const uint BN   = 8;        // 每 block 的槽数（= coopmat 的 N）
+const uint BK   = 128;      // k 分块 = 量化组宽（flush 粒度与之对齐）
+const uint WS   = BK + 16;  // smem 行跨距（字节）：+16 让行首错开 4 个 bank
+const uint BLOCK_SIZE = 256;
+const uint WR   = 16;       // 每 warp 的输出行数（coopmat 的 M）
+const uint NLD  = BM * 32u / BLOCK_SIZE;  // 每线程的权重载入条数（寄存器预取）
+
+layout(buffer_reference) buffer WIdx { uint data[]; };    // int8 权重 [M, K/4]（4 个 uint8/uint32）
+layout(buffer_reference) buffer WSz  { uint data[]; };    // fp16(尺度|零点) [M, K/128]
+layout(buffer_reference) buffer XQ   { uint data[]; };    // 量化激活 [batch, K/4]
+layout(buffer_reference) buffer XAux { vec4 data[]; };    // 每 (槽, 组) 统计 [batch, K/128]
+layout(buffer_reference) buffer OutY { float data[]; };   // [batch, M]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    WIdx in_idx;
+    WSz  in_sz;
+    XQ   in_xq;
+    XAux in_aux;
+    OutY out_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared int8_t ws[BM * WS];              // 本 k-tile 的权重（已 ^0x80）
+shared int8_t xs[BN * WS];              // 本 k-tile 的激活（有符号 int8）
+shared int    tile[8][WR * BN];         // 每 warp 的 int32 累加块（coopMatStore 落地）
+shared uint   szs[BM];                  // 本组的权重尺度/零点（每行一份）
+shared vec4   xas[BN];                  // 本组的激活统计（每槽一份）
+
+/// 把一个打包了 4 个 uint8 的 uint32 按字节写进 smem（顺带 ^0x80 下移到有符号域）。
+void store_packed4(uint base, uint packed, uint xor_mask) {
+    const uint p = packed ^ xor_mask;
+    ws[base + 0u] = int8_t((p) & 0xFFu);
+    ws[base + 1u] = int8_t((p >> 8u) & 0xFFu);
+    ws[base + 2u] = int8_t((p >> 16u) & 0xFFu);
+    ws[base + 3u] = int8_t((p >> 24u) & 0xFFu);
+}
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+    const uint wid   = gl_LocalInvocationIndex >> 5u;   // warp 号 = 输出行组
+    const uint lane  = gl_SubgroupInvocationID;
+
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint K4   = K >> 2;
+    const uint G    = K >> 7;
+
+    // 每 lane 负责 4 个输出元素：槽（col）= lane % 8 固定，行 = lane/8 + 4i
+    const uint fcol = lane & 7u;
+    const uint frow = lane >> 3u;   // 0..3 → 行 = frow, frow+4, frow+8, frow+12
+
+    float acc[4];
+    [[unroll]]
+    for (uint i = 0u; i < 4u; i++) acc[i] = 0.0;
+
+    coopmat<int32_t, gl_ScopeSubgroup, WR, BN, gl_MatrixUseAccumulator> ci;
+    coopmat<int8_t,  gl_ScopeSubgroup, WR, 32, gl_MatrixUseA> cf;
+    coopmat<int8_t,  gl_ScopeSubgroup, 32, BN, gl_MatrixUseB> xf;
+
+    for (uint kt = 0u; kt < K; kt += BK) {
+        const uint gr = kt >> 7u;   // 组号
+
+        // —— 落 smem：权重（^0x80）+ 激活 + 本组统计 ——
+        // ★ 关键：**先把全部全局载入取到寄存器，再统一落 smem**。本 kernel 只有
+        // `M/BM` 个 block（relu2 = 80 个，≈1 个/SM），没有第二个 block 帮忙掩盖延迟；
+        // 若写成「LDG → STS」逐对发出，每对都要等一次 ~600 cycle 的全局延迟 ⇒
+        // 20 个 k-tile 实测 7.7μs/k-tile（比带宽极限慢两个量级）。寄存器预取后
+        // 16 条载入并发在飞，总延迟只付一次。
+        uint wr[NLD];
+        [[unroll]]
+        for (uint n = 0u; n < NLD; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            const uint src = min(row0 + (i >> 5u), M - 1u);
+            wr[n] = params.in_idx.data[src * K4 + (kt >> 2u) + (i & 31u)];
+        }
+        [[unroll]]
+        for (uint n = 0u; n < NLD; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            store_packed4((i >> 5u) * WS + (i & 31u) * 4u, wr[n], 0x80808080u);
+        }
+        uint xr[1];
+        [[unroll]]
+        for (uint n = 0u; n < 1u; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            if (i < BN * 32u) xr[n] = params.in_xq.data[(i >> 5u) * K4 + (kt >> 2u) + (i & 31u)];
+        }
+        [[unroll]]
+        for (uint n = 0u; n < 1u; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            if (i < BN * 32u) store_packed4((i >> 5u) * WS + (i & 31u) * 4u, xr[n], 0u);
+        }
+        if (index < BM) {
+            const uint src = min(row0 + index, M - 1u);
+            szs[index] = params.in_sz.data[src * G + gr];
+        }
+        if (index < BN) {
+            xas[index] = params.in_aux.data[index * G + gr];
+        }
+        barrier();
+
+        ci = coopmat<int32_t, gl_ScopeSubgroup, WR, BN, gl_MatrixUseAccumulator>(0);
+
+        // —— 4 次 mma（本组 K = 128 = 4 × 32）——
+        [[unroll]]
+        for (uint ks = 0u; ks < 4u; ks++) {
+            // A：权重 行×k（RowMajor：(m,k) 在 ws[(wid*WR+m)*WS + ks*32 + k]）
+            coopMatLoad(cf, ws, (wid * WR) * WS + ks * 32u, WS, gl_CooperativeMatrixLayoutRowMajor);
+            // B：激活 k×槽（ColMajor：(k,s) 在 xs[s*WS + ks*32 + k]）
+            coopMatLoad(xf, xs, ks * 32u, WS, gl_CooperativeMatrixLayoutColumnMajor);
+            ci = coopMatMulAdd(cf, xf, ci);
+        }
+
+        // —— flush：int32 → fp32 尺度还原 + 零点修正 ——
+        coopMatStore(ci, tile[wid], 0u, BN, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        [[unroll]]
+        for (uint i = 0u; i < 4u; i++) {
+            const uint r = frow + i * 4u;
+            const int32_t S = tile[wid][r * BN + fcol];
+            const vec2 szv = unpackFloat2x16(szs[r]);
+            const vec4 au = xas[fcol];
+            acc[i] += szv.x * (au.x * float(S) + au.y) + szv.y * au.z;
+        }
+        barrier();
+    }
+
+    // —— epilogue：relu² + 写回 ——
+    // ⚠️ `fcol` 可能 ≥ BATCH（xq/xaux 按固定 8 槽容量分配，多读的槽是陈旧数据）：
+    //    必须按 BATCH 守卫，否则会写到 `out_y` 的 [batch, M] 之外。
+    if (fcol >= BATCH) return;
+    [[unroll]]
+    for (uint i = 0u; i < 4u; i++) {
+        const uint r = row0 + frow + i * 4u;
+        if (r < M) {
+            const float v = acc[i];
+            params.out_y.data[fcol * M + r] = v > 0.0 ? v * v : 0.0;
+        }
+    }
+}

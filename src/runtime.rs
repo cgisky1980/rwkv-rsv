@@ -1344,6 +1344,89 @@ impl Runtime {
         Ok(())
     }
 
+    /// 激活对称 int8 量化（`quant_x_i8.comp`）：x[b,k] f32 → xq[b,k/4] u32 + xaux[b,k/128] vec4。
+    /// spec = [K, BATCH]；dispatch = (K/128, ceil(batch/8), 1)，block = 256。
+    pub fn quant_x_i8(
+        &mut self,
+        x: &GpuTensor,
+        xq: &GpuTensorU32,
+        xaux: &GpuTensor,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        debug_assert_eq!(k % 128, 0, "quant_x_i8: k 需为 128 整除");
+        let spec = [k as u32, batch as u32];
+        let params = [x.device.address, xq.device.address, xaux.device.address];
+        self.record_kernel(
+            "shaders/spv/quant_x_i8.spv",
+            &spec,
+            &params,
+            ((k / 128) as u32, batch.div_ceil(8) as u32, 1),
+            &[x.device.buffer],
+            &[xq.device.buffer, xaux.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// W8A8 int8 张量核 GEMM（`gemm_imma_relu2.comp`）：`y = relu²(xq @ W^T)`，
+    /// 每 block BM=128 行 × BN=8 槽，每 k-tile（= 一个量化组）flush 一次。
+    /// spec = [M, K, BATCH]；dispatch = (M/128, 1, 1)，block = 256。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_imma_relu2(
+        &mut self,
+        a: &GpuTensorInt8,
+        xq: &GpuTensorU32,
+        xaux: &GpuTensor,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        debug_assert_eq!(a.m, m);
+        debug_assert_eq!(a.k, k);
+        debug_assert_eq!(m % 128, 0, "gemm_imma_relu2: M 需为 128 整除");
+        let spec = [m as u32, k as u32, batch as u32];
+        let params = [
+            a.idx.device.address,
+            a.sz.device.address,
+            xq.device.address,
+            xaux.device.address,
+            y.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/gemm_imma_relu2.spv",
+            &spec,
+            &params,
+            ((m / 128) as u32, 1, 1),
+            &[
+                a.idx.device.buffer,
+                a.sz.device.buffer,
+                xq.device.buffer,
+                xaux.device.buffer,
+            ],
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// W8A8（int8 激活 + int8 权重）张量核路径是否可用。
+    /// 门槛：① `shaderIntegerDotProduct`（Vulkan 1.3 core feature）已请求；
+    /// ② 设备报告过 **16×8×32 SINT8×SINT8→SINT32** 的 cooperative matrix 配置
+    /// （即 `gemm_imma_relu2.comp` 里写死的那个 tile 形状；不满足则该 shader 的
+    /// coopmat 类型无法在设备上物化）。
+    pub fn supports_int8_imma(&self) -> bool {
+        self.app.properties.integer_dot_product
+            && self.app.properties.cooperative_matrix.iter().any(|p| {
+                p.m >= 16
+                    && p.n >= 8
+                    && p.k >= 32
+                    && p.a == crate::vulkan::num::DataType::I8
+                    && p.b == crate::vulkan::num::DataType::I8
+                    && p.c == crate::vulkan::num::DataType::I32
+                    && p.o == crate::vulkan::num::DataType::I32
+            })
+    }
+
     /// 是否支持稀疏 FFN 内核（需设备支持 VK_EXT_shader_atomic_float 的 buffer fp32 原子）。
     pub fn supports_sparse_ffn(&self) -> bool {
         self.app.properties.atomic_float

@@ -403,6 +403,14 @@ fn main() {
         "ffn_value_sparse_add_batch" => "src/ffn_value_sparse_add_batch.comp" => {
             TYPE => [none("")],
         },
+        // W8A8（激活也量化成 int8）+ int8 张量核（VK_KHR_cooperative_matrix）批量 GEMM。
+        // 需要 `shaderIntegerDotProduct`/cooperative matrix 能力，运行时按设备能力门控。
+        "quant_x_i8" => "src/quant_x_i8.comp" => {
+            TYPE => [none("")],
+        },
+        "gemm_imma_relu2" => "src/gemm_imma_relu2.comp" => {
+            TYPE => [none("")],
+        },
     };
 
     for spec in &specs {

@@ -1,0 +1,83 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+
+// 激活对称 int8 量化（W8A8 的 A 侧）：fp32 x[b,k] → int8 xq[b, k/4]（4 个 int8 打包进 1 个 uint32）
+//                                    + 每组统计 xaux[b, K/128] = vec4(sx, 128*sx*cs, rs, 0)
+//
+// 粒度 **per-(token, k 组)**、组宽 128 —— 与权重 `sz[m, k/128]` 的分组同构，于是 IMMA 的
+// 「每组 flush」天然对齐（与 CUDA `quant_x_i8` 语义逐项对齐，见 backend_cuda.rs:5186）。
+//
+// 三项的用途（与 CUDA 侧注释同源）：
+//   sx        = amax/127：把 int32 的 IMMA 结果还原回 fp32 的尺度；
+//   128*sx*cs：权重侧把 byte 当**有符号** int8 解释（IMMA 只吃 s8），而磁盘 idx 是 0..255
+//              无符号 ⇒ 落 smem 时做 `byte ^ 0x80` 整体下移 128，补偿项 Σ q·128 在此预乘 sx；
+//   rs        = Σ 组内 fp32 原值：零点项 `z·Σx` 用原值算比用 `sx·Σq` 更准（量化误差相消）。
+//
+// grid = (K/128, ceil(batch/8))，block = 256（8 warp，每 warp 一个 (b,g) 组，组内 128 元素
+// 按 lane 均分 4 个，尺度/求和用 subgroup 归约）。
+
+layout(constant_id = 0) const uint K = 2560;      // 收缩维（需 128 整除）
+layout(constant_id = 1) const uint BATCH = 1;     // 实际槽数（尾组守卫）
+
+const uint BLOCK_SIZE = 256;                       // 8 warp
+const uint GROUP = 128;                            // 量化组宽（须与权重分组一致）
+
+layout(buffer_reference) buffer InX   { float data[]; };
+layout(buffer_reference) buffer OutQ  { uint data[]; };
+layout(buffer_reference) buffer OutAux { vec4 data[]; };
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InX    in_x;
+    OutQ   out_q;
+    OutAux out_aux;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+int pack4(int q0, int q1, int q2, int q3) {
+    return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint wid   = index >> 5u;         // 本组的 warp 号 = 槽位号（0..7）
+    const uint g     = gl_WorkGroupID.x;    // 组号（沿 k）
+    const uint b     = gl_WorkGroupID.y * 8u + wid;
+
+    if (b >= BATCH) return;
+
+    const uint KV = K >> 2;
+    const uint G  = K >> 7;
+    const uint k0 = (g << 7u) + (lane << 2u);   // 本 lane 负责的 4 个连续 k
+
+    const float v0 = params.in_x.data[b * K + k0];
+    const float v1 = params.in_x.data[b * K + k0 + 1u];
+    const float v2 = params.in_x.data[b * K + k0 + 2u];
+    const float v3 = params.in_x.data[b * K + k0 + 3u];
+
+    // 组内 amax → 对称尺度（整组共享，避免逐线程尺度破坏 IMMA 的 k 分组语义）
+    float amax = max(max(abs(v0), abs(v1)), max(abs(v2), abs(v3)));
+    amax = subgroupMax(amax);
+    const float sx  = amax > 0.0 ? amax * (1.0 / 127.0) : 1.0;
+    const float inv = 1.0 / sx;
+
+    // 量化：round-to-nearest-even，钳到 [-127,127]（对称量化不用 -128）
+    const int q0 = int(roundEven(clamp(v0 * inv, -127.0, 127.0)));
+    const int q1 = int(roundEven(clamp(v1 * inv, -127.0, 127.0)));
+    const int q2 = int(roundEven(clamp(v2 * inv, -127.0, 127.0)));
+    const int q3 = int(roundEven(clamp(v3 * inv, -127.0, 127.0)));
+
+    params.out_q.data[b * KV + (g << 5u) + lane] = uint(pack4(q0, q1, q2, q3));
+
+    int   cs = q0 + q1 + q2 + q3;
+    float rs = v0 + v1 + v2 + v3;
+    cs = subgroupAdd(cs);
+    rs = subgroupAdd(rs);
+    if (lane == 0u) {
+        params.out_aux.data[b * G + g] = vec4(sx, 128.0 * sx * float(cs), rs, 0.0);
+    }
+}

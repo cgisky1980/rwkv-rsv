@@ -360,13 +360,17 @@ pub struct WorkBuffers {
     x_norm: TensorId,
     tmp_c: TensorId, // 临时缓冲，用于 in-place 操作中转
     // 其他大小
-    v_mid: TensorId,         // [V_MID]
-    w_mid: TensorId,         // [W_MID]
-    a_mid: TensorId,         // [A_MID]
-    g_mid: TensorId,         // [G_MID]
-    r2: TensorId,            // [FFN_HIDDEN]
-    logits: TensorId,        // [vocab]
-    token_argmax: TensorId,  // [1] GPU argmax 采样的 token 索引（字节存 uint）
+    v_mid: TensorId, // [V_MID]
+    w_mid: TensorId, // [W_MID]
+    a_mid: TensorId, // [A_MID]
+    g_mid: TensorId, // [G_MID]
+    r2: TensorId,    // [FFN_HIDDEN]
+    /// W8A8 张量核路径的量化激活与每组统计。**固定按 8 槽容量分配**：IMMA 的 BN=8 一次覆盖
+    /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma_relu2.comp` 按 BATCH 守卫丢弃输出）。
+    xb_q: TensorId, // u32 [8, C/4]（每 4 个 int8 打包 1 个 uint32）
+    xb_aux: TensorId, // f32 vec4 [8, C/128]（sx, 128·sx·Σq, Σx, 0）
+    logits: TensorId, // [vocab]
+    token_argmax: TensorId, // [1] GPU argmax 采样的 token 索引（字节存 uint）
     current_token: TensorId, // [1] 当前待 gather 的 token 索引（f32 位模式存 uint，供 gather_row 读取）
 }
 
@@ -1967,6 +1971,18 @@ impl GpuModel {
         true
     }
 
+    /// W8A8 int8 张量核（`gemm_imma_relu2.comp`）的门控：设备能力 + 形状约束。
+    /// 形状约束来自 shader 里写死的 tile 布局（BM=128 行、BN=8 槽、BK=128=量化组宽）。
+    /// `VK_IMMA=0` 可强制回退到 SIMT 反量化路径（做 A/B 用）。
+    fn layer_imma_ok(&self, layer: usize, fh: usize, c: usize, batch: usize) -> bool {
+        std::env::var("VK_IMMA").map(|v| v != "0").unwrap_or(true)
+            && self.backend.supports_int8_imma()
+            && self.layers[layer].ffn_key_a8.is_some()
+            && fh.is_multiple_of(128)
+            && c.is_multiple_of(128)
+            && (1..=8).contains(&batch)
+    }
+
     /// batch 版单层前向：全部 kernel 走 batch 变体（B slot 共享权重一次读）。
     /// `bb` 为 [batch, ...] 布局的 batch 工作缓冲；`state` 为 batch State。
     #[allow(clippy::too_many_arguments)]
@@ -2192,7 +2208,20 @@ impl GpuModel {
         )?;
 
         // r2 = relu²(xb @ ffn_key.T)
-        if let Some(a8) = &self.layers[i].ffn_key_a8 {
+        //
+        // ★ 2026-10-04：优先走 **W8A8 int8 张量核**（激活也量化成 int8 + cooperative matrix）。
+        // 现 SIMT 路径每个权重都要 `cvt+mul+add` 反量化（O(M·K) 指令流），是四个大 GEMM
+        // 的主要成本；而 CUDA 的批量路径正是 `quant_x_i8` + `imma_gemm_batch`。数值上激活
+        // 从 f32 降到 int8（与 CUDA 同口径），故结果与 SIMT 路径**不完全逐位相同**。
+        // 门控：`VK_IMMA=0` 可关；形状需 M%128、K%128 整除且 batch ≤ 8（BN=8）。
+        let use_imma = self.layer_imma_ok(i, fh, c, batch);
+        if use_imma {
+            let a8 = self.layers[i].ffn_key_a8.as_ref().unwrap();
+            self.backend
+                .quant_x_i8(bb.xb, bb.xb_q, bb.xb_aux, c, batch)?;
+            self.backend
+                .gemm_imma_relu2(a8, bb.xb_q, bb.xb_aux, bb.r2, fh, c, batch)?;
+        } else if let Some(a8) = &self.layers[i].ffn_key_a8 {
             self.backend
                 .gemv_int8_relu2(a8, bb.xb, bb.r2, fh, c, batch)?;
         } else {
@@ -4976,6 +5005,19 @@ impl WorkBuffers {
             a_mid: mk(&mut *backend, cfg.a_mid)?,
             g_mid: mk(&mut *backend, cfg.g_mid)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
+            // W8A8 路径：固定 8 槽容量（IMMA 的 BN=8 一次覆盖全部槽）
+            xb_q: {
+                let n = 8 * (c / 4);
+                let t = backend.create_tensor(n, TensorDtype::U32)?;
+                backend.upload_u32(t, &vec![0u32; n])?;
+                t
+            },
+            xb_aux: {
+                let n = 8 * (c / 128) * 4;
+                let t = backend.create_tensor(n, TensorDtype::F32)?;
+                backend.upload(t, &vec![0.0f32; n])?;
+                t
+            },
             logits: mk(&mut *backend, vocab)?,
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,
@@ -5023,6 +5065,8 @@ impl WorkBuffers {
             self.a_mid,
             self.g_mid,
             self.r2,
+            self.xb_q,
+            self.xb_aux,
             self.logits,
             self.token_argmax,
             self.current_token,

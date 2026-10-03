@@ -422,6 +422,39 @@ pub trait ComputeBackend {
         batch: usize,
     ) -> R<()>;
 
+    /// W8A8 int8 张量核路径是否可用（激活也量化成 int8 + cooperative matrix）。
+    /// 默认 false（仅 Vulkan 在设备满足条件时返回 true）。
+    fn supports_int8_imma(&self) -> bool {
+        false
+    }
+
+    /// 激活对称 int8 量化（见 `quant_x_i8.comp`）：x[k,batch] f32 → xq（int8 打包）+ xaux。
+    fn quant_x_i8(
+        &mut self,
+        _x: TensorId,
+        _xq: TensorId,
+        _xaux: TensorId,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("quant_x_i8: backend not supported".into())
+    }
+
+    /// W8A8 int8 张量核 GEMM：`y = relu²(xq @ W^T)`（见 `gemm_imma_relu2.comp`）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_imma_relu2(
+        &mut self,
+        _a: &Int8Handle,
+        _xq: TensorId,
+        _xaux: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemm_imma_relu2: backend not supported".into())
+    }
+
     /// y += (x .* g) @ A（fp16 权重，f32 累加）——att.output 用。
     #[allow(clippy::too_many_arguments)]
     fn gemv_f16_mul_add(
@@ -1863,6 +1896,48 @@ impl ComputeBackend for VulkanBackend {
             let x_g = self.get_f32(x, "gemv_int8_relu2")?;
             self.rt.gemv_int8_relu2(&a_g, &x_g, &mut y_o, m, k, batch)
         };
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn supports_int8_imma(&self) -> bool {
+        // 需 cooperative matrix（int8 档）+ shaderIntegerDotProduct；两者都在建 device 时
+        // 按设备查询结果门控（见 vulkan/app.rs）。
+        self.rt.supports_int8_imma()
+    }
+
+    fn quant_x_i8(
+        &mut self,
+        x: TensorId,
+        xq: TensorId,
+        xaux: TensorId,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let x_g = self.get_f32(x, "quant_x_i8")?;
+        let xq_g = self.get_u32(xq, "quant_x_i8")?;
+        let aux_g = self.get_f32(xaux, "quant_x_i8")?;
+        self.rt.quant_x_i8(&x_g, &xq_g, &aux_g, k, batch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_imma_relu2(
+        &mut self,
+        a: &Int8Handle,
+        xq: TensorId,
+        xaux: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let a_g = self.int8_ref(a, "gemm_imma_relu2")?;
+        let xq_g = self.get_u32(xq, "gemm_imma_relu2")?;
+        let aux_g = self.get_f32(xaux, "gemm_imma_relu2")?;
+        let mut y_o = self.take_f32(y, "gemm_imma_relu2")?;
+        let res = self
+            .rt
+            .gemm_imma_relu2(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch);
         self.put_f32(y, y_o);
         res
     }
