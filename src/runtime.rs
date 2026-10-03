@@ -1411,11 +1411,13 @@ impl Runtime {
         // ks == 1：直接写 y、由 kernel 施加 op；ks > 1：写 partial、由归约内核施加 op。
         let out: &GpuTensor = if ks == 1 { y } else { partial };
         let spec = [m as u32, k as u32, batch as u32, op, ks as u32];
+        // Params 固定 6 槽（`out16` 只在 OP=3 用；此处填 `out` 自身，不读写）。
         let params = [
             a.idx.device.address,
             a.sz.device.address,
             xq.device.address,
             xaux.device.address,
+            out.device.address,
             out.device.address,
         ];
         self.record_kernel(
@@ -1444,6 +1446,50 @@ impl Runtime {
                 &[y.device.buffer],
             )?;
         }
+        Ok(())
+    }
+
+    /// 同 `gemm_imma`，但输出落 **fp16**（`OP=3`；v 链的 `out_v` 本就是 fp16 语义）。
+    /// 不做 split-K（归约内核是 f32 语义），故恒 `ks = 1`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_imma_f16(
+        &mut self,
+        a: &GpuTensorInt8,
+        xq: &GpuTensorU32,
+        xaux: &GpuTensor,
+        y16: &mut GpuTensor16,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        debug_assert_eq!(a.m, m);
+        debug_assert_eq!(a.k, k);
+        let bm = Self::imma_bm(m);
+        let nst = Self::imma_nst(batch);
+        let spv = format!("shaders/spv/gemm_imma_bm{bm}_nst{nst}.spv");
+        let spec = [m as u32, k as u32, batch as u32, 3u32, 1u32];
+        let addr = y16.device.address;
+        let params = [
+            a.idx.device.address,
+            a.sz.device.address,
+            xq.device.address,
+            xaux.device.address,
+            addr,
+            addr,
+        ];
+        self.record_kernel(
+            &spv,
+            &spec,
+            &params,
+            ((m / bm) as u32, 1, batch.div_ceil(8 * nst) as u32),
+            &[
+                a.idx.device.buffer,
+                a.sz.device.buffer,
+                xq.device.buffer,
+                xaux.device.buffer,
+            ],
+            &[y16.device.buffer],
+        )?;
         Ok(())
     }
 
@@ -3685,6 +3731,104 @@ impl Runtime {
                 batch.div_ceil(bgrp) as u32,
                 1,
             ),
+            &reads,
+            &writes,
+        )?;
+        Ok(())
+    }
+
+    /// 只跑 `gemv_int8_rkv_stage1_batch` 的 **mid 投影臂**（`RKV_OFF=1`）。
+    /// r/k/v 改走 `gemm_imma`（张量核 + smem x 复用）后，这一条只保留 v1/w1/a1/g1 四个投影。
+    /// r/k/v 的权重槽位填 `v1` 的地址占位（该臂关闭时不会被解引用）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_int8_rkv_mid_batch(
+        &mut self,
+        v1: &GpuTensor,
+        w1: &GpuTensor,
+        a1: &GpuTensor,
+        g1: &GpuTensor,
+        xv: &GpuTensor,
+        xw: &GpuTensor,
+        xa: &GpuTensor,
+        xg: &GpuTensor,
+        out_vm: &mut GpuTensor,
+        out_wm: &mut GpuTensor,
+        out_am: &mut GpuTensor,
+        out_gm: &mut GpuTensor,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = [
+            c as u32,
+            vm as u32,
+            wm as u32,
+            am as u32,
+            gm as u32,
+            self.app.properties.subgroup_size,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            bgrp as u32,
+            batch as u32,
+            1u32, // 15 = RKV_OFF
+        ];
+        let ph = v1.device.address; // 占位（r/k/v 臂已关）
+        let params = [
+            ph,
+            ph,
+            ph,
+            ph,
+            ph,
+            ph,
+            v1.device.address,
+            w1.device.address,
+            a1.device.address,
+            g1.device.address,
+            xv.device.address,
+            xw.device.address,
+            xa.device.address,
+            xg.device.address,
+            ph,
+            ph,
+            ph,
+            ph,
+            ph,
+            ph,
+            out_vm.device.address,
+            out_wm.device.address,
+            out_am.device.address,
+            out_gm.device.address,
+        ];
+        let reads = vec![
+            v1.device.buffer,
+            w1.device.buffer,
+            a1.device.buffer,
+            g1.device.buffer,
+            xv.device.buffer,
+            xw.device.buffer,
+            xa.device.buffer,
+            xg.device.buffer,
+        ];
+        let writes = vec![
+            out_vm.device.buffer,
+            out_wm.device.buffer,
+            out_am.device.buffer,
+            out_gm.device.buffer,
+        ];
+        self.record_kernel(
+            "shaders/spv/gemv_int8_rkv_stage1_batch.spv",
+            &spec,
+            &params,
+            ((vm + wm + am + gm) as u32, batch.div_ceil(bgrp) as u32, 1),
             &reads,
             &writes,
         )?;

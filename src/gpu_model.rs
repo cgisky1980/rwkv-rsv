@@ -2014,7 +2014,12 @@ impl GpuModel {
     fn imma_op_on(op: &str) -> bool {
         match std::env::var("VK_IMMA_OPS") {
             Ok(v) => v.split(',').any(|s| s.trim() == op),
-            Err(_) => true,
+            // `rkv` **默认关**：改成张量核要给每层多排 9 次 dispatch（3 quant + 3 gemm + 3 reduce），
+            // 实测（§5G）在 32 步的长 command buffer 下出现 ~43ms/步的 **inter-dispatch 停顿**
+            // （时间戳 SUM 只有 16ms/步，说明停顿发生在 dispatch 之间而非 kernel 内部）。
+            // 基础设施（OP=3/fp16 输出、`RKV_OFF` 的 mid-only dispatch）保留，显式
+            // `VK_IMMA_OPS=...,rkv` 可打开复现。
+            Err(_) => op != "rkv",
         }
     }
 
@@ -2093,34 +2098,97 @@ impl GpuModel {
             } else {
                 (vm, wm, am, gm)
             };
-            self.backend.gemv_int8_rkv_stage1_batch(
-                r_a8,
-                k_a8,
-                v_a8,
-                self.layers[i].v1,
-                self.layers[i].w1,
-                self.layers[i].a1,
-                self.layers[i].g1,
-                bb.xr,
-                bb.xk,
-                bb.xv,
-                bb.xw,
-                bb.xa,
-                bb.xg,
-                bb.r,
-                bb.k,
-                bb.v,
-                bb.v_mid,
-                bb.w_mid,
-                bb.a_mid,
-                bb.g_mid,
-                c,
-                mvm,
-                mwm,
-                mam,
-                mgm,
-                batch,
-            )?;
+            // ★ 2026-10-04：r/k/v 三个 C×C int8 GEMM 改走 **W8A8 张量核**（同 att.output 的形状）。
+            // 旧的 SIMT 融合核每个 workgroup 只算 `ROWS=4` 行、却要读全部 x（BGRP 个槽），
+            // x 被重读 `C/ROWS = 640` 遍 ⇒ L2 带宽成为瓶颈（实测每层 ~307MB 的 x 流量 vs
+            // 20MB 权重，B=16 时 10.4ms/步）。张量核把 x 片放 smem、按 BM=64 行复用。
+            // ② mid 投影（v1/w1/a1/g1，fp32 权重）留在原核里（`RKV_OFF=1` 只跑那一臂）。
+            let rkv_imma = c.is_multiple_of(64)
+                && c.is_multiple_of(128)
+                && Self::imma_op_on("rkv")
+                && self.imma_ok(c, c, batch);
+            if rkv_imma {
+                // 三段串行（共用量化暂存）；v 落 fp16、r/k 落 f32。
+                self.backend
+                    .quant_x_i8(bb.xr, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                self.backend.gemm_imma(
+                    r_a8,
+                    bb.xb_q,
+                    bb.xb_aux,
+                    bb.r,
+                    bb.imma_partial,
+                    c,
+                    c,
+                    batch,
+                    2,
+                )?;
+                self.backend
+                    .quant_x_i8(bb.xk, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                self.backend.gemm_imma(
+                    k_a8,
+                    bb.xb_q,
+                    bb.xb_aux,
+                    bb.k,
+                    bb.imma_partial,
+                    c,
+                    c,
+                    batch,
+                    2,
+                )?;
+                self.backend
+                    .quant_x_i8(bb.xv, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                self.backend
+                    .gemm_imma_f16(v_a8, bb.xb_q, bb.xb_aux, bb.v, c, c, batch)?;
+                self.backend.gemv_int8_rkv_mid_batch(
+                    self.layers[i].v1,
+                    self.layers[i].w1,
+                    self.layers[i].a1,
+                    self.layers[i].g1,
+                    bb.xv,
+                    bb.xw,
+                    bb.xa,
+                    bb.xg,
+                    bb.v_mid,
+                    bb.w_mid,
+                    bb.a_mid,
+                    bb.g_mid,
+                    c,
+                    mvm,
+                    mwm,
+                    mam,
+                    mgm,
+                    batch,
+                )?;
+            } else {
+                self.backend.gemv_int8_rkv_stage1_batch(
+                    r_a8,
+                    k_a8,
+                    v_a8,
+                    self.layers[i].v1,
+                    self.layers[i].w1,
+                    self.layers[i].a1,
+                    self.layers[i].g1,
+                    bb.xr,
+                    bb.xk,
+                    bb.xv,
+                    bb.xw,
+                    bb.xa,
+                    bb.xg,
+                    bb.r,
+                    bb.k,
+                    bb.v,
+                    bb.v_mid,
+                    bb.w_mid,
+                    bb.a_mid,
+                    bb.g_mid,
+                    c,
+                    mvm,
+                    mwm,
+                    mam,
+                    mgm,
+                    batch,
+                )?;
+            }
         } else {
             return Err("batch 并发路径要求 r/k/v 为 int8 量化权重（fp16 模型暂不支持）".into());
         }

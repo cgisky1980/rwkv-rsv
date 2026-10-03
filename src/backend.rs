@@ -462,6 +462,47 @@ pub trait ComputeBackend {
         Err("gemm_imma: backend not supported".into())
     }
 
+    /// 同 `gemm_imma`，但输出落 **fp16**（v 链用）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_imma_f16(
+        &mut self,
+        _a: &Int8Handle,
+        _xq: TensorId,
+        _xaux: TensorId,
+        _y16: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemm_imma_f16: backend not supported".into())
+    }
+
+    /// 只跑 rkv_stage1 的 mid 投影臂（r/k/v 走 `gemm_imma` 后，这里只剩 v1/w1/a1/g1）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_rkv_mid_batch(
+        &mut self,
+        _v1: TensorId,
+        _w1: TensorId,
+        _a1: TensorId,
+        _g1: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_vm: TensorId,
+        _out_wm: TensorId,
+        _out_am: TensorId,
+        _out_gm: TensorId,
+        _c: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int8_rkv_mid_batch: backend not supported".into())
+    }
+
     /// y += (x .* g) @ A（fp16 权重，f32 累加）——att.output 用。
     #[allow(clippy::too_many_arguments)]
     fn gemv_f16_mul_add(
@@ -1957,6 +1998,72 @@ impl ComputeBackend for VulkanBackend {
             .gemm_imma(&a_g, &xq_g, &aux_g, &mut y_o, &mut p_o, m, k, batch, op);
         self.put_f32(y, y_o);
         self.put_f32(partial, p_o);
+        res
+    }
+
+    fn gemm_imma_f16(
+        &mut self,
+        a: &Int8Handle,
+        xq: TensorId,
+        xaux: TensorId,
+        y16: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let a_g = self.int8_ref(a, "gemm_imma_f16")?;
+        let xq_g = self.get_u32(xq, "gemm_imma_f16")?;
+        let aux_g = self.get_f32(xaux, "gemm_imma_f16")?;
+        let mut y_o = self.take_f16(y16, "gemm_imma_f16")?;
+        let res = self
+            .rt
+            .gemm_imma_f16(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch);
+        self.put_f16(y16, y_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int8_rkv_mid_batch(
+        &mut self,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        let v1_g = self.get_f32(v1, "rkv_mid")?;
+        let w1_g = self.get_f32(w1, "rkv_mid")?;
+        let a1_g = self.get_f32(a1, "rkv_mid")?;
+        let g1_g = self.get_f32(g1, "rkv_mid")?;
+        let xv_g = self.get_f32(xv, "rkv_mid")?;
+        let xw_g = self.get_f32(xw, "rkv_mid")?;
+        let xa_g = self.get_f32(xa, "rkv_mid")?;
+        let xg_g = self.get_f32(xg, "rkv_mid")?;
+        let mut vm_o = self.take_f32(out_vm, "rkv_mid")?;
+        let mut wm_o = self.take_f32(out_wm, "rkv_mid")?;
+        let mut am_o = self.take_f32(out_am, "rkv_mid")?;
+        let mut gm_o = self.take_f32(out_gm, "rkv_mid")?;
+        let res = self.rt.gemv_int8_rkv_mid_batch(
+            &v1_g, &w1_g, &a1_g, &g1_g, &xv_g, &xw_g, &xa_g, &xg_g, &mut vm_o, &mut wm_o,
+            &mut am_o, &mut gm_o, c, vm, wm, am, gm, batch,
+        );
+        self.put_f32(out_vm, vm_o);
+        self.put_f32(out_wm, wm_o);
+        self.put_f32(out_am, am_o);
+        self.put_f32(out_gm, gm_o);
         res
     }
 

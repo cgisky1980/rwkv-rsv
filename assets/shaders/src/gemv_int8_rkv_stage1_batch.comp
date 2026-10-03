@@ -47,6 +47,9 @@ const uint XSLOT          = C / 4;   // 每 slot 的 vec4 数（x 输入）
 // BGRP/BATCH：同 gemv_int8.comp（constant_id 13/14）。
 layout(constant_id = 13) const uint BGRP = 1;
 layout(constant_id = 14) const uint BATCH = 1;
+// `RKV_OFF=1`：只跑 mid 投影臂（r/k/v 已改走 `gemm_imma` 张量核路径）。
+// 此时 `I8_WG = 0` ⇒ 上面的 int8 分支整体被跳过，`mid_idx = flat_idx`。
+layout(constant_id = 15) const uint RKV_OFF = 0;
 
 shared float s_dot[ROWS][BGRP][NUM_SUBGROUPS];
 shared float s_mid[BGRP][NUM_SUBGROUPS];
@@ -96,7 +99,7 @@ void main() {
     const uint subgroup_id  = gl_SubgroupID;
     const uint sub_inv      = gl_SubgroupInvocationID;
 
-    const uint I8_WG = 3u * (C / ROWS);   // int8 臂的 workgroup 数
+    const uint I8_WG = (RKV_OFF != 0u) ? 0u : 3u * (C / ROWS);   // int8 臂的 workgroup 数
 
     // ===== 分支 1：r/k/v（int8 权重，f32 输入）——每个 workgroup 只算一个矩阵 =====
     if (flat_idx < I8_WG) {

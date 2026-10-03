@@ -70,13 +70,15 @@ layout(buffer_reference) buffer WSz  { uint data[]; };    // fp16(尺度|零点)
 layout(buffer_reference) buffer XQ   { uint data[]; };    // 量化激活 [batch, K/4]
 layout(buffer_reference) buffer XAux { vec4 data[]; };    // 每 (槽, 组) 统计 [batch, K/128]
 layout(buffer_reference) buffer OutY { float data[]; };   // [batch, M]（或 split-K 的部分和）
+layout(buffer_reference) buffer Out16 { float16_t data[]; }; // fp16 视图（OP=3：v 链输出）
 
 layout(set = 0, binding = 0, std430) uniform Params {
-    WIdx in_idx;
-    WSz  in_sz;
-    XQ   in_xq;
-    XAux in_aux;
-    OutY out_y;
+    WIdx  in_idx;
+    WSz   in_sz;
+    XQ    in_xq;
+    XAux  in_aux;
+    OutY  out_y;
+    Out16 out16;
 } params;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -237,6 +239,10 @@ void main() {
                 } else if (OP == 10u) {
                     // 诊断：直读 smem 的激活字节（`xs[(组内槽=fcol, k)]`）
                     params.out_y.data[o] = float(int(xs[(g * BN + fcol) * WS + (frow + i * 4u)]));
+                } else if (OP == 3u) {
+                    // 覆盖写、但落 fp16（v 链的输出张量本就是 fp16 语义；舍入与 `float16_t`
+                    // 一致，与旧的 SIMT 路径 `float16_t(res)` 逐位相同）
+                    params.out16.data[o] = float16_t(acc[g][i]);
                 } else if (OP == 1u) {
                     params.out_y.data[o] = params.out_y.data[o] + acc[g][i];
                 } else {
