@@ -3753,6 +3753,9 @@ fn gemv_spec_batch(
 /// 能同时驻留的数量，延迟掩盖不足；ROWS=2 把 workgroup 数翻倍（权重读取总量不变，
 /// 因为每个 workgroup 只读自己那几行）。大 M（ffn.key 的 10240、head 的 65536）
 /// 本来就有几千个 workgroup，保持 ROWS=4 以摊薄 x 的重读。
+/// ⚠️ 反例留档：ROWS=8 实测**全面变慢**（relu2 0.1294→0.1821、affine 0.1174→0.1991，
+/// 同 run 的对照 kernel 未变慢）——`acc[8][8]`+`w[8][4]` ≈ 96 个寄存器把占用率压垮了。
+/// 与 CUDA 侧「ROWS=4/BGRP=8/128 线程」的结论一致。
 fn gemv_rows_batch(m: usize) -> usize {
     if m <= 4096 { 2 } else { 4 }
 }

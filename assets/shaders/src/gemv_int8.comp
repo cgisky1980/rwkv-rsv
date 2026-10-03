@@ -142,9 +142,9 @@ void main() {
             w[r][3] = sc * float(ip >> 24) + zr;
         }
         [[unroll]]
-        for (uint s = 0; s < BGRP; s++) {
-            if (s < slot_cnt) {
-                const vec4 xv = input_x.data[(slot0 + s) * (STRIDE_X.y / 4) + k];
+            for (uint s = 0; s < BGRP; s++) {
+                if (s < slot_cnt) {
+                    const vec4 xv = input_x.data[(slot0 + s) * (STRIDE_X.y / 4) + k];
                 [[unroll]]
                 for (uint r = 0; r < ROWS; r++) {
                     acc[r][s] += w[r][0] * xv.x
