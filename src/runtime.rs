@@ -1091,7 +1091,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_batch(m);
+        let rows = gemv_rows_batch(m, k);
         let bgrp = gemv_bgrp_for(batch);
         let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
@@ -1127,7 +1127,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_batch(m);
+        let rows = gemv_rows_batch(m, k);
         let bgrp = gemv_bgrp_for(batch);
         let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
@@ -1163,7 +1163,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_batch(m);
+        let rows = gemv_rows_batch(m, k);
         let bgrp = gemv_bgrp_for(batch);
         let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         let params = [
@@ -1204,7 +1204,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let rows = gemv_rows_batch(m);
+        let rows = gemv_rows_batch(m, k);
         let bgrp = gemv_bgrp_for(batch);
         let spec = gemv_spec_batch(&self.app, m, k, rows, bgrp, batch);
         // ★ 复用 `gemv_int8.comp` 的 AFFINE 变体（5 参 Params，与 head/plain 同一条
@@ -3756,8 +3756,11 @@ fn gemv_spec_batch(
 /// ⚠️ 反例留档：ROWS=8 实测**全面变慢**（relu2 0.1294→0.1821、affine 0.1174→0.1991，
 /// 同 run 的对照 kernel 未变慢）——`acc[8][8]`+`w[8][4]` ≈ 96 个寄存器把占用率压垮了。
 /// 与 CUDA 侧「ROWS=4/BGRP=8/128 线程」的结论一致。
-fn gemv_rows_batch(m: usize) -> usize {
-    if m <= 4096 { 2 } else { 4 }
+fn gemv_rows_batch(m: usize, k: usize) -> usize {
+    // k 大 ⇒ 每线程的 k 迭代多、归约占比低 ⇒ 优先要并行度（ROWS=2）；
+    // k 小（add_mul 的 K=2560，每线程仅 5 趟 k）⇒ 归约（ROWS×BGRP 次 subgroupAdd）
+    // 占比高，反而要**少** workgroup（ROWS=4）。实测 0.0624 vs 0.0720ms。
+    if m <= 4096 && k >= 8192 { 2 } else { 4 }
 }
 
 /// 批量 int8 GEMV 的槽分组宽度。
