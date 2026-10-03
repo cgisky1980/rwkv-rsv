@@ -8651,6 +8651,9 @@ impl ComputeBackend for CudaBackend {
         xr: TensorId,
         xk: TensorId,
         xv: TensorId,
+        _xr16: TensorId,
+        _xk16: TensorId,
+        _xv16: TensorId,
         xw: TensorId,
         xa: TensorId,
         xg: TensorId,
@@ -12310,8 +12313,8 @@ mod tests {
         b.upload(xat, &xa).unwrap();
         b.upload(xgt, &xg).unwrap();
         b.gemv_int8_rkv_stage1_batch(
-            &rh, &kh, &vh, v1t, w1t, a1t, g1t, xrt, xkt, xvt, xwt, xat, xgt, ort, okt, ovt, ovmt,
-            owmt, oamt, ogmt, c, vm, wm, am, gm, batch,
+            &rh, &kh, &vh, v1t, w1t, a1t, g1t, xrt, xkt, xvt, xrt, xkt, xvt, xwt, xat, xgt, ort,
+            okt, ovt, ovmt, owmt, oamt, ogmt, c, vm, wm, am, gm, batch,
         )
         .unwrap();
 

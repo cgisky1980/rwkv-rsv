@@ -571,10 +571,21 @@ impl Runtime {
             let buffers = [self.cmd];
             let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
             let submits = [submit.build()];
+            let t_sub = std::time::Instant::now();
             self.app
                 .device
                 .queue_submit(self.app.compute.queue, &submits, vk::Fence::null())?;
+            let t_wait = std::time::Instant::now();
             self.app.device.queue_wait_idle(self.app.compute.queue)?;
+            // `PROF_SUBMIT=1`：打印 submit / 等待耗时（诊断「长批出现超线性停顿」，见 §5K）。
+            if std::env::var("PROF_SUBMIT").is_ok() {
+                log::info!(
+                    "[PROF_SUBMIT] submit={:.3}ms wait={:.3}ms kernels={}",
+                    t_wait.duration_since(t_sub).as_secs_f64() * 1e3,
+                    t_wait.elapsed().as_secs_f64() * 1e3,
+                    self.prof_kernels
+                );
+            }
         }
         self.recording = false;
         self.pending.clear();
@@ -582,6 +593,15 @@ impl Runtime {
         self.read.clear();
         self.written_batch.clear();
         // uniform 池游标/slot 表复位：GPU 已 wait_idle，下批 dispatch 从池头复用 slot。
+        if std::env::var("PROF_POOL").is_ok() {
+            log::info!(
+                "[PROF_POOL] pool_cursor={} slots={} align={} cap={}",
+                self.pool_cursor,
+                self.pool_slots.len(),
+                self.pool_align,
+                self.uniform_pool.size
+            );
+        }
         self.pool_cursor = 0;
         self.pool_slots.clear();
         // GPU 时间戳剖析：读取并按 kernel label 聚合，输出每个 kernel 的执行时间与带宽利用率。
@@ -634,6 +654,28 @@ impl Runtime {
                 total / 1e6,
                 self.prof_gpu_entries.len()
             );
+            // `PROF_GAPS=1`：打印相邻 dispatch 之间的**空闲间隙** top-20（按间隙降序）。
+            // 用途：定位「时间戳 SUM 远小于墙钟」的 inter-dispatch 停顿到底落在哪两个 kernel 之间。
+            if std::env::var("PROF_GAPS").is_ok() {
+                let mut gaps: Vec<(f64, String, String)> = Vec::new();
+                for w in self.prof_gpu_entries.windows(2) {
+                    let (lb, _, e, _) = &w[0];
+                    let (lc, b2, _, _) = &w[1];
+                    let g =
+                        ((data[*b2 as usize]).saturating_sub(data[*e as usize]) as f64) * period;
+                    gaps.push((g, lb.clone(), lc.clone()));
+                }
+                gaps.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let sum_gap: f64 = gaps.iter().map(|g| g.0).sum();
+                log::info!(
+                    "[PROF_GAPS] 间隙合计 {:.3}ms / 墙钟 dispatch 数 {}",
+                    sum_gap / 1e6,
+                    gaps.len()
+                );
+                for (g, a, b) in gaps.iter().take(20) {
+                    log::info!("[PROF_GAPS] {:.1}us  {} -> {}", g / 1e3, a, b);
+                }
+            }
             self.prof_gpu_entries.clear();
             self.prof_gpu_count = 0;
         }
@@ -742,7 +784,7 @@ impl Runtime {
                 );
             }
         }
-        // WAR（写后读）：写缓冲若先前被本批读过，需插入执行依赖（src_access 为空），
+        // WAR（写后读）：写缓冲若先前被本批读过，需插入执行依赖，
         // 确保前一个 kernel 的读取完成后才允许本 kernel 写入，防止覆盖未读数据。
         for buf in writes {
             if let Some(&b) = self.read.get(&buf.as_raw()) {
@@ -751,7 +793,9 @@ impl Runtime {
                         .buffer(b)
                         .offset(0)
                         .size(vk::WHOLE_SIZE)
-                        .src_access_mask(vk::AccessFlags::empty())
+                        .src_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+                        )
                         .dst_access_mask(
                             vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                         )
@@ -3629,6 +3673,9 @@ impl Runtime {
         xr: &GpuTensor,
         xk: &GpuTensor,
         xv: &GpuTensor,
+        xr16: &GpuTensor16,
+        xk16: &GpuTensor16,
+        xv16: &GpuTensor16,
         xw: &GpuTensor,
         xa: &GpuTensor,
         xg: &GpuTensor,
@@ -3671,6 +3718,11 @@ impl Runtime {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0),
+            // 17 = MATMASK（本核只算位选中的矩阵；`VK_RKV_GEMM` 让部分矩阵走张量核时用）
+            std::env::var("RKV_MATMASK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(7),
         ];
         let params = [
             r_a8.idx.device.address,
@@ -3686,6 +3738,9 @@ impl Runtime {
             xr.device.address,
             xk.device.address,
             xv.device.address,
+            xr16.device.address,
+            xk16.device.address,
+            xv16.device.address,
             xw.device.address,
             xa.device.address,
             xg.device.address,
@@ -3711,6 +3766,9 @@ impl Runtime {
             xr.device.buffer,
             xk.device.buffer,
             xv.device.buffer,
+            xr16.device.buffer,
+            xk16.device.buffer,
+            xv16.device.buffer,
             xw.device.buffer,
             xa.device.buffer,
             xg.device.buffer,
@@ -3786,6 +3844,8 @@ impl Runtime {
             bgrp as u32,
             batch as u32,
             1u32, // 15 = RKV_OFF
+            0u32, // 16 = ABLATE（本臂只跑 mid 投影）
+            0u32, // 17 = MATMASK（同上，int8 臂整体不跑）
         ];
         let ph = v1.device.address; // 占位（r/k/v 臂已关）
         let params = [

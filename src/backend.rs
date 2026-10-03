@@ -694,6 +694,9 @@ pub trait ComputeBackend {
         _xr: TensorId,
         _xk: TensorId,
         _xv: TensorId,
+        _xr16: TensorId,
+        _xk16: TensorId,
+        _xv16: TensorId,
         _xw: TensorId,
         _xa: TensorId,
         _xg: TensorId,
@@ -2886,6 +2889,9 @@ impl ComputeBackend for VulkanBackend {
         xr: TensorId,
         xk: TensorId,
         xv: TensorId,
+        xr16: TensorId,
+        xk16: TensorId,
+        xv16: TensorId,
         xw: TensorId,
         xa: TensorId,
         xg: TensorId,
@@ -2921,13 +2927,16 @@ impl ComputeBackend for VulkanBackend {
             let xr_g = self.get_f32(xr, "gemv_int8_rkv_stage1_batch")?;
             let xk_g = self.get_f32(xk, "gemv_int8_rkv_stage1_batch")?;
             let xv_g = self.get_f32(xv, "gemv_int8_rkv_stage1_batch")?;
+            let xr16_g = self.get_f16(xr16, "gemv_int8_rkv_stage1_batch")?;
+            let xk16_g = self.get_f16(xk16, "gemv_int8_rkv_stage1_batch")?;
+            let xv16_g = self.get_f16(xv16, "gemv_int8_rkv_stage1_batch")?;
             let xw_g = self.get_f32(xw, "gemv_int8_rkv_stage1_batch")?;
             let xa_g = self.get_f32(xa, "gemv_int8_rkv_stage1_batch")?;
             let xg_g = self.get_f32(xg, "gemv_int8_rkv_stage1_batch")?;
             self.rt.gemv_int8_rkv_stage1_batch(
-                &ra8, &ka8, &va8, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
-                &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
-                &mut ogm_o, c, vm, wm, am, gm, batch,
+                &ra8, &ka8, &va8, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xr16_g,
+                &xk16_g, &xv16_g, &xw_g, &xa_g, &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o,
+                &mut owm_o, &mut oam_o, &mut ogm_o, c, vm, wm, am, gm, batch,
             )
         };
         self.put_f32(out_r, or_o);

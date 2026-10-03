@@ -335,6 +335,10 @@ pub struct WorkBuffers {
     xa: TensorId,
     xg: TensorId,
     prev_x: TensorId,
+    // fp16 副本（r/k/v 融合核读 fp16 x，流量减半）
+    xr16: TensorId,
+    xk16: TensorId,
+    xv16: TensorId,
     r: TensorId,
     k: TensorId,
     v: TensorId,
@@ -2073,6 +2077,11 @@ impl GpuModel {
             batch,
         )?;
 
+        // r/k/v 融合核读 fp16 x（流量减半）：把 xr/xk/xv 转 fp16 到 xr16/xk16/xv16。
+        self.backend.to_f16_triple(
+            bb.xr, bb.xk, bb.xv, bb.xr16, bb.xk16, bb.xv16, c, batch, batch, c, c,
+        )?;
+
         // r/k/v + mid 融合 gemv（batch 版；fp16 权重模型暂不支持 batch 路径）。
         // ★ `LOWRANK_GEMM`（Phase 2，默认开，见 [Phase 2 计划]）：低秩链两级改走 **fp16 张量核
         // tiled GEMM**（复用加载时已常驻的 `*_16` 权重），替代 fp32 SIMT 的
@@ -2107,38 +2116,97 @@ impl GpuModel {
                 && c.is_multiple_of(128)
                 && Self::imma_op_on("rkv")
                 && self.imma_ok(c, c, batch);
-            if rkv_imma {
+            // `VK_RKV_GEMM`：r/k/v 中**哪些走张量核**（字符集取自 `rkv`，默认全走）。
+            // 未选中的矩阵由 SIMT 融合核补算（`RKV_MATMASK`）。二分定位用（§5K）。
+            let rkv_sel: u32 = match std::env::var("VK_RKV_GEMM") {
+                Ok(s) => {
+                    let mut m = 0u32;
+                    if s.contains('r') {
+                        m |= 1;
+                    }
+                    if s.contains('k') {
+                        m |= 2;
+                    }
+                    if s.contains('v') {
+                        m |= 4;
+                    }
+                    m
+                }
+                Err(_) => 7,
+            };
+            let rkv_imma_any = rkv_imma && rkv_sel != 0;
+            if rkv_imma_any {
                 // 三段串行（共用量化暂存）；v 落 fp16、r/k 落 f32。
-                self.backend
-                    .quant_x_i8(bb.xr, None, bb.xb_q, bb.xb_aux, c, batch)?;
-                self.backend.gemm_imma(
-                    r_a8,
-                    bb.xb_q,
-                    bb.xb_aux,
-                    bb.r,
-                    bb.imma_partial,
-                    c,
-                    c,
-                    batch,
-                    2,
-                )?;
-                self.backend
-                    .quant_x_i8(bb.xk, None, bb.xb_q, bb.xb_aux, c, batch)?;
-                self.backend.gemm_imma(
-                    k_a8,
-                    bb.xb_q,
-                    bb.xb_aux,
-                    bb.k,
-                    bb.imma_partial,
-                    c,
-                    c,
-                    batch,
-                    2,
-                )?;
-                self.backend
-                    .quant_x_i8(bb.xv, None, bb.xb_q, bb.xb_aux, c, batch)?;
-                self.backend
-                    .gemm_imma_f16(v_a8, bb.xb_q, bb.xb_aux, bb.v, c, c, batch)?;
+                if rkv_sel & 1 != 0 {
+                    self.backend
+                        .quant_x_i8(bb.xr, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                    self.backend.gemm_imma(
+                        r_a8,
+                        bb.xb_q,
+                        bb.xb_aux,
+                        bb.r,
+                        bb.imma_partial,
+                        c,
+                        c,
+                        batch,
+                        2,
+                    )?;
+                }
+                if rkv_sel & 2 != 0 {
+                    self.backend
+                        .quant_x_i8(bb.xk, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                    self.backend.gemm_imma(
+                        k_a8,
+                        bb.xb_q,
+                        bb.xb_aux,
+                        bb.k,
+                        bb.imma_partial,
+                        c,
+                        c,
+                        batch,
+                        2,
+                    )?;
+                }
+                if rkv_sel & 4 != 0 {
+                    self.backend
+                        .quant_x_i8(bb.xv, None, bb.xb_q, bb.xb_aux, c, batch)?;
+                    self.backend
+                        .gemm_imma_f16(v_a8, bb.xb_q, bb.xb_aux, bb.v, c, c, batch)?;
+                }
+                // 未走张量核的矩阵由 SIMT 融合核补（mid 传 0 = 只算 r/k/v）。
+                if rkv_sel != 7 {
+                    self.backend.gemv_int8_rkv_stage1_batch(
+                        r_a8,
+                        k_a8,
+                        v_a8,
+                        self.layers[i].v1,
+                        self.layers[i].w1,
+                        self.layers[i].a1,
+                        self.layers[i].g1,
+                        bb.xr,
+                        bb.xk,
+                        bb.xv,
+                        bb.xr16,
+                        bb.xk16,
+                        bb.xv16,
+                        bb.xw,
+                        bb.xa,
+                        bb.xg,
+                        bb.r,
+                        bb.k,
+                        bb.v,
+                        bb.v_mid,
+                        bb.w_mid,
+                        bb.a_mid,
+                        bb.g_mid,
+                        c,
+                        0,
+                        0,
+                        0,
+                        0,
+                        batch,
+                    )?;
+                }
                 self.backend.gemv_int8_rkv_mid_batch(
                     self.layers[i].v1,
                     self.layers[i].w1,
@@ -2171,6 +2239,9 @@ impl GpuModel {
                     bb.xr,
                     bb.xk,
                     bb.xv,
+                    bb.xr16,
+                    bb.xk16,
+                    bb.xv16,
                     bb.xw,
                     bb.xa,
                     bb.xg,
@@ -2593,7 +2664,18 @@ impl GpuModel {
         // Vulkan 的行写入是纯 CPU memcpy（第 round 行），CUDA 是 pinned 异步拷贝到同一
         // device 缓冲——两者都零 host↔GPU 同步。
         let use_async = n <= self.backend.sampler_async_rows() / batch.max(1);
+        // `SELFLOOP_CHUNK=<k>`（k>0）：非 graph 后端把整段 n 轮**拆成每 k 轮一次 submit**。
+        // 诊断/规避「超长 command buffer 上每步耗时超线性增长」（见 §5K）。
+        let chunk: usize = std::env::var("SELFLOOP_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         for round in 0..n {
+            if !graph_ok && chunk > 0 && round > 0 && round.is_multiple_of(chunk) {
+                // 先提交并等待：uniform 池/查询池在下一批会被复用，必须等本批 GPU 读完。
+                self.backend.end_batch()?;
+                self.backend.begin_batch()?;
+            }
             state.v_first_set = false;
             let seeds_r: Vec<u32> = seeds.iter().map(|s| s.wrapping_add(round as u32)).collect();
             if use_async {
@@ -5118,6 +5200,9 @@ impl WorkBuffers {
             xa: mk_c(&mut *backend)?,
             xg: mk_c(&mut *backend)?,
             prev_x: mk_c(&mut *backend)?,
+            xr16: mk_c16(&mut *backend)?,
+            xk16: mk_c16(&mut *backend)?,
+            xv16: mk_c16(&mut *backend)?,
             r: mk_c(&mut *backend)?,
             k: mk_c(&mut *backend)?,
             v: mk_c16(&mut *backend)?,

@@ -43,6 +43,7 @@ const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
 const uint KV             = C / 4;
 const uint KG             = C / 128;
 const uint XSLOT          = C / 4;   // 每 slot 的 vec4 数（x 输入）
+const uint XSLOT_F16      = C / 2;   // 每 slot 的 f16vec2 数（fp16 x 输入）
 
 // BGRP/BATCH：同 gemv_int8.comp（constant_id 13/14）。
 layout(constant_id = 13) const uint BGRP = 1;
@@ -64,6 +65,7 @@ layout(buffer_reference) buffer In8  { uint data[]; };      // int8 打包 idx�
 layout(buffer_reference) buffer InSZ { uint data[]; };      // scale|zero 打包（2×fp16/uint32）
 layout(buffer_reference) buffer BufF { float data[]; };     // fp32 [batch, *]
 layout(buffer_reference) buffer InX4 { vec4 data[]; };      // fp32 vec4 [batch, C]
+layout(buffer_reference) buffer InX2 { f16vec2 data[]; };   // fp16 vec2 [batch, C/2]（r/k/v 用）
 layout(buffer_reference) buffer OutF { float data[]; };     // fp32 [batch, *]
 layout(buffer_reference) buffer Out16 { float16_t data[]; };// fp16 [batch, C]
 
@@ -81,6 +83,9 @@ layout(set = 0, binding = 0, std430) uniform Params {
     InX4 in_xr;
     InX4 in_xk;
     InX4 in_xv;
+    InX2 in_xr16;
+    InX2 in_xk16;
+    InX2 in_xv16;
     BufF in_xw;
     BufF in_xa;
     BufF in_xg;
@@ -112,15 +117,15 @@ void main() {
 
         In8  widx = params.in_r_idx;
         InSZ wsz  = params.in_r_sz;
-        InX4 xin  = params.in_xr;
+        InX2 xin  = params.in_xr16;
         if (mat == 1u) {
             widx = params.in_k_idx;
             wsz  = params.in_k_sz;
-            xin  = params.in_xk;
+            xin  = params.in_xk16;
         } else if (mat == 2u) {
             widx = params.in_v_idx;
             wsz  = params.in_v_sz;
-            xin  = params.in_xv;
+            xin  = params.in_xv16;
         }
 
         [[unroll]]
@@ -143,27 +148,32 @@ void main() {
         [[unroll]]
         for (uint k = index; k < KV && ABLATE != 3u; k += BLOCK_SIZE) {
             const uint g = k / 32;
-            // 权重（每行 1 个 uint32 = 4 个 uint8）读一次、解一次，复用给全部 BGRP 个槽。
-            float w[ROWS][4];
+            // 权重按行打包为 vec4，与 x 的 vec4 做 dot（4 FMA → 1 dot 指令）。
+            vec4 w[ROWS];
             [[unroll]]
             for (uint r = 0; r < ROWS; r++) {
                 const uint ip = (ABLATE == 1u) ? 0x7Fu : widx.data[(row_base + r) * KV + k];
                 const float sc = s_scale[r][g];
                 const float zr = s_zero[r][g];
-                w[r][0] = sc * float(ip & 0xFFu)           + zr;
-                w[r][1] = sc * float((ip >>  8) & 0xFFu)   + zr;
-                w[r][2] = sc * float((ip >> 16) & 0xFFu)   + zr;
-                w[r][3] = sc * float(ip >> 24)             + zr;
+                w[r] = vec4(
+                    sc * float(ip & 0xFFu) + zr,
+                    sc * float((ip >>  8) & 0xFFu) + zr,
+                    sc * float((ip >> 16) & 0xFFu) + zr,
+                    sc * float(ip >> 24) + zr);
             }
             [[unroll]]
             for (uint s = 0; s < BGRP; s++) {
                 if (s < slot_cnt) {
-                    const vec4 xv = (ABLATE == 2u) ? vec4(1.0)
-                                                   : xin.data[(slot0 + s) * XSLOT + k];
+                    // x 读 fp16（f16vec2 × 2 = 4 个 fp16），转 vec4 参与 fp32 累加。
+                    // 内存流量减半（8 vs 16 bytes/slot/k）。
+                    const f16vec2 hx0 = (ABLATE == 2u) ? f16vec2(1.0)
+                                                        : xin.data[(slot0 + s) * XSLOT_F16 + k * 2];
+                    const f16vec2 hx1 = (ABLATE == 2u) ? f16vec2(1.0)
+                                                        : xin.data[(slot0 + s) * XSLOT_F16 + k * 2 + 1];
+                    const vec4 xv = vec4(hx0, hx1);
                     [[unroll]]
                     for (uint r = 0; r < ROWS; r++) {
-                        acc[r][s] += w[r][0] * xv.x + w[r][1] * xv.y
-                                   + w[r][2] * xv.z + w[r][3] * xv.w;
+                        acc[r][s] += dot(w[r], xv);
                     }
                 }
             }
