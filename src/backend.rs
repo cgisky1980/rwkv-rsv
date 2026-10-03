@@ -445,6 +445,7 @@ pub trait ComputeBackend {
 
     /// W8A8 int8 张量核 GEMM：`y = op(xq @ W^T)`（见 `gemm_imma.comp`）。
     /// `op`：0 = relu² 覆盖写、1 = 累加到 y、2 = 覆盖写。
+    /// `partial` 为 split-K 的部分和暂存（形状允许时分块，内核自行决定用不用）。
     #[allow(clippy::too_many_arguments)]
     fn gemm_imma(
         &mut self,
@@ -452,6 +453,7 @@ pub trait ComputeBackend {
         _xq: TensorId,
         _xaux: TensorId,
         _y: TensorId,
+        _partial: TensorId,
         _m: usize,
         _k: usize,
         _batch: usize,
@@ -1939,6 +1941,7 @@ impl ComputeBackend for VulkanBackend {
         xq: TensorId,
         xaux: TensorId,
         y: TensorId,
+        partial: TensorId,
         m: usize,
         k: usize,
         batch: usize,
@@ -1948,10 +1951,12 @@ impl ComputeBackend for VulkanBackend {
         let xq_g = self.get_u32(xq, "gemm_imma")?;
         let aux_g = self.get_f32(xaux, "gemm_imma")?;
         let mut y_o = self.take_f32(y, "gemm_imma")?;
+        let mut p_o = self.take_f32(partial, "gemm_imma")?;
         let res = self
             .rt
-            .gemm_imma(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch, op);
+            .gemm_imma(&a_g, &xq_g, &aux_g, &mut y_o, &mut p_o, m, k, batch, op);
         self.put_f32(y, y_o);
+        self.put_f32(partial, p_o);
         res
     }
 

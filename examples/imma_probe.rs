@@ -75,7 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         v
     } else {
-        (0..idx_words).map(|_| lcg(&mut rng)).collect()
+        // ⚠️ 权重字节用**居中**随机（`q_u ∈ [124,132]` ⇒ s8 ∈ [-4,4]）：均匀 0..255 会让
+        // 每组的零点和修正项（~3e4）与结果（~0.3）严重抵消，相对误差度量失去意义。
+        (0..idx_words)
+            .map(|_| {
+                let mut w = 0u32;
+                for j in 0..4 {
+                    let b = 124 + (lcg(&mut rng) % 9);
+                    w |= (b & 0xFF) << (8 * j);
+                }
+                w
+            })
+            .collect()
     };
     let sz: Vec<u32> = (0..m * g)
         .map(|_| {
@@ -130,15 +141,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|i| (i % 7) as f32 * 0.25 - 0.5)
         .collect::<Vec<f32>>();
 
+    let partial = mk_f32(&mut *b, 8 * 8 * m)?;
+    let q = quantize(&x, k, batch);
+
     let mut runs: Vec<Vec<f32>> = Vec::new();
     for _ in 0..reps {
         let y = mk_f32(&mut *b, 8 * m)?;
         b.upload(y, &y0)?;
         b.begin_batch()?;
         b.quant_x_i8(xt, None, xq, xaux, k, batch)?;
-        b.gemm_imma(&a, xq, xaux, y, m, k, batch, op)?;
+        b.gemm_imma(&a, xq, xaux, y, partial, m, k, batch, op)?;
         b.end_batch()?;
         runs.push(b.download(y)?);
+    }
+
+    // ⓪ 逐项核对 `quant_x_i8` 的产物（xq / xaux）——gemm 出错时先确认 A 侧输入本身对。
+    {
+        let xq_h = b.download_u32(xq)?;
+        let aux_h = b.download(xaux)?;
+        let mut bad_q = 0usize;
+        let mut bad_aux = 0usize;
+        let mut first = String::new();
+        for s in 0..batch {
+            for kx in 0..k {
+                let got = ((xq_h[s * (k / 4) + kx / 4] >> (8 * (kx % 4))) & 0xFF) as i32;
+                let got = if got >= 128 { got - 256 } else { got };
+                if got != q.q[s * k + kx] {
+                    bad_q += 1;
+                    if first.is_empty() {
+                        first = format!("q slot{s} k{kx}: gpu={got} cpu={}", q.q[s * k + kx]);
+                    }
+                }
+            }
+            for gi in 0..g {
+                let a = &aux_h[(s * g + gi) * 4..(s * g + gi) * 4 + 4];
+                let want = [
+                    q.sx[s * g + gi] as f32,
+                    (128.0 * q.sx[s * g + gi] * q.cs[s * g + gi]) as f32,
+                    q.rs[s * g + gi] as f32,
+                    0.0,
+                ];
+                for j in 0..4 {
+                    if (a[j] - want[j]).abs() > 1e-3 * want[j].abs().max(1.0) {
+                        bad_aux += 1;
+                        if first.is_empty() {
+                            first =
+                                format!("aux slot{s} g{gi} [{j}]: gpu={} cpu={}", a[j], want[j]);
+                        }
+                    }
+                }
+            }
+        }
+        println!("[probe] quant_x_i8 核对：q 失配 {bad_q}，aux 失配 {bad_aux}  {first}");
     }
 
     // ① 确定性
@@ -161,7 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ② 数值：CPU 参考（fp64 复刻 kernel 的口径）
-    let q = quantize(&x, k, batch);
     let mut max_rel = 0.0f64;
     let mut worst = String::new();
     let got = &runs[0];
@@ -203,6 +256,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("[probe] 最大相对误差 = {max_rel:.3e}  最差点: {worst}");
+    // 抵消会把「相对误差」放大到无意义 ⇒ 同时给出**绝对**误差与量级（fp32 判据：绝对误差
+    // 应与 Σ|组贡献| × 1e-7 同阶，而不是与结果本身比）。
+    {
+        let (mut max_abs, mut scale) = (0.0f64, 0.0f64);
+        for s in 0..batch {
+            for r in 0..m {
+                let mut acc = 0.0f64;
+                let mut abs_terms = 0.0f64;
+                for gi in 0..g {
+                    let mut sdot = 0.0f64;
+                    for kk in 0..K_GROUP {
+                        let kx = gi * K_GROUP + kk;
+                        let byte = (idx[r * (k / 4) + kx / 4] >> (8 * (kx % 4))) & 0xFF;
+                        sdot += (((byte as i32) - 128) * q.q[s * k + kx] as i32) as f64;
+                    }
+                    let sc = f16::from_bits((sz[r * g + gi] & 0xFFFF) as u16).to_f32() as f64;
+                    let z = f16::from_bits((sz[r * g + gi] >> 16) as u16).to_f32() as f64;
+                    let t = sc
+                        * (q.sx[s * g + gi] * sdot + 128.0 * q.sx[s * g + gi] * q.cs[s * g + gi])
+                        + z * q.rs[s * g + gi];
+                    acc += t;
+                    abs_terms += t.abs();
+                }
+                let expect = match op {
+                    0 => {
+                        if acc > 0.0 {
+                            acc * acc
+                        } else {
+                            0.0
+                        }
+                    }
+                    1 => y0[s * m + r] as f64 + acc,
+                    _ => acc,
+                };
+                max_abs = max_abs.max((got[s * m + r] as f64 - expect).abs());
+                scale = scale.max(abs_terms.max(expect.abs()));
+            }
+        }
+        println!(
+            "[probe] 最大绝对误差 = {max_abs:.3e}  量级 = {scale:.3e}  ⇒ 归一到量级 = {:.3e}",
+            max_abs / scale
+        );
+    }
 
     if ones {
         println!(
@@ -219,6 +315,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sx = q.sx[s * g];
             for r in 0..8usize {
                 let yv = got[s * m + r] as f64;
+                // 权重只有 k=r%128 处非零 ⇒ 只有第 0 组的贡献非零、其余组精确相消
+                // ⇒ `y = sx · q[slot][r%128]`，直接反解即可。
                 let infer = (yv / sx).round() as i32;
                 let want = q.q[s * k + r % K_GROUP];
                 let pos = (0..k)
@@ -226,7 +324,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|j| j as i64)
                     .unwrap_or(-1);
                 println!(
-                    "  DIAG s{s} r{r}: y={yv:.4} infer_q={infer:>5} want_q={want:>5}   该值在 q[s] 的 k={pos}"
+                    "  DIAG s{s} r{r}: 期望 k={}  want_q={want:>5} | 反解 q={infer:>5} 出现在 k={pos}",
+                    r % K_GROUP
                 );
             }
         }
@@ -300,16 +399,26 @@ fn quantize(x: &[f32], k: usize, batch: usize) -> Q {
         for gi in 0..g {
             let base = b * k + gi * K_GROUP;
             let amax = (0..K_GROUP).fold(0.0f32, |a, i| a.max(x[base + i].abs()));
-            let s = if amax > 0.0 { amax as f64 / 127.0 } else { 1.0 };
+            // ⚠️ 必须**逐位复刻 shader 的 fp32 路径**：`sx = amax·(1/127)`、`inv = 1/sx`、
+            // `q = roundEven(v·inv)`，全部在 f32 里。任何一处换成 f64 的等价写法（如 `v/s`）
+            // 都会在 .5 边界上偶发 1 LSB 差异，而 1 LSB 会让 `cs` 差 1 ⇒ `128·sx·cs` 差 ~1.0，
+            // 直接把探针误差抬到 O(1)（本轮排查就栽在这上面）。
+            let s = if amax > 0.0 {
+                amax * (1.0f32 / 127.0)
+            } else {
+                1.0
+            };
+            let inv = 1.0f32 / s;
             let mut c = 0i32;
             let mut r = 0.0f64;
             for i in 0..K_GROUP {
-                let v = x[base + i] as f64;
-                let qv = (v / s).round().clamp(-127.0, 127.0) as i32;
+                let v = x[base + i];
+                let qv = (v * inv).round_ties_even().clamp(-127.0, 127.0) as i32;
                 q[base + i] = qv;
                 c += qv;
-                r += v;
+                r += v as f64;
             }
+            let s = s as f64;
             sx[b * g + gi] = s;
             cs[b * g + gi] = c as f64;
             rs[b * g + gi] = r;

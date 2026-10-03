@@ -1,0 +1,42 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+
+// split-K 的确定性归约（`gemm_imma.comp` 的配套内核，只编这一条，避免把大 GEMM 再编一遍）：
+//   `out_y[slot,row] = op( Σ_{ks=0}^{KS-1} partial[ks][slot][row] )`
+// 部分和在 `gemm_imma` 里按 `[KS][BATCH][M]` 布局落盘，这里按 ks **升序**相加 —— 固定顺序，
+// 故结果确定（不依赖 block 调度）。op 语义与 `gemm_imma` 的 epilogue 逐项一致：
+//   0 = relu² 覆盖写、1 = 累加到 out_y、2 = 覆盖写。
+
+layout(constant_id = 0) const uint M     = 10240;  // 输出行数
+layout(constant_id = 1) const uint BATCH = 8;      // 槽位数
+layout(constant_id = 2) const uint KS    = 4;      // split-K 分块数
+layout(constant_id = 3) const uint OP    = 0;
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer InP  { float data[]; };   // [KS][BATCH][M]
+layout(buffer_reference) buffer OutY { float data[]; };   // [BATCH][M]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InP  in_p;
+    OutY out_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint total = BATCH * M;
+    const uint stride = BLOCK_SIZE * gl_NumWorkGroups.x;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        float s = 0.0;
+        for (uint ks = 0u; ks < KS; ks++) {
+            s += params.in_p.data[ks * total + i];
+        }
+        if (OP == 1u) {
+            params.out_y.data[i] = params.out_y.data[i] + s;
+        } else {
+            params.out_y.data[i] = (OP == 0u) ? (s > 0.0 ? s * s : 0.0) : s;
+        }
+    }
+}

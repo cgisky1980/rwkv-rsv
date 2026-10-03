@@ -47,6 +47,11 @@ layout(constant_id = 0) const uint M     = 10240;  // 输出行数
 layout(constant_id = 1) const uint K     = 2560;   // 收缩维（须为 128 整除）
 layout(constant_id = 2) const uint BATCH = 8;      // 槽位数（BN = 8）
 layout(constant_id = 3) const uint OP    = 0;      // epilogue 见文件头
+// split-K 分块数（`grid.y = ksp`）：把 K 均分成 KS 段，每段由**独立的一批 block** 计算，
+// 各段只写自己的**部分和**（op 交给 `gemm_imma_reduce`），块数 ×KS 而**总流量不变**
+// （各段读不同的 k 区间）。动机：本 kernel 的每 block 吞吐被钉死，聚合吞吐随并发块数
+// 单调上升（CUDA 实测 80 块 → 102、160 → 172、1024 → 232 GMAC/s/SM）。
+layout(constant_id = 4) const uint KS    = 1;
 
 const uint BM   = IM_BM;    // 每 block 的输出行数
 const uint BN   = 8;        // 每 block 的槽数（= coopmat 的 N）
@@ -119,7 +124,11 @@ void main() {
     coopmat<int8_t,  gl_ScopeSubgroup, WR, 32, gl_MatrixUseA> cf;
     coopmat<int8_t,  gl_ScopeSubgroup, 32, BN, gl_MatrixUseB> xf;
 
-    for (uint kt = 0u; kt < K; kt += BK) {
+    // split-K：本 block 负责的 k 区间（host 保证 `K/128 % KS == 0`，段按量化组对齐）
+    const uint ksp = gl_WorkGroupID.y;
+    const uint kb  = K / KS;
+
+    for (uint kt = ksp * kb; kt < (ksp + 1u) * kb; kt += BK) {
         const uint gr = kt >> 7u;   // 组号
 
         // —— 落 smem：权重（^0x80）+ 激活 + 本组统计 ——
@@ -197,7 +206,11 @@ void main() {
         const uint r = row0 + wid * WR + frow + i * 4u;
         if (r < M) {
             const uint o = fcol * M + r;
-            if (OP == 9u) {
+            if (KS > 1u) {
+                // split-K：各段只写**部分和**到 `out_y + ksp*BATCH*M`（布局 [KS][BATCH][M]），
+                // 不施加 op、不读旧值 —— op 与求和交给 `gemm_imma_reduce`（固定顺序 ⇒ 确定性）。
+                params.out_y.data[ksp * BATCH * M + o] = acc[i];
+            } else if (OP == 9u) {
                 // 诊断：直读 smem 的权重字节（`ws[(行, k=fcol)]`）——验证 staging + 行映射
                 params.out_y.data[o] = float(int(ws[(wid * WR + frow + i * 4u) * WS + fcol]));
             } else if (OP == 10u) {

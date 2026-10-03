@@ -412,6 +412,10 @@ fn main() {
         "gemm_imma" => "src/gemm_imma.comp" => {
             IM_BM => [def(64, "bm64"), def(128, "bm128")],
         },
+        // split-K 的确定性归约（`gemm_imma` 配套）。
+        "gemm_imma_reduce" => "src/gemm_imma_reduce.comp" => {
+            TYPE => [none("")],
+        },
     };
 
     for spec in &specs {

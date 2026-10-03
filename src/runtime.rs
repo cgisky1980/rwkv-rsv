@@ -1383,7 +1383,11 @@ impl Runtime {
 
     /// W8A8 int8 张量核 GEMM（`gemm_imma.comp`）：`y = op(xq @ W^T)`，每 block `IM_BM` 行
     /// × BN=8 槽，每 k-tile（= 一个量化组）flush 一次。`op`：0=relu²重写、1=累加、2=重写。
-    /// spec = [M, K, BATCH, OP]；dispatch = (M/bm, 1, 1)，block = 2·bm。
+    /// spec = [M, K, BATCH, OP, KS]；dispatch = (M/bm, KS, 1)，block = 2·bm。
+    ///
+    /// split-K（`ks > 1`）：GEMM 只写部分和到 `partial`（布局 [KS][BATCH][M]），再跑一条
+    /// `gemm_imma_reduce` 按 ks 升序求和并施加 op。块数 ×KS 而总流量不变——本 kernel 的
+    /// **每 block 吞吐被钉死**，聚合吞吐随并发块数单调上升（见 `imma_ksplit`）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_imma(
         &mut self,
@@ -1391,6 +1395,7 @@ impl Runtime {
         xq: &GpuTensorU32,
         xaux: &GpuTensor,
         y: &mut GpuTensor,
+        partial: &mut GpuTensor,
         m: usize,
         k: usize,
         batch: usize,
@@ -1400,32 +1405,53 @@ impl Runtime {
         debug_assert_eq!(a.k, k);
         let bm = Self::imma_bm(m);
         debug_assert_eq!(m % bm, 0, "gemm_imma: M 需为 {bm} 整除");
-        let spec = [m as u32, k as u32, batch as u32, op];
-        let params = [
-            a.idx.device.address,
-            a.sz.device.address,
-            xq.device.address,
-            xaux.device.address,
-            y.device.address,
-        ];
+        let ks = Self::imma_ksplit(m, k, bm);
+        debug_assert!(
+            ks == 1 || partial.len >= ks * batch * m,
+            "gemm_imma: partial 缓冲不足（ks={ks} m={m} batch={batch} len={}）",
+            partial.len
+        );
         let spv = if bm == 64 {
             "shaders/spv/gemm_imma_bm64.spv"
         } else {
             "shaders/spv/gemm_imma_bm128.spv"
         };
+        // ks == 1：直接写 y、由 kernel 施加 op；ks > 1：写 partial、由归约内核施加 op。
+        let out: &GpuTensor = if ks == 1 { y } else { partial };
+        let spec = [m as u32, k as u32, batch as u32, op, ks as u32];
+        let params = [
+            a.idx.device.address,
+            a.sz.device.address,
+            xq.device.address,
+            xaux.device.address,
+            out.device.address,
+        ];
         self.record_kernel(
             spv,
             &spec,
             &params,
-            ((m / bm) as u32, 1, 1),
+            ((m / bm) as u32, ks as u32, 1),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
                 xq.device.buffer,
                 xaux.device.buffer,
             ],
-            &[y.device.buffer],
+            &[out.device.buffer],
         )?;
+        if ks > 1 {
+            let rspec = [m as u32, batch as u32, ks as u32, op];
+            let rparams = [partial.device.address, y.device.address];
+            let total = (batch * m) as u32;
+            self.record_kernel(
+                "shaders/spv/gemm_imma_reduce.spv",
+                &rspec,
+                &rparams,
+                (total.div_ceil(256), 1, 1),
+                &[partial.device.buffer],
+                &[y.device.buffer],
+            )?;
+        }
         Ok(())
     }
 
@@ -1441,6 +1467,46 @@ impl Runtime {
         } else {
             64
         }
+    }
+
+    /// `gemm_imma` 的 split-K 分块数（`VK_IMMA_KSPLIT` 可强制、`=0` 关闭）。
+    ///
+    /// **依据**：本 kernel 每 block 吞吐被钉死（CUDA 实测 ~90 GMAC/s/block），而聚合吞吐
+    /// 随并发块数单调上升；`head`（M=65536 ⇒ 1024 块）实测 477 GB/s（77% 峰值），
+    /// `ffn.key`/`ffn.value`（160/40 块）只有 ~226 GB/s（37%）⇒ **块数才是瓶颈**。
+    /// 不增加流量的加块手段只有 split-K：各段读不同的 k 区间 ⇒ 总流量不变。
+    ///
+    /// 规则：把总块数抬到 `VK_IMMA_KSPLIT_TARGET`（默认 400 ≈ 6×SM 数），分块数上限
+    /// `VK_IMMA_KSPLIT_MAX`（默认 8），并要求 `(K/128) % ks == 0`（段按量化组对齐）。
+    fn imma_ksplit(m: usize, k: usize, bm: usize) -> usize {
+        let max_ks: usize = std::env::var("VK_IMMA_KSPLIT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+            .clamp(1, 16);
+        let forced: Option<usize> = std::env::var("VK_IMMA_KSPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let blocks = m / bm;
+        let ktiles = k / 128;
+        let mut ks = match forced {
+            Some(v) => v.min(max_ks),
+            None => {
+                let target: usize = std::env::var("VK_IMMA_KSPLIT_TARGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(400);
+                if blocks == 0 || blocks >= target {
+                    1
+                } else {
+                    target.div_ceil(blocks).min(max_ks)
+                }
+            }
+        };
+        while ks > 1 && (!ktiles.is_multiple_of(ks) || k / ks < 128) {
+            ks -= 1;
+        }
+        ks
     }
 
     /// W8A8（int8 激活 + int8 权重）张量核路径是否可用。

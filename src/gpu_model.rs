@@ -366,11 +366,14 @@ pub struct WorkBuffers {
     g_mid: TensorId, // [G_MID]
     r2: TensorId,    // [FFN_HIDDEN]
     /// W8A8 张量核路径的量化激活与每组统计。**固定按 8 槽容量分配**：IMMA 的 BN=8 一次覆盖
-    /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma_relu2.comp` 按 BATCH 守卫丢弃输出）。
+    /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma.comp` 按 BATCH 守卫丢弃输出）。
     xb_q: TensorId, // u32 [8, C/4]（每 4 个 int8 打包 1 个 uint32）
     xb_aux: TensorId, // f32 vec4 [8, C/128]（sx, 128·sx·Σq, Σx, 0）
-    logits: TensorId, // [vocab]
-    token_argmax: TensorId, // [1] GPU argmax 采样的 token 索引（字节存 uint）
+    /// split-K 的部分和暂存（[KS][batch][M]）。按 `8 × 8 × max(c, fh, vocab)` 一次分配到位
+    /// （≈17MB），免得按形状反复重建 —— 实际只在小 M（块数不足）的形状上用到。
+    imma_partial: TensorId,
+    logits: TensorId,        // [vocab]
+    token_argmax: TensorId,  // [1] GPU argmax 采样的 token 索引（字节存 uint）
     current_token: TensorId, // [1] 当前待 gather 的 token 索引（f32 位模式存 uint，供 gather_row 读取）
 }
 
@@ -1501,8 +1504,17 @@ impl GpuModel {
             if Self::imma_op_on("head") && self.imma_ok(vocab, c, batch) {
                 self.backend
                     .quant_x_i8(bb.x_norm, None, bb.xb_q, bb.xb_aux, c, batch)?;
-                self.backend
-                    .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.logits, vocab, c, batch, 2)?;
+                self.backend.gemm_imma(
+                    a8,
+                    bb.xb_q,
+                    bb.xb_aux,
+                    bb.logits,
+                    bb.imma_partial,
+                    vocab,
+                    c,
+                    batch,
+                    2,
+                )?;
             } else {
                 self.backend
                     .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
@@ -2209,8 +2221,17 @@ impl GpuModel {
             if Self::imma_op_on("out") && self.imma_ok(c, c, batch) {
                 self.backend
                     .quant_x_i8(bb.y_norm, Some(bb.g), bb.xb_q, bb.xb_aux, c, batch)?;
-                self.backend
-                    .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.x, c, c, batch, 1)?;
+                self.backend.gemm_imma(
+                    a8,
+                    bb.xb_q,
+                    bb.xb_aux,
+                    bb.x,
+                    bb.imma_partial,
+                    c,
+                    c,
+                    batch,
+                    1,
+                )?;
             } else {
                 self.backend
                     .gemv_int8_mul_add(a8, bb.y_norm, bb.g, bb.x, c, c, batch)?;
@@ -2251,8 +2272,17 @@ impl GpuModel {
             let a8 = self.layers[i].ffn_key_a8.as_ref().unwrap();
             self.backend
                 .quant_x_i8(bb.xb, None, bb.xb_q, bb.xb_aux, c, batch)?;
-            self.backend
-                .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.r2, fh, c, batch, 0)?;
+            self.backend.gemm_imma(
+                a8,
+                bb.xb_q,
+                bb.xb_aux,
+                bb.r2,
+                bb.imma_partial,
+                fh,
+                c,
+                batch,
+                0,
+            )?;
         } else if let Some(a8) = &self.layers[i].ffn_key_a8 {
             self.backend
                 .gemv_int8_relu2(a8, bb.xb, bb.r2, fh, c, batch)?;
@@ -2299,8 +2329,17 @@ impl GpuModel {
             let a8 = self.layers[i].ffn_value_a8.as_ref().unwrap();
             self.backend
                 .quant_x_i8(bb.r2, None, bb.xb_q, bb.xb_aux, fh, batch)?;
-            self.backend
-                .gemm_imma(a8, bb.xb_q, bb.xb_aux, bb.x, c, fh, batch, 1)?;
+            self.backend.gemm_imma(
+                a8,
+                bb.xb_q,
+                bb.xb_aux,
+                bb.x,
+                bb.imma_partial,
+                c,
+                fh,
+                batch,
+                1,
+            )?;
         } else {
             let sparse_ok =
                 self.backend.supports_sparse_ffn() && std::env::var("FFN_SPARSE_OFF").is_err();
@@ -5054,6 +5093,8 @@ impl WorkBuffers {
                 backend.upload(t, &vec![0.0f32; n])?;
                 t
             },
+            // split-K 部分和：8(KS 上限) × 8(槽上限) × max(c, fh, vocab)
+            imma_partial: mk(&mut *backend, 8 * 8 * c.max(cfg.ffn_hidden).max(vocab))?,
             logits: mk(&mut *backend, vocab)?,
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,
@@ -5103,6 +5144,7 @@ impl WorkBuffers {
             self.r2,
             self.xb_q,
             self.xb_aux,
+            self.imma_partial,
             self.logits,
             self.token_argmax,
             self.current_token,
