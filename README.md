@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first**: Vulkan over CUDA-only, trading ~40% peak throughput for cross-vendor / cross-platform usability.
+- **Portability first, without the throughput tax**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach with **no measurable gap to the CUDA backend** on this machine (see §6.1).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -122,6 +122,11 @@ Hardware: **RTX 2080 Ti**. Model: RWKV-7 Goosed g1h-3B (weights fp16 5.49GB / in
 
 int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 
+> Re-measured **interleaved in one session on 2026-10-04** (int8, same method): Vulkan **68.4** vs
+> CUDA **68.3** tok/s — dead even. The absolute values move a lot between sessions (>40% here),
+> which is exactly why only the interleaved ratio is meaningful; the 2026-08 table above predates
+> the Vulkan r/k/v kernel work and was not measured interleaved. See §6.1.
+
 **GPU prefill throughput** (T=256 steady-state, i.e. 2nd run onward after same-length warmup; `prof_prefill_steady`, Vulkan cooperative-matrix GEMM path):
 
 | Weight | Vulkan steady | Notes |
@@ -130,6 +135,30 @@ int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 | int8 | 2263-2307 tok/s | includes per-layer dequant overhead (see Known Limitations) |
 
 A cold single-shot prefill additionally pays the one-time pipeline-creation cost of that length bucket (m_pad), ~tens to a hundred ms; servers can run one dummy prefill per common length bucket after loading. Details: [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md).
+
+### 6.1 Vulkan ⇄ CUDA parity (int8, `rwkv7-3B-int8`, C=2560 / H=40 / N=64 / V=65536 / L=32)
+
+Measured **back-to-back, interleaved, in a single session** (see the drift warning below); `batch_decode_bench` (`SLOTS`/`SEED=42`) and `prof_prefill_steady` (`PTOKENS=256`):
+
+| Path | Vulkan | CUDA | Vulkan/CUDA |
+|---|---:|---:|---:|
+| Single-stream decode | 83.5 tok/s | 83.3 tok/s | 1.00 |
+| Batched decode B=8 | 481.5 tok/s | 490.9 tok/s | 0.98 |
+| Batched decode B=16 | 880.1 tok/s | 878.6 tok/s | 1.00 |
+| Batched decode B=32 | 1471.7 tok/s | 1487.0 tok/s | 0.99 |
+| Batched decode B=64 | 2229.8 tok/s | 2192.1 tok/s | **1.02** |
+| Steady prefill T=256 | 2455.6 tok/s | 2433.0 tok/s | 1.01 |
+
+**Correctness**: the decode token fingerprint (sum / xor) is **bit-identical** between the two backends at every batch size (B=8 `0xd02e16`/`0x6d08`, B=16 `0x1a123ac`/`0x9de`, B=32 `0x345e198`/`0x64a2`, B=64 `0x68f1ce4`/`0x6456`). The CUDA backend takes the same public `gemv_int8_rkv_stage1_batch` signature but ignores the new fp16-activation inputs and keeps its original fp32 path — so the CUDA column is a genuine unchanged baseline.
+
+What closed the gap (all in the Vulkan r/k/v fused kernel `gemv_int8_rkv_stage1_batch`):
+
+- **fp16 activations**: the kernel previously read a full `vec4` (16 B) of fp32 activation per slot per k-step while weights were already int8-packed — a second large slice of L2 traffic. It now reads a `f16vec2` buffer (8 B, halved), widened back to `vec4` for the fp32 accumulator.
+- **`vec4` weight packing + `dot`**: dequantised weights are packed per row as `vec4` and combined with the activation `vec4` via `dot()` — 4 FMAs collapse to 1 instruction.
+- **Tiled `x` resident in shared memory** (`XTILE=256`): each k-element of `x` was re-read by all `BGRP=8` slots × `ROWS` rows; now it is loaded once per tile. smem drops from 80 KB (over the 48 KB sm_75 limit) to 32 KB.
+- **`BGRP=8` slot grouping** for weight reuse across slots.
+
+Details and pitfalls: [参考/2026-10-04-Vulkan追平CUDA实施记录.md](参考/2026-10-04-Vulkan追平CUDA实施记录.md).
 
 **CUDA batched-decode throughput vs Albatross** (int8 weights, C=2560 / H=40 / N=64 / V=65536 / L=32; `batch_decode_bench` vs `run_bench.bat`, both measured **back-to-back on the same machine in the same session**):
 
@@ -180,8 +209,9 @@ This project initially referenced two existing RWKV inference implementations:
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
 | Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
 | Relative gap (CUDA batched decode) | baseline | **ahead** — parity at batch 1, +11% to +26% at batch 8–256 (see §6) |
+| Relative gap (Vulkan vs our own CUDA) | n/a | **parity** — 0.98×–1.02× across decode B=1…64 and steady prefill (see §6.1) |
 
-The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path remains the portability-first trade-off — the ~40% figure above still applies to it.
+The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path has since been brought to the same level: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is now throughput-neutral against CUDA while keeping cross-vendor reach (see §6.1).
 
 Inspired by both, this repository has since evolved independently, adding capabilities neither has: **two weight-quantization paths** (fp16 / int8 auto-routed), **CPU fp32 reference plus GPU-kernel unit tests**, and an **offline quantization toolchain** with a reproducible accuracy-verification workflow.
 
@@ -191,6 +221,8 @@ Inspired by both, this repository has since evolved independently, adding capabi
 - **prefill time grows ~quadratically with T** (T=256: 0.33ms → T=512: 0.81ms, WKV parallel intra-chunk term); consider WKV chunking for long prompts.
 - **Vulkan dplr_seq occupancy is low** (40 workgroups × 64 threads + 2 barriers per token, ~10ms in steady prefill): could adopt the CUDA structure (parallel-row blocks + shuffle reduction).
 - **First prefill of a new length bucket pays pipeline creation** (kernel cache now decouples uniforms via a shared pool + DYNAMIC offsets keyed on (shader, spec): 1722 → ~30 entries; the remainder is the inherent first-appearance cost of each spec): eliminable via startup warmup.
+- **Vulkan uniform pool must be sized by hand for long batches**: at `NTOK=32`, `batch ≥ 16` exceeds the 8 MB default and aborts with `uniform pool exhausted`; set `UNIFORM_POOL_MB=64` for now. The pool should instead be derived from `batch × NTOK` inside `begin_batch`.
+- **Vulkan tensor-core r/k/v path is not usable yet** (`VK_IMMA_OPS=rkv`): inter-dispatch stalls cost 3.6×; needs the r/k/v IMMA kernels merged into fewer dispatches. The SIMT fused kernel is what reaches parity today.
 - **Accuracy headroom**: calibration-weighted k-means, G=64 denser metadata.
 
 ## 10. License

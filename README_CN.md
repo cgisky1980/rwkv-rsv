@@ -34,7 +34,7 @@
 
 ## 2. 设计目标
 
-- **可移植性优先**：Vulkan 而非仅 CUDA，牺牲约 40% 峰值吞吐，换取跨厂商 / 跨平台可用性。
+- **可移植性优先，但不牺牲吞吐**：以 Vulkan 为主后端，换取跨厂商 / 跨平台可用性，且在本机上与 CUDA 后端**实测无差距**（见 §6.1）。
 - **两路量化共存**：fp16（无损参考）/ int8（近无损）按模型文件自动路由，同一二进制全部兼容。
 - **运行时自编译 shader**：`build.rs` 在构建期用 `glslangValidator` 把 `*.comp` 编译为 SPIR-V，`constant_id` 做跨硬件自适应。
 - **研发向**：内嵌 CPU fp32 参考、DIAG 三方核对、logits 对比、teacher-forced Top-1 一致率等验证工具链。
@@ -122,6 +122,10 @@ uv run tools/quantize_any4.py --in rwkv-g1h-3B.st --out rwkv-g1h-3B.int8.st --bi
 
 int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 
+> **2026-10-04 同会话交错复测**（int8，同测法）：Vulkan **68.4** vs CUDA **68.3** tok/s —— 完全持平。
+> 绝对值跨会话漂移很大（本次差 40% 以上），所以只有交错比值有意义；上面 2026-08 那张表早于
+> Vulkan r/k/v 内核改造，且当时并非交错测得。详见 §6.1。
+
 **GPU prefill 吞吐**（T=256 稳态，即同长度预热后的第二次起；`prof_prefill_steady`，Vulkan cooperative-matrix GEMM 路径）：
 
 | 权重 | Vulkan 稳态 | 备注 |
@@ -130,6 +134,35 @@ int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 | int8 | 2263-2307 tok/s | 含每层 dequant 开销（见「已知限制」） |
 
 单次冷启动 prefill 会额外付出该长度桶（m_pad）首次的 pipeline 创建成本（~几十-上百 ms，一次性）；服务端可在加载后按常用长度桶各跑一次 dummy prefill 预热。详见 [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md)。
+
+### 6.1 Vulkan ⇄ CUDA 持平实测（int8，`rwkv7-3B-int8`，C=2560 / H=40 / N=64 / V=65536 / L=32）
+
+**同会话、背靠背、交错**测得（对齐下面的漂移警告）；测法 `batch_decode_bench`（`SLOTS` / `SEED=42`）与 `prof_prefill_steady`（`PTOKENS=256`）：
+
+| 路径 | Vulkan | CUDA | Vulkan/CUDA |
+|---|---:|---:|---:|
+| 单流 decode | 83.5 tok/s | 83.3 tok/s | 1.00 |
+| 批量 decode B=8 | 481.5 tok/s | 490.9 tok/s | 0.98 |
+| 批量 decode B=16 | 880.1 tok/s | 878.6 tok/s | 1.00 |
+| 批量 decode B=32 | 1471.7 tok/s | 1487.0 tok/s | 0.99 |
+| 批量 decode B=64 | 2229.8 tok/s | 2192.1 tok/s | **1.02** |
+| 稳态 prefill T=256 | 2455.6 tok/s | 2433.0 tok/s | 1.01 |
+
+**正确性**：每一档批量的 decode token 指纹（sum / xor）在两后端间**逐位一致**
+（B=8 `0xd02e16`/`0x6d08`，B=16 `0x1a123ac`/`0x9de`，B=32 `0x345e198`/`0x64a2`，
+B=64 `0x68f1ce4`/`0x6456`）。CUDA 后端保留了同一个 `gemv_int8_rkv_stage1_batch` 签名，
+但忽略新增的 fp16 激活入参、仍走原 fp32 路径 —— 所以上表 CUDA 列是**真正未经改动的基准**。
+
+追平所依赖的改动（全在 Vulkan 的 r/k/v 融合核 `gemv_int8_rkv_stage1_batch`）：
+
+- **fp16 激活**：此前该核每槽每 k 读一个完整 `vec4`（16 B）的 fp32 激活，而权重已是 int8 紧凑格式 ——
+  成为 L2 流量的第二个大头。现在改读 `f16vec2` 缓冲（8 B，**减半**），再展宽成 `vec4` 参与 fp32 累加。
+- **权重 `vec4` 打包 + `dot`**：解量化权重按行打包成 `vec4`，与激活 `vec4` 走 `dot()` —— 4 条 FMA 并成 1 条。
+- **x 分块常驻 shared memory**（`XTILE=256`）：原先 x 的每个 k 元素要被全部 `BGRP=8` 个槽 × `ROWS`
+  行重复读；现改为每块只读一次。smem 占用从 80 KB（超 sm_75 的 48 KB 上限）降到 32 KB。
+- **`BGRP=8` 槽分组**，跨槽复用权重。
+
+细节与踩坑记录：[参考/2026-10-04-Vulkan追平CUDA实施记录.md](参考/2026-10-04-Vulkan追平CUDA实施记录.md)。
 
 **CUDA 批量解码吞吐 vs 信天翁**（int8 权重，C=2560 / H=40 / N=64 / V=65536 / L=32；`batch_decode_bench` 对 `run_bench.bat`，两侧**同机、同会话、背靠背连测**）：
 
@@ -176,13 +209,13 @@ examples/       自包含示例程序
 |---|---|---|
 | 计算后端 | CUDA（单厂商） | Vulkan / CUDA（跨厂商/跨平台） |
 | 路线 | 极致性能，硬件特定优化 | 可移植性优先，运行时自编译 shader |
-| 相对差距 | 基准 | 约 **40%**（同为 GPU 推理路径时） |
 | 权重精度 | fp16 | fp16 / **int8**（自动路由，显存下限 8GB） |
 | 相对差距（CUDA 批量解码） | 基准 | **已反超** —— B=1 持平，B=8~256 快 **+11% ~ +26%**（见 §6） |
+| 相对差距（Vulkan vs 自研 CUDA） | 不适用 | **持平** —— decode B=1~64 与稳态 prefill 全线 **0.98× ~ 1.02×**（见 §6.1） |
 
-差距主要来自：① Albatross 更激进的 kernel 融合；② CUDA Graph 捕获减少启动开销；③ CUDA 生态成熟的硬件特定库。这是**可移植性（Vulkan）换取峰值性能（CUDA）的取舍**，而非实现缺陷。
+差距主要来自：① Albatross 更激进的 kernel 融合；② CUDA Graph 捕获减少启动开销；③ CUDA 生态成熟的硬件特定库。
 
-在 CUDA 路径上，这个差距后来被**int8 张量核 + int8 常驻权重**（每 token 字节数减半、张量核峰值翻倍）、split-K、多链合并 launch 与形状感知 tile 追平并反超（见 §6）；上表 ~40% 现在只适用于 **Vulkan** 路径——那仍是「可移植性优先」的取舍。
+在 CUDA 路径上，这个差距后来被**int8 张量核 + int8 常驻权重**（每 token 字节数减半、张量核峰值翻倍）、split-K、多链合并 launch 与形状感知 tile 追平并反超（见 §6）。在 **Vulkan** 路径上，同一水平的追平也已达成：r/k/v 融合核改读 **fp16 激活**（流量减半）、权重 `vec4` 打包 + `dot`、`x` 分块常驻 shared memory —— 最后约 40% 的差距由此关闭，Vulkan 现在相对 CUDA **吞吐中性**，同时保留跨厂商能力（见 §6.1）。
 
 在以上两者的启发下，本仓库随后独立演进，新增了它们都没有的能力：**两路权重量化推理**（fp16 / int8 自动路由）、**CPU fp32 参考实现与 GPU 内核正确性单测**、**离线量化工具链**与可复现的精度验证工作流。
 
@@ -192,6 +225,8 @@ examples/       自包含示例程序
 - **prefill 每 token 耗时随 T 近二次方增长**（T=256: 0.33ms → T=512: 0.81ms，WKV 并行形式的 chunk 内项），长 prompt 可关注 WKV 分块策略。
 - **Vulkan dplr_seq 占用率偏低**（40 workgroup × 64 线程 + 每 token 2 次 barrier，稳态 prefill 中 ~10ms）：可对齐 CUDA 版结构（block 并行行 + shuffle 归约）。
 - **新长度桶首次 prefill 付 pipeline 创建成本**（kernel cache 已按 (shader, spec) 共享 uniform 池 + DYNAMIC offset 解耦，条目 1722 → ~30；剩余为 spec 首现的固有创建费）：可用启动预热消除。
+- **Vulkan uniform 池在长批量下需手工扩容**：`NTOK=32`、`batch ≥ 16` 时会超出默认 8MB，报 `uniform pool exhausted` 中止；目前需设 `UNIFORM_POOL_MB=64`。正确做法是在 `begin_batch` 内按 `batch × NTOK` 推导池容量。
+- **Vulkan 张量核 r/k/v 路径尚不可用**（`VK_IMMA_OPS=rkv`）：inter-dispatch 停顿造成 3.6× 退化，需把 r/k/v 的 IMMA 核合并成更少的 dispatch。当前达到持平的是 SIMT 融合核路径。
 - **精度增强后路**：校准加权 k-means、G=64 提高元数据密度。
 
 ## 10. License
