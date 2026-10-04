@@ -9,7 +9,7 @@
 
 ## 0. 结论
 
-**全部路径已与 CUDA 持平（差异 ≤2%，落在测噪内），且 token 指纹与 CUDA 逐位一致。**
+**全部路径已与 CUDA 持平（比值落在 0.98~1.03，即测噪内），且 token 指纹与 CUDA 逐位一致。**
 
 | 路径 | Vulkan | CUDA | Vulkan/CUDA |
 |---|---:|---:|---:|
@@ -18,10 +18,17 @@
 | 批量 decode B=16 | 880.1 tok/s | 878.6 tok/s | 1.00 |
 | 批量 decode B=32 | 1471.7 tok/s | 1487.0 tok/s | 0.99 |
 | 批量 decode B=64 | 2229.8 tok/s | 2192.1 tok/s | 1.02 |
+| 批量 decode B=128 | 3454.1 tok/s | 3427.8 tok/s | 1.01 |
+| 批量 decode B=256 | 3932.5 tok/s | 3825.0 tok/s | 1.03 |
 | 稳态 prefill T=256（`prof_prefill_steady`） | 2455.6 tok/s | 2433.0 tok/s | 1.01 |
 
 > 数据为 **同会话背靠背交错 A/B**（见 §3 方法）。跨会话读数漂移可达 ±17%（该卡兼作桌面显示卡），
 > 单次读数不足以支撑结论 —— 本表全部取自交错跑。
+>
+> ⚠️ **本表与 README §6.1 中「信天翁列 / 09-22 CUDA 列」不可横向比较**：那是 2026-09-22 的会话，
+> 且基准参数不同（本表用默认 `SEGS=4` / `PAD_TO=512`，09-22 那轮用 `SEGS=2 PAD_TO=160`）。
+> 参数不同会独立移动绝对值，叠加会话漂移后跨列比较没有意义。**只有本表内部的 Vulkan/CUDA 比值可信。**
+> 信天翁已不在本机，无法重测刷新。
 
 ---
 
@@ -85,7 +92,7 @@ $env:PTOKENS="256"; cargo run --release --example prof_prefill_steady
 
 ## 4. 正确性验证
 
-8 个后端×批量组合的 token 指纹**逐位一致**：
+6 档批量 × 两后端的 token 指纹**逐位一致**：
 
 | B | sum | xor |
 |---|---|---|
@@ -93,6 +100,8 @@ $env:PTOKENS="256"; cargo run --release --example prof_prefill_steady
 | 16 | 0x1a123ac | 0x9de |
 | 32 | 0x345e198 | 0x64a2 |
 | 64 | 0x68f1ce4 | 0x6456 |
+| 128 | 0xd21f638 | 0x7a5a |
+| 256 | 0x1a493fad | 0x7e01 |
 
 （Vulkan 与 CUDA 在相同 `SEED=42`、相同 `SLOTS` 下输出相同 sum/xor。）
 

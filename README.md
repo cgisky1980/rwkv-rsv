@@ -134,49 +134,31 @@ int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 | fp16 | **2677-2700 tok/s** | effective GEMM 21-25 TFLOPS (75-89% of f32-accumulate tensor peak) |
 | int8 | 2263-2307 tok/s | includes per-layer dequant overhead (see Known Limitations) |
 
+Vulkan ⇄ CUDA on this path is a wash too: interleaved in one session (2026-10-04, `PTOKENS=256`) **2455.6 vs 2433.0 tok/s** (1.01×).
+
 A cold single-shot prefill additionally pays the one-time pipeline-creation cost of that length bucket (m_pad), ~tens to a hundred ms; servers can run one dummy prefill per common length bucket after loading. Details: [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md).
 
-### 6.1 Vulkan ⇄ CUDA parity (int8, `rwkv7-3B-int8`, C=2560 / H=40 / N=64 / V=65536 / L=32)
+### 6.1 Batched-decode throughput: Albatross / CUDA / Vulkan (int8, C=2560 / H=40 / N=64 / V=65536 / L=32)
 
-Measured **back-to-back, interleaved, in a single session** (see the drift warning below); `batch_decode_bench` (`SLOTS`/`SEED=42`) and `prof_prefill_steady` (`PTOKENS=256`):
+| Batch | Albatross ¹ | rwkv-rsv CUDA ¹ | Speedup ¹ | rwkv-rsv Vulkan ² | Vulkan/CUDA ² |
+|---:|---:|---:|---:|---:|---:|
+| 1 (single-stream) | 94.2 – 99.0 | 94.1 – 97.2 | **parity** (1.012× over 3 interleaved rounds) | 83.5 | 1.00 |
+| 8 | 465.4 | **547.8** | +17.7% | 481.5 | 0.98 |
+| 16 | 806.0 | **979.4** | +21.5% | 880.1 | 1.00 |
+| 32 | 1294.6 | **1632.8** | +26.1% | 1471.7 | 0.99 |
+| 64 | 2123.3 | **2354.7** | +10.9% | 2229.8 | 1.02 |
+| 128 | 2704.6 | **3123.1** | +15.5% | 3454.1 | 1.01 |
+| 256 | 3036.9 | **3467.7** | +14.2% | 3932.5 | 1.03 |
 
-| Path | Vulkan | CUDA | Vulkan/CUDA |
-|---|---:|---:|---:|
-| Single-stream decode | 83.5 tok/s | 83.3 tok/s | 1.00 |
-| Batched decode B=8 | 481.5 tok/s | 490.9 tok/s | 0.98 |
-| Batched decode B=16 | 880.1 tok/s | 878.6 tok/s | 1.00 |
-| Batched decode B=32 | 1471.7 tok/s | 1487.0 tok/s | 0.99 |
-| Batched decode B=64 | 2229.8 tok/s | 2192.1 tok/s | **1.02** |
-| Steady prefill T=256 | 2455.6 tok/s | 2433.0 tok/s | 1.01 |
+> ¹ **Albatross and the CUDA column are one same-session interleaved A/B** (2026-09-22; `batch_decode_bench` vs `run_bench.bat`, alternating, our run immediately followed by theirs). The Speedup column is only valid inside that pair.
+>
+> ² **The Vulkan column is a later session** (2026-10-04, interleaved, `SEED=42`, default `SEGS=4`/`PAD_TO=512`). Its matching CUDA readings were 83.3 / 490.9 / 878.6 / 1487.0 / 2192.1 / 3427.8 / 3825.0 tok/s — so the ~0.98–1.03 Vulkan/CUDA column is computed against *those*, not against the ¹ CUDA column. **Read the Vulkan column only through that ratio**: it is comparable with neither the Albatross nor the ¹ CUDA column, because the session *and* the bench parameters differ.
+>
+> ⚠️ This card doubles as the desktop display: readings drift up to **±17%** across sessions, and bench parameters (SEGS / PAD_TO / NTOK) shift the absolute numbers on their own. **Only same-session same-config interleaved A/B is trustworthy**; single readings can invert the conclusion by ±3%. Albatross is not installed on this machine any more, so its column cannot be refreshed.
 
-**Correctness**: the decode token fingerprint (sum / xor) is **bit-identical** between the two backends at every batch size (B=8 `0xd02e16`/`0x6d08`, B=16 `0x1a123ac`/`0x9de`, B=32 `0x345e198`/`0x64a2`, B=64 `0x68f1ce4`/`0x6456`). The CUDA backend takes the same public `gemv_int8_rkv_stage1_batch` signature but ignores the new fp16-activation inputs and keeps its original fp32 path — so the CUDA column is a genuine unchanged baseline.
+**Correctness**: at every batch size the decode token fingerprint (sum / xor) is **bit-identical** between Vulkan and CUDA — B=8 `0xd02e16`/`0x6d08`, B=16 `0x1a123ac`/`0x9de`, B=32 `0x345e198`/`0x64a2`, B=64 `0x68f1ce4`/`0x6456`, B=128 `0xd21f638`/`0x7a5a`, B=256 `0x1a493fad`/`0x7e01`. The CUDA backend keeps the same public `gemv_int8_rkv_stage1_batch` signature but ignores the new fp16-activation inputs and stays on its original fp32 path, so the CUDA column is a genuine unchanged baseline.
 
-What closed the gap (all in the Vulkan r/k/v fused kernel `gemv_int8_rkv_stage1_batch`):
-
-- **fp16 activations**: the kernel previously read a full `vec4` (16 B) of fp32 activation per slot per k-step while weights were already int8-packed — a second large slice of L2 traffic. It now reads a `f16vec2` buffer (8 B, halved), widened back to `vec4` for the fp32 accumulator.
-- **`vec4` weight packing + `dot`**: dequantised weights are packed per row as `vec4` and combined with the activation `vec4` via `dot()` — 4 FMAs collapse to 1 instruction.
-- **Tiled `x` resident in shared memory** (`XTILE=256`): each k-element of `x` was re-read by all `BGRP=8` slots × `ROWS` rows; now it is loaded once per tile. smem drops from 80 KB (over the 48 KB sm_75 limit) to 32 KB.
-- **`BGRP=8` slot grouping** for weight reuse across slots.
-
-Details and pitfalls: [参考/2026-10-04-Vulkan追平CUDA实施记录.md](参考/2026-10-04-Vulkan追平CUDA实施记录.md).
-
-**CUDA batched-decode throughput vs Albatross** (int8 weights, C=2560 / H=40 / N=64 / V=65536 / L=32; `batch_decode_bench` vs `run_bench.bat`, both measured **back-to-back on the same machine in the same session**):
-
-| Batch | Albatross (tok/s) | rwkv-rsv (tok/s) | Speedup |
-|---:|---:|---:|---:|
-| 1 (single-stream) | 94.2 – 99.0 | 94.1 – 97.2 | **parity** (1.012× over 3 interleaved rounds) |
-| 8 | 465.4 | **547.8** | +17.7% |
-| 16 | 806.0 | **979.4** | +21.5% |
-| 32 | 1294.6 | **1632.8** | +26.1% |
-| 64 | 2123.3 | **2354.7** | +10.9% |
-| 128 | 2704.6 | **3123.1** | +15.5% |
-| 256 | 3036.9 | **3467.7** | +14.2% |
-
-> ⚠️ This card doubles as the desktop display: readings drift up to **±17%** across sessions
-> (Albatross's batch-1 reading alone spans 94.2–99.0). **Only same-session interleaved A/B is
-> trustworthy**; single readings can invert the conclusion by ±3%.
-
-What got us there: **int8 tensor cores** (`mma.m8n8k16.s8`, Turing's int8 TC peak is 2× its fp16
+**What got the CUDA path ahead** of Albatross: **int8 tensor cores** (`mma.m8n8k16.s8`, Turing's int8 TC peak is 2× its fp16
 TC peak) on **int8-resident weights** (2.68 GB/token read vs 5.37 GB for an fp16 engine), **split-K
 with a deterministic reduction kernel** (more blocks without extra traffic), **merged multi-chain
 launches** (r/k/v + the 4 low-rank chains), **shape-aware tiling** (BM by batch, BN ≈ batch,
@@ -184,6 +166,15 @@ block count filled to the 68 SMs), **warp-per-row + `__shfl` reductions** replac
 trees, **atomic-free sparse FFN accumulation**, and every scan pass in the samplers unrolled for
 memory-level parallelism. Full write-ups: [int8 IMMA record](参考/2026-09-21-int8-IMMA实施记录.md) ·
 [cross-arch baseline table](参考/2026-09-21-跨架构基线表.md).
+
+**What closed the Vulkan gap** (all in the r/k/v fused kernel `gemv_int8_rkv_stage1_batch`):
+
+- **fp16 activations**: the kernel used to read a full `vec4` (16 B) of fp32 activation per slot per k-step while the weights were already int8-packed — a second large slice of L2 traffic. It now reads an `f16vec2` buffer (8 B, halved) and widens back to `vec4` for the fp32 accumulator.
+- **`vec4` weight packing + `dot`**: dequantised weights are packed per row as `vec4` and combined with the activation `vec4` via `dot()` — 4 FMAs collapse to 1 instruction.
+- **Tiled `x` resident in shared memory** (`XTILE=256`): each k-element of `x` was re-read by all `BGRP=8` slots × `ROWS` rows; it is now loaded once per tile. smem drops from 80 KB (over the 48 KB sm_75 limit) to 32 KB.
+- **`BGRP=8` slot grouping** for weight reuse across slots.
+
+Details and pitfalls: [参考/2026-10-04-Vulkan追平CUDA实施记录.md](参考/2026-10-04-Vulkan追平CUDA实施记录.md).
 
 ## 7. Layout
 
@@ -209,7 +200,7 @@ This project initially referenced two existing RWKV inference implementations:
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
 | Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
 | Relative gap (CUDA batched decode) | baseline | **ahead** — parity at batch 1, +11% to +26% at batch 8–256 (see §6) |
-| Relative gap (Vulkan vs our own CUDA) | n/a | **parity** — 0.98×–1.02× across decode B=1…64 and steady prefill (see §6.1) |
+| Relative gap (Vulkan vs our own CUDA) | n/a | **parity** — 0.98×–1.03× across decode B=1…256 and steady prefill (see §6.1) |
 
 The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path has since been brought to the same level: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is now throughput-neutral against CUDA while keeping cross-vendor reach (see §6.1).
 
