@@ -1365,7 +1365,8 @@ impl GpuModel {
     /// 本步采样**不计入**惩罚（语义与客户端池 `sample_token` 一致），调用方须在
     /// 返回后自行把新 token 追加到历史。`sp[b].seed` 每步应递增（保证多样性）。
     ///
-    /// 仅 CUDA（batch 层 kernel 与 `sample_into_host_seeded_batch` 均仅 CUDA）。
+    /// 两后端均可用（Vulkan 的 batch 层 kernel 与 `sample_into_host_seeded_batch` 于
+    /// 2026-10-10 修通，`examples/batch_decode_bench.rs` 的 `STEP=1` 对拍覆盖）。
     /// `sp[b]` 为该 slot 的采样参数（并发池各任务参数不同）；`sp.len()` 须 = batch。
     /// `batch ≤ state.batch()`：只用 batch State 的前 batch 行（并发池活跃槽前缀）。
     pub fn batch_step_sample(
@@ -1426,8 +1427,16 @@ impl GpuModel {
             hist_stride,
             0,
         )?;
-        let raw = self.backend.download(self.bufs_current_token_of(&bb))?;
+        // ★ 读回必须在 `end_batch()` **之后**，且走 `download_host` 而非 `download`：
+        // Vulkan 侧采样 dispatch 只是被记录进持久 command buffer（真正的 submit + 等待在
+        // end_batch），而 token 是写进该张量的 **host 可见镜像**（自循环的 gather 也从
+        // host 侧读 token）。`download` 会先做 device→host 拷贝，用本步上传时 device 侧
+        // 的「输入 token」覆盖掉 kernel 刚写回的采样结果 ⇒ 每步返回喂进去的 token。
+        // 客户端池每步都走这里，Vulkan 上因此全部会话卡在同一个 token 上循环。
         self.backend.end_batch()?;
+        let raw = self
+            .backend
+            .download_host(self.bufs_current_token_of(&bb))?;
         Ok(raw.iter().map(|v| f32::to_bits(*v)).collect())
     }
 

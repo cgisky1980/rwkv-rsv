@@ -298,6 +298,18 @@ impl Runtime {
         Ok(data)
     }
 
+    /// 直接读 host-visible 镜像，**不做** device→host 拷贝。
+    /// 给「kernel 把结果写进 host 缓冲」的那类算子用（`record_sample` 的 token 写回、
+    /// gather 的 token 读取都走 host 侧——见 `gather_rows_device_f16_batch` 注释）。
+    /// 对这些张量调 `download` 会用 device 侧的陈旧内容覆盖掉 kernel 刚写的值。
+    /// 前提：调用前该批已 `queue_wait_idle`（host 内存是 HOST_COHERENT）。
+    pub fn download_host(&self, tensor: &GpuTensor) -> R<Vec<f32>> {
+        let host = tensor.host.as_ref().ok_or("download_host: host dropped")?;
+        let mut data = vec![0.0f32; tensor.len];
+        host.copy_to(&mut data)?;
+        Ok(data)
+    }
+
     /// 记录并执行 buffer 拷贝命令（src → dst），使用 compute 队列
     fn copy_buffer<T: crate::vulkan::num::Scalar>(
         &self,

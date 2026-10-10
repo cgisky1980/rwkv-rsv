@@ -70,6 +70,14 @@ pub trait ComputeBackend {
     /// 批量上传结束：排空全部未完成 DMA 并释放批量上传资源。默认无操作。
     fn upload_bulk_end(&mut self) {}
     fn download(&self, t: TensorId) -> R<Vec<f32>>;
+    /// 读** kernel 写进 host-visible 缓冲**的结果，不做 device→host 拷贝。
+    /// Vulkan 上采样 kernel 的 token 写回落在张量的 host 镜像（自循环闭环就靠它：
+    /// gather 也从 host 侧读 token），对此类张量调 `download` 会用 device 侧上传时的
+    /// 旧值覆盖掉刚写回的结果 ⇒ 读到的永远是「喂进去的输入 token」。
+    /// CUDA 上 kernel 直接写 device 缓冲、host 镜像只是缓存，故此默认实现等价 `download`。
+    fn download_host(&self, t: TensorId) -> R<Vec<f32>> {
+        self.download(t)
+    }
     /// 部分下载：只取张量 [offset, offset+len) 段（f32 元素偏移）。
     /// batch State 的「只取某 slot 一行」用（整表下载在 batch=16 时是 ~260MB）。
     fn download_part(&self, t: TensorId, offset: usize, len: usize) -> R<Vec<f32>> {
@@ -1436,6 +1444,19 @@ impl ComputeBackend for VulkanBackend {
             VulkanTensor::F32(g) => self.rt.download(g),
             VulkanTensor::F16(g) => self.rt.download_f16(g),
             VulkanTensor::U32(_) => Err("download: u32 tensor unsupported here".into()),
+        }
+    }
+
+    /// 读 host 镜像（采样 token 写回落在这里，见 trait 上的 `download_host` 注释）。
+    fn download_host(&self, t: TensorId) -> R<Vec<f32>> {
+        match self
+            .tensors
+            .get(&t)
+            .ok_or("download_host: unknown tensor")?
+        {
+            VulkanTensor::F32(g) => self.rt.download_host(g),
+            VulkanTensor::F16(_) => Err("download_host: f16 tensor unsupported here".into()),
+            VulkanTensor::U32(_) => Err("download_host: u32 tensor unsupported here".into()),
         }
     }
 
@@ -3047,7 +3068,19 @@ impl ComputeBackend for VulkanBackend {
         let mask_g = self.get_f32(mask, "sample_into_host_seeded_batch")?;
         let counter_g = self.get_u32(counter, "sample_into_host_seeded_batch")?;
         let sampler_g = self.get_f32(sampler, "sample_into_host_seeded_batch")?;
-        let hist_g = self.get_f32(hist, "sample_into_host_seeded_batch")?;
+        // hist 只被用来取**设备地址 + VkBuffer**（kernel 按 u32 位模式读，barrier 按缓冲粒度插），
+        // 所以两种宿主都要接受：自循环传 `token_seq`（f32 存储、token 以位模式打包），
+        // `batch_step_sample` 传外部 `alloc_u32` 的惩罚历史（u32 存储）。
+        // 早先用单一 get_f32/get_u32 取它会让其中一条路径直接报类型错误。
+        let (hist_addr, hist_buf) = match self
+            .tensors
+            .get(&hist)
+            .ok_or("sample_into_host_seeded_batch: unknown hist tensor")?
+        {
+            VulkanTensor::F32(g) => (g.device.address, g.device.buffer),
+            VulkanTensor::F16(g) => (g.device.address, g.device.buffer),
+            VulkanTensor::U32(g) => (g.device.address, g.device.buffer),
+        };
         // ★ **一次 dispatch 覆盖全部 slot**（slot 走 grid.y）——逐槽 dispatch 会被
         // buffer 级 barrier 串行化（见 `Runtime::record_sample` 注释）。
         // token 写回 host 可见缓冲（与单流路径一致，供下一轮 gather 读取）。
@@ -3065,8 +3098,8 @@ impl ComputeBackend for VulkanBackend {
             &sampler_g,
             sampler_row,
             batch,
-            hist_g.device.address,
-            &hist_g.device.buffer,
+            hist_addr,
+            &hist_buf,
             n,
             hist_stride,
         )

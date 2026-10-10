@@ -5,6 +5,9 @@
 //!   MODEL_PATH=... VOCAB_JSON=... SLOTS=8 SEGS=4 NTOK=32
 //!   TOPK=50（0=无 top-k，走 top-p 兜底路径）；SAMPLE_TEMP 调高可制造平坦分布压测兜底多候选轮。
 //!   PAD_TO=512（批量 prefill 的固定 T_pad）；SKIP_SINGLE=1 跳过单流基准（扫并发时省时间）。
+//!   STEP=1：额外跑 `batch_step_sample` **逐步**路径（每步回主机），与上面的自循环路径
+//!   对拍同一套 sum/xor 指纹——这是「采样结果陈旧」类 bug 的回归探针（见 §STEP 块注释）。
+//!   DUMP_TOK_STEP=<路径>：STEP 路径逐 token 落盘，格式同 DUMP_TOK。
 //!
 //! **各槽提示词互不相同**（`prompt_for`）：全槽同 prompt 会把每层残差/状态压成同一条
 //! 数值路径，测出来的是「同一份计算的 N 份拷贝」，不代表真实并发的内存/带宽行为。
@@ -57,6 +60,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .parse()?;
     // 跳过单流基准（扫并发曲线时单流值是常量，重复跑纯属浪费）。
     let skip_single = std::env::var("SKIP_SINGLE").is_ok_and(|v| v != "0");
+    // 逐步采样路径（batch_step_sample）对拍开关。
+    let step_mode = std::env::var("STEP").is_ok_and(|v| v != "0");
 
     let vocab = std::fs::read_to_string(&vocab_path)?;
     let tokenizer = Tokenizer::new(&vocab)?;
@@ -194,6 +199,133 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             log::info!("[批量 B={}] tokens dumped -> {path}", slots);
+        }
+
+        // —— STEP=1：`batch_step_sample` 逐步路径对拍 ——
+        //
+        // 为什么要这条路径：自循环（`submit_sample_selfloop_batch`）一次提交跑完 n 轮、
+        // 全程无主机介入，采样结果在 `end_batch()` **之后**才下载；逐步路径每步回主机，
+        // 是客户端并发池的实际形态（stop 串判定 / 流式增量都在主机侧做）。两条路径在
+        // 「同一状态 + 同一 seed 口径 + 同一惩罚」下必须产出**逐位相同**的 token 序列，
+        // 指纹不同即说明逐步路径的采样读数有问题（历史上就是 download 夹在
+        // `begin_batch()`/`end_batch()` 之间：Vulkan 上采样 dispatch 只是被记录进持久
+        // command buffer，而 download 另开 command buffer 立即提交 → 读到上一批的陈旧值）。
+        //
+        // 惩罚历史在此固定为零（`hist_len` 恒 0，hist 只是一块零值占位缓冲），把上面那个
+        // 正确性问题与「逐 token 追加历史需要的部分上传」解耦；`PENALTY=1` 才走追加路径。
+        if step_mode {
+            // PROBE=1：只跑一步批量前向并下载 logits，把「前向算错」与「采样读数错」
+            // 解耦——`batch_step_logits` 与 `batch_step_sample` 共用同一前向核心。
+            // 期望：末位 argmax == 自循环路径该槽的首个 token。
+            if std::env::var("PROBE").is_ok_and(|v| v != "0") {
+                model.reset_state_of(&bstate)?;
+                let p_seeds = model.forward_seq_batch_padded(&mut bstate, &prompts, pad_to)?;
+                let p_feed: Vec<Vec<u32>> = p_seeds.iter().map(|&t| vec![t]).collect();
+                let p_vocab = model.info().num_vocab;
+                let lg = model.batch_step_logits(&mut bstate, &p_feed)?;
+                for s in 0..slots {
+                    let row = &lg[s * p_vocab..(s + 1) * p_vocab];
+                    let mut idx: Vec<usize> = (0..p_vocab).collect();
+                    idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+                    log::info!(
+                        "[PROBE] slot{s} feed={} argmax={} top3={:?} logits={:.3} {:.3} {:.3}",
+                        p_feed[s][0],
+                        idx[0],
+                        &idx[..3],
+                        row[idx[0]],
+                        row[idx[1]],
+                        row[idx[2]]
+                    );
+                }
+            }
+            let st_t0 = Instant::now();
+            // 复用同一 batch State（不另建，省显存）：重置 + 重新 prefill，保证与自循环
+            // 路径从完全相同的状态出发。
+            model.reset_state_of(&bstate)?;
+            let seeds2 = model.forward_seq_batch_padded(&mut bstate, &prompts, pad_to)?;
+            if seeds2 != seeds {
+                log::warn!("[STEP] 两次 prefill 的 seeds 不一致，对拍前提不成立");
+            }
+            let prefill_ms = st_t0.elapsed().as_millis();
+
+            // hist 行宽只占 8：hist_len 恒 0，内核不会读到有效数据以外的位置。
+            let hist_stride = 8usize;
+            let hist = model.alloc_u32(slots * hist_stride)?;
+            model.write_u32(hist, &vec![0u32; slots * hist_stride])?;
+            let hist_len = vec![0u32; slots];
+
+            // seed 口径必须复刻自循环：段初基 = 该槽上一段的末 token，段内第 r 步
+            // seed = 基 + r（见 `submit_sample_selfloop_batch` 的 `seeds_r`）。
+            let mut feed = seeds2.clone();
+            let mut st_sum = 0u64;
+            let mut st_xor = 0u64;
+            let mut st_total = 0usize;
+            let mut all_tokens: Vec<Vec<u32>> = vec![Vec::new(); slots];
+            let mut st_t1 = Instant::now();
+            for seg in 0..warmup + segs {
+                let base = feed.clone();
+                if seg == warmup {
+                    st_t1 = Instant::now();
+                }
+                for r in 0..ntok {
+                    let tokens: Vec<Vec<u32>> = feed.iter().map(|&t| vec![t]).collect();
+                    let sps: Vec<SamplerParams> = (0..slots)
+                        .map(|s| SamplerParams {
+                            seed: base[s].wrapping_add(r as u32),
+                            ..sp
+                        })
+                        .collect();
+                    let out = model.batch_step_sample(
+                        &mut bstate,
+                        &tokens,
+                        hist,
+                        hist_stride,
+                        &hist_len,
+                        &sps,
+                    )?;
+                    for (s, &t) in out.iter().enumerate() {
+                        feed[s] = t;
+                        if seg >= warmup {
+                            st_sum = st_sum.wrapping_add(t as u64);
+                            st_xor ^= t as u64;
+                            all_tokens[s].push(t);
+                            st_total += 1;
+                        }
+                    }
+                }
+            }
+            log::info!(
+                "[STEP B={}] prefill {} ms | decode {} tok {} ms = {:.1} tok/s（聚合，逐token回主机）",
+                slots,
+                prefill_ms,
+                st_total,
+                st_t1.elapsed().as_millis(),
+                st_total as f64 / st_t1.elapsed().as_secs_f64()
+            );
+            log::info!(
+                "[STEP B={}] decode tokens sum={st_sum:#x} xor={st_xor:#x}",
+                slots
+            );
+            log::info!(
+                "[对拍 B={}] 自循环 sum={tok_sum:#x} xor={tok_xor:#x} | STEP sum={st_sum:#x} xor={st_xor:#x} => {}",
+                slots,
+                if (tok_sum, tok_xor) == (st_sum, st_xor) {
+                    "一致"
+                } else {
+                    "**不一致**（逐步路径采样读数有问题）"
+                }
+            );
+            if let Ok(path) = std::env::var("DUMP_TOK_STEP") {
+                use std::io::Write as _;
+                let f = std::fs::File::create(&path)?;
+                let mut w = std::io::BufWriter::new(f);
+                for (slot, out) in all_tokens.iter().enumerate() {
+                    for (step, &t) in out.iter().enumerate() {
+                        writeln!(w, "{slot} {step} {t}")?;
+                    }
+                }
+                log::info!("[STEP B={}] tokens dumped -> {path}", slots);
+            }
         }
     }
 
