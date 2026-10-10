@@ -65,6 +65,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let warmup: usize = std::env::var("WARMUP")
         .unwrap_or_else(|_| "1".into())
         .parse()?;
+    // top-p 累计阈值（默认 0.2）。`TOPP=1.0` 关闭 top-p 兜底循环——该循环是「一趟全词表
+    // 只消费一个候选」，趟数由分布决定，是采样核耗时归因的主要变量。
+    let topp: f32 = std::env::var("TOPP")
+        .unwrap_or_else(|_| "0.2".into())
+        .parse()?;
     // 批量 prefill 的固定 T_pad（跨批复用 seq 缓冲；超限时 kernel 内会自动抬升一次）。
     let pad_to: usize = std::env::var("PAD_TO")
         .unwrap_or_else(|_| "512".into())
@@ -95,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut sp = SamplerParams {
         temperature: temp,
         top_k: topk,
-        top_p: 0.2,
+        top_p: topp,
         seed: 514,
         repetition_penalty: 1.0,
         frequency_penalty: 0.0,
