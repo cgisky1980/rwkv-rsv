@@ -164,7 +164,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 算 B 份——weight-bound 场景吞吐 ≈ ×B；多实例方案是 B 份权重带宽，实测无增益）。
     // prefill 走单序列 seq 路径，完成后状态经 host 中转灌入 batch State 对应 slot；
     // decode 走 batch selfloop（graph 捕获一轮 batch 前向 + 逐轮重放，GPU 内 token
-    // 自回写）。仅 CUDA 后端。
+    // 自回写）。CUDA / Vulkan 两后端均可跑（Vulkan 无 graph 捕获，等价物是把 n 轮记录进
+    // 同一批次后一次 submit）。
     let batch: usize = std::env::var("BATCH")
         .ok()
         .or_else(|| std::env::var("CONCURRENCY").ok())

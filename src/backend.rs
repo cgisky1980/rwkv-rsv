@@ -107,7 +107,10 @@ pub trait ComputeBackend {
     // `cuGraphInstantiate` 的**符号解析顺序**取到了 v1（五参数）而按三参数调用
     // （见 `backend_cuda.rs` 里 `cu_graph_instantiate` 的注释）。按 key 长期持有仍是
     // 好设计（省去重复实例化），但"高频 churn 才崩"的印象其实是概率性的 ABI 踩空。
-    /// 是否支持 CUDA graph 捕获/重放（self-loop 用）。默认 false；仅 CUDA 覆盖为 true。
+    /// 是否支持 CUDA graph 捕获/重放（self-loop 用）。默认 false；只有 CUDA 覆盖为 true。
+    /// Vulkan 的等价物不是 graph，而是「把 n 轮完整前向记录进同一持久 command buffer、
+    /// 一次 submit + wait_idle」（见 `GpuModel::submit_sample_selfloop_batch` 的
+    /// `graph_ok == false` 分支）—— 提交次数已经相同，只是没有 GPU 端重放。
     /// 不支持的后端（Vulkan）在 self-loop 时改为把完整前向逐 token 记录进同一批次。
     fn supports_graph_capture(&self) -> bool {
         false
@@ -606,15 +609,17 @@ pub trait ComputeBackend {
         false
     }
 
-    /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核两级融合，CUDA 专有）。
+    /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核两级融合，只有 CUDA 实现）。
     /// false 时 batch 低秩链走 `gemv_int8_rkv_stage1_batch` + `gemv_lowrank_chain4_batch`
-    /// 的 SIMT 路径（Vulkan）。
+    /// 的 SIMT 路径（Vulkan）。Vulkan 侧不做张量核版的原因不是「没写」而是**实测净亏
+    /// 3.3×**（3374512：同形状改 `gemm_imma` 后每步多排 9 次 dispatch，43ms 落在
+    /// dispatch 之间的固定代价上；基础设施保留，`VK_IMMA_OPS=...,rkv` 可复现）。
     fn supports_lowrank_gemm_batch(&self) -> bool {
         false
     }
 
-    /// 该后端是否支持 `ffn_value_gemm_batch`（fp16 张量核稠密 FFN，CUDA 专有）。
-    /// false 时 batch FFN 走稀疏 / `gemv_int8_add` 路径（Vulkan）。
+    /// 该后端是否支持 `ffn_value_gemm_batch`（fp16 张量核稠密 FFN，只有 CUDA 实现）。
+    /// false 时 batch FFN 走稀疏 / `gemv_int8_add` 路径（Vulkan），原因同上。
     fn supports_ffn_value_gemm_batch(&self) -> bool {
         false
     }
@@ -633,9 +638,11 @@ pub trait ComputeBackend {
         false
     }
 
-    // —— batch 并发算子（单实例多序列，权重共享读一次算 B 份；仅 CUDA 支持）——
+    // —— batch 并发算子（单实例多序列，权重共享读一次算 B 份）——
     // 布局约定：所有 per-slot 张量为 [batch, ...]（slot 主序）；权重张量跨 slot 共享。
-    // 默认实现返回 Err（Vulkan 等后端暂不支持 batch 并发路径）。
+    // CUDA 与 Vulkan 均已实现本代 decode/prefill 所需的全套算子（由
+    // `supports_batch_decode()` 声明，门控见 `GpuModel::batch_decode_blocker`）。
+    // 默认实现返回 Err：只给**未**实现批量核的后端兜底，避免「报支持、运行期才炸」。
 
     /// batch 版 embedding gather：按 tok[b] 各取一行 → dst[b*C + i]（f32）。
     #[allow(clippy::too_many_arguments)]
@@ -1091,7 +1098,7 @@ pub trait ComputeBackend {
         c: usize,
     ) -> R<()>;
     // —— batch prefill 算子（B 序列 × T_pad token，[batch, T, C] 布局）——
-    /// batch 版 token shift：t=0 读该 slot 的 state 段。仅 CUDA。
+    /// batch 版 token shift：t=0 读该 slot 的 state 段。CUDA / Vulkan 均实现。
     #[allow(clippy::too_many_arguments)]
     fn seq_shift_batch(
         &mut self,
@@ -1107,7 +1114,7 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("seq_shift_batch not supported by this backend".into())
     }
-    /// batch 版 copy_token：每 slot 把 lens[b]-1 行拷到 state[b]。仅 CUDA。
+    /// batch 版 copy_token：每 slot 把 lens[b]-1 行拷到 state[b]。CUDA / Vulkan 均实现。
     fn copy_token_batch(
         &mut self,
         _x: TensorId,
@@ -1119,7 +1126,7 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("copy_token_batch not supported by this backend".into())
     }
-    /// batch 版 DPLR 状态更新：s 为 [batch, H, N*N]，lens 截断实际长度。仅 CUDA。
+    /// batch 版 DPLR 状态更新：s 为 [batch, H, N*N]，lens 截断实际长度。CUDA / Vulkan 均实现。
     #[allow(clippy::too_many_arguments)]
     fn dplr_seq_batch(
         &mut self,
@@ -1141,7 +1148,7 @@ pub trait ComputeBackend {
         Err("dplr_seq_batch not supported by this backend".into())
     }
     /// 分段均值：x [batch, t_pad, c] → out [batch, c]（每 slot 前 lens[b] 行均值，
-    /// pad 行不计入）。批量 mean-hidden 特征提取用。仅 CUDA。
+    /// pad 行不计入）。批量 mean-hidden 特征提取用。CUDA / Vulkan 均实现。
     fn segmean(
         &mut self,
         _x: TensorId,

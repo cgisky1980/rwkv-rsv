@@ -278,6 +278,19 @@ fn selfloop_shape_key(kind: u64, batch: usize, n: usize) -> u64 {
     (kind << 62) | ((batch as u64) << 32) | (n as u64)
 }
 
+/// batch 并发路径两个前提的判据（`GpuModel::batch_decode_blocker` 的纯函数部分，
+/// 拆出来是为了不加载模型也能测到两条分支）。后端缺算子优先报——它是更硬的约束
+/// （模型换成 int8 也救不了）。
+fn batch_decode_blocker(backend_has_batch_ops: bool, rkv_is_int8: bool) -> Option<&'static str> {
+    if !backend_has_batch_ops {
+        return Some("后端未实现 batch 并发算子（supports_batch_decode=false）");
+    }
+    if !rkv_is_int8 {
+        return Some("模型 r/k/v 无 int8 句柄（fp16 模型没有批量前向路径）");
+    }
+    None
+}
+
 /// self-loop 常驻缓冲的形状数上限。超出时整体重置（释放缓冲并作废所有已捕获图）——
 /// 每个形状约 `6 × batch × vocab × 4` 字节，不设限会被 max_tokens 余数组合撑爆显存。
 const MAX_SELFLOOP_SHAPES: usize = 8;
@@ -724,7 +737,8 @@ impl GpuModel {
     ///（同一 primary ctx，设备指针跨实例有效；权重显存零复制），工作缓冲/seq
     /// 缓冲/状态为本实例私有。配合 `submit/collect_sample_selfloop` 的拆分式
     /// API，单线程即可让 K 个实例的流并发执行（提交即返回，收集时各自同步）。
-    /// 仅 CUDA 后端支持；实例须在创建它的线程上使用（cuCtxSetCurrent per-thread）。
+    /// 只有 CUDA 后端支持（`import_tensors_from` 未在 VulkanBackend 覆盖，走 trait 默认 Err）；
+    /// 实例须在创建它的线程上使用（cuCtxSetCurrent per-thread）。
     pub fn build_shared(&self) -> R<GpuModel> {
         let mut backend = crate::backend::create_backend(crate::backend::detect_backend())?;
         backend.import_tensors_from(self.backend.as_ref())?;
@@ -1066,7 +1080,8 @@ impl GpuModel {
 
     // ==== batch 并发 API（单实例多序列：1 份权重 + 1 个 batch State，一次读权重算 B 份）====
 
-    /// 创建 batch 布局的推理状态（[batch, ...]）。仅 CUDA 后端支持 batch>1。
+    /// 创建 batch 布局的推理状态（[batch, ...]）。CUDA / Vulkan 均支持 batch>1
+    /// （前提同 `supports_batch_decode()`：后端有批量算子 + 模型 r/k/v 为 int8）。
     pub fn create_batch_state(&mut self, batch: usize) -> R<State> {
         State::new_batched(
             self.backend.as_mut(),
@@ -1096,15 +1111,27 @@ impl GpuModel {
     }
 
     /// 该模型是否支持 batch 并发解码路径。两个条件同时满足：
-    /// 1. r/k/v 为 int8 量化权重（batch 层 kernel 仅有 int8 变体；fp16 模型回退逐槽单序列）；
-    /// 2. 后端实现了 `*_batch` 算子（`ComputeBackend::supports_batch_decode`）。
+    /// 1. 后端实现了 `*_batch` 算子（`ComputeBackend::supports_batch_decode`）；
+    /// 2. r/k/v 为 int8 量化权重（批量 r/k/v kernel 只有 int8 变体；fp16 模型只有
+    ///    单序列 `gemv_rkv_stage1`，故无批量前向路径）。
     ///
-    /// 缺条件 2 时若仍返回 true，调用方会选批量路径并在运行期拿到 Err（历史门控 bug）。
+    /// 缺条件 1 时若仍返回 true，调用方会选批量路径并在运行期拿到 Err（历史门控 bug）。
     pub fn supports_batch_decode(&self) -> bool {
-        self.backend.supports_batch_decode()
-            && self.layers.first().is_some_and(|l| {
+        self.batch_decode_blocker().is_none()
+    }
+
+    /// `supports_batch_decode()` 为 false 时的**原因**（None = 支持）。
+    ///
+    /// 存在的意义：裸 bool 让调用方（如客户端的并发会话池）静默回落到逐槽串行路径，
+    /// 事后无从判断是「模型是 fp16」还是「后端缺算子」——两者的处置方式完全不同
+    /// （前者换 int8 权重即可，后者只能升级后端）。加载时把它记一行日志就够。
+    pub fn batch_decode_blocker(&self) -> Option<&'static str> {
+        batch_decode_blocker(
+            self.backend.supports_batch_decode(),
+            self.layers.first().is_some_and(|l| {
                 l.receptance_a8.is_some() && l.key_a8.is_some() && l.value_a8.is_some()
-            })
+            }),
+        )
     }
 
     /// 释放外部缓冲（`alloc_u32` 的配对操作）。
@@ -1156,7 +1183,8 @@ impl GpuModel {
     /// 让 seq 缓冲只建一次；None 取批内最大长度。lens 恒按**原始长度**计算
     ///（pad 行不进 state、不计入 segmean 均值）。
     /// 返回 (seeds, seq_bufs[已 take，调用方归还], lens_t, t_pad, batch, tok[调用方释放])。
-    /// 仅 CUDA（seq_shift_batch/dplr_seq_batch/copy_token_batch）。状态重置由调用方负责。
+    /// CUDA / Vulkan 均可用（`seq_shift_batch`/`dplr_seq_batch`/`copy_token_batch` 两后端
+    /// 都已实现）。状态重置由调用方负责。
     /// 取（并在 T 变化时重建）序列缓冲：`dedicated=true` 走 `batch_seq_bufs`
     /// （批量单步路径专用，避免与单序列 prefill 的 T 抖动互相 clear_cache），
     /// false 走共享的 `seq_bufs`。返回的缓冲已被 take，调用方负责归还。
@@ -1861,7 +1889,7 @@ impl GpuModel {
         Ok(())
     }
 
-    /// 获取 batch 工作缓冲（B 变化时重建；B>1 仅 CUDA）。返回零开销 Clone 副本。
+    /// 获取 batch 工作缓冲（B 变化时重建；两后端均支持 B>1）。返回零开销 Clone 副本。
     fn batch_buffers(&mut self, batch: usize) -> R<WorkBuffers> {
         if self.batch_bufs.as_ref().is_none_or(|(b, _)| *b != batch) {
             if let Some((_, mut old)) = self.batch_bufs.take() {
@@ -5059,7 +5087,7 @@ impl State {
             backend.upload(self.v_first, &data[pos..pos + c])?;
             return Ok(());
         }
-        // batch：逐 slot 段上传（仅 CUDA 支持 upload_part）。
+        // batch：逐 slot 段上传（`upload_part` 两后端均已实现）。
         let mut pos = 0usize;
         for b in 0..self.batch {
             for s in &self.layers {
@@ -5557,4 +5585,27 @@ fn max_layer(st: &safetensors::SafeTensors) -> usize {
         })
         .max()
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_decode_blocker;
+
+    #[test]
+    fn batch_decode_blocker_covers_both_branches() {
+        // 两前提齐备 → 支持
+        assert_eq!(batch_decode_blocker(true, true), None);
+        // 后端缺 batch 算子 → 优先报后端（模型换成 int8 也救不了）
+        assert_eq!(
+            batch_decode_blocker(false, true),
+            Some("后端未实现 batch 并发算子（supports_batch_decode=false）")
+        );
+        // fp16 模型（r/k/v 无 int8 句柄）→ 报模型
+        assert_eq!(
+            batch_decode_blocker(true, false),
+            Some("模型 r/k/v 无 int8 句柄（fp16 模型没有批量前向路径）")
+        );
+        // 两者都缺 → 后端优先
+        assert!(batch_decode_blocker(false, false).is_some());
+    }
 }

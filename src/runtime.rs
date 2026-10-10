@@ -1,7 +1,9 @@
 //! Vulkan 推理 runtime 模块
-//! 提供 GPU 张量管理和 RWKV-7 单 token 推理所需的算子。
+//! 提供 GPU 张量管理和 RWKV-7 decode / prefill 所需的全部算子。
 //!
-//! 所有算子均假设 batch=1（单 token 推理），dispatch 的 batch 维度恒为 1。
+//! 算子分两族：无 `_batch` 后缀的按 **batch=1** 写死（dispatch 的 batch 维恒为 1）；
+//! `_batch` 后缀的是单实例多序列（B 序列共享一份权重），dispatch 网格按 B 展开。
+//! 两族共用同一 uniform 池 / 持久 command buffer / buffer 级 barrier 机制。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -142,7 +144,9 @@ impl Runtime {
         let app = App::new()?;
         let cmd_buf = app.allocate_compute_command_buffers(1)?;
         let cmd = cmd_buf[0];
-        // uniform 池：默认 8MB（≈ 3 万次 dispatch 的 Params），UNIFORM_POOL_MB 可覆盖。
+        // uniform 池：默认 8MB。占用是 O(批内不同 params 组合)（见 `pool_slots` dedup），
+        // 实测批量 prefill 高水位 69KB（B=8~64）、自循环 33KB、逐步 31KB，与 batch/NTOK
+        // 无关 → 8MB ≈ 6.5 万个 slot，冗余三个数量级。UNIFORM_POOL_MB 仅为极端形状兜底。
         // host-visible + host-cached：写入即 mapped memcpy，无 staging。
         let pool_mb: usize = std::env::var("UNIFORM_POOL_MB")
             .ok()
