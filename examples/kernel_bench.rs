@@ -14,6 +14,7 @@
 //!
 //! 环境变量（空字符串视为未设置，沿用项目惯例）：
 //!   `KB_OPS`     逗号分隔算子，默认 `relu2,mul_add,plain,add`；可加 `f16`（fp16 权重）
+//!                与 `imma_key,imma_out,imma_value,imma_head`（W8A8 张量核）
 //!   `KB_BATCH`   逗号分隔 batch，默认 `1,8,16`
 //!   `KB_ITERS`   每组迭代次数，默认 300
 //!   `KB_WARMUP`  预热次数，默认 5
@@ -28,6 +29,17 @@
 //!   `plain`   = head         m=vocab k=c      （`gemv_int8_plain`，读取量最大）
 //!   `add`     = ffn.value    m=c     k=fh     （`gemv_int8_add`，稠密回退）
 //!   `f16`     = head(fp16)   m=vocab k=c      （`gemv_f16`，对照组）
+//!
+//! ★ `imma_*` = **W8A8 张量核路径**（`quant_x_i8` + `gemm_imma`，含 split-K 时的
+//! `gemm_imma_reduce`），与 SIMT 的四个平坦算子一一对应：
+//!   `imma_key`   m=fh    k=c    OP=0   `imma_out`   m=c k=c OP=1（带门控）
+//!   `imma_value` m=c     k=fh   OP=1   `imma_head`  m=vocab k=c OP=2
+//! 部分和容量按**引擎真实口径**给（`8·max(c,fh)·batch`，即 `WorkBuffers::imma_partial`），
+//! 这样 `imma_ksplit` 在这个基准里选出的 ks 与真实推理一致。
+//! 为什么需要它：端到端 `batch_decode_bench` 里改一个内核要跑完整推理才看得到收益，
+//! 而 `PROF_GPU` 在自循环段只能记录到一部分 dispatch（占比不可用于 A/B）。
+//! 大 batch 的差距主体在这些 GEMM 形状上，所以这里直接量 **TOPS**
+//! （`2·m·k·batch / ms`）——它是张量核内核唯一的可比口径。
 //!
 //! **未覆盖**：`gemv_int8_rkv_stage1_batch`（26 参）与 `gemv_lowrank_chain4_batch`（20 参）
 //! ——参数表过长，待 Phase 1 主战场（4 个平坦算子）收敛后再补。
@@ -75,6 +87,12 @@ struct Case {
     op: String,
     m: usize,
     k: usize,
+    /// `true` ⇒ 走 W8A8 张量核（`quant_x_i8` + `gemm_imma`）。
+    imma: bool,
+    /// `gemm_imma` 的 epilogue 选择（0 relu²、1 累加、2 覆盖写）。
+    icode: u32,
+    /// `quant_x_i8` 是否带门控（`att.output` 的 `y_norm · g`）。
+    xgate: bool,
 }
 
 impl Case {
@@ -85,6 +103,10 @@ impl Case {
     /// fp16 权重字节 = m*k*2。
     fn wbytes_f16(&self) -> f64 {
         (self.m * self.k * 2) as f64
+    }
+    /// 张量核的标量吞吐口径：`2·m·k·batch / ms`（含 split-K 归约，是「端到端有效 TOPS」）。
+    fn tops(&self, batch: usize, ms: f64) -> f64 {
+        2.0 * self.m as f64 * self.k as f64 * batch as f64 / (ms / 1000.0) / 1e12
     }
 }
 
@@ -108,29 +130,80 @@ fn main() {
                 op: op.clone(),
                 m: fh,
                 k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
             },
             "mul_add" => Case {
                 op: op.clone(),
                 m: c,
                 k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
             },
             "plain" => Case {
                 op: op.clone(),
                 m: vocab,
                 k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
             },
             "add" => Case {
                 op: op.clone(),
                 m: c,
                 k: fh,
+                imma: false,
+                icode: 0,
+                xgate: false,
             },
             "f16" => Case {
                 op: op.clone(),
                 m: vocab,
                 k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+            },
+            // ---- W8A8 张量核四个形状（与上面 SIMT 口径一一对应）----
+            "imma_key" => Case {
+                op: op.clone(),
+                m: fh,
+                k: c,
+                imma: true,
+                icode: 0,
+                xgate: false,
+            },
+            "imma_out" => Case {
+                op: op.clone(),
+                m: c,
+                k: c,
+                imma: true,
+                icode: 1,
+                xgate: true,
+            },
+            "imma_value" => Case {
+                op: op.clone(),
+                m: c,
+                k: fh,
+                imma: true,
+                icode: 1,
+                xgate: false,
+            },
+            "imma_head" => Case {
+                op: op.clone(),
+                m: vocab,
+                k: c,
+                imma: true,
+                icode: 2,
+                xgate: false,
             },
             other => {
-                eprintln!("未知算子 '{other}'（可选 relu2/mul_add/plain/add/f16）");
+                eprintln!(
+                    "未知算子 '{other}'（可选 relu2/mul_add/plain/add/f16 \
+                     与 imma_key/imma_out/imma_value/imma_head）"
+                );
                 std::process::exit(2);
             }
         })
@@ -153,11 +226,13 @@ fn main() {
     let mut b = backend;
 
     println!(
-        "{:<8} {:>7} {:>6} {:>6} {:>11} {:>12} {:>10} {:>8}",
-        "op", "m", "k", "batch", "ms/call", "权重 MB", "有效 GB/s", "抖动"
+        "{:<11} {:>7} {:>6} {:>6} {:>11} {:>12} {:>10} {:>9} {:>8}",
+        "op", "m", "k", "batch", "ms/call", "权重 MB", "有效 GB/s", "TOPS", "抖动"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(86));
 
+    // split-K 部分和容量与引擎一致：`8·max(c,fh)·batch`（`WorkBuffers::imma_partial`）。
+    let cap_rows = 8 * fh.max(c);
     for case in &cases {
         // 维度按内核假设校验：m 需是 4 的倍数（GEMV_ROWS），k 需是 128 的倍数（int8 分组）。
         if case.m % 4 != 0 || case.k % 128 != 0 {
@@ -167,14 +242,27 @@ fn main() {
             );
             continue;
         }
+        // 张量核口径：`gemm_imma` 每 block 固定 BM=64 行 ⇒ m 需为 64 的倍数；
+        // 设备不支持 coopmat i8 时整族跳过（CUDA 后端走它自己的同名内核，不经这个 trait）。
+        if case.imma {
+            if case.m % 64 != 0 {
+                eprintln!("跳过 {} m={}：gemm_imma 需 m 为 64 的倍数", case.op, case.m);
+                continue;
+            }
+            if !b.supports_int8_imma() {
+                eprintln!("跳过 {}：本后端 supports_int8_imma() = false", case.op);
+                continue;
+            }
+        }
         for &batch in &batches {
-            let (ms, jitter) = match run_case(b.as_mut(), case, batch, iters, warmup, repeats) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("{} batch={} 失败: {e:#}", case.op, batch);
-                    continue;
-                }
-            };
+            let (ms, jitter) =
+                match run_case(b.as_mut(), case, batch, cap_rows, iters, warmup, repeats) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{} batch={} 失败: {e:#}", case.op, batch);
+                        continue;
+                    }
+                };
             let (wbytes, is_f16) = if case.op == "f16" {
                 (case.wbytes_f16(), true)
             } else {
@@ -182,7 +270,7 @@ fn main() {
             };
             let gbs = wbytes / (ms / 1000.0) / 1e9;
             println!(
-                "{:<8} {:>7} {:>6} {:>6} {:>11.4} {:>12.2} {:>10.1} {:>7.1}%{}",
+                "{:<11} {:>7} {:>6} {:>6} {:>11.4} {:>12.2} {:>10.1} {:>9.1} {:>7.1}%{}",
                 case.op,
                 case.m,
                 case.k,
@@ -190,6 +278,7 @@ fn main() {
                 ms,
                 wbytes / 1e6,
                 gbs,
+                case.tops(batch, ms),
                 jitter * 100.0,
                 if is_f16 { "  (fp16)" } else { "" }
             );
@@ -198,6 +287,7 @@ fn main() {
     println!();
     println!("注：int8 内核按 BGRP 分组，batch > BGRP 时权重实际被读 ceil(batch/BGRP) 遍；");
     println!("    上表「有效 GB/s」按单次读折算，故真实带宽 = 该值 × ceil(batch/BGRP)。");
+    println!("    TOPS = 2·m·k·batch/ms，含 split-K 归约与量化那一趟（端到端口径）。");
     println!("    抖动超过 ~10% 时该行不可用于 A/B 判断（可用 KB_REPEATS 加大重复轮数）。");
 }
 
@@ -207,6 +297,7 @@ fn run_case(
     b: &mut dyn ComputeBackend,
     case: &Case,
     batch: usize,
+    cap_rows: usize,
     iters: usize,
     warmup: usize,
     repeats: usize,
@@ -244,6 +335,21 @@ fn run_case(
     let y = b.create_tensor(batch * m, TensorDtype::F32)?;
     b.upload(y, &vec![0.0f32; batch * m])?;
 
+    // 张量核路径的三个附加张量：量化激活 xq（u32 打包 4×int8）、每组统计 xaux（vec4/组）、
+    // split-K 部分和（容量 = `cap_rows·batch`，与引擎的 `imma_partial` 同口径 ⇒ 这里选出的
+    // ks 与真实推理一致）。
+    let (xq, xaux, partial) = if case.imma {
+        let xq = b.create_tensor(batch * (k / 4), TensorDtype::U32)?;
+        b.upload_u32(xq, &vec![0u32; batch * (k / 4)])?;
+        let xaux = b.create_tensor(batch * (k / 128) * 4, TensorDtype::F32)?;
+        b.upload(xaux, &vec![1.0f32; batch * (k / 128) * 4])?;
+        let partial = b.create_tensor(cap_rows * batch, TensorDtype::F32)?;
+        b.upload(partial, &vec![0.0f32; cap_rows * batch])?;
+        (Some(xq), Some(xaux), Some(partial))
+    } else {
+        (None, None, None)
+    };
+
     let call = |b: &mut dyn ComputeBackend| -> Result<(), Box<dyn std::error::Error>> {
         match case.op.as_str() {
             "relu2" => b.gemv_int8_relu2(a8.as_ref().unwrap(), x, y, m, k, batch),
@@ -251,6 +357,23 @@ fn run_case(
             "plain" => b.gemv_int8_plain(a8.as_ref().unwrap(), x, y, m, k, batch),
             "add" => b.gemv_int8_add(a8.as_ref().unwrap(), x, y, m, k, batch),
             "f16" => b.gemv_f16(w16.unwrap(), x, y, m, k, batch),
+            "imma_key" | "imma_out" | "imma_value" | "imma_head" => {
+                let (xq, xaux, partial) = (xq.unwrap(), xaux.unwrap(), partial.unwrap());
+                // 与 `gpu_model.rs` 一致：量化与 GEMM 成对计时（门控在量化那一步做掉）。
+                b.quant_x_i8(x, case.xgate.then_some(g), xq, xaux, k, batch)?;
+                b.gemm_imma(
+                    a8.as_ref().unwrap(),
+                    xq,
+                    xaux,
+                    y,
+                    partial,
+                    m,
+                    k,
+                    batch,
+                    case.icode,
+                )?;
+                Ok(())
+            }
             other => unreachable!("已校验: {other}"),
         }
     };
@@ -289,6 +412,7 @@ fn run_case(
 
     // 释放临时张量（避免注册表膨胀）。
     let mut all: Vec<TensorId> = vec![x, g, y];
+    all.extend([xq, xaux, partial].into_iter().flatten());
     if let Some(h) = a8 {
         all.push(h.idx);
         all.push(h.sz);

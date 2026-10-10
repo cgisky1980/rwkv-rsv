@@ -464,10 +464,78 @@ Default configuration vs CUDA after the flip (`bench_ab`, 3-round medians, sessi
 | vulkan / cuda (new default) | 0.754x | 0.804x | **0.632x** | **0.413x** |
 | vulkan / cuda (old default, §6.1) | 0.87x | 0.83x | ~0.5x | ~0.3x |
 
-I.e. clearly ahead from B>=32, slightly behind at B=1/8. Gates: `BACKEND=vulkan cargo test
+I.e. the flip is a net win **inside Vulkan** (tensor core vs SIMT, the table above) from B>=32 and a
+small loss at B=1/8. ⚠️ It is **not** a statement about CUDA: the ratio row still sits below 1.0 at
+every batch, and 0.632x at B=32 being *lower* than 0.804x at B=8 is CUDA's IMMA path scaling faster
+with batch, not this flip damaging Vulkan (the old default was ~0.5x at B=32, so the flip improved
+that cell). Gates: `BACKEND=vulkan cargo test
 --release` 77 + 8 + 1 passed; `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings`
 clean. Full raw readings, plus the two numbers this record originally got wrong, are in
 `参考/2026-10-10-Vulkan-rkv张量核默认翻转-实施记录.md`.
+
+### 6.4 `gemm_imma` fetch structure (2026-10-11): +12-16 % at B>=64, bit-exact
+
+**How the bottleneck was found.** `examples/kernel_bench.rs` gained the W8A8 family
+(`imma_key / imma_out / imma_value / imma_head`, each `quant_x_i8` + `gemm_imma` with the engine's
+own partial-sum capacity so `imma_ksplit` picks the same `ks`) and a **TOPS** column. All four
+shapes land in the same 14-22 TOPS band against this card's ~107 TOPS int8 peak. If the limit were
+DRAM, the head (most weight bytes) would be worst and `att.output` (fewest) best - it isn't, so the
+limit was the **per-warp shared-memory load instruction count**: the A fragment (`m16k32` int8,
+16 B/lane ~ 4 LDS) depends only on the row block, yet was re-`coopMatLoad`ed inside the slot-group
+loop, giving 2 load instructions per mma.
+
+**Two edits, both meant to be bit-exact** (`assets/shaders/src/gemm_imma.comp`):
+
+1. hoist the A fragment out of the slot-group loop into `a0..a3` (one load per k-tile per warp);
+2. split the slot groups across warps - `SW = min(NST,2)` slot-warp columns, `RPG = NST/SW` groups
+   per warp, block = `(BM/16)·SW·32` threads. Halves `acc[NST][4]` (32 accumulators at NST=8 was the
+   spill threshold) and doubles the warp count, so latency has something to hide behind. `BM=128`
+   already has 8 row warps (`tile`'s first dimension is the warp cap) so that arm only gets edit 1.
+
+Consequence to respect: `wid` is now a 2-D index, so every place that used `wid * WR` as a **row**
+base must use `row_warp * WR` (flush's `szs`, the epilogue's output row, the OP=9/10 diagnostics).
+Missing one is silent corruption, not a crash - it is the same base that caused the 2026-10-04
+"two runs, different fingerprints" race.
+
+**A/B (same session, three arms built and swept sequentially, one bench process at a time,
+2 rounds each, means)** - `base` = the files at `7dd5a15`, `#29` = base + the shader only:
+
+| B | base tok/s | #29 tok/s | delta | token fingerprints |
+|---:|---:|---:|---:|---|
+| 1 | 69.2 | 70.2 | +1.5 % | identical |
+| 8 | 479.2 | 494.5 | +3.2 % | identical |
+| 32 | 1132.2 | 1177.7 | +4.0 % | identical |
+| 64 | 1285.3 | 1497.5 | **+16.5 %** | identical |
+| 128 | 1409.2 | 1604.6 | **+13.9 %** | identical |
+| 256 | 1425.3 | 1597.8 | **+12.1 %** | identical |
+
+Identical fingerprints at every batch means the numeric contract did not move - unlike §6.3's flip,
+this needs no quality gate. Where it pays is exactly where §6.2① said the tensor-core path was
+weakest (NST=8, i.e. B>=16): the gain tracks `RPG` shrinking from 8 to 4.
+
+**Standing ratios after this change** (same session, clean single-instance interleaved sweep,
+means over 2 rounds; the §6.3 row came from a different session and is only a rough reference):
+
+| B | 1 | 8 | 32 | 64 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vulkan tok/s | 68.6 | 493.5 | 1212.7 | 1525.8 | 1620.7 | 1592.5 |
+| cuda tok/s | 92.1 | 590.3 | 1808.3 | 2705.4 | 3403.9 | 3825.9 |
+| **vulkan / cuda** | 0.745x | 0.836x | 0.671x | 0.564x | **0.476x** | **0.416x** |
+
+Round-to-round repeatability at B>=32 is under 1 %, but **B=1 is not** (68.6 = 71.1/66.1, a 7.5 %
+spread), so the B=1 cell cannot resolve anything smaller than a few percent, and 0.745x vs §6.3's
+0.754x is drift, not a regression.
+
+**Measurement incident (worth keeping).** Two interleaved loops were found running *at the same
+time* - stopping a background job kills the outer shell, its `sh -c` child and the bench process
+survived. The contaminated pass reported B=64 at 570.9 tok/s where the same build single-instance
+gives ~1520. Every absolute number from it was thrown out, and the sweep script now refuses to
+start if a `batch_decode_bench` is already alive. Rule: if an absolute reading is 2-3x off
+history, suspect concurrency before suspecting a regression.
+
+Gates: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `BACKEND=vulkan cargo test
+--release` (77 + 9 + 1 passed, 0 failed). Details:
+`参考/2026-10-11-Vulkan-gemm_imma取数结构-实施记录.md`.
 
 ## 7. Layout
 
