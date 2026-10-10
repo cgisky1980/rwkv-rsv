@@ -4962,8 +4962,8 @@ impl GpuState {
         let bsz = batch.max(1);
         let tmix_x = backend.create_tensor(c * bsz, TensorDtype::F32)?;
         backend.upload(tmix_x, &vec![0.0; c * bsz])?;
-        // 状态 dtype：后端支持 fp16 存储才用 fp16（CUDA）；Vulkan 的 GLSL 状态内核为
-        // f32 专用，强制回退 f32（否则 `fuse_ka_dplr_norm`/`dplr_seq` 会拿到 fp16 张量报错）。
+        // 状态 dtype：两后端都有 fp16 存储档（CUDA `WKV_S16` / Vulkan `_s16` spv），
+        // 只有 `supports_f16_wkv_state()` 为 false 的后端才回退 f32。
         let state_dtype = if backend.supports_f16_wkv_state() {
             wkv_state_dtype()
         } else {

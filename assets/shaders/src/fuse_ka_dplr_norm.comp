@@ -54,7 +54,14 @@ shared float mean;
 shared float inv_std;
 shared float s_acc;
 
-layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+// 状态存储 dtype：计算全程 fp32，只在载入/回存降位（与 CUDA 的 `WKV_S16` 档同口径）。
+#ifdef WKV_S16
+#define S_TYPE float16_t
+#else
+#define S_TYPE float
+#endif
+
+layout(buffer_reference) buffer BufS  { S_TYPE data[]; }  buf_s;
 layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;   // k
 layout(buffer_reference) buffer BufKK { float data[]; }  buf_kk;  // k_k
 layout(buffer_reference) buffer BufA  { float16_t data[]; }  buf_a;   // a (fp16)
@@ -161,7 +168,7 @@ void main() {
         float sa_part = 0.0;
         uint cnt = 0;
         for (uint j = sgid; j < N; j += SUBGROUP_SIZE) {
-            sreg[cnt] = buf_s.data[s_row_base + j];
+            sreg[cnt] = float(buf_s.data[s_row_base + j]);
             sa_part = fma(sreg[cnt], sh_a[j], sa_part);
             cnt++;
         }
@@ -171,7 +178,7 @@ void main() {
         cnt = 0;
         for (uint j = sgid; j < N; j += SUBGROUP_SIZE) {
             float ns = sreg[cnt] * sh_w[j] + sa_val * sh_b[j] + v_i * sh_k[j];
-            buf_s.data[s_row_base + j] = ns;
+            buf_s.data[s_row_base + j] = S_TYPE(ns);
             y_part = fma(ns, sh_r[j], y_part);
             cnt++;
         }

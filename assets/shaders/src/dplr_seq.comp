@@ -4,6 +4,7 @@
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -38,7 +39,15 @@ shared float sh_b[BLOCK_SIZE];
 shared float sh_k[BLOCK_SIZE];
 shared float sh_r[BLOCK_SIZE];
 
-layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+// 状态存储 dtype：计算全程 fp32，只在载入/回存降位（与 CUDA 的 `WKV_S16` 档同口径）。
+// host 侧按状态张量的实际 dtype 挑 `dplr_seq_*_s16.spv` 或基线档（见 build.rs 的 WKV_S16 维）。
+#ifdef WKV_S16
+#define S_TYPE float16_t
+#else
+#define S_TYPE float
+#endif
+
+layout(buffer_reference) buffer BufS  { S_TYPE data[]; }  buf_s;
 layout(buffer_reference) buffer BufR  { float data[]; }  buf_r;
 layout(buffer_reference) buffer BufW  { float data[]; }  buf_w;
 layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;
@@ -84,7 +93,7 @@ void main() {
     float sreg[BLOCK_SIZE];
     [[unroll]]
     for (uint j = 0; j < N; ++j) {
-        sreg[j] = buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X];
+        sreg[j] = float(buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X]);
     }
 
     for (uint t = 0; t < T; ++t) {
@@ -124,6 +133,6 @@ void main() {
     // 把第 i 行 S 写回全局。
     [[unroll]]
     for (uint j = 0; j < N; ++j) {
-        buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X] = sreg[j];
+        buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X] = S_TYPE(sreg[j]);
     }
 }

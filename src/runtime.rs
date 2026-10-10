@@ -52,6 +52,45 @@ pub struct GpuTensorU32 {
     pub len: usize,
 }
 
+/// WKV 状态（`tmix_rnn`）的设备句柄：fp32 或 fp16 存储，由建张量时的 dtype 决定
+/// （`wkv_state_dtype`，与 CUDA 的 `WKV_S16` 档同口径：**fp16 存 + fp32 算**）。
+///
+/// 两条 shader 变体只差 `BufS` 的元素类型——`Params` 里那一槽本来就是个 64 位设备地址，
+/// 所以 dispatch 只需按档挑 spv 文件名。三处状态内核（`fuse_ka_dplr_norm` / `dplr_seq` /
+/// `dplr_seq_batch`）**必须**与状态张量同档：错一档就是按错误的元素宽度解释同一块显存，
+/// 症状不是报错而是静默算出垃圾。
+#[derive(Debug, Clone)]
+pub enum StateTensor {
+    F32(GpuTensor),
+    F16(GpuTensor16),
+}
+
+impl StateTensor {
+    pub fn is_f16(&self) -> bool {
+        matches!(self, Self::F16(_))
+    }
+    fn address(&self) -> u64 {
+        match self {
+            Self::F32(g) => g.device.address,
+            Self::F16(g) => g.device.address,
+        }
+    }
+    fn buffer(&self) -> vk::Buffer {
+        match self {
+            Self::F32(g) => g.device.buffer,
+            Self::F16(g) => g.device.buffer,
+        }
+    }
+    /// fp16 档走 `_s16` 变体（见 build.rs 的 `WKV_S16` 维）。
+    fn spv(&self, base: &str) -> String {
+        if self.is_f16() {
+            format!("shaders/spv/{base}_s16.spv")
+        } else {
+            format!("shaders/spv/{base}.spv")
+        }
+    }
+}
+
 /// int8 非对称 per-group 量化权重（无 LUT，256 级均匀，近无损）：
 /// `w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]`
 /// - idx: [M, K/4] uint32（每 uint32 打包 4 个 uint8 权重，低位在前）
@@ -3180,7 +3219,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     pub fn fuse_ka_dplr_norm(
         &mut self,
-        s: &mut GpuTensor,
+        s: &StateTensor,
         k: &GpuTensor,
         k_k: &GpuTensor,
         a: &GpuTensor16,
@@ -3209,7 +3248,7 @@ impl Runtime {
             self.app.properties.subgroup_size,
         ];
         let params = [
-            s.device.address,
+            s.address(),
             k.device.address,
             k_k.device.address,
             a.device.address,
@@ -3225,12 +3264,12 @@ impl Runtime {
             y_norm.device.address,
         ];
         self.record_kernel(
-            "shaders/spv/fuse_ka_dplr_norm.spv",
+            &s.spv("fuse_ka_dplr_norm"),
             &spec,
             &params,
             (h as u32, 1, 1),
             &[
-                s.device.buffer,
+                s.buffer(),
                 k.device.buffer,
                 k_k.device.buffer,
                 a.device.buffer,
@@ -3243,7 +3282,7 @@ impl Runtime {
                 r_k.device.buffer,
             ],
             &[
-                s.device.buffer,
+                s.buffer(),
                 k_mod.device.buffer,
                 y.device.buffer,
                 y_norm.device.buffer,
@@ -3259,7 +3298,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     pub fn fuse_ka_dplr_norm_batch(
         &mut self,
-        s: &mut GpuTensor,
+        s: &StateTensor,
         k: &GpuTensor,
         k_k: &GpuTensor,
         a: &GpuTensor16,
@@ -3287,7 +3326,7 @@ impl Runtime {
             self.app.properties.subgroup_size,
         ];
         let params = [
-            s.device.address,
+            s.address(),
             k.device.address,
             k_k.device.address,
             a.device.address,
@@ -3303,12 +3342,12 @@ impl Runtime {
             y_norm.device.address,
         ];
         self.record_kernel(
-            "shaders/spv/fuse_ka_dplr_norm.spv",
+            &s.spv("fuse_ka_dplr_norm"),
             &spec,
             &params,
             (h as u32, 1, batch as u32),
             &[
-                s.device.buffer,
+                s.buffer(),
                 k.device.buffer,
                 k_k.device.buffer,
                 a.device.buffer,
@@ -3321,7 +3360,7 @@ impl Runtime {
                 r_k.device.buffer,
             ],
             &[
-                s.device.buffer,
+                s.buffer(),
                 k_mod.device.buffer,
                 y.device.buffer,
                 y_norm.device.buffer,
@@ -3468,7 +3507,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     pub fn dplr_seq(
         &mut self,
-        s: &mut GpuTensor,
+        s: &StateTensor,
         r: &GpuTensor,
         w: &GpuTensor,
         k: &GpuTensor,
@@ -3483,7 +3522,7 @@ impl Runtime {
     ) -> R<()> {
         let spec = dplr_seq_spec(h, n, t, c);
         let params = [
-            s.device.address,
+            s.address(),
             r.device.address,
             w.device.address,
             k.device.address,
@@ -3493,12 +3532,12 @@ impl Runtime {
             y.device.address,
         ];
         self.record_kernel(
-            "shaders/spv/dplr_seq_f32_f32.spv",
+            &s.spv("dplr_seq_f32_f32"),
             &spec,
             &params,
             (h as u32, 1, 1),
             &[
-                s.device.buffer,
+                s.buffer(),
                 r.device.buffer,
                 w.device.buffer,
                 k.device.buffer,
@@ -3506,7 +3545,7 @@ impl Runtime {
                 a.device.buffer,
                 b.device.buffer,
             ],
-            &[s.device.buffer, y.device.buffer],
+            &[s.buffer(), y.device.buffer],
         )?;
         Ok(())
     }
@@ -3610,7 +3649,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     pub fn dplr_seq_batch(
         &mut self,
-        s: &mut GpuTensor,
+        s: &StateTensor,
         r: &GpuTensor,
         w: &GpuTensor,
         k: &GpuTensor,
@@ -3627,7 +3666,7 @@ impl Runtime {
     ) -> R<()> {
         let spec = dplr_seq_spec(h, n, t, c);
         let params = [
-            s.device.address,
+            s.address(),
             r.device.address,
             w.device.address,
             k.device.address,
@@ -3638,12 +3677,12 @@ impl Runtime {
             lens.device.address,
         ];
         self.record_kernel(
-            "shaders/spv/dplr_seq_batch.spv",
+            &s.spv("dplr_seq_batch"),
             &spec,
             &params,
             (h as u32, batch as u32, 1),
             &[
-                s.device.buffer,
+                s.buffer(),
                 r.device.buffer,
                 w.device.buffer,
                 k.device.buffer,
@@ -3652,7 +3691,7 @@ impl Runtime {
                 b.device.buffer,
                 lens.device.buffer,
             ],
-            &[s.device.buffer, y.device.buffer],
+            &[s.buffer(), y.device.buffer],
         )?;
         Ok(())
     }

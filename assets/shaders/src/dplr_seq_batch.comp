@@ -4,6 +4,7 @@
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -14,8 +15,8 @@
 //   y[i]  += S[i,j] * r[j]
 //
 // 布局：
-//   s     : [batch, H, N, N]（slot 主序；状态存储 dtype = f32，与 Vulkan 单序列
-//           `dplr_seq.comp` / `fuse_ka_dplr_norm.comp` 的 BufS 一致）
+//   s     : [batch, H, N, N]（slot 主序；状态存储 dtype 由本文件的 WKV_S16 维决定，
+//           三处状态内核必须与 host 侧状态张量同档，见 build.rs）
 //   r/w/k/v/a/b/y : [batch, T, C]，C = H*N，token 步长 C
 //   lens  : [batch] uint（实际 token 数，>=1）
 // 语义与 CUDA `rwkv_dplr_seq_batch` 一致。
@@ -42,7 +43,14 @@ shared float sh_b[BLOCK_SIZE];
 shared float sh_k[BLOCK_SIZE];
 shared float sh_r[BLOCK_SIZE];
 
-layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+// 状态存储 dtype：计算全程 fp32，只在载入/回存降位（与 CUDA 的 `WKV_S16` 档同口径）。
+#ifdef WKV_S16
+#define S_TYPE float16_t
+#else
+#define S_TYPE float
+#endif
+
+layout(buffer_reference) buffer BufS  { S_TYPE data[]; }  buf_s;
 layout(buffer_reference) buffer BufR  { float data[]; }  buf_r;
 layout(buffer_reference) buffer BufW  { float data[]; }  buf_w;
 layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;
@@ -91,7 +99,7 @@ void main() {
     float sreg[BLOCK_SIZE];
     [[unroll]]
     for (uint j = 0; j < N; ++j) {
-        sreg[j] = buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X];
+        sreg[j] = float(buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X]);
     }
 
     const uint len = min(params.lens.data[slot], T);
@@ -126,6 +134,6 @@ void main() {
 
     [[unroll]]
     for (uint j = 0; j < N; ++j) {
-        buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X] = sreg[j];
+        buf_s.data[s_base + i * STRIDE_S_Y + j * STRIDE_S_X] = S_TYPE(sreg[j]);
     }
 }

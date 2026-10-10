@@ -322,6 +322,7 @@ fn main() {
         "dplr_seq" => "src/dplr_seq.comp" => {
             I_TYPE => [def("float32_t", "f32")],
             O_TYPE => [def("float32_t", "f32")],
+            WKV_S16 => [none(""), flag("s16")],
         },
         "seq_shift" => "src/seq_shift.comp" => {
             I_TYPE => [def("float32_t", "f32")],
@@ -353,6 +354,7 @@ fn main() {
         },
         "fuse_ka_dplr_norm" => "src/fuse_ka_dplr_norm.comp" => {
             TYPE => [none("")],
+            WKV_S16 => [none(""), flag("s16")],
         },
         "sum_rk_rk" => "src/sum_rk_rk.comp" => {
             TYPE => [none("")],
@@ -384,6 +386,7 @@ fn main() {
         },
         "dplr_seq_batch" => "src/dplr_seq_batch.comp" => {
             TYPE => [none("")],
+            WKV_S16 => [none(""), flag("s16")],
         },
         "segmean" => "src/segmean.comp" => {
             TYPE => [none("")],

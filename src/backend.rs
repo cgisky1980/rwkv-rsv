@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::runtime::{
-    GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32,
+    GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32, StateTensor,
 };
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
@@ -662,9 +662,9 @@ pub trait ComputeBackend {
     }
 
     /// 该后端的状态内核是否支持 **fp16 存储**的 WKV 状态（`tmix_rnn`）。
-    /// CUDA 支持（`WKV_S16` 变体，三处状态内核同 dtype）；Vulkan 的 GLSL 状态内核
-    /// （`fuse_ka_dplr_norm` / `dplr_seq` / `dplr_seq_batch`）的 `BufS` 为 f32 专用
-    /// → 返回 false，建 state 时回退 f32，否则算子会拿到 fp16 张量并报类型错误。
+    /// 两后端都支持：CUDA 走 `WKV_S16` 变体，Vulkan 走 build.rs `WKV_S16` 维产出的
+    /// `_s16` spv（三处状态内核 `fuse_ka_dplr_norm` / `dplr_seq` / `dplr_seq_batch`
+    /// 必须与状态张量同档，否则等于按错误的元素宽度解释同一块显存）。
     fn supports_f16_wkv_state(&self) -> bool {
         false
     }
@@ -1440,6 +1440,29 @@ impl VulkanBackend {
         self.tensors.insert(t, VulkanTensor::F16(g));
     }
 
+    /// 取 WKV 状态张量：接受 f32 / f16 两档（存储 dtype 由 `wkv_state_dtype` 在建张量时
+    /// 决定，shader 变体跟着 `StateTensor` 走），其余 dtype 视为误用。
+    fn take_state(&mut self, t: TensorId, op: &str) -> R<StateTensor> {
+        match self
+            .tensors
+            .remove(&t)
+            .ok_or(format!("{op}: unknown tensor {t:?}"))?
+        {
+            VulkanTensor::F32(g) => Ok(StateTensor::F32(g)),
+            VulkanTensor::F16(g) => Ok(StateTensor::F16(g)),
+            other => {
+                self.tensors.insert(t, other);
+                Err(format!("{op}: tensor {t:?} must be the wkv state (f32 or f16)").into())
+            }
+        }
+    }
+    fn put_state(&mut self, t: TensorId, s: StateTensor) {
+        match s {
+            StateTensor::F32(g) => self.put_f32(t, g),
+            StateTensor::F16(g) => self.put_f16(t, g),
+        }
+    }
+
     // —— 量化句柄解析 ——
     /// 从平台无关 `Int8Handle` 组装出 Runtime 所需的 `GpuTensorInt8`。
     fn int8_ref(&self, a: &Int8Handle, op: &str) -> R<GpuTensorInt8> {
@@ -1830,7 +1853,7 @@ impl ComputeBackend for VulkanBackend {
         eps: f32,
         gn_eps: f32,
     ) -> R<()> {
-        let mut s_o = self.take_f32(s, "fuse_ka_dplr_norm")?;
+        let s_o = self.take_state(s, "fuse_ka_dplr_norm")?;
         let mut km_o = self.take_f32(k_mod, "fuse_ka_dplr_norm")?;
         let mut y_o = self.take_f32(y, "fuse_ka_dplr_norm")?;
         let mut yn_o = self.take_f32(y_norm, "fuse_ka_dplr_norm")?;
@@ -1846,11 +1869,11 @@ impl ComputeBackend for VulkanBackend {
             let beta_g = self.get_f32(beta, "fuse_ka_dplr_norm")?;
             let r_k_g = self.get_f32(r_k, "fuse_ka_dplr_norm")?;
             self.rt.fuse_ka_dplr_norm(
-                &mut s_o, &k_g, &k_k_g, &a_g, &k_a_g, &r_g, &v_g, &w_g, &gamma_g, &beta_g, &r_k_g,
+                &s_o, &k_g, &k_k_g, &a_g, &k_a_g, &r_g, &v_g, &w_g, &gamma_g, &beta_g, &r_k_g,
                 &mut km_o, &mut y_o, &mut yn_o, h, n, eps, gn_eps,
             )
         };
-        self.put_f32(s, s_o);
+        self.put_state(s, s_o);
         self.put_f32(k_mod, km_o);
         self.put_f32(y, y_o);
         self.put_f32(y_norm, yn_o);
@@ -2292,6 +2315,13 @@ impl ComputeBackend for VulkanBackend {
         true
     }
 
+    /// 三处状态内核都有 `WKV_S16` 的 fp16 存储档（fp16 存 + fp32 算），与 CUDA 同档。
+    /// 关掉它 = `WKV_STATE_F16=0`（host 侧 `wkv_state_dtype` 直接建 f32 张量，
+    /// `StateTensor` 跟着选基线 spv）。
+    fn supports_f16_wkv_state(&self) -> bool {
+        true
+    }
+
     fn gemv_int8_add(
         &mut self,
         a: &Int8Handle,
@@ -2648,7 +2678,7 @@ impl ComputeBackend for VulkanBackend {
         t: usize,
         c: usize,
     ) -> R<()> {
-        let mut s_o = self.take_f32(s, "dplr_seq")?;
+        let s_o = self.take_state(s, "dplr_seq")?;
         let mut y_o = self.take_f32(y, "dplr_seq")?;
         let res = {
             let r_g = self.get_f32(r, "dplr_seq")?;
@@ -2658,10 +2688,10 @@ impl ComputeBackend for VulkanBackend {
             let a_g = self.get_f32(a, "dplr_seq")?;
             let b_g = self.get_f32(b, "dplr_seq")?;
             self.rt.dplr_seq(
-                &mut s_o, &r_g, &w_g, &k_g, &v_g, &a_g, &b_g, &mut y_o, h, n, t, c,
+                &s_o, &r_g, &w_g, &k_g, &v_g, &a_g, &b_g, &mut y_o, h, n, t, c,
             )
         };
-        self.put_f32(s, s_o);
+        self.put_state(s, s_o);
         self.put_f32(y, y_o);
         res
     }
@@ -2887,7 +2917,7 @@ impl ComputeBackend for VulkanBackend {
         c: usize,
         batch: usize,
     ) -> R<()> {
-        let mut s_o = self.take_f32(s, "dplr_seq_batch")?;
+        let s_o = self.take_state(s, "dplr_seq_batch")?;
         let mut y_o = self.take_f32(y, "dplr_seq_batch")?;
         let res = {
             let r_g = self.get_f32(r, "dplr_seq_batch")?;
@@ -2898,10 +2928,10 @@ impl ComputeBackend for VulkanBackend {
             let b_g = self.get_f32(b, "dplr_seq_batch")?;
             let lens_g = self.get_u32(lens, "dplr_seq_batch")?;
             self.rt.dplr_seq_batch(
-                &mut s_o, &r_g, &w_g, &k_g, &v_g, &a_g, &b_g, &mut y_o, &lens_g, h, n, t, c, batch,
+                &s_o, &r_g, &w_g, &k_g, &v_g, &a_g, &b_g, &mut y_o, &lens_g, h, n, t, c, batch,
             )
         };
-        self.put_f32(s, s_o);
+        self.put_state(s, s_o);
         self.put_f32(y, y_o);
         res
     }
@@ -3239,7 +3269,7 @@ impl ComputeBackend for VulkanBackend {
         gn_eps: f32,
         batch: usize,
     ) -> R<()> {
-        let mut s_o = self.take_f32(s, "fuse_ka_dplr_norm_batch")?;
+        let s_o = self.take_state(s, "fuse_ka_dplr_norm_batch")?;
         let mut km_o = self.take_f32(k_mod, "fuse_ka_dplr_norm_batch")?;
         let mut y_o = self.take_f32(y, "fuse_ka_dplr_norm_batch")?;
         let mut yn_o = self.take_f32(y_norm, "fuse_ka_dplr_norm_batch")?;
@@ -3255,11 +3285,11 @@ impl ComputeBackend for VulkanBackend {
             let beta_g = self.get_f32(beta, "fuse_ka_dplr_norm_batch")?;
             let r_k_g = self.get_f32(r_k, "fuse_ka_dplr_norm_batch")?;
             self.rt.fuse_ka_dplr_norm_batch(
-                &mut s_o, &k_g, &k_k_g, &a_g, &k_a_g, &r_g, &v_g, &w_g, &gamma_g, &beta_g, &r_k_g,
+                &s_o, &k_g, &k_k_g, &a_g, &k_a_g, &r_g, &v_g, &w_g, &gamma_g, &beta_g, &r_k_g,
                 &mut km_o, &mut y_o, &mut yn_o, h, n, eps, gn_eps, batch,
             )
         };
-        self.put_f32(s, s_o);
+        self.put_state(s, s_o);
         self.put_f32(k_mod, km_o);
         self.put_f32(y, y_o);
         self.put_f32(y_norm, yn_o);
