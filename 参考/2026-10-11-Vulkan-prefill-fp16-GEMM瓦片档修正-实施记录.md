@@ -118,6 +118,44 @@ decode 3429.8 tok/s vs Vulkan 1602.0 ⇒ **decode 仍是 0.47×**，prefill 不�
 
 ## 五、遗留
 
+### 5.1 批量 prefill 的残余差距在 B=256，而且是**墙钟**问题不是内核问题（新发现，下一步）
+
+同会话（`PAD_TO=512 NTOK=1 SEGS=1 SKIP_SINGLE=1`，prefill seeds 三臂全等 `0x372cc8`）：
+
+| B | PREFILL_SLOTS | Vulkan prefill | 登记显存 | vs CUDA |
+| --- | --- | --- | --- | --- |
+| 128 | 8（默认） | 24 119 ms | ~9.5 GB | **0.961×** |
+| 128 | 16 | 27 910 ms | 11 638 MiB | 0.830× |
+| 128 | 32 | 30 998 ms | 15 438 MiB | 0.748× |
+| 128 | 64 / 0（不分块） | `ERROR_OUT_OF_DEVICE_MEMORY` | — | — |
+| 256 | 8（默认） | 75 197 ms | 12 747 MiB | **0.614×** |
+| 256 | 16 | 54 409 ms | 14 279 MiB | 0.849× |
+| 256 | 32 | 59 670 ms | 18 079 MiB | 0.774× |
+| 256 | — CUDA | 46 173 ms | — | 1.00× |
+
+B=256 仍只有 0.61×，而 B=128 已经 0.96× ⇒ 差距不是内核。剖一个 chunk（B=256/ps=8，
+bt=4096 行，32 个 chunk）：
+
+- `[PROF_GPU] SUM 1023 ms / 1723 kernels`（gemm_affine 369 + gemm 193 + relu2 186 + tanh 6 = **74 %**）
+- `[PROF_GAPS] 间隙合计 0.693 ms / 1722`（最大 159 us，`to_f16_triple → gemm_tanh`）⇒ **GPU 侧没有 inter-dispatch 停顿**
+- `[PROF_HOST] host=26.1 ms [key=0.12 cache=22.71 barrier=1.33 dispatch=1.27]` ⇒ 录制也不是瓶颈（cache 查表占大头）
+- `[PROF_SUBMIT] submit=0.05ms wait=1029ms` ⇒ 与 GPU SUM 对得上（wait 就是 GPU 时间，无排队损失）
+
+而墙钟是 75 197 / 32 = **2350 ms 每 chunk**。1029(GPU) + 26(host) + 0.7(gap) ≈ 1056 ms，
+**剩下约 1.3 s / chunk（占 B=256 prefill 墙钟的 55 %）落在 chunk 与 chunk 之间**，
+既不在内核里也不在录制里。ps=8→16 在 B=256 上省 20.8 s ≈ 16 chunk × 1.3 s，
+正好是这个量级——但同一改法在 B=128 上**反而更慢**（+3.8 s），因为登记显存
+从 ~9.5 GB 涨到 11.6 GB；再涨到 15.4 GB / 18.1 GB 就分别把 B=128、B=256 拖回更慢，
+64 与不分块直接 `ERROR_OUT_OF_DEVICE_MEMORY`。
+
+所以这不是「把 PREFILL_SLOTS 调大」能白拿的收益，而是一个**每 chunk 固定开销 × 显存
+占用**的双目标问题。下一步先归因那 1.3 s：候选是 chunk 循环里走 batch 路径**之外**
+提交的活（状态写回 / 历史上传 / 未计时的 dispatch）、以及 seq 缓冲按桶重建。
+显存侧的联动项是 #27（RNN 状态 fp16：B=256 时 5.3 GB → 2.6 GB），它把「更大子批」
+重新变成可选项。
+
+### 5.2 其余
+
 1. **pf_value（深 K、窄 N）0.45×** 是唯一没闭合的 prefill 形状：n=2560 ⇒ N 方向只有
    20 个块，k=10240 ⇒ 每块扫 320 个 K-tile，A 面板被反复流入。方向是 K 方向的分块
    /更大 TILE_K，或 N 方向的 persistent 分组；与 CUDA 的 56.6 TOPS 比还差 2.2×。

@@ -148,7 +148,7 @@ int8 ≈ +32% over fp16 (Vulkan) / +36% (CUDA).
 | fp16 | **2677-2700 tok/s** | effective GEMM 21-25 TFLOPS (75-89% of f32-accumulate tensor peak) |
 | int8 | 2263-2307 tok/s | includes per-layer dequant overhead (see Known Limitations) |
 
-Vulkan ⇄ CUDA on this path is a wash too: interleaved in one session (2026-10-04, `PTOKENS=256`) **2455.6 vs 2433.0 tok/s** (1.01×). ⚠️ Same caveat as above — that pair's CUDA gates were not recorded, so treat it as a SIMT-口径 statement. Batched prefill is a different story: at default gates Vulkan is *faster* at B=1 (1,169 ms vs 2,238 ms) and *slower* from B≥32 onward (86.5 s vs 46.7 s at B=256) — see the prefill columns in §6.1.
+Vulkan ⇄ CUDA on this path is a wash too: interleaved in one session (2026-10-04, `PTOKENS=256`) **2455.6 vs 2433.0 tok/s** (1.01×). ⚠️ Same caveat as above — that pair's CUDA gates were not recorded, so treat it as a SIMT-口径 statement. Batched prefill is a different story: at default gates Vulkan was *faster* at B=1 (1,169 ms vs 2,238 ms) and *slower* from B≥32 onward (86.5 s vs 46.7 s at B=256) — see the prefill columns in §6.1. **Corrected 2026-10-11 (§6.6)**: that B≥32 lag was mostly the fp16 GEMM tile default, not batching — after the tile fix B=128 is 24.1 s vs CUDA's 23.2 s (0.96×) and B=256 is 75.2 s vs 46.2 s (0.61×), where the remaining B=256 loss is ~1.3 s of per-chunk wall clock outside kernel execution rather than slower kernels.
 
 A cold single-shot prefill additionally pays the one-time pipeline-creation cost of that length bucket (m_pad), ~tens to a hundred ms; servers can run one dummy prefill per common length bucket after loading. Details: [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md).
 
@@ -637,6 +637,32 @@ fingerprint `0x1b9664` identical in all three): CUDA 23,168 ms / Vulkan 64x64 40
 the §9 0.59x, reproduced across sessions) / Vulkan 128x128 24,119 ms (**0.961x**). In the same lines,
 decode is still 1,602 vs 3,430 tok/s (0.47x), so prefill is no longer the large-batch story - §6.1's
 decode columns are.
+
+**But B=256 is still 0.61x, and that is no longer a kernel problem** (same session, `PAD_TO=512`,
+prefill seed fingerprint identical in every arm):
+
+| B | `PREFILL_SLOTS` | Vulkan prefill | registered VRAM | vs CUDA |
+| --- | --- | --- | --- | --- |
+| 128 | 8 (default) | 24,119 ms | ~9.5 GB | **0.961x** |
+| 128 | 16 | 27,910 ms | 11,638 MiB | 0.830x |
+| 128 | 32 | 30,998 ms | 15,438 MiB | 0.748x |
+| 128 | 64 / 0 (no chunking) | `ERROR_OUT_OF_DEVICE_MEMORY` | - | - |
+| 256 | 8 (default) | 75,197 ms | 12,747 MiB | **0.614x** |
+| 256 | 16 | 54,409 ms | 14,279 MiB | 0.849x |
+| 256 | 32 | 59,670 ms | 18,079 MiB | 0.774x |
+| 256 | - CUDA | 46,173 ms | - | 1.00x |
+
+Profiling one chunk of the B=256 case (bt=4096 rows, 32 chunks) rules out the usual suspects:
+`[PROF_GPU] SUM 1023ms over 1723 kernels`, `[PROF_GAPS] 间隙合计 0.693ms` (largest single gap 159 us -
+**no inter-dispatch stalls at all**), `[PROF_HOST] host=26.1ms [cache=22.7 barrier=1.3 dispatch=1.3]`,
+`[PROF_SUBMIT] submit=0.05ms wait=1029ms` (the wait *is* the GPU time; nothing is lost in queuing).
+Yet the chunk costs 75,197/32 = **2,350 ms of wall clock**. So ~1.3 s per chunk - **55 % of B=256
+batched prefill** - sits between chunks, outside both kernel execution and command recording. Halving
+the chunk count does recover ~20.8 s at B=256 (8 -> 16 slots), but the same move *slows B=128 down*
+(24.1 -> 27.9 s) because registered VRAM goes ~9.5 -> 11.6 GB; above ~15 GB it gets worse again, and
+64 slots / no chunking OOMs. It is a two-objective problem (per-chunk fixed cost x VRAM headroom), not
+a knob to turn. The linked memory item is §9's fp16 RNN state (5.3 GB -> 2.6 GB at B=256), which is
+what would make a larger sub-batch affordable again.
 
 Remaining: `pf_value` (deep-K, narrow-N: n=2560 gives only 20 blocks along N while k=10240 streams 320
 K-tiles per block) is the one prefill shape still 2.2x behind, and int8 tensor-core prefill is demoted
