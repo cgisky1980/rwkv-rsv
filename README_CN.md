@@ -34,7 +34,7 @@
 
 ## 2. 设计目标
 
-- **可移植性优先，但不牺牲吞吐**：以 Vulkan 为主后端，换取跨厂商 / 跨平台可用性，且在本机上与 CUDA 后端**实测无差距**（见 §6.1）。
+- **可移植性优先，但要说清代价**：以 Vulkan 为主后端，换取跨厂商 / 跨平台可用性。本机实测：**SIMT 对口径下与 CUDA 无差距**，**默认（张量核）口径下随批量拉大到 0.87×→0.27×**（见 §6.1）。
 - **两路量化共存**：fp16（无损参考）/ int8（近无损）按模型文件自动路由，同一二进制全部兼容。
 - **运行时自编译 shader**：`build.rs` 在构建期用 `glslangValidator` 把 `*.comp` 编译为 SPIR-V，`constant_id` 做跨硬件自适应。
 - **研发向**：内嵌 CPU fp32 参考、DIAG 三方核对、logits 对比、teacher-forced Top-1 一致率等验证工具链。
@@ -81,6 +81,12 @@ cargo run --release --example generate          # env: NTOKENS, TEMP, TOPK, TOPP
 cargo run --release --example benchmark
 # 稳态 prefill 基准（同长度预热后测第二次起，排除一次性 pipeline 创建开销）
 cargo run --release --example prof_prefill_steady   # env: PTOKENS
+# 批量并发吞吐/正确性基准：SLOTS × SEGS × NTOK，含 STEP=1 两条路径对拍、SLOT_BENCH=1 槽位分发、
+# BUCKET_BENCH=1 长度桶预热四档、BENCH_JSON=<路径> 把「读数 + 完整门控」落成一行 JSON
+cargo run --release --example batch_decode_bench    # env: MODEL_PATH, SLOTS, PAD_TO, TOPK, STEP, BENCH_JSON
+# 同会话**交错 A/B** 编排器（基准可信度的唯一正当姿势）：轮换测量顺序、串行子进程，
+# 出中位数 + 离散度 + 倍率 + 跨后端指纹一致性表；AB_SLOTS/AB_ROUNDS/AB_JSON/AB_SUMMARY
+cargo run --release --example bench_ab
 # State 序列化：前进→state_back→存盘→state_load→state_back 无损闭环
 cargo run --release --example state_persist     # env: OUT=state.bin
 ```
@@ -92,6 +98,15 @@ cargo run --release --example state_persist     # env: OUT=state.bin
 - **`ModelBuilder` + `Bundle`**：加载模型并绑定零初始化 `State`；`infer_tokens` / `infer_seq` / `infer` 推进会话并返回 logits。
 - **`State`**：一等公民的会话状态——`state_back()` 下载为 CPU `Vec<f32>`，`state_load()` 回灌，`reset()` 清零，序列化逐位无损。
 - **GPU 采样（`SamplerParams`）**：`infer_sample` / `infer_sample_selfloop` 全 GPU 端过滤 logits，只回传采样 token 索引。
+- **并发池原语（批量布局 `State`）**：`create_batch_state(B)` + `forward_seq_batch_padded` / `submit_sample_selfloop_batch` / `batch_step_sample`；
+  槽位管理走 `state_slot_back` / `state_slot_load`（宿主往返）与 `state_slot_broadcast`（**设备内**把一份状态分发给多个槽，
+  会话 fork / 同 prompt 多路采样用，省掉每目标 2× 单槽状态的 PCIe 往返）；
+  启动期用 `warmup_len_buckets(state, &[T_pad…])` 把长度桶的序列缓冲重建从首个真实请求挪到启动期
+  （★ 缓冲单槽：只有列表里最后一个桶留在显存）。批量 **decode** 的前提查 `supports_batch_decode()`，
+  不满足时 `batch_decode_blocker()` 给出**是哪一条**前提（后端缺算子 vs 模型无 int8 句柄）。
+  ⚠️ 这条门只管批量 decode：`forward_seq_batch_padded`（批量 prefill）走 seq 并行核，
+  **fp16 模型一样可用**，且每槽状态与单流逐位一致（2026-10-10 两后端实测）。
+  返回值是各槽提示词的末 token（解码种子），不是下一 token 预测。
 
 ## 5. 量化工具链
 
@@ -125,6 +140,10 @@ int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 > **2026-10-04 同会话交错复测**（int8，同测法）：Vulkan **68.4** vs CUDA **68.3** tok/s —— 完全持平。
 > 绝对值跨会话漂移很大（本次差 40% 以上），所以只有交错比值有意义；上面 2026-08 那张表早于
 > Vulkan r/k/v 内核改造，且当时并非交错测得。详见 §6.1。
+>
+> ⚠️ 那次单流配对的 **CUDA 门控口径没有记录**，而它决定这条「持平」成不成立：2026-10-10 同会话
+> 交错在**默认口径**（CUDA 三个张量核开关全开）下测得 **91.4 vs 79.2 = 0.87×**，B=1 就已经不平了。
+> 「B=1 持平」请按 SIMT 对口径读。
 
 **GPU prefill 吞吐**（T=256 稳态，即同长度预热后的第二次起；`prof_prefill_steady`，Vulkan cooperative-matrix GEMM 路径）：
 
@@ -133,38 +152,100 @@ int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 | fp16 | **2677-2700 tok/s** | GEMM 有效算力 21-25 TFLOPS（f32 累加 tensor 峰值 75-89%） |
 | int8 | 2263-2307 tok/s | 含每层 dequant 开销（见「已知限制」） |
 
-这条路径上 Vulkan ⇄ CUDA 同样打平：同会话交错（2026-10-04，`PTOKENS=256`）**2455.6 vs 2433.0 tok/s**（1.01×）。
+这条路径上 Vulkan ⇄ CUDA 同样打平：同会话交错（2026-10-04，`PTOKENS=256`）**2455.6 vs 2433.0 tok/s**（1.01×）。⚠️ 与上面同一条注意事项：那次配对的 CUDA 门控没有记录，所以按 SIMT 对口径读；**批量** prefill 在默认口径下位次随 B 反转 —— B=1 时 Vulkan 更快（1,169 vs 2,238 ms），B≥32 起被 CUDA 反超并越拉越远（B=256：86.5 s vs 46.7 s），见 §6.1 prefill 两列。
 
 单次冷启动 prefill 会额外付出该长度桶（m_pad）首次的 pipeline 创建成本（~几十-上百 ms，一次性）；服务端可在加载后按常用长度桶各跑一次 dummy prefill 预热。详见 [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md)。
 
-### 6.1 批量解码吞吐总表：信天翁 / CUDA / Vulkan（int8，C=2560 / H=40 / N=64 / V=65536 / L=32）
+### 6.1 批量解码吞吐总表：CUDA / Vulkan / 信天翁（int8，C=2560 / H=40 / N=64 / V=65536 / L=32）
 
-| 并发 B | 信天翁 ¹ | rwkv-rsv CUDA ¹ | 提速 ¹ | rwkv-rsv Vulkan ² | Vulkan/CUDA ² |
-|---:|---:|---:|---:|---:|---:|
-| 1（单流） | 94.2 – 99.0 | 94.1 – 97.2 | **持平**（3 轮交错均值 1.012×） | 83.5 | 1.00 |
-| 8 | 465.4 | **547.8** | +17.7% | 481.5 | 0.98 |
-| 16 | 806.0 | **979.4** | +21.5% | 880.1 | 1.00 |
-| 32 | 1294.6 | **1632.8** | +26.1% | 1471.7 | 0.99 |
-| 64 | 2123.3 | **2354.7** | +10.9% | 2229.8 | 1.02 |
-| 128 | 2704.6 | **3123.1** | +15.5% | 3454.1 | 1.01 |
-| 256 | 3036.9 | **3467.7** | +14.2% | 3932.5 | 1.03 |
+**主表 = 2026-10-10 同会话交错 A/B**（`bench_ab`，会话 `20261010-184051-89364`，B 与后端**逐轮交替**，
+每格 3 轮取**中位数**；原始记录 `bench/ab-20261010-184051-89364.jsonl` + `.summary.json`）：
 
-> ¹ **信天翁列与 CUDA 列取自同一次同会话交错 A/B**（2026-09-22；`batch_decode_bench` 对 `run_bench.bat`，
-> 交替进行，我们跑完立刻跑上游）。**提速列只在这一对内部有效。**
->
-> ² **Vulkan 列来自更晚的一次会话**（2026-10-04 交错，`SEED=42`，默认 `SEGS=4` / `PAD_TO=512`）。
-> 该会话里配对的 CUDA 读数为 83.3 / 490.9 / 878.6 / 1487.0 / 2192.1 / 3427.8 / 3825.0 tok/s ——
-> 所以 **Vulkan/CUDA 列是相对这些值算的，不是相对 ¹ 的 CUDA 列**。**Vulkan 列只能通过这个比值来读**：
-> 它既不能与信天翁列比、也不能与 ¹ 的 CUDA 列比，因为**会话不同、基准参数也不同**。
->
-> ⚠️ **该 CUDA 配对读数用的门控口径没有记录，而这一点至关重要**：CUDA 侧 `LOWRANK_GEMM` /
-> `FFN_VALUE_GEMM` / `GEMV_IMMA` 三个张量核开关默认全开。2026-10-10 抽查：B=8 默认 624.6 tok/s、
-> 三开关关 503.5（Vulkan 514.6）；B=32 默认 1900.7、关 583.4（Vulkan 929.1）。
-> 所以「0.98× 持平」只能理解为 **SIMT 对 SIMT**，**不是** Vulkan 追平 CUDA 的张量核路径。
-> 引用任一读数前请先在同一次会话里、把门控写明后重测。
->
-> ⚠️ 该卡兼作桌面显示卡：**跨会话读数漂移可达 ±17%**，而基准参数（SEGS / PAD_TO / NTOK）本身也会移动绝对值。
-> **只有同会话 + 同参数的交错 A/B 可信**，单次读数足以把结论反转 ±3%。信天翁现已不在这台机器上，其列无法刷新。
+| 并发 B | CUDA tok/s | spread | CUDA prefill | Vulkan tok/s | spread | Vulkan prefill | Vulkan/CUDA | 每格指纹 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1（单流） | 91.4 | 1.7% | 2,238 ms | 79.2 | 3.4% | 1,169 ms | **0.87** | 两边全等 `0x1acbfa` |
+| 8 | 583.1 | 1.8% | 3,719 ms | 482.4 | 5.7% | 3,712 ms | **0.83** | 分叉 |
+| 16 | 1062.8 | 1.9% | 6,153 ms | 693.3 | 2.6% | 6,605 ms | **0.65** | 分叉 |
+| 32 | 1778.0 | 12.6% | 8,403 ms | 861.2 | 2.3% | 11,761 ms | **0.48** | 分叉 |
+| 64 | 2633.1 | 19.4% | 13,894 ms | 935.5 | 1.4% | 22,269 ms | **0.36** | 分叉 |
+| 96 | 2871.7 | 8.9% | 19,407 ms | 913.2 | 3.8% | 33,020 ms | **0.32** | 分叉 |
+| 128 | 3367.6 | 1.4% | 24,427 ms | 967.4 | 1.6% | 43,670 ms | **0.29** | 分叉 |
+| 256 | 3726.5 | 1.6% | 46,652 ms | 988.5 | 1.6% | 86,453 ms | **0.27** | 分叉 |
+
+**门控快照（逐字，两后端同一次会话同一份）**：`SEGS=4` `PAD_TO=512` `NTOK=32` `WARMUP=1`
+`SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`；`LOWRANK_GEMM` / `FFN_VALUE_GEMM` / `GEMV_IMMA`
+**均未设 = 开**（CUDA 低秩四条 / FFN value / r·k·v 全走 int8 张量核）；`VK_IMMA` 开、
+`VK_IMMA_OPS` 未设 = **除 rkv 外全开**、`VK_IMMA_NST`/`VK_IMMA_BM` 按 batch/M 自动；
+`SKIP_GRAPH` 未设 = 关（自循环走图捕获）、`STEP` 关（只跑自循环路径）、`PENALTY` 关、
+`SELFLOOP_CHUNK` / `ABLATE` 默认。
+
+**这张表可以读出的四件事**：
+
+1. **默认口径下 Vulkan 每一档都落后**，且差距随 B 单调拉大：B=1 只差 0.87×，B=8 起就掉到
+   0.83×，B=32 之后基本腰斩 ⇒ B=256 只剩 **0.27×**。**旧版本节写的「B=1~256 全线 0.98×~1.03×、
+   128/256 反超」在默认口径下不成立**，那是 SIMT 对口径（把 CUDA 三个张量核开关关掉）的结论，
+   见下面「口径」段。差距随 B 拉大与「rkv 是唯一在 Vulkan 侧默认仍走 SIMT、在 CUDA 侧默认走
+   int8 张量核的批量核」一致（`VK_IMMA_OPS` 默认除 rkv 外全开），但**没有单独做逐算子消融**来
+   把它钉死，所以这里只作为一致的解释、不作为已证结论。
+2. **绝对值不可跨会话引用**：CUDA 在 B=32/64 两格自身 spread 就有 **12.6% / 19.4%**（同参数同
+   后端 3 轮，取中位数仍需 ±20% 的余量才能比较）；这张卡兼作桌面显示卡。要引用任一读数，
+   必须在**同一次会话、交错跑、门控写明**后测，并用中位数 + spread 一起报。
+3. **批量吞吐不是 ×B**：B=256 相对 B=1 只有 **×40.8（CUDA）/ ×12.5（Vulkan）**，Vulkan 侧从
+   B=64 起基本走平（935 → 988 tok/s，B 翻了 4 倍）。机理见
+   [参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md](参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md) §11
+   ——每一波都要把整份 int8 权重重读一遍，每波恒定成本 64–68 ms。
+4. **prefill 与 decode 的相对位次相反**：B=1 时 Vulkan prefill 反而更快（1,169 vs 2,238 ms），
+   B≥32 后被 CUDA 反超并越拉越远（86.5 s vs 46.7 s @ B=256）。
+
+**本次会话同时钉掉的一个真断崖（改进项 5）**：Vulkan 在 **batch>64** 会掉出张量核路径 ——
+`imma_ok` 旧门上挂着 `batch <= 64`，一旦越过就把 **head/out/key/val 四条张量核 GEMM 一起**
+（head = vocab 65536×2560，单层最大的一块矩阵乘）退回 SIMT。实测对照：
+
+| B | 旧门（batch>64 掉出 IMMA） | `VK_IMMA=0` 全批无 IMMA 对照 | 修后（同参数） |
+|---:|---:|---:|---:|
+| 64 | 934.4 | 436.5 | 935.5 |
+| 80 | 430.7 | — | — |
+| 96 | 429.2 | — | 913.2 |
+| 128 | 422.8 | — | 967.4 |
+| 256 | 426.2 | — | 988.5 |
+
+| B | 旧门（batch>64 掉出 IMMA） | `VK_IMMA=0` 全批无 IMMA 对照 | 修后（同参数） |
+|---:|---:|---:|---:|
+| 64 | 934.4 | 436.5 | 935.5 |
+| 80 | 430.7 | — | — |
+| 96 | 429.2 | — | 913.2 |
+| 128 | 428.4 | 422.8 | 967.4 |
+| 256 | 426.2 | — | 988.5 |
+
+修后 B=96/128/256 ≈ **2.1×~2.3×**，且旧门下的读数与「整批关掉 IMMA」的对照组同档（429 vs 436）
+——这就是断崖归因的证据。回归用例：`tests/batch_parity.rs::slots_beyond_the_first_wave_match`
+（72 槽 × 8 步贪心逐位一致）。
+（⚠️ 各列出处：64/80/96 与 128 的对照组来自 18:01 的定位探针 `bench/probe-imma.jsonl`，128/256
+的旧门值来自 17:26 未修版扫描 `bench/ab-20261010-172659-90152.jsonl`，「修后」列是 18:40 正式会话
+的中位数。四组同日不同 run，**只用于说明「掉出后与无 IMMA 同档」这个量级**，不参与任何比值。）
+
+**信天翁（外部参考实现）列**：⚠️ 与上表**不同会话、不同参数**，只能作为量级参考，不可与 CUDA 列
+直接相除。该实现已不在这台机器上，**无法刷新**；下表同时保留了它当初与 CUDA 的同会话交错对比
+（2026-09-22，`batch_decode_bench` 对 `run_bench.bat`，交替进行）：
+
+| 并发 B | 信天翁 | rwkv-rsv CUDA（当时会话） | 提速（仅这对内部有效） |
+|---:|---:|---:|---:|
+| 1（单流） | 94.2 – 99.0 | 94.1 – 97.2 | 持平（3 轮交错均值 1.012×） |
+| 8 | 465.4 | 547.8 | +17.7% |
+| 16 | 806.0 | 979.4 | +21.5% |
+| 32 | 1294.6 | 1632.8 | +26.1% |
+| 64 | 2123.3 | 2354.7 | +10.9% |
+| 128 | 2704.6 | 3123.1 | +15.5% |
+| 256 | 3036.9 | 3467.7 | +14.2% |
+
+> ⚠️ 表内 CUDA 列同样是**未记录门控**的历史读数（三个张量核开关自 2026-09-21 起默认开）。
+> 想要可信对比只有重测：`cargo run --release --example bench_ab`（`AB_BACKENDS` / `AB_SLOTS` /
+> `AB_ROUNDS` / `AB_JSON`），或单后端 `batch_decode_bench`（`BENCH_JSON=1` 落 JSONL）。
+
+**口径**（SIMT 对 SIMT vs 默认）：2026-10-04 的「0.98×~1.03× 持平」与「逐位一致」都是**对齐口径**
+——CUDA 侧需 `LOWRANK_GEMM=0 FFN_VALUE_GEMM=0 GEMV_IMMA=0`。抽查（同日 B=8）：CUDA 默认 624.6 /
+关 503.5 / Vulkan 514.6；B=32 默认 1900.7 / 关 583.4 / Vulkan 929.1。默认口径与对齐口径差到 3 倍，
+所以「Vulkan 追平 CUDA 张量核路径」这句话从来不是事实。
 
 **正确性 —— 同后端两条路径**：逐步路径（`batch_step_sample`，主机在环）与 GPU 自循环路径
 在两后端的**每一档批量**上 sum/xor 指纹**逐位一致**。这是 `batch_decode_bench` 的 `STEP=1`
@@ -174,9 +255,12 @@ int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 **正确性 —— 跨后端**：**只有两边跑同一条 SIMT kernel 序列时才逐位一致**。把 CUDA 压到
 Vulkan 的路径（`LOWRANK_GEMM=0 FFN_VALUE_GEMM=0 GEMV_IMMA=0`）后 B=8 两边完全一致
 （同为 `0xd08ada`/`0x2ea`）。CUDA 的**默认**路径走 int8 张量核（这三个开关自 2026-09-21 起默认开），
-此时指纹不同 —— B=8 CUDA `0xd02e16`/`0x6d08`、B=32 CUDA `0x345e198`/`0x64a2` 对 Vulkan
-`0x3477769`/`0x6bcd`。两边 logits 数值相邻，采样把罕见的单点翻转放大成后续序列分叉，
+此时指纹不同 —— 上面主表那 16 格里**只有 B=1 两边全等**（`0x1acbfa`/`0x6d5c`），B≥8 一律分叉
+（例：B=8 CUDA `0xd02e16`/`0x6d08` 对 Vulkan `0xd08ada`/`0x2ea`；B=256 CUDA `0x1a493fad`/`0x7e01`
+对 Vulkan `0x1a407915`/`0x6713`）。两边 logits 数值相邻，采样把罕见的单点翻转放大成后续序列分叉，
 所以这**不是**正确性缺陷；但任何「跨后端逐位一致」的说法都必须写明口径。
+同一份记录里另一条硬事实：**同后端 3 轮同参数指纹逐位复现**（全部 16 格 det=Y），所以分叉
+只来自后端，不来自时序抖动。
 （CUDA 保留了同一个 `gemv_int8_rkv_stage1_batch` 签名，但忽略新增的 fp16 激活入参、
 仍走原 fp32 路径，所以对齐口径下的 CUDA 列是真正未经改动的基准。）
 2026-10-04 那句「每一档批量两后端逐位一致」是按对齐口径写的，**在默认口径下不成立**。
@@ -189,7 +273,7 @@ Vulkan 的路径（`LOWRANK_GEMM=0 FFN_VALUE_GEMM=0 GEMV_IMMA=0`）后 B=8 两�
 内存级并行。完整机理：[int8 IMMA 实施记录](参考/2026-09-21-int8-IMMA实施记录.md) ·
 [跨架构基线表](参考/2026-09-21-跨架构基线表.md)。
 
-**Vulkan 追平的途径**（全在 r/k/v 融合核 `gemv_int8_rkv_stage1_batch`）：
+**Vulkan 在同 SIMT 口径下的提速手段**（全在 r/k/v 融合核 `gemv_int8_rkv_stage1_batch`；注意这**不**等于追平 CUDA 默认张量核路径）：
 
 - **fp16 激活**：此前该核每槽每 k 读一个完整 `vec4`（16 B）的 fp32 激活，而权重已是 int8 紧凑格式 ——
   成为 L2 流量的第二个大头。现在改读 `f16vec2` 缓冲（8 B，**减半**），再展宽成 `vec4` 参与 fp32 累加。
@@ -223,12 +307,12 @@ examples/       自包含示例程序
 | 计算后端 | CUDA（单厂商） | Vulkan / CUDA（跨厂商/跨平台） |
 | 路线 | 极致性能，硬件特定优化 | 可移植性优先，运行时自编译 shader |
 | 权重精度 | fp16 | fp16 / **int8**（自动路由，显存下限 8GB） |
-| 相对差距（CUDA 批量解码） | 基准 | **已反超** —— B=1 持平，B=8~256 快 **+11% ~ +26%**（见 §6） |
-| 相对差距（Vulkan vs 自家 CUDA） | 不适用 | **SIMT 口径持平** —— decode B=1~256 与稳态 prefill 全线 **0.98× ~ 1.03×**；**不含** CUDA 默认张量核路径（见 §6.1 ⚠） |
+| 相对差距（CUDA 批量解码） | 基准 | **已反超** —— 同会话交错那一次（2026-09-22）B=8~256 快 **+11% ~ +26%**；信天翁已不在本机，**该列不可刷新，也不可与 §6.1 主表跨会话相除**（见 §6.1） |
+| 相对差距（Vulkan vs 自家 CUDA） | 不适用 | **分两个口径**：① **SIMT 对 SIMT**（CUDA 关三个张量核开关）持平 —— decode B=1~256 与稳态 prefill **0.98× ~ 1.03×**；② **默认口径**（CUDA 张量核全开、Vulkan 除 rkv 外全开）**每一档都落后**，B=1 0.87× 一路到 B=256 **0.27×**（2026-10-10 同会话交错实测，见 §6.1 主表） |
 
 差距主要来自：① Albatross 更激进的 kernel 融合；② CUDA Graph 捕获减少启动开销；③ CUDA 生态成熟的硬件特定库。
 
-在 CUDA 路径上，这个差距后来被**int8 张量核 + int8 常驻权重**（每 token 字节数减半、张量核峰值翻倍）、split-K、多链合并 launch 与形状感知 tile 追平并反超（见 §6）。在 **Vulkan** 路径上，同一水平的追平也已达成：r/k/v 融合核改读 **fp16 激活**（流量减半）、权重 `vec4` 打包 + `dot`、`x` 分块常驻 shared memory —— 最后约 40% 的差距由此关闭，Vulkan 现在相对 CUDA **同 SIMT 口径吞吐中性**，同时保留跨厂商能力（见 §6.1 —— CUDA 默认走 int8 张量核，大批量下仍领先，因为 Vulkan 侧的张量核批量核按实测关闭）。
+在 CUDA 路径上，这个差距后来被**int8 张量核 + int8 常驻权重**（每 token 字节数减半、张量核峰值翻倍）、split-K、多链合并 launch 与形状感知 tile 追平并反超（见 §6）。在 **Vulkan** 路径上，**同一 SIMT 口径**的追平也已达成：r/k/v 融合核改读 **fp16 激活**（流量减半）、权重 `vec4` 打包 + `dot`、`x` 分块常驻 shared memory —— 最后约 40% 的差距由此关闭，Vulkan 在**两边跑同一条 kernel 序列时**相对 CUDA 吞吐中性，同时保留跨厂商能力。但**对 CUDA 默认口径并不中性**：`VK_IMMA_OPS` 默认唯独把 r/k/v 批量核留在 SIMT，而 CUDA 侧它走 int8 张量核，大批量的差距主要就在这里（见 §6.1 主表与「口径」段）。
 
 在以上两者的启发下，本仓库随后独立演进，新增了它们都没有的能力：**两路权重量化推理**（fp16 / int8 自动路由）、**CPU fp32 参考实现与 GPU 内核正确性单测**、**离线量化工具链**与可复现的精度验证工作流。
 
@@ -237,10 +321,11 @@ examples/       自包含示例程序
 - **prefill dequant 开销 ~10%**（T=512 时 int8 vs fp16）：彻底消除需 cooperative-matrix 融合反量化+GEMM（Marlin 式零副本），列为长期方向。
 - **prefill 每 token 耗时随 T 近二次方增长**（T=256: 0.33ms → T=512: 0.81ms，WKV 并行形式的 chunk 内项），长 prompt 可关注 WKV 分块策略。
 - **Vulkan dplr_seq 占用率偏低**（40 workgroup × 64 线程 + 每 token 2 次 barrier，稳态 prefill 中 ~10ms）：可对齐 CUDA 版结构（block 并行行 + shuffle 归约）。
-- **新长度桶首次 prefill 付 pipeline 创建成本**（kernel cache 已按 (shader, spec) 共享 uniform 池 + DYNAMIC offset 解耦，条目 1722 → ~30；剩余为 spec 首现的固有创建费）：可用启动预热消除。
+- **新长度桶首次 prefill 付 pipeline 创建成本**（kernel cache 已按 (shader, spec) 共享 uniform 池 + DYNAMIC offset 解耦，条目 1722 → ~30；剩余为 spec 首现的固有创建费）：可用启动预热消除。★ 2026-10-10 `BUCKET_BENCH=1 SLOTS=8`（3B int8，新桶 = `PAD_TO+128`）实测这条**不止** pipeline 创建：换一个长度就整表重建 45 个 `[bt,·]` 序列缓冲，代价是**秒级**——冷桶首请求 CUDA 1809.0 ms vs 同桶重复 942.7 ms（省 864.1 ms）、Vulkan 3641.0 vs 2493.2 ms（省 1152.2 ms）。`warmup_len_buckets` 把它从「用户等」变成「启动期等」，**总代价一点不省**（预热成本 1845.3 / 3623.4 ms ≈ 冷桶首请求），而且 `SeqBuffers` 是**单槽**缓存 ⇒ 预热列表里只有最后一个桶留在显存；长度来回变的请求得固定 `pad_to` 或按桶各留一个模型。
 - ~~**Vulkan uniform 池在长批量下需手工扩容**~~ —— **陈旧叙述，已实测证伪**（2026-10-10）。该结论早于 `pool_slots` 批内去重（ba08642，2026-08-25）；去重后池占用是 O(批内不同 params 组合) 而非 O(dispatch 数)。`PROF_POOL=1` 实测高水位：69,080 B（批量 prefill）/ 33,432 B（自循环）/ 31,344 B（`batch_step_sample`）—— **在 B=8/16/32/64 与 NTOK=32/64/256 上一律不变**，含 `SKIP_GRAPH=1`（n 轮全记录进一次 submit）、`STEP=1 PENALTY=1` 与长 prompt。默认 8MB 跑全部批量路径只用掉约 1.2%，`UNIFORM_POOL_MB` 只剩极端形状兜底的意义。
-- **fp16 模型没有批量前向路径**：批量 r/k/v kernel 只有 int8 变体（`gemv_int8_rkv_stage1_batch`），fp16 模型只能逐槽串行 decode。`GpuModel::batch_decode_blocker()` 会把「为什么回落串行」以字符串返回，调用方（客户端会话池、mytown 引擎）加载时记一行日志即可，不必再对着一个静默的 `supports_batch_decode() == false` 猜。
-- **Vulkan 没有批量张量核 GEMM**（`lowrank_gemm_batch` / `ffn_value_gemm_batch` 只有 CUDA 实现）：Vulkan 侧的张量核 r/k/v 变体实测**净亏 3.3×**，默认关闭（`imma_op_on("rkv") == false`；基础设施保留，`VK_IMMA_OPS=...,rkv` 可复现）—— 本机驱动上每多排一次 dispatch 的固定代价（含 buffer 级 barrier 全量失效）大于 kernel 省下的时间，每步 43ms 落在 dispatch **之间**。后果：大批量下 CUDA 默认路径领先约 1.2×（B=8）~ 2.0×（B=32）；要关闭它需要的是**更少更大的 Vulkan dispatch**，而不是更多。当前达成持平的是 SIMT 融合核路径。
+- **fp16 模型没有批量 decode 路径（但批量 prefill 可用）**：批量 decode 的融合 r/k/v kernel 只有 int8 变体（`gemv_int8_rkv_stage1_batch`），fp16 模型只能逐槽串行 decode；`forward_seq_batch_padded`（批量 prefill）走 seq 并行核、读 fp16/fp32 权重照常工作。⚠️ 本条早前写成「fp16 模型没有批量前向路径」，把 prefill 一并说成了不行——消费方照那句决策会连批量 prefill 都退成逐槽串行，白付代价。`GpuModel::batch_decode_blocker()` 会把「为什么回落串行」以字符串返回，调用方（客户端会话池、mytown 引擎）加载时记一行日志即可，不必再对着一个静默的 `supports_batch_decode() == false` 猜。★ 2026-10-10 起这条路径**有测试钉住**：`tests/batch_parity.rs::fp16_batch_path_reports_reason_not_silently` 用同架构的 `router-0.1B.st` / `router-0.1B-int8.st` 对拍 —— fp16 侧批量 prefill 必须成功且**逐槽与单流口径一致**（证明不是静默垃圾）、批量 decode 必须返回**写明需要 int8** 的错误（不许静默产出垃圾、不许 panic）、单流路径必须照常可用，int8 侧批量 prefill 必须成功，这样「换量化权重就能救」这个结论才是被验证过的。
+- **Vulkan 没有低秩 / FFN value 链的批量张量核 GEMM**（`lowrank_gemm_batch` / `ffn_value_gemm_batch` 只有 CUDA 实现）：其余批量张量核算子（head/out/key/val）**默认就是开的**（`VK_IMMA_OPS` = 除 rkv 外全开）。Vulkan 侧的张量核 r/k/v 变体实测**净亏 3.3×**，默认关闭（`imma_op_on("rkv") == false`；基础设施保留，`VK_IMMA_OPS=...,rkv` 可复现）—— 本机驱动上每多排一次 dispatch 的固定代价（含 buffer 级 barrier 全量失效）大于 kernel 省下的时间，每步 43ms 落在 dispatch **之间**。后果：大批量下 CUDA 默认路径领先约 1.2×（B=8）~ 2.1×（B=32），2026-10-10 同会话交错实测到 B=256 是 **3.8×**（见 §6.1）；要关闭它需要的是**更少更大的 Vulkan dispatch**，而不是更多。当前达成持平的是「Vulkan SIMT 融合核 vs CUDA SIMT 口径」这一对。
+- ~~**Vulkan 张量核 GEMM 只支持 batch ≤ 64**~~ —— **是 bug，已修（2026-10-10）**。`imma_ok` 里写死的 `(1..=64).contains(&batch)` 让 **B>64 整条静默回落 SIMT**：代价不是「rkv 回落 SIMT」（rkv 默认本来就不走 IMMA，见 `imma_op_on`），而是 **head/out/key/val 四条张量核 GEMM 一起被关掉**，其中 head（vocab 65536×2560）是单层最大的一块矩阵乘 ⇒ 吞吐塌到与 B=1 同量级的平台。实测断崖：B=64 张量核 **934.4** tok/s，旧门下 B=80 **430.7** / B=96 **429.2**（对照 `VK_IMMA=0` 强制无 IMMA 的 B=64 = **436.5** ⇒ 差异 100% 由门造成）。多波（`grid.z = ceil(batch/(8·NST))`）在 shader 里**早就写好了**（装载 `s0base + (i>>5) < BATCH`、写回 `slot >= BATCH` 双守卫），只是从未被执行。放开门后连带两处尺寸 bug 一起暴露并修掉：`WorkBuffers` 的 `xb_q`/`xb_aux` 写死 `bsz.min(64)`（量化内核按全局槽号写满 `bsz` 行 ⇒ 第二波越界写，B=128 实测 `ERROR_DEVICE_LOST`）；`imma_partial` **不能**按 `bsz` 配（`imma_ksplit` 在 `ks·batch·m > cap` 时会缩 `ks`，按 `bsz` 预留反而在 B=256 多要 63 MiB ⇒ `ERROR_OUT_OF_DEVICE_MEMORY`）。修后（正式会话中位数）B=96 **913.2**、B=128 **967.4**、B=256 **988.5** tok/s，即 **2.1×~2.3×**。守门用例：`tests/batch_parity.rs::slots_beyond_the_first_wave_match`（72 槽跨波边界 × 贪心逐位一致）。
 - **精度增强后路**：校准加权 k-means、G=64 提高元数据密度。
 
 ## 10. License

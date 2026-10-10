@@ -26,3 +26,5 @@ __pycache__/
 
 # Embedded reference repo (Albatross; tracked separately upstream)
 /参考/Albatross
+# 基准原始读数（JSONL 派生产物，可由 examples/bench_ab / batch_decode_bench 重新生成）
+/bench

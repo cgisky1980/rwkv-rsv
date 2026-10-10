@@ -19,6 +19,15 @@
 //!    与理由写在 [`cross_backend_batch_paths_agree`] 上。
 //! 6. **设备内状态分发**：`state_slot_broadcast` 与「`state_slot_back` + `state_slot_load`」
 //!    的宿主往返必须逐位相同，且只动目标槽（会话 fork / 同 prompt 多路采样走的就是这条）。
+//! 7. **长度桶预热**：`warmup_len_buckets` 是纯性能路径，预热过 / 没预热过的 seeds 与
+//!    贪心 token 必须逐位一致（否则就是把首请求的代价换成了错的结果）。
+//! 8. **fp16 模型的批量路径**：批量 prefill 必须可用且逐槽与单流口径一致（证明不是静默垃圾）；
+//!    批量 **decode** 必须返回**带原因**的错误（缺 int8 句柄）而不是静默降级或崩；
+//!    同架构 int8 模型批量必须可用，才证明归因落在权重格式上。
+//!    ⚠️ 本用例初版把「没有批量 decode」写成了「没有批量前向路径」并据此断言 prefill 也该报错，
+//!    两后端实测都把它推翻了（详见该用例 doc）。
+//! 9. **跨波槽位**：批宽超过一个 tensor-core 波（`8·NST`=64 槽）时，第二波、第三波的槽必须
+//!    与第一波逐位一致（全槽同 prompt + 贪心，零容差）——动 batch 门/tile 形状时的守门用例。
 //!
 //! 模型/词表文件缺失或建不出后端时，用例**显式跳过**（打印原因，不算失败）——没有 GPU
 //! 权重的 CI 也能跑这份测试文件。
@@ -417,7 +426,9 @@ fn cross_backend_batch_paths_agree() {
         return;
     }
     let _guard = gpu_lock();
-    let mut per_backend: Vec<(&'static str, (u64, u64))> = Vec::new();
+    /// `(后端名, (sum, xor), 各槽 token 序列)`
+    type BackendRun = (&'static str, (u64, u64), Vec<Vec<u32>>);
+    let mut per_backend: Vec<BackendRun> = Vec::new();
     for (name, kind) in [("cuda", BackendKind::Cuda), ("vulkan", BackendKind::Vulkan)] {
         let Some((mut model, tokenizer)) = try_load_kind(kind) else {
             return;
@@ -436,10 +447,10 @@ fn cross_backend_batch_paths_agree() {
         }
         let fp = fingerprint(&looped);
         eprintln!("[{name}] greedy tokens sum={:x} xor={:x}", fp.0, fp.1);
-        per_backend.push((name, fp));
+        per_backend.push((name, fp, looped));
         drop(model);
     }
-    let (a, b) = (per_backend[0], per_backend[1]);
+    let (a, b) = (&per_backend[0], &per_backend[1]);
     eprintln!(
         "[跨后端报告] {}={:x}/{:x} vs {}={:x}/{:x} => {}",
         a.0,
@@ -453,5 +464,335 @@ fn cross_backend_batch_paths_agree() {
         } else {
             "分叉（预期：跨后端不保证逐位一致）"
         }
+    );
+    // **分叉定位**：只报「分叉」没用，要报**从第几步分叉**——这才区分得开两种成因：
+    // 首步（step 0）就分叉 = 前向/logits 层面就不一致（数值口径没对齐，值得查）；
+    // 首步一致、后面才分叉 = 前向数值相邻、采样把罕见的单点翻转放大成序列分叉
+    // （README §6.1 记的就是这种，属预期行为，不是缺陷）。
+    if a.1 != b.1 {
+        let mut first_divergence = usize::MAX;
+        let mut diverged_slots = 0usize;
+        let mut diverged_tokens = 0usize;
+        for s in 0..SLOTS {
+            let (x, y) = (&a.2[s], &b.2[s]);
+            let n = x.len().min(y.len());
+            let mut d = 0usize;
+            while d < n && x[d] == y[d] {
+                d += 1;
+            }
+            if d < n || x.len() != y.len() {
+                diverged_slots += 1;
+                diverged_tokens += n - d;
+                first_divergence = first_divergence.min(d);
+            }
+        }
+        eprintln!(
+            "[跨后端分叉定位] 首个分叉步={first_divergence}（0 = 前向层面就不一致）\
+             分叉槽={diverged_slots}/{SLOTS} 分叉 token={diverged_tokens}/{}\
+             长度 {} vs {}",
+            SLOTS * NTOK,
+            a.2.iter().map(|v| v.len()).sum::<usize>(),
+            b.2.iter().map(|v| v.len()).sum::<usize>(),
+        );
+    }
+}
+
+/// 长度桶预热**不得改变结果**（改进项 8 的预热那半）。
+///
+/// `warmup_len_buckets` 干的事是把 `SeqBuffers`（按 `bt = 批量 × T_pad` 定容的 45 个缓冲）
+/// 提前建好，让首个真实请求不付整表重建的代价。这是纯性能路径，所以判据只有一条：
+/// 预热过 / 没预热过，同一批 prompt 的 seeds 与贪心 token 序列必须**逐位一致**
+/// （预热用的提示词是 `t_pad` 本身，与真实请求同宽 ⇒ 命中同一个 `bt`）。
+/// 顺带打印每桶耗时，供「值不值得在启动期付」的判断；时间不断言（本机 ±3% 常态）。
+#[test]
+fn warmup_buckets_do_not_change_results() {
+    let _guard = gpu_lock();
+    let Some((mut model, tokenizer)) = try_load() else {
+        return;
+    };
+    let (batch, _) = prompts(&tokenizer);
+    let pad_to = batch.iter().map(|p| p.len()).max().unwrap();
+    let sp = sampler(1, 0.0);
+
+    // 对照：从不预热的 state。
+    let mut s_cold = model.create_batch_state(SLOTS).unwrap();
+    let seeds_cold = model
+        .forward_seq_batch_padded(&mut s_cold, &batch, pad_to)
+        .unwrap();
+    let tok_cold = run_selfloop(&mut model, &mut s_cold, &batch, pad_to, &sp);
+
+    // 预热多个桶（含一个比 pad_to 更长的，模拟真实服务里的长 prompt 桶）。
+    let mut s_warm = model.create_batch_state(SLOTS).unwrap();
+    let buckets = [pad_to, pad_to + 37, 0usize];
+    let t0 = std::time::Instant::now();
+    let costs = model.warmup_len_buckets(&mut s_warm, &buckets).unwrap();
+    let warm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(
+        costs.len(),
+        2,
+        "warmup_len_buckets 应跳过 t_pad<1 的桶，其余逐桶给耗时"
+    );
+
+    let seeds_warm = model
+        .forward_seq_batch_padded(&mut s_warm, &batch, pad_to)
+        .unwrap();
+    assert_eq!(
+        seeds_cold, seeds_warm,
+        "预热后同批 prompt 的 seeds 必须与未预热逐位一致"
+    );
+    let tok_warm = run_selfloop(&mut model, &mut s_warm, &batch, pad_to, &sp);
+    assert_eq!(
+        tok_cold, tok_warm,
+        "预热不得改变贪心 token 序列（逐槽逐 token）"
+    );
+    let per: Vec<String> = costs
+        .iter()
+        .map(|(t, ms)| format!("{t}tok:{ms:.1}ms"))
+        .collect();
+    eprintln!(
+        "[BUCKET] 预热 {} 个桶共 {warm_ms:.1} ms（{}）—— 这笔开销从首请求挪到启动期",
+        costs.len(),
+        per.join(" ")
+    );
+}
+
+/// fp16 模型走**批量 decode** 时**必须给出带原因的错误**，而不是静默降级或崩（改进项 4）。
+///
+/// 事实口径（2026-10-10 实测订正，两后端一致）：批量前向分两段，只有 decode 段要 int8——
+/// 批量 **prefill** 走 seq 并行核，读 fp16/fp32 权重照常工作；批量 **decode** 的融合 r/k/v 核
+/// 只有 int8 变体（`gemv_int8_rkv_stage1_batch`），走到那里返回
+/// `batch 并发路径要求 r/k/v 为 int8 量化权重（fp16 模型暂不支持）`。
+/// 所以本用例钉四条：① 批量 prefill 可用，且**每槽状态与单流逐位一致**（两后端实测
+/// `to_bits` 全等 ⇒ 「pad 行不进 state」这条契约成立，证明它不是静默垃圾）；
+/// ② `forward_seq_batch_padded` 的返回值是**各槽提示词的末 token**（解码种子），
+///    **不是** next-token 预测——本用例初版把它当成预测值去比单流 argmax，两后端都「失败」，
+///    那是用例口径错，不是路径 bug（种子 `[11098,16417]` vs 单流 next `[19137,10080]`）；
+/// ③ 批量 decode 显式拒绝且原因写明 int8；④ 同架构 int8 模型批量可用（归因落在权重格式）。
+/// 这条 API 存在的意义就是让消费方**一眼分清**两种前提失败：
+/// 「后端缺批量算子」（只能升级后端）vs「模型没有 int8 句柄」（换量化权重即可）——
+/// 裸 bool 会让客户端池静默回落到逐槽串行，事后无从判断该改哪边。
+///
+/// ⚠️ 早前的 README 与本用例口径都写成「fp16 模型没有批量前向路径」，把 prefill 也说成了
+/// 不行；消费方照那句决策会连批量 prefill 都退成逐槽串行。
+///
+/// 用 `router-0.1B.st` / `router-0.1B-int8.st`（同架构、加载快）；缺文件则显式跳过。
+/// 单流路径在 fp16 上必须照常工作 —— 这是「换 int8 权重」这条指引成立的前提。
+///
+/// ⚠️ 这是本文件**最慢**的一个测试：两次 `CudaBackend::new()` 的首次 NVRTC 内核编译占了几乎
+/// 全部时间（模型本身只有 0.1B，加载几秒）。它测的是**拒绝路径的口径**，与吞吐无关，
+/// 只想跑批量对拍时用 `--skip fp16_batch_path` 跳过。Vulkan 后端没有 NVRTC，明显更快。
+#[test]
+fn fp16_batch_path_reports_reason_not_silently() {
+    let _guard = gpu_lock();
+    let vocab_path = std::env::var("VOCAB_JSON").unwrap_or_else(|_| DEFAULT_VOCAB.to_string());
+    let dir = Path::new(&DEFAULT_MODEL).parent().map(|p| p.to_path_buf());
+    let Some(dir) = dir else { return };
+    let fp16 = std::env::var("FP16_MODEL")
+        .unwrap_or_else(|_| dir.join("router-0.1B.st").display().to_string());
+    let int8 = std::env::var("INT8_SMALL_MODEL")
+        .unwrap_or_else(|_| dir.join("router-0.1B-int8.st").display().to_string());
+    if !Path::new(&fp16).exists() || !Path::new(&int8).exists() || !Path::new(&vocab_path).exists()
+    {
+        eprintln!("SKIP: 缺少 fp16/int8 小模型或词表（{fp16} / {int8}）");
+        return;
+    }
+    let kind = detect_backend();
+    let vocab = std::fs::read_to_string(&vocab_path).unwrap();
+    let tokenizer = Tokenizer::new(&vocab).unwrap();
+    let (batch, _) = prompts(&tokenizer);
+    let two = &batch[..2];
+    let pad_to = two.iter().map(|p| p.len()).max().unwrap();
+
+    // —— fp16：批量路径报「需要 int8」，单流路径照常 ——
+    let mut m = GpuModel::from_safetensors(create_backend(kind).unwrap(), &fp16).unwrap();
+    assert!(
+        !m.supports_batch_decode(),
+        "fp16 模型不应报告支持批量并发路径"
+    );
+    let blocker = m
+        .batch_decode_blocker()
+        .expect("fp16 模型的 blocker 必须有内容");
+    eprintln!("[FP16] blocker = {blocker}");
+    assert!(
+        blocker.contains("int8"),
+        "fp16 模型的阻塞原因必须指向 int8 权重（而不是后端缺算子），实测：{blocker}"
+    );
+    let mut single = m.create_state().unwrap();
+    let argmax = |l: &[f32]| -> u32 {
+        l.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(u32::MAX)
+    };
+    // 单流逐槽的参照值：下一 token（argmax）**加上整份状态**。每次从零态起步，槽间互不串味。
+    let mut next_single = Vec::with_capacity(2);
+    let mut state_single: Vec<Vec<f32>> = Vec::with_capacity(2);
+    for p in two {
+        m.reset_state_of(&single).unwrap();
+        let logits = m
+            .forward_seq_with_state(&mut single, p)
+            .expect("fp16 模型的单流路径必须可用（否则「换 int8 权重」这条指引无意义）");
+        assert_eq!(
+            logits.len(),
+            m.info().num_vocab,
+            "单流 logits 长度应为词表大小"
+        );
+        next_single.push(argmax(&logits));
+        state_single.push(m.state_back(&single).expect("单流状态下载必须可用"));
+    }
+    // 实测口径（2026-10-10，两后端一致）：要求 int8 的是**批量 decode** 的融合 r/k/v 核
+    // （`forward_layer_batch`），而**批量 prefill** 走 seq 并行核、读 fp16/fp32 权重照常工作。
+    // 早前 README/本用例把这条写成「fp16 没有批量前向路径」，是把 prefill 也说成了不行——
+    // 消费方照那句做决策会连批量 prefill 都回退成逐槽串行。
+    match m.create_batch_state(2) {
+        Ok(mut bstate) => {
+            m.reset_state_of(&bstate).unwrap();
+            let seeds = m
+                .forward_seq_batch_padded(&mut bstate, two, pad_to)
+                .expect("fp16 模型的批量 prefill 应可用（seq 并行核不依赖 int8 句柄）");
+            // ★ 返回值是**各槽提示词的末 token**（解码种子），不是 next-token 预测。
+            // 本用例初版把它当成预测值去和单流 argmax 比，两边必然不同——那是**用例的口径错**，
+            // 不是路径的 bug（两后端读数一致：种子 = 提示词末位）。
+            let last_tok: Vec<u32> = two.iter().map(|p| *p.last().unwrap()).collect();
+            assert_eq!(
+                seeds, last_tok,
+                "批量 prefill 必须返回各槽提示词的末 token 作为解码种子"
+            );
+            // 「不是静默垃圾」的真正判据在这里：**批量 prefill 之后每槽的状态**必须与单流逐槽
+            // 一致。「pad 行不进 state」这条契约比种子看不见、比长度看不见，只有比状态看得见。
+            for (i, a) in state_single.iter().enumerate() {
+                let b = m
+                    .state_slot_back(&bstate, i)
+                    .expect("批量状态单槽下载必须可用");
+                assert_eq!(
+                    b.len(),
+                    a.len(),
+                    "slot {i}：单流与批量槽状态的布局长度必须一致（slot_back/slot_load 的契约）"
+                );
+                let bitwise = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+                let max_abs = a
+                    .iter()
+                    .zip(&b)
+                    .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+                let scale = a.iter().fold(0f32, |acc, x| acc.max(x.abs())).max(1e-6);
+                let rel = max_abs / scale;
+                eprintln!(
+                    "[FP16] slot {i} 批量 vs 单流状态：逐位一致={bitwise} max_abs={max_abs:.3e} rel={rel:.3e}"
+                );
+                assert!(
+                    bitwise,
+                    "slot {i}：批量 prefill 之后的状态必须与单流**逐位**一致（2026-10-10 两后端实测全等）；\
+                     现在 max_abs={max_abs:.3e} rel={rel:.3e} ⇒ prefill 的数值口径变了，先归因再谈放宽"
+                );
+            }
+            eprintln!(
+                "[FP16] 批量 prefill OK seeds={seeds:?}（=提示词末位）；单流 next={next_single:?}；\
+                 状态与单流对齐见上面逐槽读数"
+            );
+            // `SelfloopTicket` 没有 Debug，所以拿不到 `expect_err`（它要求 Ok 侧可调试）。
+            match m.submit_sample_selfloop_batch(&mut bstate, &seeds, 4, &sampler(1, 0.0)) {
+                Err(err) => assert!(
+                    err.to_string().contains("int8"),
+                    "fp16 模型的批量 decode 必须显式拒绝且原因写明 int8（不许静默产出垃圾），\
+                     实际: {err}"
+                ),
+                Ok(_) => panic!("fp16 模型的批量 decode 竟然成功了——门控失效或被绕过"),
+            }
+            eprintln!("[FP16] 批量 decode 显式拒绝 ✓");
+        }
+        Err(e) => assert!(
+            e.to_string().contains("int8"),
+            "批量状态都建不起来，但原因必须写明，实际: {e}"
+        ),
+    }
+
+    // —— int8（同架构）：批量路径可用，证明确实是权重格式这一条前提在起作用 ——
+    let mut m2 = GpuModel::from_safetensors(create_backend(kind).unwrap(), &int8).unwrap();
+    if !m2.supports_batch_decode() {
+        // 后端本身没有批量算子时，fp16 侧的 blocker 会是「后端缺算子」而不是「缺 int8」，
+        // 上面那条断言已经把这种情形挡掉了；这里只做 int8 侧的说明性跳过。
+        eprintln!("SKIP: 该后端未实现批量算子，int8 侧对照不做归因结论");
+        return;
+    }
+    let mut s2 = m2.create_batch_state(2).unwrap();
+    m2.reset_state_of(&s2).unwrap();
+    let seeds = m2
+        .forward_seq_batch_padded(&mut s2, two, pad_to)
+        .expect("int8 模型的批量 prefill 应成功");
+    assert_eq!(seeds.len(), 2);
+    eprintln!("[INT8] 批量 prefill OK seeds={seeds:?}");
+}
+
+/// 9：**批宽跨过「一波」边界时，第二波的槽必须和第一波算得一模一样**（改进项 5 的守门用例）。
+///
+/// 为什么要单独钉这条：Vulkan 的 W8A8 张量核 GEMM 每 block 只覆盖 `8·NST` 个槽（NST 构建期
+/// 只编 1/2/4/8 四档 ⇒ 一波 64 槽），批宽超过一波时靠 `grid.z = ceil(batch / (8·NST))` 起
+/// 第二波、第三波。CUDA 侧也是按 BM/BN tile 分块。**波与波之间唯一的差别就是槽行的地址偏移**，
+/// 一旦某处的行步长用了「本波内槽号」而不是「全局槽号」，后果是批宽 ≤64 时全对、>64 时后半
+/// 槽静默错——正是最难被吞吐基准发现、又最容易在上线后被用户报出来的那类 bug（2026-10-10 的
+/// 同会话扫描实测：Vulkan 每步耗时 B=64 68ms → B=128 299ms，因为 `imma_ok` 的 batch 门把
+/// >64 整段踢回 SIMT 反量化路径；把门放开就是在动这段形状，所以先把这条钉上）。
+///
+/// 判据不含任何数值容差：**全槽同 prompt + 同 seed + 贪心（`top_k=1`）** ⇒ 每条槽是同一份计算
+/// 的 72 份拷贝，token 序列必须逐位相同。72 = 64 + 8 ⇒ 第二波是**不满波**，越界读写也一并覆盖。
+/// 贪心是这里唯一正确的判读口径：随机采样连跑两遍都做不到逐 token 复现（见用例 4 的 ★ 注）。
+#[test]
+fn slots_beyond_the_first_wave_match() {
+    const WAVE_SLOTS: usize = 72;
+    const PAD_TO: usize = 96;
+    let _gpu = gpu_lock();
+    let Some((mut model, tokenizer)) = try_load() else {
+        eprintln!("SKIP: 模型或后端不可用，跨波槽位对拍跳过");
+        return;
+    };
+
+    // 同一条 prompt 喂满所有槽：任何槽间差异都只可能来自寻址，不可能来自输入。
+    let toks = tokenizer
+        .encode(PROMPTS[0].repeat(2).as_bytes())
+        .expect("中文提示词必须能编码");
+    let seed = *toks.last().unwrap();
+    let prompt = toks[..toks.len() - 1].to_vec();
+    let prompts: Vec<Vec<u32>> = vec![prompt; WAVE_SLOTS];
+    let feeds = vec![seed; WAVE_SLOTS];
+
+    let mut state = match model.create_batch_state(WAVE_SLOTS) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SKIP: {WAVE_SLOTS} 槽批量状态建不出来（显存不足？），跳过: {e}");
+            return;
+        }
+    };
+    model.reset_state_of(&state).unwrap();
+    model
+        .forward_seq_batch_padded(&mut state, &prompts, PAD_TO)
+        .unwrap();
+
+    let sp = sampler(1, 0.0);
+    let ticket = model
+        .submit_sample_selfloop_batch(&mut state, &feeds, NTOK, &sp)
+        .unwrap();
+    let outs = model
+        .collect_sample_selfloop_batch(ticket, WAVE_SLOTS)
+        .unwrap();
+
+    let bad: Vec<usize> = (0..WAVE_SLOTS).filter(|&s| outs[s] != outs[0]).collect();
+    if !bad.is_empty() {
+        // 把「从哪一槽开始分叉」打出来：≥64 说明是第二波，<64 说明与波无关（另一类 bug）。
+        eprintln!(
+            "分叉槽: {:?}（首波边界 64）槽0={:?} 分叉槽={:?}",
+            bad, outs[0], outs[bad[0]]
+        );
+    }
+    assert!(
+        bad.is_empty(),
+        "{WAVE_SLOTS} 槽同输入同贪心，必须逐位一致；实际 {}/{} 槽分叉，首个分叉槽 {}（波边界 64）",
+        bad.len(),
+        WAVE_SLOTS,
+        bad[0],
+    );
+    eprintln!(
+        "[WAVE] {WAVE_SLOTS} 槽 × {NTOK} 步贪心逐位一致（首 token {}）",
+        outs[0][0]
     );
 }

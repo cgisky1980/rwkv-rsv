@@ -286,7 +286,9 @@ fn batch_decode_blocker(backend_has_batch_ops: bool, rkv_is_int8: bool) -> Optio
         return Some("后端未实现 batch 并发算子（supports_batch_decode=false）");
     }
     if !rkv_is_int8 {
-        return Some("模型 r/k/v 无 int8 句柄（fp16 模型没有批量前向路径）");
+        return Some(
+            "模型 r/k/v 无 int8 句柄（fp16 模型可批量 prefill，但批量 decode 需要 int8 权重）",
+        );
     }
     None
 }
@@ -310,6 +312,10 @@ struct SelfloopBufs {
     kind: u64,
     batch: usize,
     n: usize,
+    /// 当前绑在这张图上的 `State::uid()`；0 = 条目刚建、还没绑过任何 State。
+    /// 形状 key 里没有 State 身份（u64 只有 2 bit 留给 kind，塞不下），所以由这里记账：
+    /// 绑定的 State 一变，`selfloop_key_for_state` 就作废该 kind 的全部已捕获图并重捕获。
+    state_uid: u64,
     temp: TensorId,      // [batch, vocab]
     mask: TensorId,      // [batch, vocab]
     counter: TensorId,   // [batch, vocab] u32
@@ -319,6 +325,8 @@ struct SelfloopBufs {
 }
 
 impl SelfloopBufs {
+    /// 形状 key（图缓存的键）。**不要直接拿去捕获/重放**——同一形状换 State 必须先作废旧图，
+    /// 走 [`GpuModel::selfloop_key_for_state`]。
     fn key(&self) -> u64 {
         selfloop_shape_key(self.kind, self.batch, self.n)
     }
@@ -952,7 +960,7 @@ impl GpuModel {
             // 之后每 token 重放，消除 258 次/层的 cuLaunchKernel 启动开销。
             // **每个形状只捕获一次**，此后跨 submit 永久重放（原先每段重捕获）。
             // 每轮重放前更新 seed/hist_len，sample kernel 在重放时读取最新设备参数。
-            let key = b.key();
+            let key = self.selfloop_key_for_state(&b, state);
             let graph_ok = self.ensure_selfloop_graph(key, |m| {
                 m.sample_selfloop_step(
                     state,
@@ -1112,8 +1120,16 @@ impl GpuModel {
 
     /// 该模型是否支持 batch 并发解码路径。两个条件同时满足：
     /// 1. 后端实现了 `*_batch` 算子（`ComputeBackend::supports_batch_decode`）；
-    /// 2. r/k/v 为 int8 量化权重（批量 r/k/v kernel 只有 int8 变体；fp16 模型只有
-    ///    单序列 `gemv_rkv_stage1`，故无批量前向路径）。
+    /// 2. r/k/v 为 int8 量化权重（批量 decode 的融合 r/k/v kernel 只有 int8 变体
+    ///    `gemv_int8_rkv_stage1_batch`；fp16 模型只有单序列 `gemv_rkv_stage1`）。
+    ///
+    /// ⚠️ 前提 2 只管**批量 decode**：`forward_seq_batch_padded`（批量 prefill）走 seq
+    /// 并行核、读 fp16/fp32 权重照常工作（2026-10-10 两后端实测：批量 prefill 之后每槽的
+    /// **state 与单流逐位一致**，见 `tests/batch_parity.rs::fp16_batch_path_reports_reason_not_silently`）。
+    /// 注意别把那条判断写成「与单流 argmax 一致」——批量 prefill 的返回值是各槽提示词的
+    /// **末 token（解码种子）**，不是下一 token 预测，拿它和单流的下一 token 比是口径错误。
+    /// 所以 `false` 的含义是「不能多路并行 decode」，不是「批量布局全不可用」——
+    /// 消费方若照后者决策会白付逐槽串行的代价。
     ///
     /// 缺条件 1 时若仍返回 true，调用方会选批量路径并在运行期拿到 Err（历史门控 bug）。
     pub fn supports_batch_decode(&self) -> bool {
@@ -1373,6 +1389,49 @@ impl GpuModel {
         }
         self.prefill_state = Some((w, sub));
         Ok(seeds)
+    }
+
+    /// 长度桶预热：对每个 `t_pad` 走一次「同宽、单 token 提示词」的批量 prefill，
+    /// 把该桶的一次性代价从**首个真实请求**挪到**启动期**。
+    ///
+    /// **代价是什么**：`SeqBuffers` 按 `bt = 批量 × T_pad` 定容（45 个 `[bt, ·]` 缓冲）。
+    /// 每换一个长度，`take_seq_bufs` 就 `clear_cache()` + 整表释放重分配；用户看到的
+    /// 现象是「每换一种长度的第一个请求特别慢」。固定 `pad_to` 能绕开，但那是拿显存
+    /// 换延迟（短 prompt 也按最长算），不一定划算 —— 所以给池化服务一条显式预热路径。
+    ///
+    /// **口径**：预热用的是 `t_pad` 本身（提示词 1 token，`t_pad = max(pad_to, 1)`），
+    /// 与真实请求同宽时命中的是**同一个 `bt`**，缓冲不再重建。
+    /// 每桶结束后 `reset_state_of`，不留残余状态；返回每桶耗时（毫秒）供调用方记账。
+    ///
+    /// ★ **缓冲是单槽的**：`seq_bufs` 只存一份，预热列表里**只有最后一个桶**留在显存里，
+    /// 前面的桶会被下一次重建顶掉。所以这条 API 适用于「池子固定一个 `pad_to`，启动期把
+    /// 该桶建好」；跨桶抖动（长度来回变）每次都要重建，预热救不了 —— 那种场景要么固定
+    /// `pad_to`，要么按桶各留一个 `GpuModel`。`examples/batch_decode_bench.rs` 的
+    /// `BUCKET_BENCH=1` 量的是这三档（冷桶首请求 / 预热后首请求 / 同桶重复）。
+    ///
+    /// 结果不变性由 `tests/batch_parity.rs` 的 `warmup_buckets_do_not_change_results` 钉：
+    /// 预热过 / 没预热过，同一批 prompt 的 seeds 与贪心 token 必须逐位一致。
+    pub fn warmup_len_buckets(
+        &mut self,
+        state: &mut State,
+        t_pads: &[usize],
+    ) -> R<Vec<(usize, f64)>> {
+        let batch = state.batch();
+        if batch == 0 {
+            return Err("warmup_len_buckets: state.batch()==0".into());
+        }
+        let mut out = Vec::with_capacity(t_pads.len());
+        for &t in t_pads {
+            if t < 1 {
+                continue;
+            }
+            let dummy: Vec<Vec<u32>> = vec![vec![0u32; 1]; batch];
+            let t0 = std::time::Instant::now();
+            self.forward_seq_batch_padded(state, &dummy, t)?;
+            self.reset_state_of(state)?;
+            out.push((t, t0.elapsed().as_secs_f64() * 1000.0));
+        }
+        Ok(out)
     }
 
     /// 批量 mean-hidden 特征提取：batch prefill 全层前向后，对每 slot 的末层残差
@@ -2013,6 +2072,7 @@ impl GpuModel {
             kind,
             batch,
             n,
+            state_uid: 0,
             temp,
             mask,
             counter,
@@ -2022,6 +2082,42 @@ impl GpuModel {
         };
         self.selfloop_bufs.push(bufs.clone());
         Ok(bufs)
+    }
+
+    /// 取「这份 State 现在可以用的」self-loop 图 key。
+    ///
+    /// 图里烘焙的是 **State 各张量的设备指针**，而形状 key 只有 `(kind, batch, n)`——所以同一
+    /// 实例上换一个同宽 State，若不作废就会重放**另一份状态**的图（静默算错，无日志）。
+    /// 这里记账并收口：绑定的 `State::uid()` 一变，就作废该 kind 的全部已捕获图（它们全是
+    /// 按旧 State 捕获的），让下一次 `ensure_selfloop_graph` 按新 State 重新捕获。
+    ///
+    /// 代价：同一实例上**交替**使用多个同宽 State 时，每段都要重捕获一次（约一次
+    /// stream 同步 + instantiate）。常规用法不会走到这条路：一个实例配一份状态
+    /// （多会话并发是 `build_shared()` 每实例私有状态），单实例单 State 时 uid 恒定，
+    /// 捕获仍然每形状一次。慢比错强，且这是修好之前**唯一**正确的行为。
+    fn selfloop_key_for_state(&mut self, bufs: &SelfloopBufs, state: &State) -> u64 {
+        let uid = state.uid();
+        if bufs.state_uid != uid {
+            if bufs.state_uid != 0 {
+                log::debug!(
+                    "self-loop 换 State（kind={} batch={} n={}：{:#x} → {:#x}），作废该 kind 的已捕获图",
+                    bufs.kind,
+                    bufs.batch,
+                    bufs.n,
+                    bufs.state_uid,
+                    uid
+                );
+                self.backend.clear_selfloop_graphs(Some(bufs.kind));
+            }
+            if let Some(e) = self
+                .selfloop_bufs
+                .iter_mut()
+                .find(|e| e.kind == bufs.kind && e.batch == bufs.batch && e.n == bufs.n)
+            {
+                e.state_uid = uid;
+            }
+        }
+        bufs.key()
     }
 
     /// 捕获该形状的 self-loop 图（若尚未捕获）。
@@ -2060,13 +2156,32 @@ impl GpuModel {
     /// W8A8 int8 张量核（`gemm_imma.comp`）的门控：设备能力 + 形状约束。
     /// 形状约束来自 shader 里写死的 tile 布局（BM = 64/128 行、BN=8 槽、BK=128=量化组宽）。
     /// `VK_IMMA=0` 可强制回退到 SIMT 反量化路径（做 A/B 用；`VK_IMMA_BM=128` 切大 tile）。
+    ///
+    /// **批宽不设上限**（2026-10-10 改掉；此前这里是 `(1..=64).contains(&batch)`）：
+    /// 每 block 覆盖 `8·NST` 个槽，NST 构建期只编 1/2/4/8 四档 ⇒ 一波 64 槽；批宽超过一波时
+    /// 由 `grid.z = ceil(batch / (8·NST))` 起第二波、第三波（装载 `s0base + (i>>5) < BATCH`、
+    /// 写回 `slot >= BATCH` 双守卫在 shader 里**早就写好了**，只是旧门让它从未被执行）。
+    ///
+    /// ⚠️ 旧门的代价不是「rkv 回落 SIMT」——rkv 默认就不走 IMMA（见 `imma_op_on`），
+    /// 而是 **head/out/key/val 四条张量核 GEMM 一起被关掉**，其中 head（vocab 65536×2560）
+    /// 是单层最大的一块矩阵乘。所以 B>64 的读数直接塌到「完全没有 IMMA」那一档：
+    /// 同口径实测（NTOK=32 SEGS=4 PAD_TO=512，`rwkv7-3B-int8.st`）张量核 B=64 **934.4** tok/s，
+    /// 旧门下的 B=80 **430.7**、B=96 **429.2**、B=128 **428.4**、B=256 **426.2**（后两档为
+    /// 3 轮交错 A/B 中位数）；对照 `VK_IMMA=0` 强制无 IMMA 的 B=64 **436.5**、B=128 **422.8**
+    /// ⇒ 旧门读数与「无 IMMA」同量级，断崖 100% 由这条门造成。
+    ///
+    /// 修后同参数：B=96 **913.2**、B=128 **967.4**、B=256 **988.5** tok/s（3 轮交错 A/B 中位数，
+    /// 门控见 README §6.1 表头）。**每步耗时仍与波数成正比**（一波 = 权重整读一次，64–68 ms/步），
+    /// 这是改进项 5 剩下的「一波覆盖更多槽（`IM_NST` 16/32 档）」这条杠杆，量化判据见
+    /// [参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md](../参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md) §11。
+    /// 跨波槽位寻址的正确性由 `tests/batch_parity.rs::slots_beyond_the_first_wave_match` 钉
+    /// （72 槽 = 满波 64 + 不满波 8，全槽同 prompt + 贪心逐位一致）。
     fn imma_ok(&self, m: usize, k: usize, batch: usize) -> bool {
         std::env::var("VK_IMMA").map(|v| v != "0").unwrap_or(true)
             && self.backend.supports_int8_imma()
             && m.is_multiple_of(64)
             && k.is_multiple_of(128)
-            // 每 block 覆盖 `8·NST ≤ 64` 个槽（构建期只编了 NST ∈ {1,2,4,8}）
-            && (1..=64).contains(&batch)
+            && batch > 0
     }
 
     /// `VK_IMMA_OPS`：逗号分隔的白名单（`key,out,val,head`），默认全开。
@@ -2625,9 +2740,18 @@ impl GpuModel {
     }
 
     /// batch 采样 self-loop：B 个 slot 在**同一 GpuModel/同一 batch State** 上并发
-    /// 生成各 n 个 token——一次读权重算 B 份（weight-bound 场景吞吐 ≈ ×B）。
+    /// 生成各 n 个 token——权重共享，所以吞吐随 B 上升，但**不是 ×B**：每步仍有
+    /// `ceil(B/一波槽数)` 次权重整读与固定 dispatch 开销。3B int8 / RTX 2080 Ti 实测
+    /// （B=256 相对 B=1）：**CUDA ×40.8、Vulkan ×12.5**，Vulkan 从 B=64 起基本走平
+    /// （935 → 988 tok/s 对应 B 翻 4 倍）。机理与数据见 README §6.1 与
+    /// [参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md](../参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md) §11。
     /// CUDA graph 捕获一轮 batch 前向后逐轮重放，seed 经 pinned 宽行异步更新。
-    /// `seeds`：每 slot 首个 token（如 prompt 末 token）；返回 ticket 供 collect。
+    /// `seeds`：每 slot 首个 token（如 prompt 末 token，即 `forward_seq_batch_padded` 的返回值）；
+    /// 返回 ticket 供 collect。
+    ///
+    /// ⚠️ 前提 `supports_batch_decode()`：本方法是**批量 decode**，融合 r/k/v 核只有 int8
+    /// 变体，fp16 模型在此返回 Err（原因见 `batch_decode_blocker()`）。fp16 模型并非「批量全不可用」——
+    /// 批量 prefill（`forward_seq_batch_padded`）照常工作。
     #[allow(clippy::too_many_arguments)]
     pub fn submit_sample_selfloop_batch(
         &mut self,
@@ -2695,7 +2819,7 @@ impl GpuModel {
         self.backend.upload(b.sampler, &sampler0)?;
 
         self.backend.begin_batch()?;
-        let key = b.key();
+        let key = self.selfloop_key_for_state(&b, state);
         // graph 捕获只在支持的后端（CUDA）尝试；Vulkan 走下面的「逐轮直接记录」分支
         // （整段 n 轮同批、一次 submit）。SKIP_GRAPH 仍可强制降级（逐 kernel 剖析用）。
         let skip_graph = std::env::var("SKIP_GRAPH").is_ok_and(|v| !v.is_empty());
@@ -2856,7 +2980,7 @@ impl GpuModel {
             // CUDA：捕获首个 token 的完整前向 kernel 序列，之后每 token 重放，
             // 消除 258 次/层的 cuLaunchKernel 启动开销。
             // **每个形状只捕获一次**，此后跨调用永久重放（原先每次调用重捕获）。
-            let key = b.key();
+            let key = self.selfloop_key_for_state(&b, state);
             let graph_ok = self.ensure_selfloop_graph(key, |m| {
                 m.selfloop_step(state, c, h, ns, b.token_seq, b.seq_cnt)
             });
@@ -5012,7 +5136,19 @@ pub struct State {
     v_first_set: bool,
     /// batch 并发布局（batch > 1 时张量为 [batch, ...]；1 = 单序列）。
     batch: usize,
+    /// 本 State 的身份号（进程内单调递增，见 [`STATE_UID`]）。
+    ///
+    /// 存在的唯一理由：**CUDA graph 里烘焙的是这份 State 各张量的设备指针**，而 self-loop
+    /// 的图缓存原先只按 `(kind, batch, n)` 形状收键——同一实例上出现第二个同宽 State 时，
+    /// 它会重放第一份 State 的图，于是**算的是别人的状态、写的也是别人的状态**，全程无错误
+    /// 无日志。2026-10-10 由 `tests/batch_parity.rs::warmup_buckets_do_not_change_results`
+    /// 实测抓到（CUDA 上冷/热两臂的贪心序列整段平移了几个 token，正是「接着另一份状态跑」
+    /// 的形状）。把身份混进图 key 后，换 State 会作废该 kind 的图并重捕获。
+    uid: u64,
 }
+
+/// `State` 身份号发号器（从 1 起，0 保留给「缓存条目还没绑过任何 State」）。
+static STATE_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl State {
     /// 创建零初始化的状态（单序列）。
@@ -5048,7 +5184,13 @@ impl State {
             v_first,
             v_first_set: false,
             batch: bsz,
+            uid: STATE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// 本 State 的身份号（self-loop 图缓存用它区分「同一形状的不同状态」）。
+    pub fn uid(&self) -> u64 {
+        self.uid
     }
 
     /// 该状态的 batch 数（1 = 单序列）。
@@ -5314,25 +5456,33 @@ impl WorkBuffers {
             a_mid: mk(&mut *backend, cfg.a_mid)?,
             g_mid: mk(&mut *backend, cfg.g_mid)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
-            // W8A8 路径：`bsz` 槽容量（IMMA 一次覆盖 `8·NST` 槽，NST≤8 ⇒ 最多 64 槽），
+            // W8A8 路径的量化激活/辅助缓冲：容量按 **实际批宽 `bsz`** 算。
             // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
-            // ⚠️ 容量必须按 **batch** 算：只按 8 槽分配时 batch≥16 会越界写（实测 DEVICE_LOST）。
+            // ⚠️ 历史坑①：只按 8 槽分配时 batch≥16 越界写（实测 DEVICE_LOST）。
+            // ⚠️ 历史坑②：曾写成 `bsz.min(64)`——那是配合旧 `imma_ok` 的 batch≤64 门（一波装得下
+            //   全部槽）。门放开后批宽超过 64 要靠 `grid.z` 起第二波，而**量化内核按全局槽号
+            //   写满 bsz 行**，`min(64)` 就让第二波直接越界写 ⇒ B=128 实测 `ERROR_DEVICE_LOST`
+            //   （2026-10-10，见本文件 `imma_ok` 的注与 tests/batch_parity.rs 的跨波用例）。
             xb_q: {
-                let n = bsz.min(64) * (c.max(cfg.ffn_hidden) / 4);
+                let n = bsz * (c.max(cfg.ffn_hidden) / 4);
                 let t = backend.create_tensor(n, TensorDtype::U32)?;
                 backend.upload_u32(t, &vec![0u32; n])?;
                 t
             },
             xb_aux: {
-                let n = bsz.min(64) * (c.max(cfg.ffn_hidden) / 128) * 4;
+                let n = bsz * (c.max(cfg.ffn_hidden) / 128) * 4;
                 let t = backend.create_tensor(n, TensorDtype::F32)?;
                 backend.upload(t, &vec![0.0f32; n])?;
                 t
             },
-            // split-K 部分和：8(KS 上限) × batch(≤64) × max(c, fh)。
+            // split-K 部分和：8(KS 上限) × 64(一波槽数) × max(c, fh) —— 固定 21 MiB 量级。
+            // 这里**故意不跟 bsz 走**：批宽超过一波时 `imma_ksplit` 会按实际容量把 ks 缩下去
+            // （`ks·batch·m > cap ⇒ ks-=1`），所以容量无须为最坏形状预留。按 bsz 预留会在
+            // B=256 上多要 63 MiB，而那张卡此时已经贴到显存上限（实测 ERROR_OUT_OF_DEVICE_MEMORY）。
+            // 副作用是大批量下 split-K 块数变少 —— 但仍是张量核路径，实测远好过掉回 SIMT。
             // 不含 `vocab`：head 的 M 很大 ⇒ 块数充足 ⇒ `imma_ksplit` 恒取 1；万一被
             // `VK_IMMA_KSPLIT` 强制，`imma_ksplit` 也会按容量自行缩回去。
-            imma_partial: mk(&mut *backend, 8 * bsz.min(64) * c.max(cfg.ffn_hidden))?,
+            imma_partial: mk(&mut *backend, 8 * 64 * c.max(cfg.ffn_hidden))?,
             logits: mk(&mut *backend, vocab)?,
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,
@@ -5647,7 +5797,9 @@ mod tests {
         // fp16 模型（r/k/v 无 int8 句柄）→ 报模型
         assert_eq!(
             batch_decode_blocker(true, false),
-            Some("模型 r/k/v 无 int8 句柄（fp16 模型没有批量前向路径）")
+            Some(
+                "模型 r/k/v 无 int8 句柄（fp16 模型可批量 prefill，但批量 decode 需要 int8 权重）"
+            )
         );
         // 两者都缺 → 后端优先
         assert!(batch_decode_blocker(false, false).is_some());

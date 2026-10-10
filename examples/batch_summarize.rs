@@ -161,7 +161,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let vocab_path = std::env::var("VOCAB_JSON").unwrap_or_else(|_| DEFAULT_VOCAB.to_string());
     // 并发度：**单模型实例 + batch 维并发**（B 个 slot 共享一份权重，一次读权重
-    // 算 B 份——weight-bound 场景吞吐 ≈ ×B；多实例方案是 B 份权重带宽，实测无增益）。
+    // 算 B 份 ⇒ 吞吐随 B 上升但**远不是 ×B**：2080 Ti / 3B int8 实测 B=256 只有
+    // ×40.8（CUDA）/ ×12.5（Vulkan），Vulkan 从 B=64 起走平，机理是每一波（64 槽）
+    // 重读一次整份权重；多实例方案是 B 份权重带宽，实测无增益）。
     // prefill 走单序列 seq 路径，完成后状态经 host 中转灌入 batch State 对应 slot；
     // decode 走 batch selfloop（graph 捕获一轮 batch 前向 + 逐轮重放，GPU 内 token
     // 自回写）。CUDA / Vulkan 两后端均可跑（Vulkan 无 graph 捕获，等价物是把 n 轮记录进
