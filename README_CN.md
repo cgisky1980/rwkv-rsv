@@ -352,6 +352,31 @@ a/g 链读到垃圾指针，于是**崩**），这正是它六天没被看懂的
 另记一条与 ③ 同批暴露的问题：`log_vram` 在 B=256 全程打印「登记张量 0 MiB」——**显存记账是坏的**，
 所以「溢出」这件事在日志里完全看不出来，只能靠外部 `nvidia-smi`。
 
+**③的订正（2026-10-10，同日）**：上面那句记账问题**已修**，而 ③ 里的占用数字是**低记**，
+要按「至少这么大」来读：
+- `device_bytes` 原来汇总一张旁路表（`lens`），而 `u32`／批量张量根本没进表 ⇒ 静默算成 **0**；
+  现在改成逐张量取 `GpuTensorU32::len` 求和，并且 `log_vram` 多打一列 **host 镜像**——Vulkan
+  侧每个张量都有一份 host-visible 镜像，那些字节是**系统内存**，`nvidia-smi` 看不见，
+  绝不能再从显存预算里减。
+- 把没打印的 self-loop 段补回来之后，**B=256 的登记占用是 17 869 MiB，不是 ~13.1 GB**；
+  外部峰值 **20 662 / 22 528 MiB**（桌面基线 2 128~2 786 MiB，这张卡同时是显示输出）。
+  登记 vs 外部现在只差 **+7 MiB（B=256）／+36 MiB（B=128）**，所以旧「6 GB 说不清」是
+  **打印时机**，不是泄漏：`WARMUP=0` 时 self-loop scratch 是在被计时的那一段里才第一次分配，
+  那一行 `log_vram` 打在分配之前。
+- 因此「**B=256 必然 OOM** 作废」——它装得下，还剩 ~1.8 GB 余量。③ 里 B≥192 采样核变慢
+  仍是实测数据，而且真实占用更大 ⇒ ③ 的方向（**容量效应，不是核质量**）是**被加强**的；
+  变的是预算算术，现在按项拆：RNN 状态 **每槽 20.6 MiB**（B=256 就是 5.3 GB）≫ 采样工作区。
+- 采样 mask 在 Vulkan 侧已改成**位图档**（新增 spec 常量 `MASK_WORD_STRIDE`，host 侧按缓冲
+  实际长度反推跨距；CUDA 靠 `supports_compact_sample_mask() = false` 保持稠密口径）：
+  B=256 的 64 MiB → 2 MiB，外部口径实测**峰值 −61 MiB**（理论 −62 MiB）。
+  **吞吐实测持平**（B=128 稳态 1039.0 vs 改动前 1037.6 tok/s）⇒ **别把它写成加速项**，
+  它真正省的是 top-p 循环每趟 `reduce_max` 的 mask 访存（每槽 256 KiB → 8 KiB）。
+  守护用例：`tests/batch_parity.rs::top_p_sampled_tokens_stay_inside_the_nucleus`——mask 路径
+  此前**零 CI 覆盖**（原有采样用例全是贪心，而贪心根本不进 top-p 兜底循环）。用例同时带
+  **正向**判据（采到的 token 不许掉出宿主侧同口径算出的候选集 ⇒ 抓跨槽污染／上一轮残留）
+  和**反向**判据（候选集 ≥2 的槽必须偶尔采到非 argmax ⇒ 抓「mask 完全没生效」，
+  那种故障会退化成贪心、正向判据照样通过）。两个方向都用故障注入验证过。
+
 **④ 「重编 shader 后的第一个进程」不能用作 A/B 的任一侧**——本轮就栽在这里，把一条假收益
 写进了结论。`vulkan/app.rs` 的 `pipeline_cache` 只建在**内存**（`PipelineCacheCreateInfo` 不给
 初始数据、也不落盘），而驱动自己的盘缓存按 SPIR-V 哈希索引 ⇒ `build.rs` 重编之后的第一个进程
@@ -360,6 +385,12 @@ a/g 链读到垃圾指针，于是**崩**），这正是它六天没被看懂的
 （decode 5.4 / 5.8s）——与张量核那一档（2.36 / 2.38）**持平**，6.4× 差额整个是产物。
 输出侧完全不受影响：同一配置三次独立进程的 20 条摘要**逐字全同 20/20** ⇒ 被污染的只有计时。
 ⇒ 纪律：动过 `assets/shaders/` 就先跑一个丢弃用的进程；单轮单侧的读数一律不用。
+★ 2026-10-10 把这条量化了（`sample.comp` 加一个 spec 常量，同参数连跑两个新进程）：decode 增量
+是**与批宽无关的 ~4.5 s**（B=128/192/256 分别 +4692/+4385/+4665 ms），即一次性开销而非每轮变慢；
+第 1 个进程 479.3 tok/s，第 2 个 **1039.0** tok/s，token 指纹完全相同。`sample.spv` 单条管线就要
+4.4~4.7 s（它对全词表循环做了 `[[unroll]]`），而且**每一种 spec 常量组合各付一次**
+（`N/HIST_STRIDE/SAMPLER_ROW/BATCH/MASK_WORD_STRIDE` 全组合独立）⇒ 加 spec 常量等于给下一轮扫描
+悄悄加税。
 
 ### 6.3 2026-10-10 默认翻转：Vulkan 的 r/k/v 也走 W8A8 张量核
 
@@ -457,7 +488,7 @@ examples/       自包含示例程序
   3. **CUDA 有 `RKV_MERGE`（r/k/v 三链一次 dispatch），Vulkan 没有** ⇒ 每层多排 3 条 `quant_x_i8` + 3 条 `gemm_imma_reduce`（任务 #24）。合并的收益预期按第 1 条**下调**：它救不了 B=1，价值在大批量的 partial 流量与 host 录制条数。
   量化后的现状（默认口径 vs CUDA，同会话交错）：**0.754×(B=1) / 0.804×(B=8) / 0.632×(B=32) / 0.413×(B=128)**（§6.3）。⚠️ B≥192 那档**不能全记在核质量上**——显存被推满后 WDDM 静默溢到系统内存，单是采样核就从 0.87ms 跳到 68ms（§6.2③），要拿到干净对比得先把每槽占用降下来（下一条）。
 - **批量 prefill 落后得比 decode 更多，而且它在大批量才是大头**（2026-10-10 `PROF_GPU`）：B=128 同一 workload `prefill 42 367 ms / decode 5 831 ms` ⇒ **prefill 是 decode 墙钟的 7.3 倍**；同参数 CUDA 是 `24 859 / 2 403 ms` ⇒ **prefill 只有 CUDA 的 0.59×**（decode 0.41×，两个口径别混着讲）。Vulkan 批量 prefill 走 `forward_seq_batch`，GEMM 是 **fp16 coopmat 且没有 int8 张量核版本**：一个分块里 `gemm_f16_f32_affine` 37% + `gemm_f16_f32_relu2` 27% + `gemm_f16_f32` 22% = **86%**，而 `dequant_int8_f16` 只占 **0.9%** ⇒ 瓶颈不是反量化，是 fp16 GEMM 本身比 CUDA 慢 ~1.8×。⚠️ 这份 workload 里还有 4~5× 是 **padding 浪费**（各槽 prompt 104..139 tok 却按 `PAD_TO=512` 算），那是长度桶问题，别记到后端头上。prefill 分块由 `PREFILL_SLOTS=8` 决定 ⇒ 128 槽切成 16 块串行。
-- **Vulkan 的 RNN 状态仍是 fp32，且 `log_vram` 的显存记账是坏的**（2026-10-10 暴露）：`supports_f16_wkv_state()` 在 Vulkan 侧返回 false，每层每槽 `H·N·N = 163 840` 元素 ⇒ B=256 时状态合计约 **5.3 GB**，转 fp16 可省 2.6 GB；而 B=256 全程日志打印「登记张量 0 MiB」，溢出在日志里完全看不见，只能靠外部 `nvidia-smi`（实测 21 775 / 22 528 MiB）。两条一起做才能把 §6.1 里 B≥192 的读数变成可解释的读数（任务 #23）。
+- **Vulkan 的 RNN 状态仍是 fp32**——**每槽显存剩下的唯一大杠杆**（本条的另一半「`log_vram` 记账是坏的」2026-10-10 已修，见 §6.2③的订正）：`supports_f16_wkv_state()` 在 Vulkan 侧返回 false（CUDA 为 true），每层每槽 `H·N·N = 163 840` 元素 × 32 层 × 4 B ⇒ **每槽 20.6 MiB**，B=256 就是约 **5.3 GB**，在按项拆开的记账里远大于其它任何每槽开销。转 fp16 直接省一半（B=256 −2.6 GB），这是把 §6.1 里 B≥192 的读数变成与 CUDA 同条件可比的前提。落地障碍：状态核 `fuse_ka_dplr_norm.comp` 的状态臂声明是 `BufS{float data[]}`，要先加 fp16 档的 `buffer_reference`/spec 才能把 `supports_f16_wkv_state()` 翻过来；而且数值契约必须有门（fp16 状态在长自循环里会漂，`tests/batch_parity.rs` 的对拍用例就是证伪器）。
 - ~~**Vulkan 张量核 GEMM 只支持 batch ≤ 64**~~ —— **是 bug，已修（2026-10-10）**。`imma_ok` 里写死的 `(1..=64).contains(&batch)` 让 **B>64 整条静默回落 SIMT**：代价不是「rkv 回落 SIMT」（rkv 默认本来就不走 IMMA，见 `imma_op_on`），而是 **head/out/key/val 四条张量核 GEMM 一起被关掉**，其中 head（vocab 65536×2560）是单层最大的一块矩阵乘 ⇒ 吞吐塌到与 B=1 同量级的平台。实测断崖：B=64 张量核 **934.4** tok/s，旧门下 B=80 **430.7** / B=96 **429.2**（对照 `VK_IMMA=0` 强制无 IMMA 的 B=64 = **436.5** ⇒ 差异 100% 由门造成）。多波（`grid.z = ceil(batch/(8·NST))`）在 shader 里**早就写好了**（装载 `s0base + (i>>5) < BATCH`、写回 `slot >= BATCH` 双守卫），只是从未被执行。放开门后连带两处尺寸 bug 一起暴露并修掉：`WorkBuffers` 的 `xb_q`/`xb_aux` 写死 `bsz.min(64)`（量化内核按全局槽号写满 `bsz` 行 ⇒ 第二波越界写，B=128 实测 `ERROR_DEVICE_LOST`）；`imma_partial` **不能**按 `bsz` 配（`imma_ksplit` 在 `ks·batch·m > cap` 时会缩 `ks`，按 `bsz` 预留反而在 B=256 多要 63 MiB ⇒ `ERROR_OUT_OF_DEVICE_MEMORY`）。修后（正式会话中位数）B=96 **913.2**、B=128 **967.4**、B=256 **988.5** tok/s，即 **2.1×~2.3×**。守门用例：`tests/batch_parity.rs::slots_beyond_the_first_wave_match`（72 槽跨波边界 × 贪心逐位一致）。
 - **精度增强后路**：校准加权 k-means、G=64 提高元数据密度。
 

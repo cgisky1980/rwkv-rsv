@@ -123,6 +123,29 @@ pub trait ComputeBackend {
         0
     }
 
+    /// 尚未释放的 **host 镜像**字节总数（系统内存，不计入显存）。默认 0（后端未实现）。
+    ///
+    /// 只有「每个登记张量 = host-visible 镜像 + DEVICE_LOCAL 缓冲一对」的后端才有意义
+    /// （Vulkan）。与 `device_bytes` 并列打印，才能解释「登记张量比 nvidia-smi 读数大」
+    /// 那段差额到底是显存里的别的开销，还是根本不占显存的系统内存。
+    fn host_mirror_bytes(&self) -> usize {
+        0
+    }
+
+    /// 采样 mask 缓冲能否按**位图**分配（每 token 1 bit 而不是 1 个 u32）。
+    ///
+    /// 默认 false = 稠密档：mask 按 [vocab, batch] 分配，kernel 按整字判零
+    /// （CUDA 侧采样核是稠密实现，没跟着改位图，这里必须保持 false——否则 host
+    /// 只给 1/32 的缓冲，稠密核会越界读）。
+    /// Vulkan 的 sample.comp 同时编了位图/稠密两档，选档由 spec 常量
+    /// `MASK_WORD_STRIDE` 从缓冲实际长度反推。收益在**热循环的访存**而非显存：
+    /// top-p 兜底循环每一趟 `reduce_max` 都要读整行 mask，位图把每槽每趟的 mask 流量
+    /// 从 256 KiB 压到 8 KiB（vocab=65536）；显存侧 B=256 只从 64 MiB 降到 2 MiB，
+    /// 相比之下 temp/counter 仍是 [vocab, batch]。
+    fn supports_compact_sample_mask(&self) -> bool {
+        false
+    }
+
     // —— CUDA prefill graph（整段 prefill 一次抓到图，消除跨层 launch 开销）——
     /// 当前 T 是否已有捕获好的 prefill graph（无 → 需重新捕获）。
     /// 默认 no-op；仅支持的后端（CUDA）覆盖。
@@ -1437,16 +1460,38 @@ impl ComputeBackend for VulkanBackend {
         Ok(id)
     }
 
-    /// 登记在册张量的设备字节总数（与 CUDA 侧同口径：只算 `create_tensor` 建出的 device
-    /// buffer，不含 uniform 池 / work buffer / 图缓存，故小于 `nvidia-smi` 读数，用于比较
-    /// 各阶段增量）。U32 变体不带 len 字段，长度取自 `lens`。
+    /// 登记在册张量的**设备侧**字节总数（只算每个张量的 DEVICE_LOCAL buffer）。
+    ///
+    /// ⚠️ Vulkan 侧每个张量都是「host-visible 镜像 + DEVICE_LOCAL 缓冲」**一对**
+    ///（`Runtime::create_tensor*`），所以本数是「每张量设备缓冲之和」，**不含**：
+    /// 仍然挂着的 host 镜像（那是系统内存，nvidia-smi 看不见，见 `host_mirror_bytes`）、
+    /// uniform 池、以及图捕获里的命令缓冲。与 CUDA 侧同口径（CUDA 的 `device_bytes`
+    /// 同样跳过 `foreign` 登记的暂存缓冲）。
     fn device_bytes(&self) -> usize {
         self.tensors
-            .iter()
-            .map(|(id, t)| match t {
+            .values()
+            .map(|t| match t {
                 VulkanTensor::F32(g) => 4 * g.len,
                 VulkanTensor::F16(g) => 2 * g.len,
-                VulkanTensor::U32(_) => 4 * self.lens.get(id).copied().unwrap_or(0),
+                VulkanTensor::U32(g) => 4 * g.len,
+            })
+            .sum()
+    }
+
+    /// 位图档 mask（见 trait 里的说明）：sample.comp 两档都编好了，按缓冲长度自动选档。
+    fn supports_compact_sample_mask(&self) -> bool {
+        true
+    }
+
+    /// 尚未 `drop_host` 的 host-visible 镜像字节总数（**系统内存**，不计入显存）。
+    /// 与 `device_bytes` 并列打印才能解释「登记张量比 nvidia-smi 读数大」这段差额。
+    fn host_mirror_bytes(&self) -> usize {
+        self.tensors
+            .values()
+            .map(|t| match t {
+                VulkanTensor::F32(g) => g.host.as_ref().map_or(0, |_| 4 * g.len),
+                VulkanTensor::F16(g) => g.host.as_ref().map_or(0, |_| 2 * g.len),
+                VulkanTensor::U32(g) => g.host.as_ref().map_or(0, |_| 4 * g.len),
             })
             .sum()
     }

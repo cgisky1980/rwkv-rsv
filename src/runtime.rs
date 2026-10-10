@@ -43,10 +43,13 @@ pub struct GpuTensor16 {
 }
 
 /// GPU 端 u32 张量（int8 打包索引 / scale-zero 对用）。
+/// `len` 为**元素个数**（不是字节）：`download_u32` 与 host 镜像字节数记账都要用，
+/// 以前只能靠调用方另存一张 id→len 表（Vulkan 后端的 `lens`），漏存就静默算 0 字节。
 #[derive(Debug, Clone)]
 pub struct GpuTensorU32 {
     pub host: Option<Tensor<u32>>,
     pub device: Tensor<u32>,
+    pub len: usize,
 }
 
 /// int8 非对称 per-group 量化权重（无 LUT，256 级均匀，近无损）：
@@ -213,6 +216,7 @@ impl Runtime {
         Ok(GpuTensorU32 {
             host: Some(host),
             device,
+            len,
         })
     }
 
@@ -1729,7 +1733,9 @@ impl Runtime {
         history: &[u32],
     ) -> R<()> {
         let temp = self.create_tensor(n)?;
-        let mask = self.create_tensor(n)?;
+        // mask 走位图档（每 token 1 bit = N/32 个 u32）；sample.comp 的 MASK_WORD_STRIDE
+        // 由 record_sample 从缓冲长度反推，两边不会不一致。本 runtime 只有 Vulkan 用。
+        let mask = self.create_tensor(n / 32)?;
         let counter = self.create_tensor_u32(n)?;
         let sampler = self.create_tensor(8)?;
         self.store_sampler_host(
@@ -1836,11 +1842,16 @@ impl Runtime {
             .as_ref()
             .ok_or("record_sample: sampler host dropped")?;
         self.host_write_to_shader_barrier(&sampler_host.buffer)?;
+        // mask 的字跨距**从缓冲自身长度反推**（而不是再传一个布尔）：shader 的寻址与
+        // host 的分配因此不可能脱钩——长度写错会立刻体现为跨距错，而不是越界读。
+        // 稠密档 [vocab, batch] → 跨距 N；位图档 [vocab/32, batch] → 跨距 N/32。
+        let mask_wstride = (mask.len / batch.max(1)) as u32;
         let spec = [
             n as u32,
             hist_stride as u32,
             sampler_row as u32,
             batch.max(1) as u32,
+            mask_wstride,
         ];
         let params = [
             logits.device.address,

@@ -336,8 +336,41 @@ Also exposed by ③: `log_vram` printed "registered tensors 0 MiB" throughout th
 accounting is broken**, which is why a 13 GB footprint and a full card were invisible in our own logs and
 only detectable with external `nvidia-smi`.
 
+**③-correction (2026-10-10, same day)**: that accounting sentence is now **resolved**, and the footprint
+numbers in ③ were *under*-counts, so read them as "at least this big":
+- `device_bytes` summed a side table (`lens`) that had no entry for `u32`/batch tensors ⇒ silent **0**; it
+  now sums `GpuTensorU32::len` per tensor, and `log_vram` prints a second column
+  `host 镜像` (Vulkan mirrors every tensor host-side; those bytes are **system RAM**, invisible to
+  `nvidia-smi` and must never be subtracted from the GPU budget).
+- With the unlogged self-loop scratch counted, **B=256 registered footprint is 17 869 MiB, not ~13.1 GB**,
+  and external peak is **20 662 / 22 528 MiB** (desktop baseline 2 128-2 786 MiB — this card is also the
+  display adapter). Registered vs external now closes to **+7 MiB (B=256) / +36 MiB (B=128)**, so the old
+  "6 GB unaccounted" was **logging timing**, not a leak: with `WARMUP=0` the `log_vram` line fires *before*
+  the self-loop scratch is allocated inside the timed region.
+- Consequently **"B=256 must OOM" is refuted** — it fits with ~1.8 GB headroom. The B≥192 *sampler*
+  slowdown in ③ stays as measured data, and ③'s direction ("capacity, not kernel quality") is
+  **strengthened** by the larger true footprint; what changes is the budget arithmetic, which is now
+  per-item: RNN state **20.6 MiB/slot** (5.3 GB at B=256) ≫ self-loop scratch ≫ sampler workspaces.
+- The sampler mask is now a **bitmap** on Vulkan (`MASK_WORD_STRIDE` spec constant; the host derives the
+  stride from the buffer's actual length, CUDA keeps the dense 口径 via
+  `supports_compact_sample_mask() = false`): 64 MiB → 2 MiB at B=256, externally measured **−61 MiB** peak
+  (theory −62 MiB). It is **throughput-neutral** (B=128 steady 1039.0 vs 1037.6 tok/s) — do **not** cite it
+  as a speed win; its real saving is per-`reduce_max` mask traffic (256 KiB → 8 KiB per slot).
+  Guard: `tests/batch_parity.rs::top_p_sampled_tokens_stay_inside_the_nucleus` — the mask path previously
+  had **zero** CI coverage (every existing sampling test is greedy, and greedy never enters the top-p
+  fallback loop). It carries a forward criterion (no sampled token may fall outside the host-computed
+  nucleus ⇒ catches cross-slot contamination / stale mask bits) **and** a reverse one (a ≥2-candidate slot
+  must occasionally beat a non-argmax ⇒ catches "mask never takes effect", which degrades to greedy and
+  would otherwise pass the forward test). Both directions were verified by fault injection.
+
 **④ The first process after a shader rebuild must not be used as either side of an A/B** - this
-round got burned by exactly that and published a fake win. `vulkan/app.rs` keeps the
+round got burned by exactly that and published a fake win.
+★ Quantified 2026-10-10 (`sample.comp` + one new spec constant, same params, two fresh processes):
+the decode increment is a flat **~4.5 s** regardless of batch (+4692/+4385/+4665 ms at B=128/192/256),
+i.e. one-time, not per-round; process 1 read 479.3 tok/s and process 2 read **1039.0** on identical token
+fingerprints. `sample.spv` alone costs 4.4-4.7 s to compile (it `[[unroll]]`s a full-vocab loop), and
+**every distinct spec-constant tuple pays it separately** (`N/HIST_STRIDE/SAMPLER_ROW/BATCH/MASK_WORD_STRIDE`),
+so adding a spec constant is a hidden bench-tax on the next sweep. `vulkan/app.rs` keeps the
 `pipeline_cache` in **memory only** (`PipelineCacheCreateInfo` with no initial data, never
 persisted), while the driver keeps its own disk cache keyed by SPIR-V hash ⇒ the **first**
 process after `build.rs` recompiles shaders compiles pipelines **inside the timed region**. Measured
@@ -446,7 +479,17 @@ Inspired by both, this repository has since evolved independently, adding capabi
   3. **CUDA merges the three r/k/v chains into one dispatch (`RKV_MERGE`); Vulkan does not**, so it records 3 extra `quant_x_i8` + 3 extra `gemm_imma_reduce` per layer. Expectations for merging them are revised *down* by point 1: it cannot rescue B=1; the value is partial traffic and host recording at large batch.
   Current standing, default configuration vs CUDA (same-session interleaved): **0.754x (B=1) / 0.804x (B=8) / 0.632x (B=32) / 0.413x (B=128)** (§6.3). ⚠️ The B>=192 slot must not be charged entirely to kernel quality - once VRAM is full WDDM silently spills to system memory and the sampler alone goes from 0.87 ms to 68 ms (§6.2③), so a clean comparison needs the per-slot footprint down first (next entry).
 - **Batched prefill lags further than decode and is the real large-batch cost** (2026-10-10 `PROF_GPU`): at B=128 the same workload reads `prefill 42,367 ms / decode 5,831 ms` ⇒ prefill is **7.3x** the decode wall clock; CUDA at the same parameters reads `24,859 / 2,403 ms` ⇒ **prefill runs at 0.59x of CUDA** (decode 0.41x - the two must not be merged). Vulkan batched prefill goes through `forward_seq_batch`, whose GEMMs are **fp16 coopmat with no int8 tensor-core variant**: in one chunk `gemm_f16_f32_affine` 37% + `gemm_f16_f32_relu2` 27% + `gemm_f16_f32` 22% = **86%**, while `dequant_int8_f16` is only **0.9%** ⇒ the cost is the fp16 GEMM itself (~1.8x slower than CUDA), not dequantization. ⚠️ 4-5x of this workload is **padding waste** (prompts are 104..139 tokens but `PAD_TO=512`) - a bucketing problem, not a backend one. Prefill is chunked by `PREFILL_SLOTS=8` ⇒ 128 slots run as 16 serial chunks.
-- **Vulkan still keeps the RNN state in fp32, and `log_vram` accounting is broken** (exposed 2026-10-10): `supports_f16_wkv_state()` returns false on Vulkan, `H·N·N = 163 840` elements per layer per slot ⇒ ~**5.3 GB** of state at B=256, of which fp16 would save 2.6 GB; meanwhile the B=256 run printed "registered tensors 0 MiB" the whole way, so the spill was invisible in our own logs and only detectable with external `nvidia-smi` (measured 21 775 / 22 528 MiB). Both fixes are needed before §6.1's B>=192 readings become interpretable.
+- **Vulkan still keeps the RNN state in fp32** — the **only remaining large per-slot VRAM lever** (the
+  other half of this entry, `log_vram` accounting, is **fixed** 2026-10-10, see §6.2③-correction):
+  `supports_f16_wkv_state()` returns false on Vulkan (CUDA true), `H·N·N = 163 840` elements per layer per
+  slot × 32 layers × 4 B ⇒ **20.6 MiB per slot**, ~**5.3 GB** at B=256 — by far the largest per-slot item
+  in the accounting (see §6.2③-correction for the full B=256 breakdown). fp16 halves it (−2.6 GB at B=256)
+  and is what must happen before
+  §6.1's B≥192 readings are comparable to CUDA on equal terms. Blocking detail: the state kernel
+  `fuse_ka_dplr_norm.comp` declares its state arm as `BufS{float data[]}`, so an fp16 arm needs a new
+  `buffer_reference`/spec variant before `supports_f16_wkv_state()` can flip. Numeric contract must be
+  gated (fp16 state drifts vs fp32 across a long self-loop; `tests/batch_parity.rs` parity cases are the
+  falsifier).
 - **Run one throwaway process before any A/B** (§6.2④): the Vulkan pipeline cache is memory-only and the driver keys its disk cache by SPIR-V hash, so the first process after a shader rebuild compiles pipelines inside the timed region. This round it manufactured a 6.4x fake win (0.52 -> 2.41 summaries/s); interleaved, both arms are level. Single-round, single-side readings are never citable.
 - ~~**Vulkan's tensor-core batched GEMM only supports batch ≤ 64**~~ — **that was a bug, fixed 2026-10-10**. `imma_ok`'s hard `(1..=64).contains(&batch)` predicate silently dropped **B>64 onto the SIMT path**. Note what that actually cost: it is *not* "rkv fell back to SIMT" (rkv never used IMMA by default anyway - see `imma_op_on`), it is **all four tensor-core GEMMs - head/out/key/val - switching off together**, and head (vocab 65536×2560) is the single largest matmul in a layer. Throughput collapsed to a B=1-sized plateau: measured cliff at the same session and parameters - B=64 tensor core **934.4** tok/s vs B=80 **430.7** / B=96 **429.2** under the old gate (control: B=64 with IMMA forced off via `VK_IMMA=0` = **436.5**, i.e. the drop was 100 % the gate). Multi-wave (`grid.z = ceil(batch/(8·NST))`) had **already been written** into `gemm_imma.comp` - load guarded by `s0base + (i>>5) < BATCH`, store by `slot >= BATCH` - it had simply never been *executed*. Lifting the gate exposed two more sizing bugs, also fixed: `WorkBuffers.xb_q`/`xb_aux` were capped at `bsz.min(64)` while the quantize kernel writes all `bsz` rows by global slot index (wave 2 wrote out of bounds → `ERROR_DEVICE_LOST` at B=128), and `imma_partial` must **not** scale with `bsz` (`imma_ksplit` shrinks `ks` when `ks·batch·m > cap`, so a `bsz`-sized reserve asks for 63 MiB more and hits `ERROR_OUT_OF_DEVICE_MEMORY` at B=256). After the fix (formal-session medians): B=96 **913.2**, B=128 **967.4**, B=256 **988.5** tok/s, i.e. **2.1×–2.3×**. Guard test: `tests/batch_parity.rs::slots_beyond_the_first_wave_match` (72 slots straddling the 64-slot wave boundary, greedy, bitwise equality against wave 0) - this class of bug is invisible to throughput sweeps and shows up as user-reported garbage above B=64.
 - **Accuracy headroom**: calibration-weighted k-means, G=64 denser metadata.

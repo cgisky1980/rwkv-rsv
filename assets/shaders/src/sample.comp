@@ -46,6 +46,13 @@ layout(constant_id = 0) const uint N = 65536;            // logits 长度（voca
 layout(constant_id = 1) const uint HIST_STRIDE = 65536;  // 每 slot 历史缓冲步长
 layout(constant_id = 2) const uint SAMPLER_ROW = 0;      // 本轮读 sampler 的第几行
 layout(constant_id = 3) const uint BATCH = 1;            // 槽位数（grid.y 维长度）
+// mask 每槽占多少个 u32 字。由 host 按**实际分配的缓冲长度 / batch** 传入（见
+// Runtime::record_sample），所以 shader 的寻址不可能和缓冲尺寸脱钩：
+//   = N/32 ⇒ 位图（每 token 1 bit，Vulkan 侧默认）；= N ⇒ 稠密（每 token 一个 u32，CUDA 口径）。
+// 收益口径（2026-10-10 实测订正，别写成显存）：vocab=65536 时 [vocab, batch] 三项在 B=256
+// 各是 64 MiB（合计 192 MiB，**不是** GiB 量级）⇒ 位图省下的是 top-p 兜底循环每趟
+// `reduce_max` 的 mask 访存：每槽每趟 256 KiB → 8 KiB；显存侧 mask 64 MiB → 2 MiB。
+layout(constant_id = 4) const uint MASK_WORD_STRIDE = 0; // 0 = 未 specialize（按稠密 N 回退）
 
 // ★ workgroup 大小 = 采样内核占用率的唯一杠杆（2026-10-03 实测）：本内核是**纯流式扫描**
 // （每趟全词表 65536），靠内存级并行掩盖延迟；而 dispatch 是 (1, batch, 1)，B=8 时全卡
@@ -59,7 +66,7 @@ const uint SAMP_STRIDE = 10;       // 每 slot 每轮 10 个 f32
 layout(buffer_reference) buffer InLogits { float data[]; };
 layout(buffer_reference) buffer OutToken { uint data[]; };
 layout(buffer_reference) buffer Temp { float data[]; };    // 工作区 [batch, N]
-layout(buffer_reference) buffer Mask { uint data[]; };     // top-k / top-p 已选标记 [batch, N]
+layout(buffer_reference) buffer Mask { uint data[]; };     // top-k / top-p 已选标记；见 MASK_WORD_STRIDE（位图或稠密）
 layout(buffer_reference) buffer Counter { uint data[]; };  // 历史 token 计数 [batch, N]
 layout(buffer_reference) buffer Hist { uint data[]; };     // 历史 token 序列 [batch, hist_stride]
 layout(buffer_reference) buffer Sampler { uint data[]; };  // [row, batch, 10]
@@ -120,13 +127,24 @@ float u01(uint s) {
 
 // 找 mask==0 的最大值（含索引），结果放 shared_val[0]/shared_idx[0]。
 // 平局取更小索引（与 CPU 严格大于 argmax 一致）。
-// `sbase` 为本 slot 在 temp/mask 中的起始下标（slot 主序，步长 N）。
-void reduce_max(uint index, uint sbase, Temp temp, Mask mask) {
+// `sbase` 为本 slot 在 temp/counter 中的起始下标（slot 主序，步长 N）；
+// `mbase` 为 mask 的本槽基址（步长 = MASK_WORD_STRIDE：位图档一槽只占 N/32 个字）。
+void reduce_max(uint index, uint sbase, uint mbase, Temp temp, Mask mask) {
     float lm = -1e30;
     uint  li = 0u;
     [[unroll]]
     for (uint i = index; i < N; i += BLOCK_SIZE) {
-        if (mask.data[sbase + i] == 0u && temp.data[sbase + i] > lm) {
+        // 位图档：一个 u32 装 32 个 token 的标记，取位即可（顺带把每趟 top-p/top-k
+        // 的 mask 流量从 256 KiB/槽降到 8 KiB/槽）；稠密档：整字判零。
+        // ⚠️ 两档的**下标口径不同**（位图 i/32、稠密 i），只分叉判等而不分叉下标会让
+        // 稠密档读到 i/32 那个字——今天 Vulkan 恒走位图、CUDA 用自己的采样核，所以这条
+        // 分支是死的，但它同时是「未 specialize 时的兜底」，必须保持正确。
+        const bool dense = MASK_WORD_STRIDE == 0u || MASK_WORD_STRIDE >= N;
+        const uint mw = mbase + (dense ? i : i / 32u);
+        const bool chosen = dense
+            ? (mask.data[mw] != 0u)
+            : ((mask.data[mw] >> (i & 31u)) & 1u) != 0u;
+        if (!chosen && temp.data[sbase + i] > lm) {
             lm = temp.data[sbase + i];
             li = i;
         }
@@ -160,7 +178,10 @@ void main() {
     Mask mask = params.mask;
     Sampler samp = params.samp;
 
-    const uint sbase = slot * N;                                 // temp/mask/counter/logits 语段
+    const uint sbase = slot * N;                                 // temp/counter/logits 语段
+    // mask 语段基址：位图档（MASK_WORD_STRIDE = N/32）每槽只占 N/32 个 u32 字；
+    // 未 specialize（=0）时回退成稠密的 N，与 reduce_max 内的 dense 判定一致。
+    const uint mbase = slot * ((MASK_WORD_STRIDE == 0u || MASK_WORD_STRIDE >= N) ? N : MASK_WORD_STRIDE);
     const uint hbase = slot * HIST_STRIDE;                       // hist 语段
     const uint sb    = (SAMPLER_ROW * BATCH + slot) * SAMP_STRIDE; // 本槽本轮参数行
 
@@ -326,7 +347,8 @@ void main() {
 
     // ---------- 6. top-p ----------
     if (top_p > 0.0 && top_p < 1.0) {
-        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[sbase + i] = 0u;
+        const uint mwords = (MASK_WORD_STRIDE == 0u || MASK_WORD_STRIDE >= N) ? N : MASK_WORD_STRIDE;
+        for (uint w = index; w < mwords; w += BLOCK_SIZE) mask.data[mbase + w] = 0u;
         barrier();
         if (index == 0u) {
             g_cum = 0.0;
@@ -334,9 +356,17 @@ void main() {
         }
         barrier();
         for (int cnt = 0; cnt < MAX_TOP_P_ITERS && g_cum < top_p; cnt++) {
-            reduce_max(index, sbase, temp, mask);
+            reduce_max(index, sbase, mbase, temp, mask);
             if (index == 0u) {
-                mask.data[sbase + shared_idx[0]] = 1u;
+                // 置位：这一行只有 index==0 写 mask，无跨线程竞争，普通读改写即可。
+                // 下标口径与 `reduce_max` 一致：稠密档一 token 一个字，位图档 32 个 token
+                // 共用一个字（写 1 会把整字清零、把别的候选标记擦掉，所以两档分别写）。
+                if (mwords == N) {
+                    mask.data[mbase + shared_idx[0]] = 1u;
+                } else {
+                    const uint mw = mbase + shared_idx[0] / 32u;
+                    mask.data[mw] |= (1u << (shared_idx[0] & 31u));
+                }
                 g_cum += shared_val[0];
                 g_cutoff = shared_val[0];
             }

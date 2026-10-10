@@ -792,11 +792,23 @@ impl GpuModel {
         self.backend.device_bytes()
     }
 
+    /// 尚未释放的 host 镜像字节（系统内存，**不占显存**；只有镜像/设备成对分配的后端非 0）。
+    pub fn host_mirror_bytes(&self) -> usize {
+        self.backend.host_mirror_bytes()
+    }
+
     /// 分阶段显存报告（诊断用，单位 MiB）。调用点在关键节点，便于定位大户。
+    ///
+    /// 两个数一起打：`登记张量` 是设备侧缓冲之和，`host 镜像` 是配套的系统内存
+    /// （只有镜像/设备成对分配的后端非 0，见 `ComputeBackend::host_mirror_bytes`）。
+    /// ⚠️ 但**打字的时机比列数更容易骗人**：2026-10-10 那次「登记 12.4 GB 却用掉 20 GB」
+    /// 的惊诧与镜像无关，是 `WARMUP=0` 时自循环 scratch 在被计时的段里才第一次分配
+    /// （打印发生在分配之前）。要么 `WARMUP≥1`，要么把这一行移到计时之后。
     pub fn log_vram(&self, stage: &str) {
         log::info!(
-            "[VRAM] {stage:<22} 登记张量 {} MiB",
-            self.device_bytes() / (1024 * 1024)
+            "[VRAM] {stage:<22} 登记张量 {} MiB | host 镜像 {} MiB（不占显存）",
+            self.device_bytes() / (1024 * 1024),
+            self.host_mirror_bytes() / (1024 * 1024)
         );
     }
 
@@ -2005,12 +2017,19 @@ impl GpuModel {
                 }
             }
             let vocab = self.config.vocab;
+            // mask 只需 0/1：后端支持位图档时按 vocab/32 个 u32 分配（省的是 top-p 循环里
+            // 每趟 reduce_max 的 mask 访存，32 倍；显存侧 B=256 是 64 MiB → 2 MiB）。
+            let mask_len = if self.backend.supports_compact_sample_mask() {
+                vocab / 32
+            } else {
+                vocab
+            };
             let temp = self
                 .backend
                 .create_tensor(vocab * batch, TensorDtype::F32)?;
             let mask = self
                 .backend
-                .create_tensor(vocab * batch, TensorDtype::F32)?;
+                .create_tensor(mask_len * batch, TensorDtype::F32)?;
             let counter = self
                 .backend
                 .create_tensor(vocab * batch, TensorDtype::U32)?;
@@ -2050,12 +2069,18 @@ impl GpuModel {
             }
         }
         let vocab = self.config.vocab;
+        // 与 `batch_step_tmp` 同口径：mask 支持位图档时按 vocab/32 分配。
+        let mask_len = if self.backend.supports_compact_sample_mask() {
+            vocab / 32
+        } else {
+            vocab
+        };
         let temp = self
             .backend
             .create_tensor(vocab * batch, TensorDtype::F32)?;
         let mask = self
             .backend
-            .create_tensor(vocab * batch, TensorDtype::F32)?;
+            .create_tensor(mask_len * batch, TensorDtype::F32)?;
         let counter = self
             .backend
             .create_tensor(vocab * batch, TensorDtype::U32)?;

@@ -28,6 +28,13 @@
 //!    两后端实测都把它推翻了（详见该用例 doc）。
 //! 9. **跨波槽位**：批宽超过一个 tensor-core 波（`8·NST`=64 槽）时，第二波、第三波的槽必须
 //!    与第一波逐位一致（全槽同 prompt + 贪心，零容差）——动 batch 门/tile 形状时的守门用例。
+//! 10. **top-p 兜底循环的候选集**（`sample.comp` 里 mask 的读/置/清路径）：上面所有采样用例
+//!     都走贪心（`top_k=1`），而贪心**根本不进这个循环** ⇒ 一条都钉不住 mask。mask 从稠密档
+//!     压成位图档（2026-10-10，`MASK_WORD_STRIDE`）之后，「位偏移/行步长算错」的具体表现是
+//!     **别的槽的位被当成本槽的位**或**上一轮的位没清干净** ⇒ 高概率候选被误标已选、`g_cutoff`
+//!     落到尾部 ⇒ 轮盘赌能选到概率极低的 token。判据不依赖 RNG（随机采样做不到逐 token 复现，
+//!     见用例 4 的 ★ 注）：采到的 token 必须落在宿主侧按同一口径算出的 top-p 候选集内，
+//!     见 [`top_p_sampled_tokens_stay_inside_the_nucleus`]。
 //!
 //! 模型/词表文件缺失或建不出后端时，用例**显式跳过**（打印原因，不算失败）——没有 GPU
 //! 权重的 CI 也能跑这份测试文件。
@@ -794,5 +801,237 @@ fn slots_beyond_the_first_wave_match() {
     eprintln!(
         "[WAVE] {WAVE_SLOTS} 槽 × {NTOK} 步贪心逐位一致（首 token {}）",
         outs[0][0]
+    );
+}
+
+/// 宿主侧复刻 `sample.comp` §3–§6 的 top-p 口径（惩罚全关 ⇒ 只有 temperature + softmax +
+/// 「按 p 降序累计到 top_p，末位即 `g_cutoff`」）：返回 `(候选集大小, cutoff 概率)`。
+///
+/// 用 f64 累积：GPU 侧是 f32 树形归约，边界可能差一个元素 —— 所以判据只取 cutoff 的
+/// **量级**（见用例里的 `P_SLACK`），不取精确位次。
+///
+/// ★ 必须复刻 kernel 的趟数上限 `MAX_TOP_P_ITERS`（=512）：阈值很高（temp 抬高 + top_p 调大）
+/// 时宿主侧会算出上千个候选，而 GPU 只消费前 512 个就停 ⇒ 真实 cutoff 是**第 512 名**的概率，
+/// 比第 N 名高。不夹这一刀，宿主侧候选集是 GPU 的**超集**，判据白白放松。
+fn top_p_nucleus(logit_row: &[f32], temperature: f32, top_p: f32) -> (usize, f64) {
+    const MAX_TOP_P_ITERS: usize = 512;
+    let inv_t = if temperature > 0.0 {
+        1.0 / f64::from(temperature)
+    } else {
+        1.0
+    };
+    let m = logit_row
+        .iter()
+        .map(|&v| f64::from(v))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut sum = 0.0;
+    let mut probs: Vec<f64> = logit_row
+        .iter()
+        .map(|&v| {
+            let e = (f64::from(v) * inv_t - m).exp();
+            sum += e;
+            e
+        })
+        .collect();
+    for p in &mut probs {
+        *p /= sum;
+    }
+    let mut desc = probs;
+    desc.sort_by(|a, b| b.total_cmp(a));
+    let mut cum = 0.0;
+    let mut size = 0usize;
+    let mut cutoff = 0.0;
+    for &p in &desc {
+        cum += p;
+        size += 1;
+        cutoff = p;
+        if cum >= f64::from(top_p) || size >= MAX_TOP_P_ITERS {
+            break;
+        }
+    }
+    // probs 已被 move 进 desc，这里返回它需要的信息只有 (size, cutoff)。
+    (size, cutoff)
+}
+
+/// 10：**mask 路径（top-p 兜底循环）的候选集守门用例**。
+///
+/// 为什么必须单独有这一条：本文件其它采样判据全是贪心（`top_k=1`），贪心不进 top-p 循环 ⇒
+/// mask 的读/置/清在现有 CI 里**一次都没被执行过**。位图化改动（`MASK_WORD_STRIDE`，
+/// 2026-10-10）动的正是这个循环：行步长或位偏移写错的后果是「跨槽位污染 / 上一轮残留」，
+/// 那会把真正的高概率候选标成已选，`g_cutoff` 掉到分布尾部，于是能采出概率极低（甚至接近 0）
+/// 的 token —— 用户侧表现为偶发乱码，而吞吐基准完全看不出来。
+///
+/// 判据刻意**不依赖随机数**（同 seed 连跑两遍逐 token 都不可复现，见用例 4 的 ★ 注）：
+/// 只要求「采到的 token 的概率 ≥ 宿主侧算出的 cutoff × `P_SLACK`」。合法的顶格候选之间
+/// 差不到一个数量级，而泄漏进来的尾部候选比 cutoff 低**几个数量级**，所以这条既不会因
+/// f32/f64 边界抖动而假失败，又能确实抓住位偏移类 bug。
+///
+/// 覆盖性自证：断言里同时要求**至少一半槽的候选集 ≥ 2**（否则循环一趟就退出，mask 读路径
+/// 没被走到 ⇒ 本用例退化成空判），分布若哪天变得过分尖锐，这里会直接报出来而不是静默失去效力。
+#[test]
+fn top_p_sampled_tokens_stay_inside_the_nucleus() {
+    const DRAWS: usize = 8;
+    /// 判据容差：概率相对 cutoff 的下限。取 1e-2 是为了「绝不误报」优先——它仍然比
+    /// 尾部泄漏（1e-5..1e-8 量级）高三个数量级。
+    const P_SLACK: f64 = 1e-2;
+
+    let _guard = gpu_lock();
+    let Some((mut model, tokenizer)) = try_load() else {
+        return;
+    };
+    let (batch, _) = prompts(&tokenizer);
+    let pad_to = batch.iter().map(|p| p.len()).max().unwrap();
+    let vocab = model.info().num_vocab;
+    let mut state = model.create_batch_state(SLOTS).unwrap();
+
+    // top_k=0 ⇒ 跳过 top-k 基数选择，直接进 top-p 兜底循环（mask 每步都被清/置/读）。
+    //
+    // ★ 口径必须**故意把分布摊平**（temp 1.25 + top_p 0.3），否则本用例是空判：
+    // 2026-10-10 用默认 `sampler()`（temp 1.0 / top_p 0.2）实测四条槽的 top-1 概率分别是
+    // 0.229 / 0.443 / 0.793 / 0.488 —— 全都在第一趟就累计过阈值 ⇒ 循环只跑一趟，
+    // mask 只被清和被写、**从没被读**（下面的覆盖性断言正是为此而设，它当场把这条报了出来）。
+    // 反过来也不能摊得太平：temp 2.0 / top_p 0.5 实测候选集 828–1412 个，cutoff 落到
+    // 1e-4 量级，判据下限（cutoff×P_SLACK）就贴到分布尾部了。1.25/0.3 是「候选集 ≥ 2
+    // 且 cutoff 仍在 1e-2 量级」的窗口，覆盖性与区分度同时拿到。
+    let sp = SamplerParams {
+        temperature: 1.25,
+        top_k: 0,
+        top_p: 0.3,
+        seed: 514,
+        repetition_penalty: 1.0,
+        frequency_penalty: 0.0,
+        ..Default::default()
+    };
+    assert!(
+        (sp.repetition_penalty - 1.0).abs() < f32::EPSILON
+            && sp.frequency_penalty == 0.0
+            && sp.presence_penalty == 0.0,
+        "本用例的宿主侧复刻不含惩罚项，sampler 口径若加惩罚必须同步"
+    );
+
+    // —— 参考分布：从零态 prefill 后跑第一步前向，取 logits ——
+    model.reset_state_of(&state).unwrap();
+    let feed = model
+        .forward_seq_batch_padded(&mut state, &batch, pad_to)
+        .unwrap();
+    model.reset_state_of(&state).unwrap();
+    let feed2 = model
+        .forward_seq_batch_padded(&mut state, &batch, pad_to)
+        .unwrap();
+    assert_eq!(
+        feed, feed2,
+        "prefill 必须可复现，否则 logits 与抽样不同分布"
+    );
+    let tokens_in: Vec<Vec<u32>> = feed.iter().map(|&t| vec![t]).collect();
+    let logits = model
+        .batch_step_logits(&mut state, &tokens_in)
+        .expect("batch_step_logits 必须可用");
+
+    let mut cutoffs = Vec::with_capacity(SLOTS);
+    let mut sizes = Vec::with_capacity(SLOTS);
+    let mut argmaxes = Vec::with_capacity(SLOTS);
+    for s in 0..SLOTS {
+        let row = &logits[s * vocab..(s + 1) * vocab];
+        let (size, cutoff) = top_p_nucleus(row, sp.temperature, sp.top_p);
+        let am = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            })
+            .0 as u32;
+        eprintln!("[NUCLEUS] slot{s} 候选集={size} cutoff={cutoff:.3e} argmax={am}");
+        sizes.push(size);
+        cutoffs.push(cutoff);
+        argmaxes.push(am);
+    }
+    assert!(
+        sizes.iter().filter(|&&n| n >= 2).count() * 2 >= SLOTS,
+        "top-p 循环全程只走一趟（候选集全为 1）⇒ mask 读路径没被覆盖，本用例已失效；\
+         调高 temperature 或调低 top_p 再造出多候选分布。实测 sizes={sizes:?}"
+    );
+
+    // —— 多 seed 独立抽样：每次从零态重跑到同一步，保证与 logits 参考同分布 ——
+    let hist = model.alloc_u32(SLOTS * 8).unwrap();
+    model.write_u32(hist, &[0u32; SLOTS * 8]).unwrap();
+    let hist_len = vec![0u32; SLOTS];
+    // 宿主侧按 token id 查概率只需要参考行；排序已丢掉位次，这里重算单点概率。
+    let prob_of = |s: usize, tok: u32| -> f64 {
+        let row = &logits[s * vocab..(s + 1) * vocab];
+        let inv_t = if sp.temperature > 0.0 {
+            1.0 / f64::from(sp.temperature)
+        } else {
+            1.0
+        };
+        let m = row
+            .iter()
+            .map(|&v| f64::from(v))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = 0.0;
+        let ps: Vec<f64> = row
+            .iter()
+            .map(|&v| {
+                let e = (f64::from(v) * inv_t - m).exp();
+                sum += e;
+                e
+            })
+            .collect();
+        ps[tok as usize] / sum
+    };
+
+    let mut drawn = 0usize;
+    // mask **失效**类故障的反向判据：见函数末尾的断言说明。
+    let mut off_greedy = 0usize;
+    let mut greedy_eligible = 0usize;
+    for r in 0..DRAWS {
+        model.reset_state_of(&state).unwrap();
+        let seeds_r = model
+            .forward_seq_batch_padded(&mut state, &batch, pad_to)
+            .unwrap();
+        assert_eq!(seeds_r, feed, "第 {r} 次抽样的起点状态必须与参考一致");
+        let sps: Vec<SamplerParams> = (0..SLOTS)
+            .map(|s| SamplerParams {
+                seed: 7919u32.wrapping_mul(r as u32 + 1).wrapping_add(s as u32),
+                ..sp
+            })
+            .collect();
+        let got = model
+            .batch_step_sample(&mut state, &tokens_in, hist, 8, &hist_len, &sps)
+            .unwrap();
+        for (s, &t) in got.iter().enumerate() {
+            let p = prob_of(s, t);
+            let floor = cutoffs[s] * P_SLACK;
+            assert!(
+                p >= floor,
+                "[NUCLEUS] slot{s} 第{r}抽采出候选集外的 token {t}：p={p:.3e} < cutoff×{P_SLACK}={floor:.3e}（cutoff={:.3e} 候选集={}）\
+                 ⇒ mask 位偏移/行步长/清除范围有错（跨槽污染或上一轮残留）",
+                cutoffs[s],
+                sizes[s]
+            );
+            if sizes[s] >= 2 {
+                greedy_eligible += 1;
+                if t != argmaxes[s] {
+                    off_greedy += 1;
+                }
+            }
+            drawn += 1;
+        }
+    }
+    model.release_tensor(hist);
+    // 反向判据（与上面的「不许掉出候选集」成对，缺一不可）：
+    // mask 若**整体失效**（比如行步长算错到读不到任何置位、或置位写到读不到的位置），
+    // 循环就每趟都重新挑中同一个 argmax，`g_cum` 反复累加同一个 p，最终 `g_cutoff = p_argmax`
+    // ⇒ 截断后只剩 argmax ⇒ 采样**退化成贪心**。这种故障不会掉出宿主侧候选集（argmax 当然在
+    // 集合内），所以只靠上一条判据是抓不住的 —— 2026-10-10 注入 `mask_wstride /= 2` 实测正是
+    // 如此：上一条判据照样通过。这里要求「候选集 ≥2 的槽里至少出现过一次非 argmax」。
+    // 概率上极宽松：slot0 候选集 11、argmax 占比 ~1/11..1/3 ⇒ 32 次全中的概率 < 1e-6。
+    assert!(
+        greedy_eligible > 0 && off_greedy > 0,
+        "[NUCLEUS] {greedy_eligible} 次候选集≥2 的抽样**全部**等于 argmax ⇒ top-p 循环没真的消费掉\
+         已选候选（mask 失效 / 置位写到读不到的位置），采样已退化成贪心。sizes={sizes:?}"
+    );
+    eprintln!(
+        "[NUCLEUS] {drawn} 次 top-p 抽样全部落在候选集内（top_p={} temp={}）",
+        sp.top_p, sp.temperature
     );
 }
