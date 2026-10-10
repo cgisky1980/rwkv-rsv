@@ -5513,14 +5513,15 @@ impl WorkBuffers {
                 backend.upload(t, &vec![0.0f32; n])?;
                 t
             },
-            // split-K 部分和：8(KS 上限) × 64(一波槽数) × max(c, fh) —— 固定 21 MiB 量级。
-            // 这里**故意不跟 bsz 走**：批宽超过一波时 `imma_ksplit` 会按实际容量把 ks 缩下去
-            // （`ks·batch·m > cap ⇒ ks-=1`），所以容量无须为最坏形状预留。按 bsz 预留会在
-            // B=256 上多要 63 MiB，而那张卡此时已经贴到显存上限（实测 ERROR_OUT_OF_DEVICE_MEMORY）。
-            // 副作用是大批量下 split-K 块数变少 —— 但仍是张量核路径，实测远好过掉回 SIMT。
-            // 不含 `vocab`：head 的 M 很大 ⇒ 块数充足 ⇒ `imma_ksplit` 恒取 1；万一被
-            // `VK_IMMA_KSPLIT` 强制，`imma_ksplit` 也会按容量自行缩回去。
-            imma_partial: mk(&mut *backend, 8 * 64 * c.max(cfg.ffn_hidden))?,
+            // split-K 部分和布局是 `[KS][batch][M]`，`imma_ksplit` 的容量约束是
+            // `ks·batch·m ≤ partial.len`，ks 上限 8、最大 m 是 `max(c, ffn_hidden)`。
+            // ⇒ 需要的长度 = `8 · batch · max(c, fh)`，而 `mk` **已经**乘了 bsz，这里只传
+            // 「每槽 8·m」。⚠️ 曾写成 `8 * 64 * max(c, fh)`（把「一波 64 槽」又乘了一遍）
+            // ⇒ 长度多 **64 倍**：B=64 实测 1280 MiB、B=256 实测 ~5.1 GB（TRACE_ALLOC 抓到
+            // 的单条最大分配就是它），正是 B≥192 把卡推到 WDDM 溢出的主因之一。
+            // 修正后 B=256 = 80 MiB，且 **默认路径逐位不变**：新容量下 `ks·m ≤ 8·10240`
+            // 对 m ≤ fh 恒成立（ks 仍取 8），head 的 m=vocab 因块数 ≥ 目标本就恒取 ks=1。
+            imma_partial: mk(&mut *backend, 8 * c.max(cfg.ffn_hidden))?,
             logits: mk(&mut *backend, vocab)?,
             token_argmax: mk(&mut *backend, 1)?,
             current_token: mk(&mut *backend, 1)?,
