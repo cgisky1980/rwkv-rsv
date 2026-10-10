@@ -3876,32 +3876,39 @@ impl Runtime {
             0u32, // 16 = ABLATE（本臂只跑 mid 投影）
             0u32, // 17 = MATMASK（同上，int8 臂整体不跑）
         ];
-        let ph = v1.device.address; // 占位（r/k/v 臂已关）
-        let params = [
-            ph,
-            ph,
-            ph,
-            ph,
-            ph,
-            ph,
-            v1.device.address,
-            w1.device.address,
-            a1.device.address,
-            g1.device.address,
-            xv.device.address,
-            xw.device.address,
-            xa.device.address,
-            xg.device.address,
-            ph,
-            ph,
-            ph,
-            ph,
-            ph,
-            ph,
-            out_vm.device.address,
-            out_wm.device.address,
-            out_am.device.address,
-            out_gm.device.address,
+        let ph = v1.device.address; // 占位（r/k/v 臂已关，对应指针永不被解引用）
+        // ★ 顺序必须与 shader 的 `Params` **逐字段一致**（26 个 buffer_reference）：
+        //   这里少写一项就会让后续所有槽位整体前移，末位读到 uniform 池里的**残留字节**
+        //   当指针解引用 ⇒ ERROR_DEVICE_LOST，且因为偏移固定而只在部分分支上发作，
+        //   极难从现象反推（本函数曾因此缺 2 项而从未跑通过）。类型标注 `[u64; 26]`
+        //   把这个约束变成编译期检查。
+        let params: [u64; 26] = [
+            ph,                    // 0  in_r_idx
+            ph,                    // 1  in_r_sz
+            ph,                    // 2  in_k_idx
+            ph,                    // 3  in_k_sz
+            ph,                    // 4  in_v_idx
+            ph,                    // 5  in_v_sz
+            v1.device.address,     // 6  in_v1
+            w1.device.address,     // 7  in_w1
+            a1.device.address,     // 8  in_a1
+            g1.device.address,     // 9  in_g1
+            ph,                    // 10 in_xr   （int8 臂关）
+            ph,                    // 11 in_xk   （int8 臂关）
+            xv.device.address,     // 12 in_xv
+            ph,                    // 13 in_xr16 （int8 臂关）
+            ph,                    // 14 in_xk16 （int8 臂关）
+            ph,                    // 15 in_xv16 （int8 臂关）
+            xw.device.address,     // 16 in_xw
+            xa.device.address,     // 17 in_xa
+            xg.device.address,     // 18 in_xg
+            ph,                    // 19 out_r   （int8 臂关）
+            ph,                    // 20 out_k   （int8 臂关）
+            ph,                    // 21 out_v   （int8 臂关）
+            out_vm.device.address, // 22 out_vm
+            out_wm.device.address, // 23 out_wm
+            out_am.device.address, // 24 out_am
+            out_gm.device.address, // 25 out_gm
         ];
         let reads = vec![
             v1.device.buffer,
