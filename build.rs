@@ -412,7 +412,7 @@ fn main() {
         // 两者都要让编译器能展开循环 ⇒ 走构建期 define，每个组合一份 spv。
         "gemm_imma" => "src/gemm_imma.comp" => {
             IM_BM => [def(64, "bm64"), def(128, "bm128")],
-            IM_NST => [def(1, "nst1"), def(2, "nst2"), def(4, "nst4"), def(8, "nst8")],
+            IM_NST => [def(1, "nst1"), def(2, "nst2"), def(4, "nst4"), def(8, "nst8"), def(16, "nst16")],
         },
         // split-K 的确定性归约（`gemm_imma` 配套）。
         "gemm_imma_reduce" => "src/gemm_imma_reduce.comp" => {

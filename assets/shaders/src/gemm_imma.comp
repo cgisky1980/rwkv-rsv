@@ -30,7 +30,7 @@
 //   - k：`grid.y = KS`（split-K 分块数），各段只写部分和，由 `gemm_imma_reduce` 求和。
 //
 // `IM_BM` / `IM_NST` 决定 `local_size_x` 与循环上界，必须走构建期 define ⇒ 每个组合一份 spv
-// （`gemm_imma_bm{64,128}_nst{1,2,4,8}.spv`）。
+// （`gemm_imma_bm{64,128}_nst{1,2,4,8,16}.spv`）。
 //
 // `OP`（特化常量 3）决定 epilogue：
 //   0 = relu² 覆盖写（ffn.key）
@@ -60,6 +60,7 @@ const uint BN   = 8;        // coopmat 的 N
 const uint SLOT = BN * NST; // 每 block 覆盖的槽数
 const uint BK   = 128;      // k 分块 = 量化组宽（flush 粒度与之对齐）
 const uint WS   = BK + 16;  // smem 行跨距（字节）：+16 让行首错开 4 个 bank
+const uint WPU  = WS / 4u;  // 同一跨距按 **uint** 计（smem 是 packed 的，见下方声明）
 const uint WR   = 16;       // 每 warp 的输出行数（coopmat 的 M）
 const uint RW   = BM / WR;  // 行 warp 数
 // ★ 2026-10-11：槽组也分到 warp（`SW`），每 warp 只跑 `RPG = NST/SW` 组。
@@ -93,32 +94,25 @@ layout(set = 0, binding = 0, std430) uniform Params {
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-shared int8_t ws[BM * WS];              // 本 k-tile 的权重（已 ^0x80）
-shared int8_t xs[SLOT * WS];            // 本 k-tile 的激活（有符号 int8，全部 NST 组一次落盘）
+/// smem 按 **uint** 存（4 个 int8 打包进一个 uint），不是按字节：
+///   - 落盘：一条 `STS.u32` 替掉 4 条 `STS.u8`。这是本 kernel 的**主瓶颈**——BM=64/NST=8 档
+///     每 block 每 k-tile 要落 `(BM + SLOT)·BK` = 16 KiB，旧写法 = 512 条 warp 级 STS，
+///     而同期只有 128 条 mma；`VK_IMMA_NST` 扫描的实测曲线（NST 2→8 慢 2.07×，正比于
+///     每槽摊到的落盘字节）也指向同一结论。
+///   - 读回：coopmat 的 int8 片段每 lane 正好 4 个连续字节 ⇒ 一条 `LDS.u32`。
+///   GLSL 允许 8 位矩阵从 32 位标量数组打包载入，此时 `stride`/`offset` 按 uint 计。
+shared uint ws[BM * WPU];               // 本 k-tile 的权重（已 ^0x80）
+shared uint xs[SLOT * WPU];             // 本 k-tile 的激活（有符号 int8，全部 NST 组一次落盘）
 shared int    tile[RW * SW][WR * BN];   // 每 warp 的 int32 累加块（coopMatStore 落地）
                                         // 第一维 = 本档的 warp 数（写成字面量 8 会在
                                         // `SW` 提到 4 时静默越界 ⇒ 由构造绑定 `RW*SW`）
 shared uint   szs[BM];                  // 本组的权重尺度/零点（每行一份）
 shared vec4   xas[SLOT];                // 本组的激活统计（每槽一份）
 
-/// 把一个打包了 4 个 uint8 的 uint32 按字节写进**权重** smem（顺带 ^0x80 下移到有符号域）。
-void store_packed4(uint base, uint packed, uint xor_mask) {
-    const uint p = packed ^ xor_mask;
-    ws[base + 0u] = int8_t((p) & 0xFFu);
-    ws[base + 1u] = int8_t((p >> 8u) & 0xFFu);
-    ws[base + 2u] = int8_t((p >> 16u) & 0xFFu);
-    ws[base + 3u] = int8_t((p >> 24u) & 0xFFu);
-}
-
-/// 同上，但写进**激活** smem `xs`（不做 xor：激活侧本来就是有符号 int8）。
-/// ⚠️ 2026-10-04：此前激活 staging 误用了 `store_packed4`（硬编码写 `ws`）⇒ 权重 0..7 行被
-/// 踩掉、`xs` 从未写入（B 恒为 0，mma 的贡献恒为 0，只剩零点修正项）。
-void store_packed4_xs(uint base, uint packed) {
-    xs[base + 0u] = int8_t((packed) & 0xFFu);
-    xs[base + 1u] = int8_t((packed >> 8u) & 0xFFu);
-    xs[base + 2u] = int8_t((packed >> 16u) & 0xFFu);
-    xs[base + 3u] = int8_t((packed >> 24u) & 0xFFu);
-}
+/// 取 packed smem 里第 `byte` 个字节并**按 int8 符号扩展**（只服务 OP=9/10 诊断路径）。
+/// 写成宏而不是函数：GLSL 的数组形参必须带尺寸，而 `ws`/`xs` 的尺寸按档位不同。
+#define PACKED_BYTE(arr, byte) \
+    int(int8_t(((arr)[(byte) >> 2u] >> (8u * ((byte) & 3u))) & 0xFFu))
 
 void main() {
     const uint index = gl_LocalInvocationIndex;
@@ -181,13 +175,15 @@ void main() {
         [[unroll]]
         for (uint n = 0u; n < NLD; n++) {
             const uint i = index + n * BLOCK_SIZE;
-            store_packed4((i >> 5u) * WS + (i & 31u) * 4u, wr[n], 0x80808080u);
+            // 权重：整字 ^0x80 下移到有符号域（与 CUDA IMMA 只吃 s8 一致）。
+            ws[(i >> 5u) * WPU + (i & 31u)] = wr[n] ^ 0x80808080u;
         }
         [[unroll]]
         for (uint n = 0u; n < NLDX; n++) {
             const uint i = index + n * BLOCK_SIZE;
+            // 激活：写 `xs` 不是 `ws`（2026-10-04 曾误写权重数组 ⇒ B 恒为 0）。
             if (i < XW && s0base + (i >> 5u) < BATCH) {
-                store_packed4_xs((i >> 5u) * WS + (i & 31u) * 4u, xr[n]);
+                xs[(i >> 5u) * WPU + (i & 31u)] = xr[n];
             }
         }
         if (index < BM) {
@@ -200,11 +196,12 @@ void main() {
         barrier();  // (1) staging 完成
 
         // —— 权重片段一次性载入寄存器（本 k-tile 内本 warp 的 RPG 组共用）——
-        const uint wrow = (row_warp * WR) * WS;
-        coopMatLoad(a0, ws, wrow + 0u, WS, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a1, ws, wrow + 32u, WS, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a2, ws, wrow + 64u, WS, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a3, ws, wrow + 96u, WS, gl_CooperativeMatrixLayoutRowMajor);
+        // 偏移 0/8/16/24 = 一个 32 字节 k 切片 = 8 个 uint。
+        const uint wrow = (row_warp * WR) * WPU;
+        coopMatLoad(a0, ws, wrow + 0u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a1, ws, wrow + 8u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a2, ws, wrow + 16u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a3, ws, wrow + 24u, WPU, gl_CooperativeMatrixLayoutRowMajor);
 
         // —— 逐 slot 组复用同一份权重（本 warp 只跑 `slot_warp` 那一段）——
         [[unroll]]
@@ -213,15 +210,15 @@ void main() {
             ci = coopmat<int32_t, gl_ScopeSubgroup, WR, BN, gl_MatrixUseAccumulator>(0);
 
             // 4 次 mma（本组 K = 128 = 4 × 32）；B：激活 k×槽
-            // （ColMajor：(k,s) 在 xs[(g*BN+s)*WS + ks*32 + k]）
-            const uint xrow = (g * BN) * WS;
-            coopMatLoad(xf, xs, xrow + 0u, WS, gl_CooperativeMatrixLayoutColumnMajor);
+            // （ColMajor：(k,s) 在 xs[(g*BN+s)*WPU + ks*8 + k/4]）
+            const uint xrow = (g * BN) * WPU;
+            coopMatLoad(xf, xs, xrow + 0u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
             ci = coopMatMulAdd(a0, xf, ci);
-            coopMatLoad(xf, xs, xrow + 32u, WS, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(xf, xs, xrow + 8u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
             ci = coopMatMulAdd(a1, xf, ci);
-            coopMatLoad(xf, xs, xrow + 64u, WS, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(xf, xs, xrow + 16u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
             ci = coopMatMulAdd(a2, xf, ci);
-            coopMatLoad(xf, xs, xrow + 96u, WS, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(xf, xs, xrow + 24u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
             ci = coopMatMulAdd(a3, xf, ci);
 
             // flush：int32 → fp32 尺度还原 + 零点修正
@@ -264,10 +261,10 @@ void main() {
                     params.out_y.data[ksp * BATCH * M + o] = acc[gg][i];
                 } else if (OP == 9u) {
                     // 诊断：直读 smem 的权重字节（`ws[(行, k=fcol)]`）——验证 staging + 行映射
-                    params.out_y.data[o] = float(int(ws[(row_warp * WR + frow + i * 4u) * WS + fcol]));
+                    params.out_y.data[o] = float(PACKED_BYTE(ws, (row_warp * WR + frow + i * 4u) * WS + fcol));
                 } else if (OP == 10u) {
                     // 诊断：直读 smem 的激活字节（`xs[(组内槽=fcol, k)]`）
-                    params.out_y.data[o] = float(int(xs[(g * BN + fcol) * WS + (frow + i * 4u)]));
+                    params.out_y.data[o] = float(PACKED_BYTE(xs, (g * BN + fcol) * WS + (frow + i * 4u)));
                 } else if (OP == 3u) {
                     // 覆盖写、但落 fp16（v 链的输出张量本就是 fp16 语义；舍入与 `float16_t`
                     // 一致，与旧的 SIMT 路径 `float16_t(res)` 逐位相同）

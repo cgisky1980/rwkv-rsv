@@ -1660,14 +1660,22 @@ impl Runtime {
     /// 而 CUDA 426 → 766 → 1296 → 1898 近似线性）。kernel 里在 block 内循环 NST 组槽、
     /// 复用同一份 smem 权重，即可把重读次数压到 1。
     ///
-    /// 取「≥ ceil(batch/8) 的最小 2 的幂」（构建期只编了 1/2/4/8 四档），上限 8 ⇒ batch ≤ 64。
+    /// 取「≥ ceil(batch/8) 的最小 2 的幂」（构建期编了 1/2/4/8/16 五档），自动规则上限 8 ⇒ batch ≤ 64。
+    ///
+    /// ⚠️ **`NST=16` 已实测否决，别当优化项再试一遍**（2026-10-11，§6.8）：让一个 block 盖 128 槽
+    /// ⇒ 权重对 B=128 只读一遍，本该省下重读，实测反而**慢 7.6~12.8 %**
+    /// （key 0.2982→0.3209、head 1.6596→1.8727 ms）。同一批扫描里 `BM=128`、`NST=4/2`、强制 split-K
+    /// 全部不如默认的 `BM=64/NST=8/ks=auto` ⇒ 本 kernel 的开销**不由权重重读决定**，
+    /// 而由每 block 每 k-tile 的 smem staging 指令数决定（`(BM+8·NST)·BK` 字节按字存 ⇒ 见
+    /// `gemm_imma.comp` 的 packed smem 注释）。
+    /// `VK_IMMA_NST=16` 只作为**探针口径**保留（档位已编出来，复测不需要重新构建）。
     fn imma_nst(batch: usize) -> usize {
         let want = batch.div_ceil(8).next_power_of_two();
         match std::env::var("VK_IMMA_NST")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            Some(v) => v.clamp(1, 8),
+            Some(v) => v.clamp(1, 16),
             None => want.clamp(1, 8),
         }
     }

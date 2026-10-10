@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, but **0.87× down to 0.27× at default gates as batch grows** (see §6.1).
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**, batched prefill 0.79…0.84× (2026-10-11 same-session re-measures, §6.1 / §6.6-§6.8; the older 0.27×-at-B=256 row predates that chain and needs re-measuring).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -169,6 +169,36 @@ taken; raw records `bench/ab-20261010-184051-89364.jsonl` + `.summary.json`):
 | 128 | 3367.6 | 1.4% | 24,427 ms | 967.4 | 1.6% | 43,670 ms | **0.29** | diverged |
 | 256 | 3726.5 | 1.6% | 46,652 ms | 988.5 | 1.6% | 86,453 ms | **0.27** | diverged |
 
+**Re-measured 2026-10-11** (same harness, same gate defaults, session `20261011-040726-67976`, 2
+rounds/cell median, decode only - the table above's decode column predates §6.3's rkv tensor-core default
+flip and §6.4/§6.5, so it is kept as the pre-chain baseline):
+
+| Batch | CUDA tok/s | spread | Vulkan tok/s | spread | Vulkan/CUDA | was (2026-10-10) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 590.2 | 1.4% | 499.8 | 1.1% | **0.847** | 0.83 |
+| 32 | 1786.9 | 1.5% | 1210.8 | 1.8% | **0.678** | 0.48 |
+| 128 | 3440.8 | 2.2% | 1626.9 | 1.2% | **0.473** | 0.29 |
+
+Vulkan B=128 decode went 967.4 -> **1 626.9 tok/s (+68 %)** while CUDA stayed inside its own drift
+(3 367.6 -> 3 440.8), so the 2026-10-11 chain (§6.3 rkv flip + §6.4 `gemm_imma` fetch structure + §6.5
+v-chain split-K) is worth **+0.18x** at B=128 and **+0.20x** at B=32. Cross-backend fingerprints still
+diverge (expected - different kernel implementations, see the 口径 note in
+`tests/batch_parity.rs`). **Decode remains the largest open gap** (prefill is at 0.79x, §6.7), and it is
+still *widening* with B.
+
+**Re-measured again the same day after §6.8** (packed `gemm_imma` smem staging; session
+`20261011-043110-89384`, same harness and gates, 2 rounds/cell median):
+
+| Batch | CUDA tok/s | spread | Vulkan tok/s | spread | Vulkan/CUDA | was (a few hours earlier) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 585.4 | 1.2% | 512.1 | 0.8% | **0.875** | 0.847 |
+| 32 | 1782.0 | 1.2% | 1275.2 | 0.4% | **0.716** | 0.678 |
+| 128 | 3426.6 | 1.4% | 1739.7 | 1.4% | **0.508** | 0.473 |
+
+CUDA again inside its own drift; **Vulkan's own decode fingerprints are unchanged**
+(`0xd0c265`/`0x7b05` at B=8, `0x3460382`/`0x16fa` at B=32, `0xd1b5310`/`0x7bfc` at B=128 — byte-identical
+to the session above), so this is a pure speed change (§6.8).
+
 **Gate snapshot (verbatim, identical for both backends in that session)**: `SEGS=4` `PAD_TO=512`
 `NTOK=32` `WARMUP=1` `SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`;
 `LOWRANK_GEMM` / `FFN_VALUE_GEMM` / `GEMV_IMMA` **all unset = ON** (CUDA low-rank 4-chain / FFN value
@@ -200,6 +230,11 @@ capture), `STEP` off (self-loop path only), `PENALTY` off, `SELFLOOP_CHUNK` / `A
    over B=1, and Vulkan is essentially flat from B=64 on (935 → 988 tok/s for a 4× larger batch).
    Mechanism: [参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md](参考/2026-10-10-批量并发收尾与基准可信度-实施记录.md) §11 —
    every wave re-reads the whole int8 weight set, at a constant 64–68 ms per wave.
+   ⚠️ **That reading of the mechanism is now falsified for the tensor-core kernel (2026-10-11, §6.8)**:
+   making one wave cover 128 slots instead of 64 (so the weights are read **once** instead of twice)
+   made `gemm_imma` **7–14 % slower**, and the flat-throughput curve persists. Cost per wave is set by
+   per-block *instruction issue*, not by weight re-read traffic — CUDA's own `IMMA_DB`/`IM_PIPE`
+   dead-ends (`backend_cuda.rs` ≈1866) say the same thing from the other side.
 4. **prefill and decode rank in opposite directions**: at B=1 Vulkan prefill is *faster*
    (1,169 vs 2,238 ms), then CUDA takes over from B≥32 and pulls away (86.5 s vs 46.7 s at B=256).
 
@@ -749,6 +784,66 @@ Still open in this item, in size order:
 
 Details: [参考/2026-10-11-Vulkan-分块prefill状态回灌设备化-实施记录.md](参考/2026-10-11-Vulkan-分块prefill状态回灌设备化-实施记录.md).
 
+### 6.8 `gemm_imma` shared memory packed 4-bytes-per-word (2026-10-11): decode +2.4…+7.2 %, bit-exact
+
+**Where the gap actually is.** After §6.3-§6.5 the decode ratio was still 0.47x at B=128, so the four
+W8A8 tensor-core shapes were timed in isolation against CUDA's own IMMA kernel
+(`kernel_bench`; CUDA reaches its imma path through `gemv_int8_*` because `IMMA_MIN_BATCH = 1` and
+`GEMV_IMMA` defaults on - note `supports_int8_imma()` is Vulkan-only, so the `imma_*` op family is
+skipped on CUDA and the equivalent shapes must be read off the SIMT op names:
+`relu2` = key, `mul_add` = out, `add` = value, `plain` = head):
+
+| Shape (m × k) | B | Vulkan (before) | CUDA | Vulkan/CUDA |
+|---|---:|---:|---:|---:|
+| key 10240×2560 | 128 | 0.2982 ms | 0.1816 ms | 1.64x slower |
+| value 2560×10240 | 128 | 0.3229 ms | 0.1714 ms | 1.88x slower |
+| head 65536×2560 | 128 | 1.6596 ms | 0.8439 ms | 1.97x slower |
+| out 2560×2560 | 128 | 0.0990 ms | 0.0706 ms | 1.40x slower |
+
+**The re-read hypothesis, tested and rejected.** `imma_nst` covered only `NST ∈ {1,2,4,8}` (build.rs),
+so a block served `8·NST = 64` slots and **B=128 read every int8 weight twice, B=256 four times**. Adding
+an `nst16` variant (128 slots per block ⇒ single read) was supposed to be the easy 2x. It is
+**slower** - key 0.2982 → 0.3209, head 1.6596 → 1.8727 (+7.6…+12.8 %) - and so is every other tile
+move (`BM=128`, `NST=4/2`, forced split-K): the default `BM=64 / NST=8 / split-K auto` is the top of
+that whole space, which closes §6.1's item 3 as a *mechanism* (see the ⚠️ note there).
+
+**What the knob sweep instead exposed** is the real limiter. Cost scales with the bytes each block has
+to *stage per k-tile*, i.e. `(BM + 8·NST)·BK` - `NST` 2→8 bought 2.07x while block count went *down*,
+which is the signature of instruction-issue pressure on the staging path, not of DRAM traffic. And the
+staging path was storing one byte at a time: `store_packed4` unpacked each `uint` (4 quantised bytes)
+into **four `STS.u8`**. At `BM=64/NST=8` that is 16 KiB per block per k-tile = ~512 warp-wide store
+instructions against only 128 `mma` instructions.
+
+The fix is to keep the shared memory **packed**: `shared uint ws[]/xs[]` (4 int8 per word), one
+`STS.u32` per loaded word, and let `coopMatLoad` take the packed form (GLSL allows an 8-bit coopmat to
+load from a 32-bit scalar array - `stride`/`offset` are then counted in words, `WS/4 = 36`). Each
+fragment needs exactly 4 contiguous bytes per lane, so the read-back becomes one `LDS.u32` too. The
+`^0x80` signed shift moves to the whole word (`^ 0x80808080u`).
+
+Measured, isolated (B=128 / B=256, `sum(y)` byte-identical to the pre-change kernel on all four shapes):
+
+| Shape | B=128 before → after | B=256 before → after | after vs CUDA |
+|---|---|---|---|
+| key | 0.2982 → **0.2492** (1.20x) | 0.5735 → **0.4757** (1.21x) | 1.37x slower |
+| value | 0.3229 → **0.2675** (1.21x) | 0.6051 → **0.5117** (1.18x) | 1.56x slower |
+| head | 1.6596 → **1.2682** (1.31x) | 3.3022 → **2.5209** (1.31x) | 1.50x slower |
+| out | 0.0990 → **0.0876** (1.13x) | 0.1900 → **0.1640** (1.16x) | 1.24x slower |
+
+End to end, same-session interleaved against CUDA (§6.1's second re-measure table): **+2.4 % (B=8) /
++5.2 % (B=32) / +7.2 % (B=128)** decode, ratio 0.875 / 0.716 / **0.508**, CUDA columns unchanged within
+their own spread, and **Vulkan decode fingerprints unchanged** (`0xd0c265`/`0x7b05`,
+`0x3460382`/`0x16fa`, `0xd1b5310`/`0x7bfc`) - the accumulation order per output element is untouched by
+construction, so this is a pure speed change. Gates: `cargo fmt --all`, `cargo clippy --all-targets
+--release -- -D warnings` clean, `cargo test --release` green (78 + 11 + 1, 3 ignored).
+
+Left on this kernel, in size order: (i) the split-K *rule* was tuned on the old staging and is now
+mistuned for `value` (auto ≈ ks 8 gives 0.512 ms at B=256, forced `VK_IMMA_KSPLIT=2` gives 0.462 ms);
+(ii) the remaining 1.2-1.6x per-kernel gap to CUDA is inside the loop (fragment load / epilogue
+structure), not in tile shape - §6.4's fetch-structure work is the template; (iii) the same packing
+argument applies to the fp16 prefill `gemm` (2-byte elements, 2 per word) and is unbilled in §6.6.
+
+Details: [参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md](参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md).
+
 ## 7. Layout
 
 ```
@@ -773,9 +868,9 @@ This project initially referenced two existing RWKV inference implementations:
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
 | Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
 | Relative gap (CUDA batched decode) | baseline | **ahead** — that same-session pair gave parity at B=1 and +11% to +26% at B=8–256; Albatross is gone from this machine, so **the column cannot be refreshed and must not be divided into §6.1's CUDA column** |
-| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1) |
+| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1). ⚠️ **Updated 2026-10-11**: that row's "but rkv" is stale (§6.3 put r/k/v on W8A8 tensor cores by default), and after §6.3-§6.5 + §6.8 the same-session medians are **0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**; B=256 has not been re-measured since. |
 
-The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path was brought to the same level *at the same SIMT 口径*: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is throughput-neutral against CUDA **when CUDA is held to the same kernel sequence** while keeping cross-vendor reach. Against CUDA's *default* tensor-core path Vulkan is not neutral — the r/k/v batched kernel is the one op Vulkan keeps on SIMT by default (`VK_IMMA_OPS`), and that is where most of the B-scaling gap lives (see §6.1, 口径 paragraph).
+The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path was brought to the same level *at the same SIMT 口径*: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is throughput-neutral against CUDA **when CUDA is held to the same kernel sequence** while keeping cross-vendor reach. Against CUDA's *default* tensor-core path Vulkan is not neutral — the r/k/v batched kernel is the one op Vulkan keeps on SIMT by default (`VK_IMMA_OPS`), and that is where most of the B-scaling gap lives (see §6.1, 口径 paragraph). ⚠️ That last sentence is the 2026-10-10 pre-flip state: §6.3 (same day) moved r/k/v onto the W8A8 tensor-core path by default, and §6.4/§6.5/§6.8 then re-measured the remaining gap as sitting inside `gemm_imma` and the low-rank chain, not in r/k/v being SIMT.
 
 Inspired by both, this repository has since evolved independently, adding capabilities neither has: **two weight-quantization paths** (fp16 / int8 auto-routed), **CPU fp32 reference plus GPU-kernel unit tests**, and an **offline quantization toolchain** with a reproducible accuracy-verification workflow.
 
