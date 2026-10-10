@@ -8052,6 +8052,17 @@ impl ComputeBackend for CudaBackend {
         Ok(())
     }
 
+    /// ★ CUDA 的 `begin_batch`/`end_batch` **不提交也不等待**（内核直接在 stream 上 launch，
+    /// 真正的收口在 graph replay / `download`），所以任何「圈一段时间」的基准都必须调用这个，
+    /// 否则量到的是 host 入队时间。见 `ComputeBackend::synchronize` 的注释。
+    fn synchronize(&mut self) -> R<()> {
+        cu_check!(
+            (self.drv.cu_stream_synchronize)(self.stream),
+            "cuStreamSynchronize"
+        );
+        Ok(())
+    }
+
     fn supports_graph_capture(&self) -> bool {
         // 兼容开关：RWKV_GRAPH=0 时禁用 CUDA graph（降级为批量记录）。
         // 背景：驱动 610.47 上图捕获+重放在个别请求上非确定性挂死（2026-09-19，

@@ -594,6 +594,19 @@ impl Runtime {
         Ok(())
     }
 
+    /// 只等队列空闲，不结束批次、不动记账（基准/剖析用）。
+    ///
+    /// 为什么要有它：跨后端可比的计时必须显式等待。CUDA 侧的 `begin_batch`/`end_batch`
+    /// **既不提交也不等待**（内核直接在 stream 上 launch，收口靠 graph replay / download），
+    /// 所以「begin → N 次调用 → end」的循环在 CUDA 上量到的是 host 入队时间；Vulkan 侧
+    /// `end_batch` 恰好自带 submit + wait_idle，两边只有都走 `synchronize` 才同口径。
+    pub fn wait_queue(&self) -> R<()> {
+        unsafe {
+            self.app.device.queue_wait_idle(self.app.compute.queue)?;
+        }
+        Ok(())
+    }
+
     /// 结束批处理：end command buffer，一次性 submit + wait，随后释放 kernel 资源（归还 descriptor set）
     pub fn end_batch(&mut self) -> R<()> {
         if !self.recording {
@@ -2589,8 +2602,10 @@ impl Runtime {
     /// B 为权重 [N, K]（行主序，即 PyTorch nn.Linear 的 [out, in] 布局），
     /// 输出 C = A @ B^T 为 [M, N]（行主序）。
     ///
-    /// 要求 M/N 为 TILE_M=256 / TILE_N=256 的整数倍，K 为 TILE_K=32 的整数倍。
-    /// dispatch: (M/256, N/256, 1)。
+    /// 要求 M 为 TILE_M 的整数倍、N 为 TILE_N 的整数倍、K 为 TILE_K 的整数倍；
+    /// 瓦片由 `gemm_tile_for` 按硬件能力 + 形状整除性自动选档（默认 NVIDIA 偏好
+    /// 128×128×32，整除不了的低秩形状自动退到 64×64 一档）。
+    /// dispatch: (ceil(M/TILE_M), ceil(N/TILE_N), 1)。
     #[allow(clippy::too_many_arguments)]
     pub fn gemm(
         &mut self,
@@ -4491,15 +4506,16 @@ fn gemm_tile(app: &App) -> (u32, u32, u32) {
     let (base_tile_m, base_tile_n, base_tile_k) = match vendor_id {
         // NVIDIA (0x10DE): 通常有更大的共享内存和更好的张量核心支持
         0x10DE => {
-            // 检查共享内存大小，高端卡支持更大瓦片
-            if max_shared_memory >= 163840 {
-                // 高端 NVIDIA 卡（如 RTX 3080+）
+            // 按**真实共享内存需求**选档，而不是按 `max_shared_memory` 的绝对值门限。
+            // 旧代码写的是「≥163840 才给 128×128」，而这张 Turing 的 API 返回值是
+            // 48 KB ⇒ 永久锁在 64×64×32。实测（2026-10-11，pf_* 带 sum(y) 指纹对拍，
+            // 两档输出逐位相同）128×128×32 只需 36 KB 且在 prefill 形状上快
+            // 1.9~2.8×（pf_key 4096 行 13.6→39.2 TOPS，与 cuBLAS 的 33~58 同档）。
+            if gemm_shmem(128, 128, 32) <= max_shared_memory {
                 (128, 128, 32)
-            } else if max_shared_memory >= 98304 {
-                // 中端 NVIDIA 卡（如 RTX 2080 Ti）
+            } else if gemm_shmem(64, 64, 64) <= max_shared_memory {
                 (64, 64, 64)
             } else {
-                // 低端 NVIDIA 卡
                 (64, 64, 32)
             }
         }
@@ -4533,15 +4549,9 @@ fn gemm_tile(app: &App) -> (u32, u32, u32) {
         env("GEMM_TILE_K", tile_k),
     );
 
-    // 共享内存上限校验：计算当前瓦片配置的共享内存使用量
-    // gemm.comp 中共享内存计算：
-    //   SH_A_BUF = TILE_M * (TILE_K + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4
-    //   SH_B_BUF = TILE_N * (TILE_K + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4
-    //   总共享内存 = (SH_A_BUF + SH_B_BUF) * 16 字节 (uvec4)
-    const NUM_ELEMENT_VEC4: u32 = 4; // 每个 uvec4 包含 4 个元素
-    let sh_a_buf = tile_m * (tile_k + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
-    let sh_b_buf = tile_n * (tile_k + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
-    let total_shared_memory = (sh_a_buf + sh_b_buf) * 16; // uvec4 = 16 字节
+    // 共享内存上限校验：gemm.comp 的 sh_a/sh_b 是 uvec4 数组，每块按
+    //   TILE_(M|N) * (TILE_K + 8) / 4 个 uvec4 计，每个 uvec4 = 16 字节。
+    let total_shared_memory = gemm_shmem(tile_m, tile_n, tile_k);
 
     // 如果超过硬件限制，逐步减小瓦片尺寸直到满足要求
     if total_shared_memory > max_shared_memory {
@@ -4562,11 +4572,7 @@ fn gemm_tile(app: &App) -> (u32, u32, u32) {
         // 最多尝试 10 次调整
         for _ in 0..10 {
             // 重新计算共享内存使用量
-            let sh_a_buf =
-                adjusted_tile_m * (adjusted_tile_k + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
-            let sh_b_buf =
-                adjusted_tile_n * (adjusted_tile_k + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
-            let total = (sh_a_buf + sh_b_buf) * 16;
+            let total = gemm_shmem(adjusted_tile_m, adjusted_tile_n, adjusted_tile_k);
 
             if total <= max_shared_memory {
                 log::info!(
@@ -4579,31 +4585,65 @@ fn gemm_tile(app: &App) -> (u32, u32, u32) {
                 return (adjusted_tile_m, adjusted_tile_n, adjusted_tile_k);
             }
 
-            // 按优先级减小瓦片尺寸
+            // 按优先级减小瓦片尺寸。**下界是结构约束而非性能选择**：
+            // SUBTILE_M = TILE_M/4 必须 ≥ MAT_M=16，否则 NUM_MAT_SUBTILE_M=0，
+            // 内核一帧都不干活却照样「成功」返回（2026-10-11 就是 32×32×32 这一档
+            // 静默空转，被报成 234 TOPS = fp16 峰值 4.3 倍的假胜利）。
             if adjusted_tile_k > 16 {
                 adjusted_tile_k /= 2;
-            } else if adjusted_tile_m > subgroup_size {
-                adjusted_tile_m = (adjusted_tile_m / 2).max(subgroup_size);
-            } else if adjusted_tile_n > subgroup_size {
-                adjusted_tile_n = (adjusted_tile_n / 2).max(subgroup_size);
+            } else if adjusted_tile_m > 64 {
+                adjusted_tile_m = (adjusted_tile_m / 2).max(64);
+            } else if adjusted_tile_n > 32 {
+                adjusted_tile_n = (adjusted_tile_n / 2).max(32);
             } else {
                 // 无法进一步减小，使用最小配置
                 log::warn!("无法进一步减小瓦片尺寸，使用最小配置");
-                return (subgroup_size, subgroup_size, 16);
+                return (64, 32, 16);
             }
         }
 
         // 如果多次调整后仍无法满足要求，使用保守的最小配置
         log::warn!("多次调整后仍无法满足共享内存限制，使用保守的最小配置");
-        (subgroup_size, subgroup_size, 16)
+        (64, 32, 16)
     } else {
         (tile_m, tile_n, tile_k)
     }
 }
 
+/// 一组瓦片配置需要的共享内存字节数（sh_a + sh_b，uvec4 计）。
+/// 与 `gemm_spec` 里 `ROW = TILE_K + 8` 的 fp16 行填充一致。
+fn gemm_shmem(tile_m: u32, tile_n: u32, tile_k: u32) -> u32 {
+    const NUM_ELEMENT_VEC4: u32 = 4;
+    let row = tile_k + 8;
+    (tile_m * row / NUM_ELEMENT_VEC4 + tile_n * row / NUM_ELEMENT_VEC4) * 16
+}
+
+/// 把偏好瓦片收缩到能**整除**当前问题形状的最大档（形状相关的瓦片选择）。
+///
+/// `gemm.comp` 是 Khronos 风格的 coopmat 内核：三层循环全是编译期定长 trip count、
+/// 内层没有任何边界检查，而 dispatch 用 `div_ceil` ⇒ 只要 M/N 不是 TILE_M/TILE_N 的
+/// 整数倍，最后一个 tile 就会**读写越过缓冲末尾**。低秩投影正是这种形状
+/// （n = round_up(mid, 64)，可以恰为 64）：128×128 会往 [M_PAD, 64] 的 v_mid 上多写
+/// 64 列、并越过 v1_16 尾部。整除性在这里保证，内核保持无分支。
+/// 收缩只会**降低**共享内存需求，故与上面的上限校验不冲突。
+fn gemm_tile_for(app: &App, m: usize, n: usize, k: usize) -> (u32, u32, u32) {
+    let (tm, tn, tk) = gemm_tile(app);
+    let shrink = |t: u32, len: usize, floor: u32| -> u32 {
+        let mut t = t;
+        while t > floor && !(len as u32).is_multiple_of(t) {
+            t /= 2;
+        }
+        t
+    };
+    // M 维下界 64（= 4·MAT_M，见上），N 维下界 32（= 2·MAT_N），K 维下界 16（= MAT_K）。
+    (shrink(tm, m, 64), shrink(tn, n, 32), shrink(tk, k, 16))
+}
+
 /// 由瓦片尺寸计算 dispatch 网格（M/TILE_M × N/TILE_N）。
+/// 瓦片取 `gemm_tile_for`（与 `gemm_spec` 同一处决议；TILE_M/TILE_N 只依赖 M/N，
+/// 故两处必然一致，不会出现「spec 用 128、grid 用 64」这类错位）。
 fn gemm_grid(app: &App, m: usize, n: usize) -> (u32, u32) {
-    let (tm, tn, _) = gemm_tile(app);
+    let (tm, tn, _) = gemm_tile_for(app, m, n, 0);
     (
         m.div_ceil(tm as usize).max(1) as u32,
         n.div_ceil(tn as usize).max(1) as u32,
@@ -4612,7 +4652,7 @@ fn gemm_grid(app: &App, m: usize, n: usize) -> (u32, u32) {
 
 #[allow(non_snake_case)]
 fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 42] {
-    let (TILE_M, TILE_N, TILE_K) = gemm_tile(app);
+    let (TILE_M, TILE_N, TILE_K) = gemm_tile_for(app, m, n, k);
     const MAT_M: u32 = 16;
     const MAT_N: u32 = 16;
     const MAT_K: u32 = 16;

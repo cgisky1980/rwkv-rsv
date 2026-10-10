@@ -93,6 +93,15 @@ pub trait ComputeBackend {
     fn begin_batch(&mut self) -> R<()>;
     fn end_batch(&mut self) -> R<()>;
 
+    /// 阻塞直到设备把**已提交/已入队**的活全部跑完。基准与剖析专用，推理路径不需要
+    /// （Vulkan 靠 `end_batch` 的 submit+wait_idle 收口，CUDA 靠 graph replay / `download`）。
+    ///
+    /// ★ **两个后端都必须真正实现，不给默认实现**：CUDA 的 `begin_batch`/`end_batch`
+    /// 既不提交也不等待（内核直接在 stream 上 launch），所以「begin → iters 次调用 → end」
+    /// 这样的计时圈在 CUDA 上量到的是**纯 host 入队时间**。`kernel_bench` 就因此报过
+    /// 1840~112000 TOPS 的 `gemm`（fp16 张量峰值只有 ~54 TOPS）——不是 cuBLAS 快，是没等它。
+    fn synchronize(&mut self) -> R<()>;
+
     /// 清空累计的 per-kernel profiling 时间（仅诊断；CUDA 覆盖，其余为 no-op）。
     fn clear_kernel_prof(&mut self) {}
 
@@ -1633,6 +1642,10 @@ impl ComputeBackend for VulkanBackend {
 
     fn end_batch(&mut self) -> R<()> {
         self.rt.end_batch()
+    }
+
+    fn synchronize(&mut self) -> R<()> {
+        self.rt.wait_queue()
     }
 
     fn gemv_f16(

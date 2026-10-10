@@ -93,6 +93,12 @@ struct Case {
     icode: u32,
     /// `quant_x_i8` 是否带门控（`att.output` 的 `y_norm · g`）。
     xgate: bool,
+    /// `true` ⇒ 走**批量 prefill 的稠密 fp16 GEMM**（`gemm`：`C[rows,n] = A[rows,k] @ B[n,k]^T`）。
+    /// 这一族与 `imma_*` 的语义不同：`batch` 那一列在这里是**行数 = token 数**（`B·T_pad`），
+    /// `m` 是输出特征数。之所以要有它：`supports_int8_imma()` 在 CUDA 后端是 false，
+    /// `imma_*` 只能量 Vulkan，跨后端比不了；而 prefill 的 86 % 时间在这条 `gemm` 上，
+    /// **两后端都实现** ⇒ 这是唯一能在同精度、同形状下直接对拍 Vulkan/CUDA 的口径。
+    pf16: bool,
 }
 
 impl Case {
@@ -133,6 +139,7 @@ fn main() {
                 imma: false,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             "mul_add" => Case {
                 op: op.clone(),
@@ -141,6 +148,7 @@ fn main() {
                 imma: false,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             "plain" => Case {
                 op: op.clone(),
@@ -149,6 +157,7 @@ fn main() {
                 imma: false,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             "add" => Case {
                 op: op.clone(),
@@ -157,6 +166,7 @@ fn main() {
                 imma: false,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             "f16" => Case {
                 op: op.clone(),
@@ -165,6 +175,7 @@ fn main() {
                 imma: false,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             // ---- W8A8 张量核四个形状（与上面 SIMT 口径一一对应）----
             "imma_key" => Case {
@@ -174,6 +185,7 @@ fn main() {
                 imma: true,
                 icode: 0,
                 xgate: false,
+                pf16: false,
             },
             "imma_out" => Case {
                 op: op.clone(),
@@ -182,6 +194,7 @@ fn main() {
                 imma: true,
                 icode: 1,
                 xgate: true,
+                pf16: false,
             },
             "imma_value" => Case {
                 op: op.clone(),
@@ -190,6 +203,7 @@ fn main() {
                 imma: true,
                 icode: 1,
                 xgate: false,
+                pf16: false,
             },
             "imma_head" => Case {
                 op: op.clone(),
@@ -198,11 +212,41 @@ fn main() {
                 imma: true,
                 icode: 2,
                 xgate: false,
+                pf16: false,
+            },
+            // ---- 批量 prefill 的稠密 fp16 GEMM（`gemm`）：与上面 imma_* 同形状，但那一列
+            //      在这里是 token 行数 ----
+            "pf_out" => Case {
+                op: op.clone(),
+                m: c,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "pf_key" => Case {
+                op: op.clone(),
+                m: fh,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "pf_value" => Case {
+                op: op.clone(),
+                m: c,
+                k: fh,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
             },
             other => {
                 eprintln!(
                     "未知算子 '{other}'（可选 relu2/mul_add/plain/add/f16 \
-                     与 imma_key/imma_out/imma_value/imma_head）"
+                     与 imma_key/imma_out/imma_value/imma_head、pf_out/pf_key/pf_value）"
                 );
                 std::process::exit(2);
             }
@@ -226,8 +270,8 @@ fn main() {
     let mut b = backend;
 
     println!(
-        "{:<11} {:>7} {:>6} {:>6} {:>11} {:>12} {:>10} {:>9} {:>8}",
-        "op", "m", "k", "batch", "ms/call", "权重 MB", "有效 GB/s", "TOPS", "抖动"
+        "{:<11} {:>7} {:>6} {:>6} {:>11} {:>12} {:>10} {:>9} {:>8} {:>12}",
+        "op", "m", "k", "batch", "ms/call", "权重 MB", "有效 GB/s", "TOPS", "抖动", "sum(y)"
     );
     println!("{}", "-".repeat(86));
 
@@ -255,7 +299,7 @@ fn main() {
             }
         }
         for &batch in &batches {
-            let (ms, jitter) =
+            let (ms, jitter, fp) =
                 match run_case(b.as_mut(), case, batch, cap_rows, iters, warmup, repeats) {
                     Ok(v) => v,
                     Err(e) => {
@@ -263,14 +307,14 @@ fn main() {
                         continue;
                     }
                 };
-            let (wbytes, is_f16) = if case.op == "f16" {
+            let (wbytes, is_f16) = if case.op == "f16" || case.pf16 {
                 (case.wbytes_f16(), true)
             } else {
                 (case.wbytes_int8(), false)
             };
             let gbs = wbytes / (ms / 1000.0) / 1e9;
             println!(
-                "{:<11} {:>7} {:>6} {:>6} {:>11.4} {:>12.2} {:>10.1} {:>9.1} {:>7.1}%{}",
+                "{:<11} {:>7} {:>6} {:>6} {:>11.4} {:>12.2} {:>10.1} {:>9.1} {:>7.1}% {:>12.4}{}",
                 case.op,
                 case.m,
                 case.k,
@@ -280,6 +324,7 @@ fn main() {
                 gbs,
                 case.tops(batch, ms),
                 jitter * 100.0,
+                fp,
                 if is_f16 { "  (fp16)" } else { "" }
             );
         }
@@ -289,10 +334,16 @@ fn main() {
     println!("    上表「有效 GB/s」按单次读折算，故真实带宽 = 该值 × ceil(batch/BGRP)。");
     println!("    TOPS = 2·m·k·batch/ms，含 split-K 归约与量化那一趟（端到端口径）。");
     println!("    抖动超过 ~10% 时该行不可用于 A/B 判断（可用 KB_REPEATS 加大重复轮数）。");
+    println!("    sum(y) = 计时后单独一次调用的输出前 4096 个元素之和；**为 0 ⇒ 内核没跑**，");
+    println!("      该行的 ms/call 与 TOPS 全部作废（这一列是 2026-10-11 加的，起因是");
+    println!("      GEMM_TILE=32/32/32 报出 234 TOPS = fp16 峰值的 4.3 倍这种假胜利）。");
+    println!("    pf_* 族的 batch 是 **token 行数**（prefill 的 B·T_pad）、m 是输出特征数；");
+    println!("      它走稠密 fp16 `gemm`（两后端都实现 ⇒ 可跨后端对拍），「有效 GB/s」只是");
+    println!("      权重单次读的下界口径，判断请看 TOPS 列（fp16 张量峰值 ≈ 54 TOPS）。");
 }
 
 /// 建张量 → 预热 → `repeats` 轮（每轮 `iters` 次调用 + 一次同步）→
-/// 返回 `(最小 ms/call, 抖动)`，抖动 = (最大-最小)/最小。取最小以剔除外部占卡干扰。
+/// 返回 `(最小 ms/call, 抖动, 结果指纹)`，抖动 = (最大-最小)/最小。取最小以剔除外部占卡干扰。
 fn run_case(
     b: &mut dyn ComputeBackend,
     case: &Case,
@@ -301,12 +352,12 @@ fn run_case(
     iters: usize,
     warmup: usize,
     repeats: usize,
-) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
     let (m, k) = (case.m, case.k);
     let mut rng = Rng(0x5A5A_1234_ABCD_0001);
 
     // 权重：int8（idx 打包 4×uint8 + sz 打包 scale/zero 两个 f16）或 fp16。
-    let (a8, w16) = if case.op == "f16" {
+    let (a8, w16) = if case.op == "f16" || case.pf16 {
         let t = b.create_tensor(m * k, TensorDtype::F16)?;
         b.upload(t, &vec![0.01f32; m * k])?;
         (None, Some(t))
@@ -325,13 +376,22 @@ fn run_case(
     };
 
     // 激活 [batch, k] f32 / 门控 [batch, k] f16 / 输出 [batch, m] f32。
-    let x = b.create_tensor(batch * k, TensorDtype::F32)?;
-    let xs: Vec<f32> = (0..batch * k)
-        .map(|_| 0.01 * (1.0 + rng.next_f32().abs()))
-        .collect();
-    b.upload(x, &xs)?;
-    let g = b.create_tensor(batch * k, TensorDtype::F16)?;
-    b.upload(g, &vec![0.5f32; batch * k])?;
+    // ★ pf16 三族**不建 f32 的 x**：它的「batch」是 token 行，rows=65536 时 x 是 671 MB 的
+    //   上传（在计时之外，但会把一次基准的准备拖到分钟级），而 `gemm` 的 A 本来就要求 fp16。
+    let (x, g, a16) = if case.pf16 {
+        let a = b.create_tensor(batch * k, TensorDtype::F16)?;
+        b.upload(a, &vec![0.01f32; batch * k])?;
+        (None, None, Some(a))
+    } else {
+        let x = b.create_tensor(batch * k, TensorDtype::F32)?;
+        let xs: Vec<f32> = (0..batch * k)
+            .map(|_| 0.01 * (1.0 + rng.next_f32().abs()))
+            .collect();
+        b.upload(x, &xs)?;
+        let g = b.create_tensor(batch * k, TensorDtype::F16)?;
+        b.upload(g, &vec![0.5f32; batch * k])?;
+        (Some(x), Some(g), None)
+    };
     let y = b.create_tensor(batch * m, TensorDtype::F32)?;
     b.upload(y, &vec![0.0f32; batch * m])?;
 
@@ -352,15 +412,28 @@ fn run_case(
 
     let call = |b: &mut dyn ComputeBackend| -> Result<(), Box<dyn std::error::Error>> {
         match case.op.as_str() {
-            "relu2" => b.gemv_int8_relu2(a8.as_ref().unwrap(), x, y, m, k, batch),
-            "mul_add" => b.gemv_int8_mul_add(a8.as_ref().unwrap(), x, g, y, m, k, batch),
-            "plain" => b.gemv_int8_plain(a8.as_ref().unwrap(), x, y, m, k, batch),
-            "add" => b.gemv_int8_add(a8.as_ref().unwrap(), x, y, m, k, batch),
-            "f16" => b.gemv_f16(w16.unwrap(), x, y, m, k, batch),
+            "relu2" => b.gemv_int8_relu2(a8.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
+            "mul_add" => {
+                b.gemv_int8_mul_add(a8.as_ref().unwrap(), x.unwrap(), g.unwrap(), y, m, k, batch)
+            }
+            "plain" => b.gemv_int8_plain(a8.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
+            "add" => b.gemv_int8_add(a8.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
+            "f16" => b.gemv_f16(w16.unwrap(), x.unwrap(), y, m, k, batch),
+            "pf_out" | "pf_key" | "pf_value" => {
+                // `gemm(a, w, out, rows, n, k)`：`case.m` 在这里是**输出特征数 n**。
+                b.gemm(a16.unwrap(), w16.unwrap(), y, batch, m, k)
+            }
             "imma_key" | "imma_out" | "imma_value" | "imma_head" => {
                 let (xq, xaux, partial) = (xq.unwrap(), xaux.unwrap(), partial.unwrap());
                 // 与 `gpu_model.rs` 一致：量化与 GEMM 成对计时（门控在量化那一步做掉）。
-                b.quant_x_i8(x, case.xgate.then_some(g), xq, xaux, k, batch)?;
+                b.quant_x_i8(
+                    x.unwrap(),
+                    case.xgate.then_some(g.unwrap()),
+                    xq,
+                    xaux,
+                    k,
+                    batch,
+                )?;
                 b.gemm_imma(
                     a8.as_ref().unwrap(),
                     xq,
@@ -378,17 +451,52 @@ fn run_case(
         }
     };
 
-    // ★ 必须用 begin_batch/end_batch 包住调用：Vulkan 的 `record_kernel` 只把 dispatch
-    // 记进持久 command buffer，**不提交**（`end_batch` 才 submit + wait_idle）。
-    // 旧版本漏了这一步 ⇒ 内核从未真正执行，测到的是纯 host 记录时间
-    // （`add`(27MB 权重) 报 0.0053 ms/call = 5100 GB/s，物理不可能）。
+    // ★ 计时圈必须**两边都收口**，而两个后端的收口方式相反：
+    //   - Vulkan 的 `record_kernel` 只把 dispatch 记进持久 command buffer，**不提交**
+    //     （`end_batch` 才 submit + wait_idle）⇒ 漏 `end_batch` 量到的是纯 host 记录时间
+    //     （`add`（27 MB 权重）报 0.0053 ms/call = 5100 GB/s，物理不可能）；
+    //   - CUDA 的 `begin_batch`/`end_batch` **既不提交也不等待**（内核当场 launch 到 stream，
+    //     真正的收口在 graph replay / download）⇒ 只靠 `end_batch` 量到的是 host 入队时间
+    //     （`gemm` 报 1840~112000 TOPS，而 fp16 张量峰值只有 ~54）。
+    //   ⇒ 统一走 `synchronize()`，它才是跨后端可比的口径。
     for _ in 0..warmup {
         b.begin_batch()?;
         call(b)?;
         b.end_batch()?;
     }
     // 预热后同步一次，避免把首次编译/首次 launch 的开销计入。
-    let _ = b.download(y)?;
+    // ★ 这里原来用 `download(y)` 兜同步：`pf_*` 的 y 在 rows=16384 时是 671 MB 的下载
+    //   （纯浪费）。`synchronize` 就是为这件事存在的原语。
+    b.synchronize()?;
+
+    let mut sum = 0.0f64;
+    // ★ 一次「带读回」的调用（放在计时圈**外面**，圈保持纯净）。
+    //   `sum == 0` ⇒ 输出从未落地 ⇒ 下面那一行的 ms/call 是「内核根本没跑」的速度，不可用。
+    //   为什么必须内建：tile=32×32×32 那一档一开始报出 234 TOPS（fp16 张量峰值 54 的 4.3 倍），
+    //   而它在表里与其他档看不出任何区别——只有读回才暴露得出来。
+    {
+        b.begin_batch()?;
+        call(b)?;
+        b.end_batch()?;
+        b.synchronize()?;
+        let mut chunk = 1usize << 16; // 先试 65536 元素
+        loop {
+            match b.download_part(y, 0, chunk) {
+                Ok(v) => {
+                    sum = v.iter().take(4096).map(|&x| x as f64).sum();
+                    break;
+                }
+                Err(e) => {
+                    if chunk > 16 {
+                        chunk /= 2; // 后端对下载长度有约束（对齐/页）⇒ 逐半退让
+                    } else {
+                        eprintln!("读回失败（结果不可验证）: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // repeats 轮，每轮 iters 次调用 + 一次同步；取最小值（最不易被外部占卡污染）。
     let mut best = f64::INFINITY;
@@ -399,7 +507,11 @@ fn run_case(
         for _ in 0..iters {
             call(b)?;
         }
-        b.end_batch()?; // submit + wait_idle：把 GPU 执行时间算进来
+        b.end_batch()?; // Vulkan：submit + wait_idle
+        // ★ CUDA 的 end_batch **不等**（内核直接 launch 到 stream 上），少了这一行就会
+        //   把 host 入队时间当 GPU 时间报出去（实测 `gemm` 报 1840~112000 TOPS，而 fp16
+        //   张量峰值只有 ~54）⇒ 跨后端可比的唯一办法是两边都显式 synchronize。
+        b.synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         best = best.min(ms);
         worst = worst.max(ms);
@@ -410,8 +522,12 @@ fn run_case(
         0.0
     };
 
+    // 结果指纹：由上面那次带读回的调用填的 `sum`（见其注释）。
+    let fp = sum;
+
     // 释放临时张量（避免注册表膨胀）。
-    let mut all: Vec<TensorId> = vec![x, g, y];
+    let mut all: Vec<TensorId> = vec![y];
+    all.extend([x, g, a16].into_iter().flatten());
     all.extend([xq, xaux, partial].into_iter().flatten());
     if let Some(h) = a8 {
         all.push(h.idx);
@@ -423,5 +539,5 @@ fn run_case(
     for t in all {
         b.free_tensor(t);
     }
-    Ok((best, jitter))
+    Ok((best, jitter, fp))
 }

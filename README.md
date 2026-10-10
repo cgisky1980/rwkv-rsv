@@ -576,6 +576,73 @@ shift. Rule for greedy-sampling outputs: a 20-sample summary gate can only detec
 Gates: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `BACKEND=vulkan` and
 `BACKEND=cuda cargo test --release` (both 77 + 9 + 1 passed, 0 failed).
 
+### 6.6 Batched-prefill fp16 GEMM tile default (2026-10-11): 0.574x -> **0.96x** of CUDA
+
+The §9 item said batched prefill ran at 0.59x of CUDA and blamed the fp16 coopmat GEMM itself
+(~1.8x slower). Fixing that was supposed to need an int8 tensor-core prefill kernel. It needed a
+one-line tile-selection change instead - but getting a *trustworthy* number for `gemm` across
+backends first exposed two harness bugs.
+
+**① CUDA's `begin_batch`/`end_batch` neither submit nor synchronize** (kernels launch straight onto
+the stream; synchronization happens at graph replay / download). So the timed loop measured **host
+enqueue**, and `gemm` reported 1,840-112,640 TOPS on a card whose fp16 tensor peak is ~54. Not
+cuBLAS being fast - cuBLAS not being waited for. `ComputeBackend::synchronize()` is now a **required
+trait method with no default implementation** (a default no-op would let the next backend reproduce
+the bug); Vulkan = `queue_wait_idle`, CUDA = `cuStreamSynchronize`. ⚠️ **Every historical CUDA
+kernel_bench row is void.**
+
+**② A GPU timing without a read-back is not a measurement.** After ①, the tile sweep still showed
+`32x32x32` at 234 TOPS - 4.3x the fp16 peak, indistinguishable from the other arms in the table. The
+new `sum(y)` column (one untimed call + partial read-back) returned 0.0000: that arm never wrote an
+output. Root cause is structural - `SUBTILE_M = TILE_M/4` and `NUM_MAT_SUBTILE_M = SUBTILE_M/MAT_M`,
+MAT_M = 16, so **TILE_M < 64 gives zero loop iterations**: the kernel legally does nothing and
+returns success. The shared-memory fallback's `(subgroup_size, subgroup_size, 16)` = `(32,32,16)` was
+exactly such a silent no-op arm; floors are now `(64, 32, 16)`.
+
+**What was actually wrong with the tile choice**: the NVIDIA branch gated 128x128 on
+`max_shared_memory >= 163840`, while this Turing reports 48 KB - so it was pinned at 64x64x32
+forever (that threshold is an AMD-sized-VRAM notion, it does not map to what NVIDIA's API returns).
+`128x128x32` needs 36 KB by the same formula the code already uses for its guard (40 KB with the
+shader's `ROW = TILE_K+8`), so the card fits it comfortably. Selection is now requirement-based
+(`gemm_shmem`), and the guard uses the same single formula instead of two divergent ones.
+
+**Shape divisibility is what makes the bigger tile safe to ship**: `gemm.comp` is Khronos-style coopmat -
+fixed compile-time trip counts, no bounds checks - while the dispatch uses `div_ceil`. So if M/N is not
+a multiple of TILE_M/TILE_N, the last tile **reads and writes past the end of the buffer**. The low-rank
+projections are exactly that shape (n = `round_up(mid, 64)`, can be 64): 128-wide N would write 64
+columns past a `[M_PAD, 64]` v_mid. `gemm_tile_for()` therefore shrinks the preferred tile to the
+largest one that divides the problem (floors as above); `gemm_spec` and `gemm_grid` both go through it,
+and TILE_M/TILE_N depend only on M/N so the two cannot disagree. Prerequisites that keep the main path
+at 128: `SeqBuffers.m_pad = t.div_ceil(256)*256` (gpu_model.rs:5601) is always a multiple of 256, and
+2560 / 10240 / 65536 are all multiples of 128.
+
+**Kernel level** (4096 token-rows, same session, `sum(y)` bit-identical across every arm):
+
+| shape (`pf_*` = fp16 `gemm`, the only cross-backend-comparable prefill measure) | CUDA cuBLAS | Vulkan new | Vulkan old | new ratio |
+| --- | --- | --- | --- | --- |
+| `pf_out` 2560x2560 | 41.1 TOPS | 36.9 | 13.8 | **0.90x** |
+| `pf_key` 10240x2560 | 48.2 | 39.2 | 13.6 | **0.81x** |
+| `pf_value` 2560x10240 | 56.6 | 25.6 | 12.2 | **0.45x** |
+
+No batch-dependent gating was needed: at 512+ rows 128x128 is never worse and usually 1.5-2.9x
+better, and at 256 rows the two arms are equal inside the noise (0.19 ms/call is below the timer's
+resolution). Small-M under-fill (256/128 x 2560/128 = 40 blocks < 68 SMs) does not show up in practice.
+
+**End to end**, single-sequence (`prof_prefill_steady`, best-of-3): 2048 tokens 2,670 -> **3,788 tok/s**
+against CUDA's 4,328 (0.62x -> 0.87x); 512 tokens 2,932 -> 2,973 vs 3,706 (0.80x - short prompts are
+RNN-bound, not GEMM-bound, hence the small move there).
+
+**Batched** (`batch_decode_bench` B=128 `PAD_TO=512`, three arms in one session, prefill seed
+fingerprint `0x1b9664` identical in all three): CUDA 23,168 ms / Vulkan 64x64 40,421 ms (**0.574x** -
+the §9 0.59x, reproduced across sessions) / Vulkan 128x128 24,119 ms (**0.961x**). In the same lines,
+decode is still 1,602 vs 3,430 tok/s (0.47x), so prefill is no longer the large-batch story - §6.1's
+decode columns are.
+
+Remaining: `pf_value` (deep-K, narrow-N: n=2560 gives only 20 blocks along N while k=10240 streams 320
+K-tiles per block) is the one prefill shape still 2.2x behind, and int8 tensor-core prefill is demoted
+behind it - dequant is only 0.9% of the chunk, and fp16 is now at parity. Details:
+[参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md](参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md).
+
 ## 7. Layout
 
 ```
@@ -621,7 +688,7 @@ Inspired by both, this repository has since evolved independently, adding capabi
   2. **The two-stage low-rank chain still only has a SIMT batched kernel** (`gemv_lowrank_chain4_batch`), where CUDA has the two-stage fp16 tensor-core `lowrank_gemm_batch`. ★ 2026-10-10: measured with `PROF_GPU=1 SKIP_GRAPH=1` at B=128 decode rather than guessing - `gemm_imma` **48.7%**, low-rank chain **15.5%**, state kernel `fuse_ka_dplr_norm` **14.5%**, rkv stage-2 `gemv_int8_rkv_stage1_batch` **10.6%**, `gemm_imma_reduce` 4.4%, `quant_x_i8` 2.0% ⇒ **the three SIMT kernels together are 40.6%** while the tensor-core GEMMs take 48.7%. The same dump works out to ~100 ms of GPU per step against 88 ms/step unprofiled ⇒ **the GPU is saturated; large batch is not a host/submission bottleneck** (which also lowers expectations for point 3). Data: `参考/2026-10-10-Vulkan-rkv张量核默认翻转-实施记录.md` §3.5.
   3. **CUDA merges the three r/k/v chains into one dispatch (`RKV_MERGE`); Vulkan does not**, so it records 3 extra `quant_x_i8` + 3 extra `gemm_imma_reduce` per layer. Expectations for merging them are revised *down* by point 1: it cannot rescue B=1; the value is partial traffic and host recording at large batch.
   Current standing, default configuration vs CUDA (same-session interleaved): **0.754x (B=1) / 0.804x (B=8) / 0.632x (B=32) / 0.413x (B=128)** (§6.3). ⚠️ The B>=192 slot must not be charged entirely to kernel quality: §6.2③ recorded a 57x sampler slowdown there and read it as WDDM spill. The footprint has since been cut - `imma_partial` was 64x oversized, and reclaiming it took B=256 from 17 807 to 12 747 MiB registered / 20 585 to 15 528 MiB external, **bit-exact and throughput-neutral** (§6.2③-bis) - and in the current build the B>=192 slowdown **does not reproduce at all** (1465-1505 tok/s, monotone in batch, TOPP=1.0, alternating rounds). So capacity is no longer the open explanation; what is left is the 0.41x itself, whose remaining footprint item is the fp32 RNN state (next entry) and whose remaining kernel items are the low-rank chain (§9 item 2) and batched prefill.
-- **Batched prefill lags further than decode and is the real large-batch cost** (2026-10-10 `PROF_GPU`): at B=128 the same workload reads `prefill 42,367 ms / decode 5,831 ms` ⇒ prefill is **7.3x** the decode wall clock; CUDA at the same parameters reads `24,859 / 2,403 ms` ⇒ **prefill runs at 0.59x of CUDA** (decode 0.41x - the two must not be merged). Vulkan batched prefill goes through `forward_seq_batch`, whose GEMMs are **fp16 coopmat with no int8 tensor-core variant**: in one chunk `gemm_f16_f32_affine` 37% + `gemm_f16_f32_relu2` 27% + `gemm_f16_f32` 22% = **86%**, while `dequant_int8_f16` is only **0.9%** ⇒ the cost is the fp16 GEMM itself (~1.8x slower than CUDA), not dequantization. ⚠️ 4-5x of this workload is **padding waste** (prompts are 104..139 tokens but `PAD_TO=512`) - a bucketing problem, not a backend one. Prefill is chunked by `PREFILL_SLOTS=8` ⇒ 128 slots run as 16 serial chunks.
+- ~~**Batched prefill lags further than decode and is the real large-batch cost**~~ — **measured and largely fixed 2026-10-11 (§6.6)**. The old 口径 (2026-10-10 `PROF_GPU`): at B=128 `prefill 42,367 ms / decode 5,831 ms` ⇒ prefill is 7.3x the decode wall clock, CUDA at the same parameters `24,859 / 2,403 ms` ⇒ **prefill ran at 0.59x of CUDA**, and Vulkan batched prefill's GEMMs are fp16 coopmat with no int8 variant (`gemm_f16_f32_affine` 37% + `_relu2` 27% + `gemm_f16_f32` 22% = **86%**, `dequant_int8_f16` only **0.9%**) ⇒ the cost was the fp16 GEMM itself. What it was *not* was an int8-tensor-core gap: the NVIDIA tile-selection branch gated the 128x128 tile on `max_shared_memory >= 163840` while this card reports 48 KB, so prefill ran pinned at 64x64x32 even though 128x128x32 fits in 40 KB. One tile-selection change (+ a shape-divisibility guard so the low-rank n=64 shapes can't read/write OOB) took batched prefill B=128 from 40,421 ms to **24,119 ms** against CUDA's 23,168 ms = **0.96x**, bit-identical seeds. What is left in this item: `pf_value` (deep-K narrow-N) is still 0.45x of cuBLAS at kernel level, and int8 prefill is demoted behind it (dequant is 0.9%, fp16 is at parity). ⚠️ 4-5x of that workload remains **padding waste** (prompts are 104..139 tokens but `PAD_TO=512`) - a bucketing problem on the consumer side, common-mode between backends.
 - **Vulkan still keeps the RNN state in fp32** — the **only remaining large per-slot VRAM lever** (the
   other half of this entry, `log_vram` accounting, is **fixed** 2026-10-10, see §6.2③-correction):
   `supports_f16_wkv_state()` returns false on Vulkan (CUDA true), `H·N·N = 163 840` elements per layer per
