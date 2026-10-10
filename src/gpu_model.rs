@@ -2379,8 +2379,16 @@ impl GpuModel {
                 if rkv_sel & 4 != 0 {
                     self.backend
                         .quant_x_i8(bb.xv, None, bb.xb_q, bb.xb_aux, c, batch)?;
-                    self.backend
-                        .gemm_imma_f16(v_a8, bb.xb_q, bb.xb_aux, bb.v, c, c, batch)?;
+                    self.backend.gemm_imma_f16(
+                        v_a8,
+                        bb.xb_q,
+                        bb.xb_aux,
+                        bb.v,
+                        bb.imma_partial,
+                        c,
+                        c,
+                        batch,
+                    )?;
                 }
                 // 未走张量核的矩阵由 SIMT 融合核补（mid 传 0 = 只算 r/k/v）。
                 if rkv_sel != 7 {

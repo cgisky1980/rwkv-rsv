@@ -537,6 +537,45 @@ Gates: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `BACKEND=
 --release` (77 + 9 + 1 passed, 0 failed). Details:
 `参考/2026-10-11-Vulkan-gemm_imma取数结构-实施记录.md`.
 
+### 6.5 v-arm split-K (2026-10-11): +2-4 % at B<=64, quality gate passed at n=232
+
+`gemm_imma_f16` (the v chain) was the one IMMA arm that never split K: `grid.x = M/BM` = 40 blocks
+at M=C=2560, below this card's 68 SMs, while the r/k arms (same shape, `gemm_imma`) had long since
+been raised to 40x`ks` blocks. The reason was purely that the reduce kernel only had f32 exits, so
+`OP=3` (fp16 store) forced `ks = 1`. `gemm_imma_reduce.comp` gained an `Out16` buffer_reference and
+an `OP == 3` arm, so v now writes f32 partials and reduces them into fp16 in ascending `ks` order -
+deterministic, but **not** the same bytes as the old path: same quantization, same fp32 accumulation,
+different association order. That makes it a numeric-contract change, which is exactly the situation
+§6.3 handles with a quality gate rather than a fingerprint check.
+
+**Speed** (same-session three-arm A/B, `#29` vs `#29+#30`, 2 rounds, means): +3.3 / +2.2 / +3.5 /
++2.6 / 0.0 / +0.3 % at B = 1 / 8 / 32 / 64 / 128 / 256 - the expected shape (v is one of three chains
+and only 40 blocks, so it is a small-batch occupancy fix; at B>=128 `grid.z` already supplies the
+blocks). In the deployment summary pipeline (batch=8) it is 2.81/2.95 -> **3.00/3.03 summaries/s**.
+
+**Quality** (`batch_summarize`, all 105 real multi-turn scenarios = 232 summaries, CUDA as
+reference; `VK_IMMA_V_KSPLIT=1` pins the old path so the A/B is one environment variable, same
+binary, same shaders):
+
+| arm | common-prefix ratio vs CUDA (cp/min) | cp/max | byte-identical | mean chars (CUDA = 77.3) | collapsed |
+| --- | --- | --- | --- | --- | --- |
+| v split-K OFF (committed before this) | 0.514 | 0.426 | 69/232 | 80.8 | 18 |
+| v split-K ON (new default) | **0.541** | **0.483** | **91/232** | **76.7** | 18 |
+
+Collapsed = CUDA gave >= 80 chars and the arm gave < 35 % of that (the §6.3 failure mode). Paired:
+8 collapsed only with OFF, 8 only with ON (McNemar chi2 = 0.06, not significant); every config
+reproduced byte-identically across its two runs.
+
+⚠️ **The first pass of this gate used 20 summaries and pointed the wrong way.** It showed the prefix
+ratio up but the mean length dropping 77.9 -> 56.9, which reads like the SIMT truncation symptom, and
+the reasonable conclusion looked like "revert". At n=232 the length column reverses (80.8 -> 76.7
+against a CUDA mean of 77.3): the drop was four short draws in a 20-sample mean, not a distribution
+shift. Rule for greedy-sampling outputs: a 20-sample summary gate can only detect gross damage
+(§6.3's 0.332 vs 0.501); anything within ~0.1 needs the full scenario set.
+
+Gates: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `BACKEND=vulkan` and
+`BACKEND=cuda cargo test --release` (both 77 + 9 + 1 passed, 0 failed).
+
 ## 7. Layout
 
 ```

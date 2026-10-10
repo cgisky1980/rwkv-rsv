@@ -499,7 +499,8 @@ pub trait ComputeBackend {
         Err("gemm_imma: backend not supported".into())
     }
 
-    /// 同 `gemm_imma`，但输出落 **fp16**（v 链用）。
+    /// 同 `gemm_imma`，但输出落 **fp16**（v 链用）。`partial` 同 `gemm_imma`：形状允许时
+    /// 后端自行决定分块，分块后由归约内核的 `OP=3` 臂落 fp16。
     #[allow(clippy::too_many_arguments)]
     fn gemm_imma_f16(
         &mut self,
@@ -507,6 +508,7 @@ pub trait ComputeBackend {
         _xq: TensorId,
         _xaux: TensorId,
         _y16: TensorId,
+        _partial: TensorId,
         _m: usize,
         _k: usize,
         _batch: usize,
@@ -2124,6 +2126,7 @@ impl ComputeBackend for VulkanBackend {
         xq: TensorId,
         xaux: TensorId,
         y16: TensorId,
+        partial: TensorId,
         m: usize,
         k: usize,
         batch: usize,
@@ -2132,10 +2135,12 @@ impl ComputeBackend for VulkanBackend {
         let xq_g = self.get_u32(xq, "gemm_imma_f16")?;
         let aux_g = self.get_f32(xaux, "gemm_imma_f16")?;
         let mut y_o = self.take_f16(y16, "gemm_imma_f16")?;
+        let mut p_o = self.take_f32(partial, "gemm_imma_f16")?;
         let res = self
             .rt
-            .gemm_imma_f16(&a_g, &xq_g, &aux_g, &mut y_o, m, k, batch);
+            .gemm_imma_f16(&a_g, &xq_g, &aux_g, &mut y_o, &mut p_o, m, k, batch);
         self.put_f16(y16, y_o);
+        self.put_f32(partial, p_o);
         res
     }
 

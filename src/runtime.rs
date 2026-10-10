@@ -1511,23 +1511,21 @@ impl Runtime {
             &[out.device.buffer],
         )?;
         if ks > 1 {
-            let rspec = [m as u32, batch as u32, ks as u32, op];
-            let rparams = [partial.device.address, y.device.address];
-            let total = (batch * m) as u32;
-            self.record_kernel(
-                "shaders/spv/gemm_imma_reduce.spv",
-                &rspec,
-                &rparams,
-                (total.div_ceil(256), 1, 1),
-                &[partial.device.buffer],
-                &[y.device.buffer],
-            )?;
+            self.record_imma_reduce(partial, y.device.address, y.device.buffer, m, batch, ks, op)?;
         }
         Ok(())
     }
 
     /// 同 `gemm_imma`，但输出落 **fp16**（`OP=3`；v 链的 `out_v` 本就是 fp16 语义）。
-    /// 不做 split-K（归约内核是 f32 语义），故恒 `ks = 1`。
+    ///
+    /// ★ 2026-10-11：这一臂也开始吃 split-K（此前恒 `ks = 1`，因为归约内核只有 f32 出口）。
+    /// 动机是**占用**：`grid.x = M/BM`，v 的 `M = C = 2560`、`BM = 64` ⇒ 只有 40 块，
+    /// 而这张卡 68 个 SM ⇒ rkv 三条链里唯独 v 铺不满（r/k 走 `gemm_imma`，早已 split-K 到
+    /// 40×ks 块）。CUDA 侧对同一问题的解法是 `RKV_MERGE`（三链并进一次 launch，
+    /// `backend_cuda.rs` ≈8735）。`ks > 1` 时 GEMM 只写 f32 `partial`，由
+    /// `gemm_imma_reduce` 的 `OP=3` 臂按 ks 升序求和后落 fp16 ⇒ 确定性。
+    /// ⚠️ 求和结合顺序与 `ks = 1` 不同 ⇒ 落盘字节不再是旧路径的逐位值（数值契约不变：
+    /// 同样的量化、同样的 fp32 累加，只是加法顺序；r/k 两条链早就在这个契约上跑）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_imma_f16(
         &mut self,
@@ -1535,6 +1533,7 @@ impl Runtime {
         xq: &GpuTensorU32,
         xaux: &GpuTensor,
         y16: &mut GpuTensor16,
+        partial: &mut GpuTensor,
         m: usize,
         k: usize,
         batch: usize,
@@ -1543,31 +1542,88 @@ impl Runtime {
         debug_assert_eq!(a.k, k);
         let bm = Self::imma_bm(m);
         let nst = Self::imma_nst(batch);
+        // 门禁用单变量开关：`VK_IMMA_V_KSPLIT=1` 关掉 v 臂 split-K，回到 ks=1 直写路径
+        // （= 未接入 split-K 的提交版行为）。只支持「关」：强行指定任意 ks 需满足
+        // `(k/128) % ks == 0` 等约束，这里不放开。
+        let v_off = std::env::var("VK_IMMA_V_KSPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|v| v <= 1);
+        let ks = if v_off {
+            1
+        } else {
+            Self::imma_ksplit(m, k, bm, partial.len, batch)
+        };
         let spv = format!("shaders/spv/gemm_imma_bm{bm}_nst{nst}.spv");
-        let spec = [m as u32, k as u32, batch as u32, 3u32, 1u32];
-        let addr = y16.device.address;
+        let spec = [m as u32, k as u32, batch as u32, 3u32, ks as u32];
+        // ks == 1 直接写 y16；ks > 1 写 partial（f32），再由归约内核落 fp16。
+        let out_addr = if ks == 1 {
+            y16.device.address
+        } else {
+            partial.device.address
+        };
+        let out_buf = if ks == 1 {
+            y16.device.buffer
+        } else {
+            partial.device.buffer
+        };
+        // Params 固定 6 槽（`out16` 只在 OP=3 且 ks==1 用；`out` 与 `out16` 同址）。
         let params = [
             a.idx.device.address,
             a.sz.device.address,
             xq.device.address,
             xaux.device.address,
-            addr,
-            addr,
+            out_addr,
+            out_addr,
         ];
         self.record_kernel(
             &spv,
             &spec,
             &params,
-            ((m / bm) as u32, 1, batch.div_ceil(8 * nst) as u32),
+            ((m / bm) as u32, ks as u32, batch.div_ceil(8 * nst) as u32),
             &[
                 a.idx.device.buffer,
                 a.sz.device.buffer,
                 xq.device.buffer,
                 xaux.device.buffer,
             ],
-            &[y16.device.buffer],
+            &[out_buf],
         )?;
+        if ks > 1 {
+            let y16_addr = y16.device.address;
+            self.record_imma_reduce(partial, y16_addr, y16.device.buffer, m, batch, ks, 3)?;
+        }
         Ok(())
+    }
+
+    /// split-K 归约（`gemm_imma` / `gemm_imma_f16` 共用）：`partial [KS][BATCH][M]` 按 ks
+    /// 升序求和 + 施加 `op` 写进 `out`。
+    /// ⚠️ `rparams` 的**槽位数必须与 `gemm_imma_reduce.comp` 的 `Params` 字段数一致**
+    /// （现在是 3：`in_p` / `out_y` / `out16`）——少一个就整体错位，把某个地址当指针解引用
+    /// （commit `5b410ec` 修的就是这类错位）。OP=3 时 `out_y` 槽填 fp16 输出的地址，
+    /// 该字段在 OP=3 下不会被读写。
+    #[allow(clippy::too_many_arguments)]
+    fn record_imma_reduce(
+        &mut self,
+        partial: &mut GpuTensor,
+        out_addr: u64,
+        out_buf: vk::Buffer,
+        m: usize,
+        batch: usize,
+        ks: usize,
+        op: u32,
+    ) -> R<()> {
+        let rspec = [m as u32, batch as u32, ks as u32, op];
+        let rparams = [partial.device.address, out_addr, out_addr];
+        let total = (batch * m) as u32;
+        self.record_kernel(
+            "shaders/spv/gemm_imma_reduce.spv",
+            &rspec,
+            &rparams,
+            (total.div_ceil(256), 1, 1),
+            &[partial.device.buffer],
+            &[out_buf],
+        )
     }
 
     /// `gemm_imma` 的 BM 选择：默认 64（小 batch 时 `grid = M/BM` 是唯一加块手段，

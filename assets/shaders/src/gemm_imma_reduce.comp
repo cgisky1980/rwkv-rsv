@@ -1,12 +1,15 @@
 #version 450 core
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
 
 // split-K 的确定性归约（`gemm_imma.comp` 的配套内核，只编这一条，避免把大 GEMM 再编一遍）：
 //   `out_y[slot,row] = op( Σ_{ks=0}^{KS-1} partial[ks][slot][row] )`
 // 部分和在 `gemm_imma` 里按 `[KS][BATCH][M]` 布局落盘，这里按 ks **升序**相加 —— 固定顺序，
 // 故结果确定（不依赖 block 调度）。op 语义与 `gemm_imma` 的 epilogue 逐项一致：
-//   0 = relu² 覆盖写、1 = 累加到 out_y、2 = 覆盖写。
+//   0 = relu² 覆盖写、1 = 累加到 out_y、2 = 覆盖写、3 = 覆盖写但落 fp16（`out16`）。
+// ⚠️ `Params` 的三个字段 = host 侧 `rparams` 的三个槽位，**数量必须严格一致**
+//   （少一个就整体错位、把某个地址当指针解引用 —— 见 commit `5b410ec` 的那次崩溃）。
 
 layout(constant_id = 0) const uint M     = 10240;  // 输出行数
 layout(constant_id = 1) const uint BATCH = 8;      // 槽位数
@@ -17,10 +20,12 @@ const uint BLOCK_SIZE = 256;
 
 layout(buffer_reference) buffer InP  { float data[]; };   // [KS][BATCH][M]
 layout(buffer_reference) buffer OutY { float data[]; };   // [BATCH][M]
+layout(buffer_reference) buffer Out16 { float16_t data[]; }; // [BATCH][M]，仅 OP=3
 
 layout(set = 0, binding = 0, std430) uniform Params {
     InP  in_p;
     OutY out_y;
+    Out16 out16;
 } params;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -33,7 +38,9 @@ void main() {
         for (uint ks = 0u; ks < KS; ks++) {
             s += params.in_p.data[ks * total + i];
         }
-        if (OP == 1u) {
+        if (OP == 3u) {
+            params.out16.data[i] = float16_t(s);
+        } else if (OP == 1u) {
             params.out_y.data[i] = params.out_y.data[i] + s;
         } else {
             params.out_y.data[i] = (OP == 0u) ? (s > 0.0 ? s * s : 0.0) : s;
