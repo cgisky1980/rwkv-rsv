@@ -864,7 +864,18 @@ forced ks 2 = 0.462 ms). It now targets **320 whole-grid blocks**; kernel-level 
 −20 % (`out` B=256), −7…−11 % (`value` B=128/256), end to end **+3.3 % ratio at B=128** and provably
 zero change at B≤32 (see §6.1's third re-measure and 参考 §九);
 (ii) the remaining 1.2-1.6x per-kernel gap to CUDA is inside the loop (fragment load / epilogue
-structure), not in tile shape - §6.4's fetch-structure work is the template; (iii) ~~the same packing
+structure), not in tile shape - §6.4's fetch-structure work is the template; **(ii-a) probed and
+falsified the same day**: dropping weight staging altogether and letting `coopMatLoad` read the A
+fragment straight from global (glslang *and* the NVIDIA driver accept a `buffer_reference` pointer
+here - a capability worth remembering for §6.9/#25) is **32-42 % slower** (`imma_key` B=8 0.076 →
+0.102, B=128 0.204 → 0.291): staging is a necessary cost, not a removable one, because the packed
+bulk LDG prefetch buys more than the eliminated `STS`/`LDS` instructions cost. What remains of (ii)
+is the `tile[]` store→barrier→read-back round trip in the flush. Methodology note from this probe:
+the **first** A/B was invalid - the shader was compiled with `-DIM_DIRECT_A` while the macro is
+`IMMA_DIRECT_A`, so the "probe" spv was byte-identical to the baseline (its `md5sum` matched) and the
+reported 2 % was pure noise; both arms printing the **same `sum(y)`** is the signature of a dead
+probe, so every probe arm now also carries a numeric marker unrelated to performance (here: overwrite
+`szs[]` with a constant scale, which moved `sum(y)` by 39.5x and proved the arm ran). (iii) ~~the same packing
 argument applies to the fp16 prefill `gemm`~~ — **checked and voided**: `gemm.comp` already stages
 `shared uvec4` (16 B per store), so there is nothing to pack there; §6.6's prefill gap is a different
 mechanism (see 参考 §七 item 3).
