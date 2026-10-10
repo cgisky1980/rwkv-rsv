@@ -159,7 +159,7 @@ const GATED_KNOBS: [(&str, &str); 6] = [
     ("GEMV_IMMA", "开 —— CUDA r/k/v 走 int8 张量核"),
     ("LOWRANK_GEMM", "开 —— CUDA 低秩四条走 int8 张量核"),
     ("FFN_VALUE_GEMM", "开 —— CUDA FFN value 走 int8 张量核"),
-    ("VK_IMMA_OPS", "除 rkv 外全开"),
+    ("VK_IMMA_OPS", "全开（含 rkv，2026-10-10 翻转）"),
     ("SKIP_GRAPH", "关 —— 自循环走图捕获/单批录制"),
     ("SELFLOOP_CHUNK", "内核默认分段"),
 ];

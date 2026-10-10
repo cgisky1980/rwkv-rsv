@@ -611,9 +611,12 @@ pub trait ComputeBackend {
 
     /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核两级融合，只有 CUDA 实现）。
     /// false 时 batch 低秩链走 `gemv_int8_rkv_stage1_batch` + `gemv_lowrank_chain4_batch`
-    /// 的 SIMT 路径（Vulkan）。Vulkan 侧不做张量核版的原因不是「没写」而是**实测净亏
-    /// 3.3×**（3374512：同形状改 `gemm_imma` 后每步多排 9 次 dispatch，43ms 落在
-    /// dispatch 之间的固定代价上；基础设施保留，`VK_IMMA_OPS=...,rkv` 可复现）。
+    /// 的 SIMT 路径（Vulkan）。**注意区分两件事**（2026-10-10 订正）：旧记录把这里的原因
+    /// 写成「r/k/v 改张量核实测净亏 3.3×」，那句是误记——当时 `gemv_int8_rkv_mid_batch` 的
+    /// `params` 少填 2 项（26 个 `buffer_reference` 只给了 24 个）⇒ 任何 batch 都直接
+    /// `ERROR_DEVICE_LOST`，崩溃被读成了慢。r/k/v 三个投影本身**已经**有 Vulkan 张量核版并
+    /// 默认开启（`gemm_imma`，见 `imma_op_on`）；缺的是**低秩链**（w/a/g mid + lowrank stage）
+    /// 的 Vulkan 张量核版，它从未被实现过，所以这条恒为 false 与性能无关。
     fn supports_lowrank_gemm_batch(&self) -> bool {
         false
     }
@@ -1432,6 +1435,20 @@ impl ComputeBackend for VulkanBackend {
         self.tensors.insert(id, t);
         self.lens.insert(id, len);
         Ok(id)
+    }
+
+    /// 登记在册张量的设备字节总数（与 CUDA 侧同口径：只算 `create_tensor` 建出的 device
+    /// buffer，不含 uniform 池 / work buffer / 图缓存，故小于 `nvidia-smi` 读数，用于比较
+    /// 各阶段增量）。U32 变体不带 len 字段，长度取自 `lens`。
+    fn device_bytes(&self) -> usize {
+        self.tensors
+            .iter()
+            .map(|(id, t)| match t {
+                VulkanTensor::F32(g) => 4 * g.len,
+                VulkanTensor::F16(g) => 2 * g.len,
+                VulkanTensor::U32(_) => 4 * self.lens.get(id).copied().unwrap_or(0),
+            })
+            .sum()
     }
 
     fn upload(&self, t: TensorId, data: &[f32]) -> R<()> {

@@ -560,7 +560,7 @@ fn gating_json() -> serde_json::Value {
         "GEMV_IMMA": knob("GEMV_IMMA", "开 —— CUDA r/k/v 走 int8 张量核"),
         "LOWRANK_GEMM": knob("LOWRANK_GEMM", "开 —— CUDA 低秩四条走 int8 张量核"),
         "FFN_VALUE_GEMM": knob("FFN_VALUE_GEMM", "开 —— CUDA FFN value 走 int8 张量核"),
-        "VK_IMMA_OPS": knob("VK_IMMA_OPS", "除 rkv 外全开"),
+        "VK_IMMA_OPS": knob("VK_IMMA_OPS", "全开（含 rkv，2026-10-10 翻转）"),
         "VK_IMMA": knob("VK_IMMA", "开 —— Vulkan W8A8 张量核 GEMM；但受 `imma_ok` 的 batch 门约束，见下"),
         "VK_IMMA_NST": knob("VK_IMMA_NST", "按 batch 自动（≥ceil(batch/8) 的最小 2 的幂，上限 8）"),
         "VK_IMMA_BM": knob("VK_IMMA_BM", "按 M 自动（64/128 tile）"),

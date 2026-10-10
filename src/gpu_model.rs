@@ -2184,17 +2184,30 @@ impl GpuModel {
             && batch > 0
     }
 
-    /// `VK_IMMA_OPS`：逗号分隔的白名单（`key,out,val,head`），默认全开。
+    /// `VK_IMMA_OPS`：逗号分隔的白名单（`rkv,key,out,val,head`），默认全开。
     /// 用于按算子二分（排查数值/竞态问题时不至于一次关掉整条路径）。
     fn imma_op_on(op: &str) -> bool {
         match std::env::var("VK_IMMA_OPS") {
             Ok(v) => v.split(',').any(|s| s.trim() == op),
-            // `rkv` **默认关**：改成张量核要给每层多排 9 次 dispatch（3 quant + 3 gemm + 3 reduce），
-            // 实测（§5G）在 32 步的长 command buffer 下出现 ~43ms/步的 **inter-dispatch 停顿**
-            // （时间戳 SUM 只有 16ms/步，说明停顿发生在 dispatch 之间而非 kernel 内部）。
-            // 基础设施（OP=3/fp16 输出、`RKV_OFF` 的 mid-only dispatch）保留，显式
-            // `VK_IMMA_OPS=...,rkv` 可打开复现。
-            Err(_) => op != "rkv",
+            // `rkv` **默认开（2026-10-10 翻转）**。旧记录（§5G）把它默认关的理由是
+            // 「每层多排 9 次 dispatch ⇒ ~43ms/步 inter-dispatch 停顿」，但那是在
+            // `gemv_int8_rkv_mid_batch` 的 params 少传 2 项（槽位整体前移 ⇒
+            // ERROR_DEVICE_LOST）之前测的——那条路径当时根本跑不通。
+            // 翻转依据一（数值口径，主因）：部署同款批量摘要管线 batch=8、20 条摘要、同 seed 贪心，
+            //   与 CUDA 输出的平均公共前缀比 SIMT **0.332** → IMMA **0.501**，输出长度 CUDA 均 88 字 /
+            //   SIMT 49 字（截断式偏短）/ IMMA 78 字；逐字全同两档都是 5/20（分叉由采样放大，不是口径）。
+            //   根因在权重之外：CUDA 侧 r/k/v 的**激活本来就量化成 int8** 走 W8A8（backend_cuda.rs 的
+            //   use_imma，阈值 IMMA_MIN_BATCH = 1），SIMT 的「fp32 激活 × int8 权重」才是异端那一边。
+            // 翻转依据二（速度，同会话交错 A/B，decode-only）：B=32 **+29%**（832.8→1075.5 tok/s）、
+            //   B=8 持平（462.7→454.5）、B=1 **-12%**（74.9→65.9）。
+            //   B=1 的亏损**不是** dispatch 条数（PROF_GAPS 实测相邻间隙仅 1.3~1.8µs、整批合计
+            //   0.5ms），而是 BN=8 那 8 个槽位只用了 1 个 + KS 段间 partial 往返；小批量的 tile
+            //   变体（IM_BM/IM_NST 在 batch≤4 档）是 §9 的后续项，不设 batch 下限（宁可慢 12%
+            //   也不要在 B=1 换回与 CUDA 不同口径的数值）。
+            // 曾写在此处的「生产摘要管线 4.6×」**是假象**：那是重编 shader 后第一个进程付的驱动
+            // 着色器编译时间（app.rs 的 pipeline cache 只在内存）。交错重跑两档持平，见 README §6.2④。
+            // 复现旧口径用 `VK_IMMA_OPS=key,out,val,head`（显式白名单即关闭 rkv）。
+            Err(_) => true,
         }
     }
 
