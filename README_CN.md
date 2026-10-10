@@ -154,6 +154,8 @@ int8 较 fp16 约 +32%（Vulkan）/ +36%（CUDA）。
 
 这条路径上 Vulkan ⇄ CUDA 同样打平：同会话交错（2026-10-04，`PTOKENS=256`）**2455.6 vs 2433.0 tok/s**（1.01×）。⚠️ 与上面同一条注意事项：那次配对的 CUDA 门控没有记录，所以按 SIMT 对口径读；**批量** prefill 在默认口径下位次随 B 反转 —— B=1 时 Vulkan 更快（1,169 vs 2,238 ms），B≥32 起被 CUDA 反超并越拉越远（B=256：86.5 s vs 46.7 s），见 §6.1 prefill 两列。
 
+> ⚠️ **2026-10-11 订正**：上面那组 86.5 / 46.7 s 与「B≥32 越拉越远」读自被污染的 bench prefill 列（`t0` 在 `create_batch_state` 之前、`t1` 在解码循环之后，含 `WARMUP` 自循环的图捕获 / JIT）。按干净口径（`PROF_CHUNK=1 PAD_TO=512 NTOK=1 SEGS=1 WARMUP=0 SKIP_SINGLE=1`，只读 chunk 循环自身墙钟）批量 prefill 现为 **0.84×（B=128：18.2 vs 15.3 s）/ 0.79×（B=256：36.0 vs 28.5 s）**。完整经过见 README.md §6.6–§6.7（这两节暂未回译到本文档）。
+
 单次冷启动 prefill 会额外付出该长度桶（m_pad）首次的 pipeline 创建成本（~几十-上百 ms，一次性）；服务端可在加载后按常用长度桶各跑一次 dummy prefill 预热。详见 [参考/Vulkan-prefill单发与稳态差异排查记录.md](参考/Vulkan-prefill单发与稳态差异排查记录.md)。
 
 ### 6.1 批量解码吞吐总表：CUDA / Vulkan / 信天翁（int8，C=2560 / H=40 / N=64 / V=65536 / L=32）
