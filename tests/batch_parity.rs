@@ -36,6 +36,17 @@
 //!     见用例 4 的 ★ 注）：采到的 token 必须落在宿主侧按同一口径算出的 top-p 候选集内，
 //!     见 [`top_p_sampled_tokens_stay_inside_the_nucleus`]。
 //!
+//! 11. **跨 State 的设备内行段回灌**：分块 prefill 把子批状态灌进大 batch 状态走的是
+//!     `state_rows_copy`（一次提交、不过主机）。它必须与「`state_slot_back` 下载 +
+//!     `state_slot_load` 回灌」的宿主读数**逐位相同**；同一用例另查分块 prefill 的
+//!     **前提**：子批宽度不影响 prefill 结果。★ 这条**按后端分档**（2026-10-11 实测）：
+//!     Vulkan 上 1/2 宽子批与 4 宽批量逐位相同 ⇒ 断言全等；CUDA 上批形跨过某个阈值就换
+//!     一套 kernel ⇒ 结果按 ~1 % 量级改变（不是 fp 噪声），只能报告。另：
+//!     `forward_seq_batch_padded` 的 seeds
+//!     是「各槽末 prompt token」，与数值路径无关，判不了这两条——能判的只有状态本身与下游
+//!     解码 token。失败信息一律走 `bit_diff` 紧凑摘要，不 `assert_eq!` 整段 Vec
+//!     （单槽 5.4 M 个 f32，一次失败打出 122 MB 日志）。
+//!
 //! 模型/词表文件缺失或建不出后端时，用例**显式跳过**（打印原因，不算失败）——没有 GPU
 //! 权重的 CI 也能跑这份测试文件。
 //!
@@ -419,13 +430,157 @@ fn device_slot_broadcast_matches_host_roundtrip() {
         "slot3 不在目标列表里，必须保持原状"
     );
 }
+
+/// 两段状态读数的**紧凑**差异：`(不同的位数, 元素总数, max|Δ|, max 相对差)`。
+///
+/// 存在的理由：单槽状态是 `3·n_layer+1` 段、5.4 M 个 f32。把 `Vec` 直接交给
+/// `assert_eq!` 会把两整段打进失败信息——2026-10-11 实测一次跑掉 **122 MB** 输出，
+/// CI 日志和终端一起废掉。判据打印不出来就不叫判据。
+fn bit_diff(a: &[u32], b: &[u32]) -> (usize, usize, f64, f64) {
+    let mut n = 0usize;
+    let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b) {
+        if x != y {
+            n += 1;
+            let (xf, yf) = (f32::from_bits(*x) as f64, f32::from_bits(*y) as f64);
+            let d = (xf - yf).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            let r = d / yf.abs().max(1.0);
+            if r > max_rel {
+                max_rel = r;
+            }
+        }
+    }
+    (n, a.len().min(b.len()), max_abs, max_rel)
+}
+
+/// 11：跨 State 的设备内行段回灌（`state_rows_copy`）必须与逐槽「下载 + 回灌」的宿主
+/// 读数**逐位相同**；同一用例另查分块 prefill 的**前提**：子批宽度是否影响 prefill 结果
+/// （Vulkan 不影响 ⇒ 断言全等；CUDA 影响 ⇒ 只报告，见下面 ★）。
+///
+/// 存在的理由：分块 prefill 每 chunk 末尾都要把子批状态灌进大 batch 状态。这条路
+/// 2026-10-11 之前走宿主往返，实测（B=256 / `PREFILL_SLOTS=8` / `PROF_CHUNK=1`）每 chunk
+/// 200–225 ms 花在**每槽 194 次独立提交**上（`download_part`/`upload_part` 每次都
+/// `queue_wait_idle`），占该 chunk 墙钟的 16 %；换成设备内拷贝后 1.2 ms/chunk，
+/// 而 B=256 的解码 token 指纹（`0x2799db/0x63ab`）与 `prefill seeds` 都不变。
+/// 「行为等价」是这次改写的**全部**主张，所以必须由断言钉住，不能靠一次手工对拍。
+///
+/// ★ 为什么 seeds 不够、还要单独查宽度：`forward_seq_batch_padded` 返回的 seeds 是各槽
+/// **末 prompt token**，与 GPU 算了什么无关——它只能证明行搬到了对的槽，证明不了数值等价。
+/// 能判的只有状态本身（这里）和下游解码 token（基准里）。
+///
+/// ★ 宽度不变性的口径**按后端分开**，2026-10-11 实测（同 prompt、同 `pad_to`，只改批宽）：
+/// - Vulkan：1 宽 / 2 宽子批与 4 宽批里同一 prompt 的状态**逐位相同**（0 / 5 409 280 位不同；
+///   coopmat GEMM 的单行点积与 M 无关，tile 划分不改变单行的归约顺序）⇒ 断言全等。
+///   即分块 prefill 在 Vulkan 上是**纯性能旋钮**，改 `PREFILL_SLOTS` 不动结果。
+/// - CUDA：**结果确实随宽度变**，且量级不是 fp 舍入噪声——w=1 与 w=2 **彼此逐位相同**，
+///   但两者与 w=4 都是 3 996 677 / 5 409 280 位不同（`max_abs=6.250e-2`、槽 0
+///   `max_rel=3.027e-2`、槽 1 `1.227e-2`）。⇒ 不是累加顺序慢慢漂移，而是**批形跨过某个
+///   阈值就换了一套 kernel**（cuBLAS 按 M 选算法）。所以这里**只报告**、不断言全等，
+///   第一版写成 `max_rel <= 1e-3` 直接跑红。唯一的公共下限是「不得出现非有限值」。
+///   ⇒ 在 CUDA 上 `PREFILL_SLOTS` 是**影响结果**的旋钮（和 SIMT 口径 env 同级），
+///   把它写成 `assert_eq!` 只会得到一条永远红的 CI，写成「两侧都只报告」又会丢掉
+///   Vulkan 那条真实性质，所以分成两条。
+#[test]
+fn cross_state_rows_copy_matches_host_roundtrip() {
+    let _guard = gpu_lock();
+    let Some((mut model, tokenizer)) = try_load() else {
+        return;
+    };
+    let kind = detect_backend();
+    let (batch, _) = prompts(&tokenizer);
+    let pad_to = batch.iter().map(|p| p.len()).max().unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    // 大 state：一次 prefill 全部 SLOTS 槽。
+    let mut state = model.create_batch_state(SLOTS).unwrap();
+    model.reset_state_of(&state).unwrap();
+    model
+        .forward_seq_batch_padded(&mut state, &batch, pad_to)
+        .unwrap();
+    // 子批：只 prefill 前 2 槽（分块 prefill 的「一个 chunk」的形状）；后半段拿它做行段回灌。
+    let mut sub = model.create_batch_state(2).unwrap();
+    model.reset_state_of(&sub).unwrap();
+    model
+        .forward_seq_batch_padded(&mut sub, &batch[..2], pad_to)
+        .unwrap();
+    // 另配一个 1 宽批：宽度探针取 {1,2,4} 三档——CUDA 上正是 w=1 与 w=2 相同、w=4 分叉，
+    // 才看出「换 kernel」是阈值而非漂移。
+    let mut solo = model.create_batch_state(1).unwrap();
+    model.reset_state_of(&solo).unwrap();
+    model
+        .forward_seq_batch_padded(&mut solo, &batch[..1], pad_to)
+        .unwrap();
+
+    // 前提探针：同一 prompt 在窄子批（w=1、w=2）与 w=SLOTS 大批里 prefill 出的状态。
+    let wide = [
+        bits(&model.state_slot_back(&state, 0).unwrap()),
+        bits(&model.state_slot_back(&state, 1).unwrap()),
+    ];
+    for (w, src) in [(1usize, &solo), (2usize, &sub)] {
+        for (i, wide_i) in wide.iter().enumerate().take(w) {
+            let narrow = bits(&model.state_slot_back(src, i).unwrap());
+            let (n, len, max_abs, max_rel) = bit_diff(wide_i, &narrow);
+            eprintln!(
+                "[WIDTH {kind:?}] w={w} 槽 {i}: 不同位 {n}/{len} max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+            );
+            assert!(
+                narrow.iter().all(|b| f32::from_bits(*b).is_finite()),
+                "w={w} 槽 {i}：窄子批 prefill 出非有限值"
+            );
+            if kind == BackendKind::Vulkan {
+                assert_eq!(
+                    n, 0,
+                    "w={w} 槽 {i}：Vulkan 上子批宽度改变了 prefill 结果（分块 prefill 的前提不成立）"
+                );
+            }
+        }
+    }
+
+    // 设备内行段拷贝的目标行，其参照值走的是**宿主**路径（`state_slot_back` 的
+    // download_part），所以「设备 vs 宿主」的对照不需要额外的槽。
+    let ref0 = bits(&model.state_slot_back(&sub, 0).unwrap());
+    let ref1 = bits(&model.state_slot_back(&sub, 1).unwrap());
+    for (slot, src) in [(2usize, &ref0), (3usize, &ref1)] {
+        let (n, len, _, _) = bit_diff(&bits(&model.state_slot_back(&state, slot).unwrap()), src);
+        assert!(
+            n * 2 > len,
+            "目标槽 {slot} 初始必须与源明显不同，否则「拷过去了」没有判据（只有 {n}/{len} 位不同）"
+        );
+    }
+
+    // 一次两行、dst_slot 非 0：state 的 [2,4) = sub 的 [0,2)。
+    model.state_rows_copy(&state, &sub, 0, 2, 2).unwrap();
+    for (slot, src) in [(2usize, &ref0), (3usize, &ref1)] {
+        let (n, len, max_abs, max_rel) =
+            bit_diff(&bits(&model.state_slot_back(&state, slot).unwrap()), src);
+        assert_eq!(
+            n, 0,
+            "设备内行段回灌的槽 {slot} 与宿主读数不等价：{n}/{len} 位不同 max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+        );
+    }
+
+    // src_slot 非 0 + 只拷一行：不得越界改写下一行。
+    let keep1 = bits(&model.state_slot_back(&state, 1).unwrap());
+    model.state_rows_copy(&state, &sub, 1, 0, 1).unwrap();
+    let (n, _, max_abs, max_rel) =
+        bit_diff(&bits(&model.state_slot_back(&state, 0).unwrap()), &ref1);
+    assert_eq!(
+        n, 0,
+        "src_slot=1 必须取子批的第二行（源偏移不是硬编码 0）：{n} 位不同 max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+    );
+    let (n, _, _, _) = bit_diff(&bits(&model.state_slot_back(&state, 1).unwrap()), &keep1);
+    assert_eq!(n, 0, "rows=1 时 [dst+1, …) 不得被动过（{n} 位被改写）");
+}
+/// 跨后端（CUDA vs Vulkan）同 scenario 对拍。**默认跳过**，见文件头的口径说明。
 ///
 /// 断言的是**各后端内部**两条批量路径必须一致（这是正确性口径，跨后端都该成立）；
 /// 跨后端之间只**报告**贪心 token 指纹，不判等：2026-10-10 实测同 SIMT 口径
 /// （`GEMV_IMMA=0 LOWRANK_GEMM=0`）下 cuda=`0xce5f5/0xfb9`、vulkan=`0xcd73a/0x7d96`
 /// 已经分叉，而两侧内部 step-vs-selfloop 全等——即「跨后端逐位一致」从来不是本引擎的
 /// 承诺（两侧是不同的 kernel 实现），把它写成断言只会得到一条永远红的 CI。
-/// 跨后端（CUDA vs Vulkan）同 scenario 对拍。**默认跳过**，见文件头的口径说明。
 #[test]
 fn cross_backend_batch_paths_agree() {
     if !std::env::var("CROSS_BACKEND").is_ok_and(|v| v != "0") {

@@ -154,6 +154,29 @@ bt=4096 行，32 个 chunk）：
 显存侧的联动项是 #27（RNN 状态 fp16：B=256 时 5.3 GB → 2.6 GB），它把「更大子批」
 重新变成可选项。
 
+#### ⚠️ 订正（同日，见 [2026-10-11-Vulkan-分块prefill状态回灌设备化-实施记录.md](2026-10-11-Vulkan-分块prefill状态回灌设备化-实施记录.md)）
+
+上面这段的**结论错了**，错在把污染的窗口当分母：
+
+1. `2350 ms / chunk` 是 `75 197 / 32` 得来的，而 `75 197` 是 bench 的
+   `[批量] prefill` 列——它从 `create_batch_state` 之前起表、到**解码循环之后**停表，
+   含 tokenize、状态分配与 `WARMUP` 自循环（图捕获 / NVRTC JIT）。chunk 循环自己的墙钟
+   加进 `PROF_CHUNK=1` 后实测为 **42 430 ms**（旧代码）/ **36 023 ms**（修好以后），
+   即每 chunk 1 326 / 1 126 ms，不是 2 350 ms。
+2. 因此「1.3 s 落在 chunk 与 chunk 之间」不成立。它**在 chunk 里面**，而且就在候选清单的
+   第一条：状态写回走宿主往返，每槽 194 次「独立提交 + `queue_wait_idle`」
+   （`download_part`/`upload_part` 各录一个临时 command buffer）。实测拆分为
+   reset 62 + core 1 030 + **xfer 210** ms / chunk（B=256 / ps=8）。改成设备内行段拷贝
+   （`State::copy_rows_from`，一块一次提交）后 xfer 6 713 → **44 ms**（整轮），
+   B=256 对 CUDA **0.67× → 0.79×**、B=128 **0.84×**。
+3. 上面那张 PREFILL_SLOTS 六臂表的全部 ms 与 `vs CUDA` 列都读自被污染的 prefill 列，
+   **只有定性结论仍成立**：登记显存随子批宽度上涨、64 / 不分块放不下（OOM 两行是真实
+   观测）。ps=8→16「省 20.8 s ≈ 16 × 1.3 s」的对应关系是巧合而非机制——干净口径下
+   `PREFILL_SLOTS` 各臂需要重测才能引用。
+4. 顺带发现一条跨后端口径差异：**CUDA 上 `PREFILL_SLOTS` 是影响结果的旋钮**
+   （w=1 与 w=2 逐位相同、两者与 w=4 差 ~1 %，即批形跨阈值换 kernel），Vulkan 上逐位
+   不变。已由 `tests/batch_parity.rs::cross_state_rows_copy_matches_host_roundtrip` 分档钉住。
+
 ### 5.2 其余
 
 1. **pf_value（深 K、窄 N）0.45×** 是唯一没闭合的 prefill 形状：n=2560 ⇒ N 方向只有

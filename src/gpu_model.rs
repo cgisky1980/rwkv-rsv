@@ -1186,6 +1186,30 @@ impl GpuModel {
         self.backend.free_tensor(t);
     }
 
+    /// 分块 prefill 的状态回灌（设备内、一次提交）：`sub` 的
+    /// `[src_slot, src_slot+rows)` 行 → `batch_state` 的 `[dst_slot, dst_slot+rows)` 行。
+    /// 与逐槽 `state_slot_back` + `state_slot_load` 结果逐位一致，但不过主机、
+    /// 且把每槽 194 次同步提交压成一整批设备拷贝（见 [`State::copy_rows_from`]）。
+    pub fn state_rows_copy(
+        &mut self,
+        batch_state: &State,
+        sub: &State,
+        src_slot: usize,
+        dst_slot: usize,
+        rows: usize,
+    ) -> R<()> {
+        batch_state.copy_rows_from(
+            self.backend.as_mut(),
+            sub,
+            src_slot,
+            dst_slot,
+            rows,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
     /// 单 slot 状态回灌（batch State）：把单序列布局数据写入 batch_state 的
     /// 第 `slot` 段（prefill 单序列 → 状态灌入 batch slot 的桥）。
     pub fn state_slot_load(&self, batch_state: &State, slot: usize, data: &[f32]) -> R<()> {
@@ -1381,6 +1405,16 @@ impl GpuModel {
             _ => self.create_batch_state(w)?,
         };
         let mut seeds: Vec<u32> = Vec::with_capacity(tokens_batch.len());
+        // `PROF_CHUNK=1`：把每块的墙钟拆成「状态重置 / prefill 主体 / 状态回灌」三段。
+        // 存在的理由：分块路径的墙钟里有一大段既不在内核时间戳里（`PROF_GPU` 的 SUM），
+        // 也不在录制里（`PROF_HOST`），只在 `end_batch` 之后——必须有一段计时才能定位。
+        let prof = std::env::var("PROF_CHUNK").is_ok_and(|v| v != "0");
+        let (mut t_reset, mut t_core, mut t_xfer) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let t_all = std::time::Instant::now();
         for (ci, chunk) in tokens_batch.chunks(w).enumerate() {
             // 末块不足 w：用最后一个 prompt 补齐到 w（`forward_seq_batch_core` 要求
             // state.batch()==batch）；补齐槽的结果不参与状态回灌，只是少量冗余计算。
@@ -1388,16 +1422,46 @@ impl GpuModel {
             while padded.len() < w {
                 padded.push(chunk.last().cloned().unwrap_or_else(|| vec![0]));
             }
+            let c0 = std::time::Instant::now();
             self.reset_state_of(&sub)?;
+            let c1 = std::time::Instant::now();
             let (s, seq_bufs, _l, _t, _b, tok) =
                 self.forward_seq_batch_core(&mut sub, &padded, Some(pad_to), false)?;
             self.backend.free_tensor(tok);
             self.seq_bufs = Some(seq_bufs); // 下块同 bt 直接复用
             seeds.extend(s.into_iter().take(chunk.len()));
-            for i in 0..chunk.len() {
-                let d = self.state_slot_back(&sub, i)?;
-                self.state_slot_load(state, ci * w + i, &d)?;
+            let c2 = std::time::Instant::now();
+            // 整块一次设备内回灌：源是 sub 的前 chunk.len() 行（连续），目标是
+            // 大 state 的 ci*w 起的同样行数（连续）。补齐槽（padded 出来的重复
+            // prompt）留在 sub 里不回灌。
+            self.state_rows_copy(state, &sub, 0, ci * w, chunk.len())?;
+            let c3 = std::time::Instant::now();
+            if prof {
+                t_reset += c1 - c0;
+                t_core += c2 - c1;
+                t_xfer += c3 - c2;
+                log::info!(
+                    "[PROF_CHUNK] {ci} w={w} reset={:.1}ms core={:.1}ms xfer={:.1}ms",
+                    (c1 - c0).as_secs_f64() * 1e3,
+                    (c2 - c1).as_secs_f64() * 1e3,
+                    (c3 - c2).as_secs_f64() * 1e3,
+                );
             }
+        }
+        if prof {
+            let total = t_reset + t_core + t_xfer;
+            log::info!(
+                "[PROF_CHUNK] B={} w={w} pad_to={pad_to}: total={:.1}ms 墙钟={:.1}ms \
+                 [reset={:.1}ms core={:.1}ms xfer={:.1}ms ({:.0}%) 每槽回灌={:.1}ms]",
+                tokens_batch.len(),
+                total.as_secs_f64() * 1e3,
+                t_all.elapsed().as_secs_f64() * 1e3,
+                t_reset.as_secs_f64() * 1e3,
+                t_core.as_secs_f64() * 1e3,
+                t_xfer.as_secs_f64() * 1e3,
+                100.0 * t_xfer.as_secs_f64() / total.as_secs_f64().max(1e-9),
+                t_xfer.as_secs_f64() * 1e3 / (tokens_batch.len() as f64).max(1.0),
+            );
         }
         self.prefill_state = Some((w, sub));
         Ok(seeds)
@@ -5384,6 +5448,79 @@ impl State {
         for &t in to {
             self.slot_move(backend, from, t, c, h, n)?;
         }
+        Ok(())
+    }
+
+    /// 设备内**跨 State** 行段迁移：把 `src` 的 `[src_slot, src_slot+rows)` 行灌进
+    /// `self` 对应张量的 `[dst_slot, dst_slot+rows)` 行（分块 prefill 的状态回灌）。
+    ///
+    /// 存在的理由：等价的宿主往返（逐槽 `slot_back` + `slot_load`）每槽要发
+    /// `2 × (3·n_layer + 1)` = 194 次**独立提交**——`download_part`/`upload_part` 每次都是
+    /// 一个临时 command buffer + `queue_wait_idle`（`Runtime::copy_range_standalone`）。
+    /// 实测（2026-10-11，B=256 / `PREFILL_SLOTS=8`，`PROF_CHUNK=1`）：回灌 200–225 ms/chunk，
+    /// 与内核本身（1 030 ms）同量级；而这里同样的数据是 **一次**提交里的
+    /// `3·n_layer + 1` 条设备内拷贝（源与目标行段各自连续，故每类张量一条）。
+    ///
+    /// 前提：两个 State 由同一模型创建（层数与逐张量布局一致）。
+    ///
+    /// `c/h/n` 与 `slot_*` 一族保持同样的传参口径（模型维度不在 State 里），故 9 个参数。
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows_from(
+        &self,
+        backend: &mut dyn ComputeBackend,
+        src: &State,
+        src_slot: usize,
+        dst_slot: usize,
+        rows: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if src.layers.len() != self.layers.len() {
+            return Err(format!(
+                "copy_rows_from: 层数不符 src={} dst={}",
+                src.layers.len(),
+                self.layers.len()
+            )
+            .into());
+        }
+        if src_slot + rows > src.batch || dst_slot + rows > self.batch {
+            return Err(format!(
+                "copy_rows_from: 行段越界 {}..{}(batch {}) -> {}..{}(batch {})",
+                src_slot,
+                src_slot + rows,
+                src.batch,
+                dst_slot,
+                dst_slot + rows,
+                self.batch
+            )
+            .into());
+        }
+        let rnn = h * n * n;
+        // 一批录到底：begin/end_batch 之间只有 command buffer 记录，最后一次提交 + 等待。
+        backend.begin_batch()?;
+        for (d, s) in self.layers.iter().zip(&src.layers) {
+            backend.copy_range(s.tmix_x, src_slot * c, d.tmix_x, dst_slot * c, rows * c)?;
+            backend.copy_range(
+                s.tmix_rnn,
+                src_slot * rnn,
+                d.tmix_rnn,
+                dst_slot * rnn,
+                rows * rnn,
+            )?;
+            backend.copy_range(s.cmix_x, src_slot * c, d.cmix_x, dst_slot * c, rows * c)?;
+        }
+        backend.copy_range(
+            src.v_first,
+            src_slot * c,
+            self.v_first,
+            dst_slot * c,
+            rows * c,
+        )?;
+        backend.end_batch()?;
         Ok(())
     }
 
