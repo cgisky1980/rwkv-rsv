@@ -2383,8 +2383,16 @@ impl GpuModel {
         // 0.4~0.6 TOPS，四个形状合计 0.44 ms/层，**比 SIMT 的 0.266 ms 还慢 1.7×** ⇒ 一级换
         // 过去是负收益。CUDA 的两级融合没有这个问题（它有自己的 tile 配置 + 四链合并 launch）。
         // 与 `lowrank_gemm` 互斥：后者只有 CUDA 返回 true。
+        //
+        // ★ 门限 `batch >= 32` 同样是量出来的（2026-10-11，同会话交错各 3 轮，
+        // `C:\tmp\lr2gate.sh`，口径与 §5.2 一致，下面一律记**每步墙钟 ms**，小=好）：
+        // `rows` 补到 64 是硬下限，所以小批量下张量核那一半的工作量**不随 batch 降**，
+        // 而 SIMT 的 chain4 会降 ⇒ 收益在低批宽翻负：B=16 17.7 → 18.9 ms（**慢 6.8 %，
+        // 两臂分布不重叠**）、B=32 23.9 → 23.2 ms（快 2.9 %）、B=64 37.0 → 33.1 ms
+        // （快 10.7 %）、B=128 66.8 → 57.2 ms（快 14.4 %，§5.2）。32 是唯一被实测证明赢
+        // 的下界，17~31 一律留在 SIMT 侧。
         let lowrank_stage2 = !lowrank_gemm
-            && batch >= 16
+            && batch >= 32
             && c.is_multiple_of(64)
             && [wmp, amp, vmp, gmp].iter().all(|p| p.is_multiple_of(64))
             && self.backend.supports_lowrank_gemm_stage2()

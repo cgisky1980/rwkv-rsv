@@ -908,7 +908,7 @@ kernel — same formulation §6.6 tuned, so the fp16-accumulation semantics are 
 zero-initialised f32 accumulators, and a new fused **`lowrank_epilogue`** shader that applies each
 chain's tail semantics in one pass (`CHAIN` spec 0=w scale, 1=a, 2=v read-modify-write into the
 attention v, 3=g gate). 14 dispatches/layer replace 1, and `PROF_GAPS` says the gaps are not the cost.
-Gate: `lowrank_stage2 = batch >= 16 && c % 64 == 0 && all mid_pad % 64 == 0 &&
+Gate: `lowrank_stage2 = batch >= 32 && c % 64 == 0 && all mid_pad % 64 == 0 &&
 supports_lowrank_gemm_stage2()` — **default ON for Vulkan**, `LOWRANK_GEMM2=0` to force off; CUDA and
 fp16-weight models report `false` and keep their own paths. Two invariants bite: `gemm.comp` has no
 bounds checks (⇒ `rows = batch.div_ceil(64)*64`, `to_f16` zero-fills rows ≥ batch) and padded mid
@@ -937,8 +937,12 @@ matches the −9.6 ms/step wall change; every other kernel's per-avg stays insid
 kernels/layer and the profile ring truncates at 2 048 entries; only per-avg is citable.
 
 Details: [参考/2026-10-11-Vulkan-低秩二级张量核-实施记录.md](参考/2026-10-11-Vulkan-低秩二级张量核-实施记录.md).
-Open on this lever: the `batch >= 16` threshold is unvalidated for B=16…63 (TC at `rows=64` costs more
-than the measured B≥128 case), and the 8 cast/epilogue dispatches could merge into 2 quads for ≤0.04
+Open on this lever: ~~the `batch >= 16` threshold is unvalidated for B=16…63~~ — **swept the same day,
+and it was wrong**: `rows` floors at 64, so below batch 64 the tensor-core half does not shrink while
+SIMT `chain4` does ⇒ B=16 is **6.9 % slower** (interleaved, non-overlapping), B=32 +2.8 %, B=64 +10.7 %,
+B=128 +14.4 % (per-step ms). The default gate is therefore `batch >= 32`. Remaining: 17…31 sits on the
+safe side without its own measurement, and a `TILE_M < 64` variant in `gemm.comp` is what would actually
+extend the win downward. Also possible: merge the 8 cast/epilogue dispatches into 2 quads for ≤0.04
 ms/layer.
 
 ## 7. Layout
