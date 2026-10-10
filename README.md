@@ -869,7 +869,7 @@ zero change at B≤32 (see §6.1's third re-measure and 参考 §九);
 structure), not in tile shape - §6.4's fetch-structure work is the template; **(ii-a) probed and
 falsified the same day**: dropping weight staging altogether and letting `coopMatLoad` read the A
 fragment straight from global (glslang *and* the NVIDIA driver accept a `buffer_reference` pointer
-here - a capability worth remembering for §6.9/#25) is **32-42 % slower** (`imma_key` B=8 0.076 →
+here - a capability worth remembering) is **32-42 % slower** (`imma_key` B=8 0.076 →
 0.102, B=128 0.204 → 0.291): staging is a necessary cost, not a removable one, because the packed
 bulk LDG prefetch buys more than the eliminated `STS`/`LDS` instructions cost. What remains of (ii)
 is the `tile[]` store→barrier→read-back round trip in the flush. Methodology note from this probe:
@@ -883,6 +883,63 @@ argument applies to the fp16 prefill `gemm`~~ — **checked and voided**: `gemm.
 mechanism (see 参考 §七 item 3).
 
 Details: [参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md](参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md).
+
+### 6.9 Low-rank chain, second level on coopmat fp16 tensor cores (2026-10-11): B=128 decode **+16.9 %**
+
+The last batched chain without a Vulkan tensor core (§9 item 2) was the low-rank one: 20.9 % of B=128
+decode in `gemv_lowrank_chain4_batch`, measured at **6.6 % of fp32 SIMT peak** and 40× above its
+bandwidth floor — latency-bound by the per-row subgroup reductions over K=64/96, which is a
+*structure* problem, so the lever was a tensor-core arm, not a tuning sweep.
+
+**Only the second level moved**, and that is a measurement, not a hedge. `kernel_bench`'s new `lr*`
+arms ran both levels at both precisions on this model's real shapes (same session, interleaved):
+
+| level | shape (B=128) | SIMT | coopmat fp16 | verdict |
+|---|---|---:|---:|---|
+| 1 (mid projections, `w/a/v/g`) | M=128 × N=96/96/64/320 × K=C | 0.274 ms/layer | 0.443 ms/layer | **keep SIMT** (TC 1.7× slower) |
+| 2 (out projections, `w/a/v/g`) | M=128 × N=C × K=128/128/64/320 | 0.398 ms/layer | **0.0824 ms/layer** | TC (4.8× faster) |
+
+Level 1's N is 64..320, so coopmat's 16×16 tile leaves whole column bands idle at `TILE_M`'s floor of
+64 rows; level 2 is a normal [B,C]×[mid,C] GEMM and tiles cleanly.
+
+**Implementation**: level 1 stays as-is (SIMT, writes the mids with *unpadded* stride), then 4× `to_f16`
+cast + `elementwise_sigmoid_inplace` on `g_mid`, 4× `gemm`/`gemm_bias` (the existing prefill coopmat
+kernel — same formulation §6.6 tuned, so the fp16-accumulation semantics are already validated) into
+zero-initialised f32 accumulators, and a new fused **`lowrank_epilogue`** shader that applies each
+chain's tail semantics in one pass (`CHAIN` spec 0=w scale, 1=a, 2=v read-modify-write into the
+attention v, 3=g gate). 14 dispatches/layer replace 1, and `PROF_GAPS` says the gaps are not the cost.
+Gate: `lowrank_stage2 = batch >= 16 && c % 64 == 0 && all mid_pad % 64 == 0 &&
+supports_lowrank_gemm_stage2()` — **default ON for Vulkan**, `LOWRANK_GEMM2=0` to force off; CUDA and
+fp16-weight models report `false` and keep their own paths. Two invariants bite: `gemm.comp` has no
+bounds checks (⇒ `rows = batch.div_ceil(64)*64`, `to_f16` zero-fills rows ≥ batch) and padded mid
+*columns* must be zero-initialised at allocation, because `0 × uninitialised = NaN`.
+
+**Correctness** — greedy divergence is useless here (it saturates: 17.9 % of 2 048 steps vs the 21.6/23.3 %
+already accepted for the fp16-state arm, and a *batch-only* change is invisible to the single-stream
+`ARGMAX_VERIFY` gate). So the decision was made on a **calibrated element-wise yardstick**: dump the
+full B=128 logits (`DUMP_LG`) and take rmse against the SIMT arm —
+
+| perturbation | logit rmse |
+|---|---:|
+| same arm re-run (noise floor) | 0.000 % |
+| **this arm vs SIMT** | **6.850 %** |
+| fp16-state arm (already shipped, same yardstick) | 6.646 % |
+
+i.e. the tensor-core change costs what the already-accepted fp16 rounding costs, and 0 % of a
+computation error. Supporting: argmax agrees 127/128 with every top-3 *set* intact (a coherent
+distribution shift, not corruption), and each arm is bit-deterministic across rounds.
+
+**Performance** (same session, interleaved, `SKIP_GRAPH=1`): 66.8 → **57.2 ms/step**, +16.9 % tok/s, the
+two arms' three-round distributions do not overlap (worst TC round still 13 % above the best SIMT
+round). Per-kernel attribution: low-rank level 2 **0.3977 → 0.1069 ms/layer** = −9.3 ms/step, which
+matches the −9.6 ms/step wall change; every other kernel's per-avg stays inside cross-process noise.
+⚠️ `PROF_GPU`'s `SUM`/`count` are **not** comparable across the arms — the ON arm dispatches 13 more
+kernels/layer and the profile ring truncates at 2 048 entries; only per-avg is citable.
+
+Details: [参考/2026-10-11-Vulkan-低秩二级张量核-实施记录.md](参考/2026-10-11-Vulkan-低秩二级张量核-实施记录.md).
+Open on this lever: the `batch >= 16` threshold is unvalidated for B=16…63 (TC at `rows=64` costs more
+than the measured B≥128 case), and the 8 cast/epilogue dispatches could merge into 2 quads for ≤0.04
+ms/layer.
 
 ## 7. Layout
 
@@ -922,13 +979,13 @@ Inspired by both, this repository has since evolved independently, adding capabi
 - **First prefill of a new length bucket pays pipeline creation** (kernel cache now decouples uniforms via a shared pool + DYNAMIC offsets keyed on (shader, spec): 1722 → ~30 entries; the remainder is the inherent first-appearance cost of each spec): eliminable via startup warmup. ★ Measured 2026-10-10 (`BUCKET_BENCH=1 SLOTS=8`, 3B int8, fresh bucket = `PAD_TO+128`) - and it is **more** than pipeline creation: switching length rebuilds all 45 `[bt,·]` seq buffers, which costs *seconds*, not ms - cold-bucket first request 1809.0 ms vs same-bucket repeat 942.7 ms on CUDA (864.1 ms saved), 3641.0 vs 2493.2 ms on Vulkan (1152.2 ms saved). `warmup_len_buckets` moves that wait from the user to startup; **total cost is unchanged** (warmup itself costs 1845.3 / 3623.4 ms ≈ the cold first request), and because `SeqBuffers` caches **one** shape only, just the last bucket in the warmup list stays resident - requests that alternate lengths need a fixed `pad_to` or one model per bucket.
 - ~~**Vulkan uniform pool must be sized by hand for long batches**~~ — **stale, verified resolved** (2026-10-10). The claim predates `pool_slots` dedup (ba08642, 2026-08-25), which made pool use O(distinct params per batch) rather than O(dispatches). Measured high-water with `PROF_POOL=1`: 69,080 B (batched prefill) / 33,432 B (self-loop) / 31,344 B (`batch_step_sample`) — **flat across B=8/16/32/64 and NTOK=32/64/256**, including `SKIP_GRAPH=1` (all n rounds in one submit), `STEP=1 PENALTY=1` and long prompts. Default 8 MB therefore runs every batch path with ~1.2 % of the pool; `UNIFORM_POOL_MB` is only an extreme-shape fallback.
 - **fp16 models have no batched *decode* path (batched prefill does work)**: the batched decode r/k/v kernels exist only in int8 variants (`gemv_int8_rkv_stage1_batch`), so an fp16 model falls back to per-slot single-sequence decode; `forward_seq_batch_padded` (batched prefill) uses the seq-parallel kernels and reads fp16/fp32 weights fine - verified on both backends 2026-10-10 by comparing the **per-slot state after batched prefill against the single-stream state, bitwise identical** (that is the assertion that actually pins "pad rows never enter the state"; the seeds the call returns are each slot's *last prompt token*, i.e. the decode seed, **not** a next-token prediction - comparing them to single-stream argmax is a category error, and an earlier version of this test did exactly that). `GpuModel::batch_decode_blocker()` returns the reason as a string so callers (client session pool, mytown engine) can log *why* they went serial instead of reading a silent `supports_batch_decode() == false` - and instead of over-reacting to "no batched forward path" and serializing prefill too.
-- **The only batched chain still missing a tensor core on Vulkan is the low-rank one** (`lowrank_gemm_batch` is CUDA-only. ⚠️ This entry used to charge **FFN value** to "SIMT only" as well, which was **wrong**: at batch >= 16 CUDA runs the dense tiled `ffn_value_gemm_batch` / `ffn_value_imma_batch`, while Vulkan runs the generic `imma_op_on("val")` path `gemm_imma(M=C, K=fh, OP=accumulate)` - both are tensor cores, just different shapes): every other batched tensor-core op (head/out/key/val **and rkv**) is now on by default - the `VK_IMMA_OPS` default flipped from "everything but rkv" to "everything" on 2026-10-10, see §6.3.
+- **The low-rank chain is the only batched chain left with a SIMT half on Vulkan** (level 2 is on tensor cores since 2026-10-11 — §6.9; `lowrank_gemm_batch` was CUDA-only. ⚠️ This entry used to charge **FFN value** to "SIMT only" as well, which was **wrong**: at batch >= 16 CUDA runs the dense tiled `ffn_value_gemm_batch` / `ffn_value_imma_batch`, while Vulkan runs the generic `imma_op_on("val")` path `gemm_imma(M=C, K=fh, OP=accumulate)` - both are tensor cores, just different shapes): every other batched tensor-core op (head/out/key/val **and rkv**) is now on by default - the `VK_IMMA_OPS` default flipped from "everything but rkv" to "everything" on 2026-10-10, see §6.3.
   ~~The Vulkan tensor-core r/k/v variant measured a 3.3x net loss~~ - **that was a misreading, corrected 2026-10-10**: the path hit `ERROR_DEVICE_LOST` at every batch (`gemv_int8_rkv_mid_batch` wrote only 24 of the shader's 26 `buffer_reference` params => every later slot shifted, the tail dereferenced as a pointer), so "3.3x" was a crash read as slowness. Fixed and re-measured interleaved in one session it is a **net win of +27.9%~+42.9%** (B=32/64/128/256, §6.2②), and the end-to-end quality gate passed ⇒ **the default is now the tensor core** (§6.3).
   Three separate gaps remain; stop collapsing them into "Vulkan is slower":
   1. **Small batches are slightly slower** (tensor core / SIMT: B=1 0.88x, B=8 0.98x). This is *not* dispatch count - `PROF_GAPS=1` shows 1.3-1.8 us between dispatches, 0.5 ms total per recorded batch (2047 dispatches), and forcing `VK_IMMA_KSPLIT=1` (three fewer dispatches per layer) is slower. The cost is BN=8 using 1/8 of its slot lanes at batch=1 plus the split-K partial round-trip. ⇒ a **tile variant dedicated to batch<=4** is needed (`IM_BM`/`IM_NST`/KSPLIT were never swept at small batch).
-  2. **The two-stage low-rank chain still only has a SIMT batched kernel** (`gemv_lowrank_chain4_batch`), where CUDA has the two-stage fp16 tensor-core `lowrank_gemm_batch`. ★ 2026-10-10: measured with `PROF_GPU=1 SKIP_GRAPH=1` at B=128 decode rather than guessing - `gemm_imma` **48.7%**, low-rank chain **15.5%**, state kernel `fuse_ka_dplr_norm` **14.5%**, rkv stage-2 `gemv_int8_rkv_stage1_batch` **10.6%**, `gemm_imma_reduce` 4.4%, `quant_x_i8` 2.0% ⇒ **the three SIMT kernels together are 40.6%** while the tensor-core GEMMs take 48.7%. The same dump works out to ~100 ms of GPU per step against 88 ms/step unprofiled ⇒ **the GPU is saturated; large batch is not a host/submission bottleneck** (which also lowers expectations for point 3). Data: `参考/2026-10-10-Vulkan-rkv张量核默认翻转-实施记录.md` §3.5.
+  2. ~~**The two-stage low-rank chain still only has a SIMT batched kernel** (`gemv_lowrank_chain4_batch`), where CUDA has the two-stage fp16 tensor-core `lowrank_gemm_batch`.~~ — **level 2 landed on coopmat fp16 tensor cores 2026-10-11 (§6.9): B=128 decode 66.8 → 57.2 ms/step (+16.9 %), default ON (`LOWRANK_GEMM2=0` to force off). Level 1 stays SIMT — measured, not assumed: the same `kernel_bench` arms put stage 1 at 0.443 ms/layer on TC vs 0.274 SIMT, because N=64..320 leaves coopmat tiles mostly idle.** ★ 2026-10-10: measured with `PROF_GPU=1 SKIP_GRAPH=1` at B=128 decode rather than guessing - `gemm_imma` **48.7%**, low-rank chain **15.5%**, state kernel `fuse_ka_dplr_norm` **14.5%**, rkv stage-2 `gemv_int8_rkv_stage1_batch` **10.6%**, `gemm_imma_reduce` 4.4%, `quant_x_i8` 2.0% ⇒ **the three SIMT kernels together are 40.6%** while the tensor-core GEMMs take 48.7%. ⚠️ **Superseded 2026-10-11** by a fresh dump after both the `gemm_imma` rounds and the fp16 state landed (`参考/2026-10-11-Vulkan-状态fp16存储-实施记录.md` §3.7): the decode denominator fell from ≈200 ms to 122 ms per 2 steps, and the shares are now `gemm_imma` **38.6 %**, **low-rank chain 20.9 %**, state kernel 15.0 %, rkv stage-2 13.9 % - the three SIMT kernels are **49.8 %**. The fp16-state saving is fully attributed to the state kernel itself (22.79 → 18.35 ms = −19.5 %, everything else inside cross-process noise), which also records that **fp16 *storage* does not halve this kernel's time** - the arithmetic stays fp32. And the low-rank chain is now provably neither bandwidth- nor peak-bound: 40× the bandwidth floor, **6.6 % of fp32 SIMT peak** - it is latency-bound by subgroup-per-row reductions over K=64/96, which is why a tensor-core arm is the lever rather than a tuning sweep. The same dump works out to ~100 ms of GPU per step against 88 ms/step unprofiled ⇒ **the GPU is saturated; large batch is not a host/submission bottleneck** (which also lowers expectations for point 3). Data: `参考/2026-10-10-Vulkan-rkv张量核默认翻转-实施记录.md` §3.5. ⇒ After §6.9 that 20.9 % is **split**, not removed: level 2 (0.3977 → 0.1069 ms/layer on TC) leaves only level 1's 0.274 ms/layer of SIMT in this chain, so the chain's share falls to ≈12 % and the "three SIMT kernels = 49.8 %" line is ≈41 % (折算 from the same per-avgs; the pairwise CUDA re-measure is what has to confirm it, not arithmetic).
   3. **CUDA merges the three r/k/v chains into one dispatch (`RKV_MERGE`); Vulkan does not**, so it records 3 extra `quant_x_i8` + 3 extra `gemm_imma_reduce` per layer. Expectations for merging them are revised *down* by point 1: it cannot rescue B=1; the value is partial traffic and host recording at large batch.
-  Current standing, default configuration vs CUDA (same-session interleaved): **0.754x (B=1) / 0.804x (B=8) / 0.632x (B=32) / 0.413x (B=128)** (§6.3). ⚠️ The B>=192 slot must not be charged entirely to kernel quality: §6.2③ recorded a 57x sampler slowdown there and read it as WDDM spill. The footprint has since been cut - `imma_partial` was 64x oversized, and reclaiming it took B=256 from 17 807 to 12 747 MiB registered / 20 585 to 15 528 MiB external, **bit-exact and throughput-neutral** (§6.2③-bis) - and in the current build the B>=192 slowdown **does not reproduce at all** (1465-1505 tok/s, monotone in batch, TOPP=1.0, alternating rounds). So capacity is no longer the open explanation; what is left is the 0.41x itself. The per-slot fp32 RNN state that used to sit here as "the remaining footprint item" **is now halved** (Vulkan `_s16` state arm, §9), so the only items left in that 0.41x are kernel-side: the low-rank chain (§9 item 2) and batched prefill.
+  Current standing, default configuration vs CUDA (same-session interleaved): **0.754x (B=1) / 0.804x (B=8) / 0.632x (B=32) / 0.413x (B=128)** (§6.3). ⚠️ The B>=192 slot must not be charged entirely to kernel quality: §6.2③ recorded a 57x sampler slowdown there and read it as WDDM spill. The footprint has since been cut - `imma_partial` was 64x oversized, and reclaiming it took B=256 from 17 807 to 12 747 MiB registered / 20 585 to 15 528 MiB external, **bit-exact and throughput-neutral** (§6.2③-bis) - and in the current build the B>=192 slowdown **does not reproduce at all** (1465-1505 tok/s, monotone in batch, TOPP=1.0, alternating rounds). So capacity is no longer the open explanation; what is left is the 0.41x itself. The per-slot fp32 RNN state that used to sit here as "the remaining footprint item" **is now halved** (Vulkan `_s16` state arm, §9), so the only items left in that 0.41x are kernel-side: the low-rank chain (§9 item 2) and batched prefill. ⚠️ **§6.9 has since taken the chain's second level onto tensor cores (+16.9 % at B=128 in a Vulkan-vs-Vulkan pair)**, so that 0.413× is now two levers older than the number — it has to be re-measured against CUDA to move, and *must not* be multiplied by 1.169.
 - ~~**Batched prefill lags further than decode and is the real large-batch cost**~~ — **measured and largely fixed 2026-10-11 (§6.6)**. The old 口径 (2026-10-10 `PROF_GPU`): at B=128 `prefill 42,367 ms / decode 5,831 ms` ⇒ prefill is 7.3x the decode wall clock, CUDA at the same parameters `24,859 / 2,403 ms` ⇒ **prefill ran at 0.59x of CUDA**, and Vulkan batched prefill's GEMMs are fp16 coopmat with no int8 variant (`gemm_f16_f32_affine` 37% + `_relu2` 27% + `gemm_f16_f32` 22% = **86%**, `dequant_int8_f16` only **0.9%**) ⇒ the cost was the fp16 GEMM itself. What it was *not* was an int8-tensor-core gap: the NVIDIA tile-selection branch gated the 128x128 tile on `max_shared_memory >= 163840` while this card reports 48 KB, so prefill ran pinned at 64x64x32 even though 128x128x32 fits in 40 KB. One tile-selection change (+ a shape-divisibility guard so the low-rank n=64 shapes can't read/write OOB) took batched prefill B=128 from 40,421 ms to **24,119 ms** = **1.68x**, bit-identical seeds. ⚠️ The "= 0.96x of CUDA" attached to that pair, and the "B=256 = 0.61x" below it, were both read through a contaminated window; on the clean protocol (§6.7) the same two points are **0.84x** (18.2 vs 15.3 s) and **0.79x** (36.0 vs 28.5 s, after the state hand-back moved onto the device). What is left in this item: `pf_value` (deep-K narrow-N) is still 0.45x of cuBLAS at kernel level, and int8 prefill is demoted behind it (dequant is 0.9%, fp16 is at parity). ⚠️ 4-5x of that workload remains **padding waste** (prompts are 104..139 tokens but `PAD_TO=512`) - a bucketing problem on the consumer side, common-mode between backends.
 - ~~**Vulkan still keeps the RNN state in fp32** — the only remaining large per-slot VRAM lever~~ —
   **done 2026-10-11**: Vulkan now has CUDA's arm exactly, **fp16 storage + fp32 compute**

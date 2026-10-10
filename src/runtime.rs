@@ -2665,6 +2665,59 @@ impl Runtime {
         Ok(())
     }
 
+    /// 低秩链第二级的 epilogue（batch 并发，fp16 张量核档）：把 `gemm`/`gemm_bias` 落在
+    /// [batch, C] 的 f32 累加器直接写成 **fp16** 输出，四档语义见 `lowrank_epilogue.comp`
+    /// （与 `gemv_lowrank_chain4_batch` 的 epilogue 逐式对应）。
+    /// `scale` 只有 chain 0 读、`v_first` 只有 chain 2 读，其余传 0 地址（同 `gemm` 的未用
+    /// bias 槽）；chain 2 是读改写 `out`（= 注意力 v），故 `out` 同时进读集与写集。
+    #[allow(clippy::too_many_arguments)]
+    pub fn lowrank_epilogue(
+        &mut self,
+        acc: &GpuTensor,
+        scale: &GpuTensor,
+        v_first: &GpuTensor16,
+        out: &mut GpuTensor16,
+        chain: u32,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        let spv = match chain {
+            0 => "shaders/spv/lowrank_epilogue_w.spv",
+            1 => "shaders/spv/lowrank_epilogue_a.spv",
+            2 => "shaders/spv/lowrank_epilogue_v.spv",
+            3 => "shaders/spv/lowrank_epilogue_g.spv",
+            other => return Err(format!("lowrank_epilogue: 未知 chain {other}").into()),
+        };
+        let spec = [c as u32, batch as u32];
+        let params = [
+            acc.device.address,
+            if chain == 0 { scale.device.address } else { 0 },
+            if chain == 2 {
+                v_first.device.address
+            } else {
+                0
+            },
+            out.device.address,
+        ];
+        let mut reads = vec![acc.device.buffer];
+        if chain == 0 {
+            reads.push(scale.device.buffer);
+        }
+        if chain == 2 {
+            reads.push(v_first.device.buffer);
+            reads.push(out.device.buffer);
+        }
+        self.record_kernel(
+            spv,
+            &spec,
+            &params,
+            (batch as u32, 1, 1),
+            &reads,
+            &[out.device.buffer],
+        )?;
+        Ok(())
+    }
+
     /// tensor-core GEMM：C[M,N] = A[M,K] @ B[N,K]^T（fp32io16）。
     ///
     /// A/B 为 fp16，累加与输出为 fp32。A 为激活 [M, K]（行主序，M=token 数），

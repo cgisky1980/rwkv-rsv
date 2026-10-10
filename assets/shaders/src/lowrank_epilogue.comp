@@ -1,0 +1,84 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 低秩链第二级的 epilogue（batch 并发，fp16 张量核档）。
+//
+// 上游 `gemm`/`gemm_bias` 已经把 `mid16 @ W2^T (+ w0)` 算成 f32 累加器 [BATCH, C]，这里只做
+// `gemv_lowrank_chain4_batch` 里那四段 epilogue 的最后一步，并把结果落成 **fp16** 输出——
+// 也就是把「sigmoid / exp / lerp / 降位」三次 dispatch 合成一次。四档与 chain4 的链序一致：
+//   CHAIN=0 (w)：out = exp(scale[0] * sigmoid(acc))
+//   CHAIN=1 (a)：out = sigmoid(acc)
+//   CHAIN=2 (v)：out = out + sigmoid(acc) * (v_first - out)   // 原地读改写 out
+//   CHAIN=3 (g)：out = acc                                    // g 的 sigmoid 在 mid 上做过
+//
+// 每 workgroup 一个槽，线程循环 C 个通道。`scale` 是 [1] 标量（跨槽共享，同 elementwise OP 8/9）。
+// v_first/out 为 fp16 [BATCH, C]；acc 为 f32 [BATCH, C]。
+
+#ifndef CHAIN
+#define CHAIN 0
+#endif
+
+layout(constant_id = 0) const uint C = 2560;
+layout(constant_id = 1) const uint BATCH = 1;
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer InAcc   { float data[]; }      buf_acc;   // [BATCH, C]
+layout(buffer_reference) buffer InScale { float data[]; }      buf_scale; // [1]
+layout(buffer_reference) buffer InVf    { float16_t data[]; }  buf_vf;    // [BATCH, C]
+layout(buffer_reference) buffer Out16   { float16_t data[]; }  buf_out;   // [BATCH, C]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InAcc   buf_acc;
+    InScale buf_scale;
+    InVf    buf_vf;
+    Out16   buf_out;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    const uint slot = gl_WorkGroupID.x;
+    if (slot >= BATCH) {
+        return;
+    }
+
+    InAcc buf_acc = params.buf_acc;
+    Out16 buf_out = params.buf_out;
+
+    const uint index = gl_LocalInvocationIndex;
+    const uint base = slot * C;
+
+#if CHAIN == 0
+    InScale buf_scale = params.buf_scale;
+    const float sc = buf_scale.data[0];
+#elif CHAIN == 2
+    InVf buf_vf = params.buf_vf;
+#endif
+
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        const float a = buf_acc.data[base + i];
+#if CHAIN == 0
+        buf_out.data[base + i] = float16_t(exp(sc * sigmoid(a)));
+#elif CHAIN == 1
+        buf_out.data[base + i] = float16_t(sigmoid(a));
+#elif CHAIN == 2
+        const float cur = float(buf_out.data[base + i]);
+        const float vf = float(buf_vf.data[base + i]);
+        buf_out.data[base + i] = float16_t(cur + sigmoid(a) * (vf - cur));
+#else
+        buf_out.data[base + i] = float16_t(a);
+#endif
+    }
+}

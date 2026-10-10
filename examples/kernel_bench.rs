@@ -14,7 +14,10 @@
 //!
 //! 环境变量（空字符串视为未设置，沿用项目惯例）：
 //!   `KB_OPS`     逗号分隔算子，默认 `relu2,mul_add,plain,add`；可加 `f16`（fp16 权重）
-//!                与 `imma_key,imma_out,imma_value,imma_head`（W8A8 张量核）
+//!                与 `imma_key,imma_out,imma_value,imma_head`（W8A8 张量核）、
+//!                `pf_out,pf_key,pf_value`（批量 prefill 的稠密 fp16 GEMM）、
+//!                `lrb_w,lrb_v,lr_g`（低秩链第二级的四个 fp16 GEMM 形状之一，
+//!                w/a 共用 k=128 ⇒ 读数 ×2）
 //!   `KB_BATCH`   逗号分隔 batch，默认 `1,8,16`
 //!   `KB_ITERS`   每组迭代次数，默认 300
 //!   `KB_WARMUP`  预热次数，默认 5
@@ -42,7 +45,9 @@
 //! （`2·m·k·batch / ms`）——它是张量核内核唯一的可比口径。
 //!
 //! **未覆盖**：`gemv_int8_rkv_stage1_batch`（26 参）与 `gemv_lowrank_chain4_batch`（20 参）
-//! ——参数表过长，待 Phase 1 主战场（4 个平坦算子）收敛后再补。
+//! ——参数表过长，待 Phase 1 主战场（4 个平坦算子）收敛后再补。低秩链的 SIMT 融合档因此
+//! **不在这里量**，它的对照值是 `PROF_GPU` 在同模型同 batch 下 dump 的 per-dispatch 均值
+//! （见 `参考/` 的实施记录）；`lrb_*`/`lr_g` 只量**张量核档的 GEMM 部分**。
 
 use std::time::Instant;
 
@@ -243,10 +248,71 @@ fn main() {
                 xgate: false,
                 pf16: true,
             },
+            // ---- 低秩链**第二级**的四个形状（decode：rows = 槽数，n = C，k = mid 补长）----
+            //      w/a 同为 k=128（只量一次，读数 ×2 计），v 为 k=64，g 为 k=320 且无 bias。
+            //      `lrb_*` 走 `gemm_bias`（引擎的 w/a/v 链就是它），`lr_g` 走 `gemm`。
+            "lrb_w" => Case {
+                op: op.clone(),
+                m: c,
+                k: 128,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "lrb_v" => Case {
+                op: op.clone(),
+                m: c,
+                k: 64,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "lr_g" => Case {
+                op: op.clone(),
+                m: c,
+                k: 320,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            // ---- 低秩链**第一级**（mid 投影）的三个形状：n = mid 补长、k = C ----
+            //      这一族的形状是「窄 N 深 K」（n 只有 64/128/320），块数极少 ⇒ 必须单独
+            //      量，不能从二级外推。v/w/a 的二级各算一次，故 w 的读数 ×2。
+            "lr1_w" => Case {
+                op: op.clone(),
+                m: 128,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "lr1_v" => Case {
+                op: op.clone(),
+                m: 64,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
+            "lr1_g" => Case {
+                op: op.clone(),
+                m: 320,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
             other => {
                 eprintln!(
                     "未知算子 '{other}'（可选 relu2/mul_add/plain/add/f16 \
-                     与 imma_key/imma_out/imma_value/imma_head、pf_out/pf_key/pf_value）"
+                     与 imma_key/imma_out/imma_value/imma_head、pf_out/pf_key/pf_value、\
+                     lrb_w/lrb_v/lr_g 与 lr1_w/lr1_v/lr1_g）"
                 );
                 std::process::exit(2);
             }
@@ -278,10 +344,19 @@ fn main() {
     // split-K 部分和容量与引擎一致：`8·max(c,fh)·batch`（`WorkBuffers::imma_partial`）。
     let cap_rows = 8 * fh.max(c);
     for case in &cases {
-        // 维度按内核假设校验：m 需是 4 的倍数（GEMV_ROWS），k 需是 128 的倍数（int8 分组）。
-        if case.m % 4 != 0 || case.k % 128 != 0 {
+        // 维度按内核假设校验，两族约束**不同**：
+        //   - int8 SIMT 族：m 需 4 的倍数（`GEMV_ROWS`）、k 需 128 的倍数（分组量化）；
+        //   - fp16 coopmat 族（`pf16`）：没有上面两条，但 k 需 32 的倍数，且**行维必须是
+        //     TILE_M 的整数倍**——`gemm.comp` 三层循环全是定长 trip count、内层无边界检查，
+        //     `gemm_tile_for` 最多把 tile 收缩到 64，rows 不整除就会越界读写（见其注释）。
+        let shape_ok = if case.pf16 {
+            case.k % 32 == 0
+        } else {
+            case.m % 4 == 0 && case.k % 128 == 0
+        };
+        if !shape_ok {
             eprintln!(
-                "跳过 {} m={} k={}：m 需为 4 的倍数、k 需为 128 的倍数",
+                "跳过 {} m={} k={}：不满足该内核的整除性（int8 需 m%4=0 且 k%128=0，fp16 coopmat 需 k%32=0）",
                 case.op, case.m, case.k
             );
             continue;
@@ -299,6 +374,13 @@ fn main() {
             }
         }
         for &batch in &batches {
+            if case.pf16 && batch % 64 != 0 {
+                eprintln!(
+                    "跳过 {} batch={}：fp16 coopmat `gemm` 无边界检查，行维需为 64 的倍数",
+                    case.op, batch
+                );
+                continue;
+            }
             let (ms, jitter, fp) =
                 match run_case(b.as_mut(), case, batch, cap_rows, iters, warmup, repeats) {
                     Ok(v) => v,
@@ -395,6 +477,15 @@ fn run_case(
     let y = b.create_tensor(batch * m, TensorDtype::F32)?;
     b.upload(y, &vec![0.0f32; batch * m])?;
 
+    // `lrb_*` 的偏置 [m] f32（低秩链 w/a/v 的 `gemm_bias` 才需要；`lr_g` 无 bias）。
+    let bias = if case.op.starts_with("lrb") {
+        let t = b.create_tensor(m, TensorDtype::F32)?;
+        b.upload(t, &vec![0.1f32; m])?;
+        Some(t)
+    } else {
+        None
+    };
+
     // 张量核路径的三个附加张量：量化激活 xq（u32 打包 4×int8）、每组统计 xaux（vec4/组）、
     // split-K 部分和（容量 = `cap_rows·batch`，与引擎的 `imma_partial` 同口径 ⇒ 这里选出的
     // ks 与真实推理一致）。
@@ -421,6 +512,14 @@ fn run_case(
             "f16" => b.gemv_f16(w16.unwrap(), x.unwrap(), y, m, k, batch),
             "pf_out" | "pf_key" | "pf_value" => {
                 // `gemm(a, w, out, rows, n, k)`：`case.m` 在这里是**输出特征数 n**。
+                b.gemm(a16.unwrap(), w16.unwrap(), y, batch, m, k)
+            }
+            // 低秩链第二级的 GEMM 部分（`gemm_bias` = GEMM + 逐列加偏置；Vulkan 是两次
+            // dispatch，CUDA 融合成一次 ⇒ 这里量到的是**引擎真实会付的**成本）。
+            "lrb_w" | "lrb_v" => {
+                b.gemm_bias(a16.unwrap(), w16.unwrap(), bias.unwrap(), y, batch, m, k)
+            }
+            "lr_g" | "lr1_w" | "lr1_v" | "lr1_g" => {
                 b.gemm(a16.unwrap(), w16.unwrap(), y, batch, m, k)
             }
             "imma_key" | "imma_out" | "imma_value" | "imma_head" => {

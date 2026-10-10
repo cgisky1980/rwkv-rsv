@@ -389,7 +389,14 @@ pub struct WorkBuffers {
     w_mid: TensorId, // [W_MID]
     a_mid: TensorId, // [A_MID]
     g_mid: TensorId, // [G_MID]
-    r2: TensorId,    // [FFN_HIDDEN]
+    /// 低秩链二级 fp16 张量核档（`LOWRANK_GEMM2`，只有 Vulkan 走）：mid 的 fp16 **补长**副本
+    /// `[lr_rows, mid_pad]`。`lr_rows = round_up(batch, 64)`——coopmat `gemm` 的三层循环全是
+    /// 定长 trip count、内层无边界检查，行维不整除就越界读写（`runtime::gemm_tile_for`）。
+    w_mid16: TensorId,
+    a_mid16: TensorId,
+    v_mid16: TensorId,
+    g_mid16: TensorId,
+    r2: TensorId, // [FFN_HIDDEN]
     /// W8A8 张量核路径的量化激活与每组统计。**固定按 8 槽容量分配**：IMMA 的 BN=8 一次覆盖
     /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma.comp` 按 BATCH 守卫丢弃输出）。
     xb_q: TensorId, // u32 [8, C/4]（每 4 个 int8 打包 1 个 uint32）
@@ -2369,6 +2376,21 @@ impl GpuModel {
                 .map(|v| v != "0")
                 .unwrap_or(true)
             && std::env::var("GEMV_IMMA").map(|v| v != "0").unwrap_or(true);
+        // ★ #25（Vulkan 的拆法，2026-10-11）：**只把二级换成 fp16 张量核**，一级 mid 投影仍走
+        // SIMT 的 `gemv_int8_rkv_stage1_batch`。原因是实测（`examples/kernel_bench.rs` 的
+        // `lr1_*`/`lrb_*` 档，rows=128）：二级四个形状合计 **0.082 ms/层**，而 chain4 融合核
+        // 0.400 ms/层；一级是「窄 N 深 K」（n=64/128/320、k=C），coopmat 只有 2×1~3 个块、
+        // 0.4~0.6 TOPS，四个形状合计 0.44 ms/层，**比 SIMT 的 0.266 ms 还慢 1.7×** ⇒ 一级换
+        // 过去是负收益。CUDA 的两级融合没有这个问题（它有自己的 tile 配置 + 四链合并 launch）。
+        // 与 `lowrank_gemm` 互斥：后者只有 CUDA 返回 true。
+        let lowrank_stage2 = !lowrank_gemm
+            && batch >= 16
+            && c.is_multiple_of(64)
+            && [wmp, amp, vmp, gmp].iter().all(|p| p.is_multiple_of(64))
+            && self.backend.supports_lowrank_gemm_stage2()
+            && std::env::var("LOWRANK_GEMM2")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
             &self.layers[i].receptance_a8,
             &self.layers[i].key_a8,
@@ -2586,6 +2608,71 @@ impl GpuModel {
                 amp,
                 vmp,
                 gmp,
+            )?;
+        } else if lowrank_stage2 {
+            // #25：一级 mid 已由上面的 `gemv_int8_rkv_stage1_batch` 算好（f32，步长=真实 mid），
+            // 这里只做「降位补长 → 二级 GEMM → epilogue 落 fp16」，四段 epilogue 与 chain4
+            // 逐式对应（见 `lowrank_epilogue.comp`）。
+            let rows = batch.div_ceil(64) * 64; // = `WorkBuffers::lr_rows`
+            self.backend
+                .to_f16(bb.w_mid, bb.w_mid16, wm, batch, rows, wm, wmp)?;
+            self.backend
+                .to_f16(bb.a_mid, bb.a_mid16, am, batch, rows, am, amp)?;
+            self.backend
+                .to_f16(bb.v_mid, bb.v_mid16, vm, batch, rows, vm, vmp)?;
+            // g 链的 sigmoid 在 chain4 里本来就在 mid 上做（`out = sigmoid(xg) @ G2`），
+            // 这里提前到 f32 的 mid 上，再降位。
+            self.backend
+                .elementwise_sigmoid_inplace(bb.g_mid, gm, batch)?;
+            self.backend
+                .to_f16(bb.g_mid, bb.g_mid16, gm, batch, rows, gm, gmp)?;
+            let l = &self.layers[i];
+            let (w2_16, a2_16, v2_16, g2_16) = (l.w2_16, l.a2_16, l.v2_16, l.g2_16);
+            let (w0, a0, v0) = (l.w0, l.a0, l.v0);
+            self.backend
+                .gemm_bias(bb.w_mid16, w2_16, w0, bb.w_full, rows, c, wmp)?;
+            self.backend
+                .gemm_bias(bb.a_mid16, a2_16, a0, bb.a_full, rows, c, amp)?;
+            self.backend
+                .gemm_bias(bb.v_mid16, v2_16, v0, bb.v_full, rows, c, vmp)?;
+            // g 无 bias ⇒ 纯 GEMM，累加器借 `gate`（见 WorkBuffers 的注释）。
+            self.backend
+                .gemm(bb.g_mid16, g2_16, bb.gate, rows, c, gmp)?;
+            self.backend.lowrank_epilogue(
+                bb.w_full,
+                self.scale_w,
+                state.v_first,
+                bb.w,
+                0,
+                c,
+                batch,
+            )?;
+            self.backend.lowrank_epilogue(
+                bb.a_full,
+                self.scale_w,
+                state.v_first,
+                bb.a,
+                1,
+                c,
+                batch,
+            )?;
+            self.backend.lowrank_epilogue(
+                bb.v_full,
+                self.scale_w,
+                state.v_first,
+                bb.v,
+                2,
+                c,
+                batch,
+            )?;
+            self.backend.lowrank_epilogue(
+                bb.gate,
+                self.scale_w,
+                state.v_first,
+                bb.g,
+                3,
+                c,
+                batch,
             )?;
         } else {
             self.backend.gemv_lowrank_chain4_batch(
@@ -5595,6 +5682,26 @@ impl WorkBuffers {
             b.upload(t, &vec![0.0f32; c * bsz])?;
             Ok(t)
         };
+        // 低秩链二级张量核档的行数（见 `WorkBuffers` 的 `*_mid16` 注释）。该档的门控要求
+        // `batch >= 16`，更小的批宽永不启用 ⇒ 不必补到 64，按原批宽分配省显存。
+        let lr_rows = if bsz >= 16 {
+            bsz.div_ceil(64) * 64
+        } else {
+            bsz
+        };
+        let mk_lr = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let t = b.create_tensor(len * lr_rows, TensorDtype::F32)?;
+            b.upload(t, &vec![0.0; len * lr_rows])?;
+            Ok(t)
+        };
+        // ⚠️ `mk_lr` 的补长行**必须零初始化**：`to_f16` 只写前 `mid` 列，补出来的列（如
+        // w/a 的 96→128）永远不再被写。权重在这些列上是 0，但 `0 × 未初始化 = NaN` 会把整行
+        // 污染掉，所以这里靠 upload 的零把「不会重写的列」钉成 0。
+        let mk_lr16 = |b: &mut dyn ComputeBackend, len: usize| -> R<TensorId> {
+            let t = b.create_tensor(len * lr_rows, TensorDtype::F16)?;
+            b.upload(t, &vec![0.0f32; len * lr_rows])?;
+            Ok(t)
+        };
 
         Ok(Self {
             x: mk_c(&mut *backend)?,
@@ -5612,12 +5719,15 @@ impl WorkBuffers {
             r: mk_c(&mut *backend)?,
             k: mk_c(&mut *backend)?,
             v: mk_c16(&mut *backend)?,
-            v_full: mk_c(&mut *backend)?,
-            gate: mk_c(&mut *backend)?,
-            w_full: mk_c(&mut *backend)?,
+            // 低秩链二级张量核档的 f32 累加器（`gemm`/`gemm_bias` 的输出，行维 = lr_rows）：
+            // v_full/a_full/w_full = v/a/w 链，**gate 在这里是 g 链的累加器**（g 无 bias，
+            // epilogue 只做降位）——这四个名字沿用了 prefill 的语义，SIMT 档下它们都闲置。
+            v_full: mk_lr(&mut *backend, c)?,
+            gate: mk_lr(&mut *backend, c)?,
+            w_full: mk_lr(&mut *backend, c)?,
             w_sig: mk_c(&mut *backend)?,
             w: mk_c16(&mut *backend)?,
-            a_full: mk_c(&mut *backend)?,
+            a_full: mk_lr(&mut *backend, c)?,
             a: mk_c16(&mut *backend)?,
             kk_l2: mk_c(&mut *backend)?,
             k_mod: mk_c(&mut *backend)?,
@@ -5638,6 +5748,10 @@ impl WorkBuffers {
             w_mid: mk(&mut *backend, cfg.w_mid)?,
             a_mid: mk(&mut *backend, cfg.a_mid)?,
             g_mid: mk(&mut *backend, cfg.g_mid)?,
+            v_mid16: mk_lr16(&mut *backend, cfg.v_mid_pad)?,
+            w_mid16: mk_lr16(&mut *backend, cfg.w_mid_pad)?,
+            a_mid16: mk_lr16(&mut *backend, cfg.a_mid_pad)?,
+            g_mid16: mk_lr16(&mut *backend, cfg.g_mid_pad)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
             // W8A8 路径的量化激活/辅助缓冲：容量按 **实际批宽 `bsz`** 算。
             // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
@@ -5713,6 +5827,10 @@ impl WorkBuffers {
             self.w_mid,
             self.a_mid,
             self.g_mid,
+            self.v_mid16,
+            self.w_mid16,
+            self.a_mid16,
+            self.g_mid16,
             self.r2,
             self.xb_q,
             self.xb_aux,

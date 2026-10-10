@@ -276,6 +276,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                         row[idx[2]]
                     );
                 }
+                // `DUMP_LG=<路径>`：把整行 logits 逐元素落盘（`slot idx value`），供两档做
+                // **采样无关**的误差对拍。分叉率会被贪心级联放大到饱和（见 参考 §3.3），
+                // 只有逐元素误差能分开「fp16 舍入级扰动」与「前向算错」。
+                if let Ok(path) = std::env::var("DUMP_LG") {
+                    use std::io::Write as _;
+                    let f = std::fs::File::create(&path)?;
+                    let mut w = std::io::BufWriter::new(f);
+                    for s in 0..slots {
+                        for (i, &v) in lg[s * p_vocab..(s + 1) * p_vocab].iter().enumerate() {
+                            writeln!(w, "{s} {i} {v:.6}")?;
+                        }
+                    }
+                    log::info!("[PROBE] logits dumped -> {path}");
+                }
             }
             let st_t0 = Instant::now();
             // 复用同一 batch State（不另建，省显存）：重置 + 重新 prefill，保证与自循环

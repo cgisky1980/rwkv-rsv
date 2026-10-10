@@ -655,6 +655,14 @@ pub trait ComputeBackend {
         false
     }
 
+    /// 该后端是否支持「一级 SIMT + 二级 fp16 张量核」的低秩链拆法
+    /// （`lowrank_epilogue` + `gemm_bias`/`gemm`，Vulkan 独有）。
+    /// 与 `supports_lowrank_gemm_batch` **互斥使用**：CUDA 两级都在一个 kernel 里，Vulkan 的
+    /// coopmat 只在二级形状上划算（一级窄 N 深 K 实测 0.4~0.6 TOPS，比 SIMT 还慢）。
+    fn supports_lowrank_gemm_stage2(&self) -> bool {
+        false
+    }
+
     /// 该后端是否支持 `ffn_value_gemm_batch`（fp16 张量核稠密 FFN，只有 CUDA 实现）。
     /// false 时 batch FFN 走稀疏 / `gemv_int8_add` 路径（Vulkan），原因同上。
     fn supports_ffn_value_gemm_batch(&self) -> bool {
@@ -841,6 +849,24 @@ pub trait ComputeBackend {
         _gmp: usize,
     ) -> R<()> {
         Err("lowrank_gemm_batch not supported by this backend".into())
+    }
+
+    /// 低秩链**第二级** epilogue（fp16 张量核档，Vulkan）：`gemm`/`gemm_bias` 的 f32 累加器
+    /// → fp16 输出，四档 `chain` 与 chain4 的链序一致（0 w / 1 a / 2 v / 3 g）。
+    /// 只有 CUDA 的 `lowrank_gemm_batch` 把两级都吃了；Vulkan 的一级留在 SIMT（实测窄 N 深 K
+    /// 的 fp16 coopmat 只有 0.4~0.6 TOPS，见 `参考/` 的 #25 记录），故这里单独出一个二级档。
+    #[allow(clippy::too_many_arguments)]
+    fn lowrank_epilogue(
+        &mut self,
+        _acc: TensorId,
+        _scale: TensorId,
+        _v_first: TensorId,
+        _out: TensorId,
+        _chain: u32,
+        _c: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("lowrank_epilogue not supported by this backend".into())
     }
     /// ffn_value 稠密 fp16 张量核 GEMM（`FFN_VALUE_GEMM`，默认开）：
     /// `x[b, c] += Σ_f r2_16[b, f] · W[c, f]`。大 batch 下用稠密换掉稀疏 gather
@@ -2322,6 +2348,12 @@ impl ComputeBackend for VulkanBackend {
         true
     }
 
+    /// 低秩链**二级**走 fp16 coopmat `gemm`/`gemm_bias` + 独立 `lowrank_epilogue`（一级仍是
+    /// SIMT 的 mid 投影）。关掉它 = `LOWRANK_GEMM2=0`（host 侧门控，见 gpu_model）。
+    fn supports_lowrank_gemm_stage2(&self) -> bool {
+        true
+    }
+
     fn gemv_int8_add(
         &mut self,
         a: &Int8Handle,
@@ -2489,6 +2521,27 @@ impl ComputeBackend for VulkanBackend {
         let bias_g = self.get_f32(bias, "gemm_bias")?;
         let res = self.rt.gemm_bias(&a_g, &b_g, &bias_g, &mut c_o, m, n, k);
         self.put_f32(c, c_o);
+        res
+    }
+
+    fn lowrank_epilogue(
+        &mut self,
+        acc: TensorId,
+        scale: TensorId,
+        v_first: TensorId,
+        out: TensorId,
+        chain: u32,
+        c: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut out_o = self.take_f16(out, "lowrank_epilogue")?;
+        let acc_g = self.get_f32(acc, "lowrank_epilogue")?;
+        let scale_g = self.get_f32(scale, "lowrank_epilogue")?;
+        let vf_g = self.get_f16(v_first, "lowrank_epilogue")?;
+        let res = self
+            .rt
+            .lowrank_epilogue(&acc_g, &scale_g, &vf_g, &mut out_o, chain, c, batch);
+        self.put_f16(out, out_o);
         res
     }
 

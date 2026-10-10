@@ -294,6 +294,9 @@ fn main() {
         "gemv_lowrank_stage1" => "src/gemv_lowrank_stage1.comp" => {
             TYPE => [none("")],
         },
+        "lowrank_epilogue" => "src/lowrank_epilogue.comp" => {
+            CHAIN => [def(0, "w"), def(1, "a"), def(2, "v"), def(3, "g")],
+        },
         "token_shift" => "src/token_shift.comp" => {
             I_TYPE => [def("float16_t", "f16"), def("float32_t", "f32")],
             O_TYPE => [def("float16_t", "f16"), def("float32_t", "f32")],
