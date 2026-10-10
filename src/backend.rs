@@ -1520,29 +1520,39 @@ impl ComputeBackend for VulkanBackend {
         dst_off: usize,
         len: usize,
     ) -> R<()> {
+        // ★ src 的只读句柄**必须**在 `remove(dst)` 之前取。本函数的主要用途是同一张量内的
+        // 区间拷贝（`State::slot_move` / `slot_broadcast` 传的就是
+        // copy_range(t, from*stride, t, to*stride, stride)，src == dst），而原先的写法先
+        // 把 dst 从映射表摘掉、再去查 src，于是自己把 src 查没了：Vulkan 上所有槽位拷贝
+        // 恒定报 "copy_range: unknown src"（2026-10-10 由 `tests/batch_parity.rs` 的槽位
+        // 广播用例抓到；CUDA 侧的 `lens` 是另一张表，所以没这个症状）。
+        let known = self.tensors.contains_key(&src);
+        let src_f32 = match self.tensors.get(&src) {
+            Some(VulkanTensor::F32(g)) => Some(g.clone()),
+            _ => None,
+        };
+        let src_f16 = match self.tensors.get(&src) {
+            Some(VulkanTensor::F16(g)) => Some(g.clone()),
+            _ => None,
+        };
+        if !known {
+            return Err("copy_range: unknown src".into());
+        }
         // 取出 dst（可变借用），src 只读；同 dtype 约束由运行期自然报错。
         match self.tensors.remove(&dst).ok_or("copy_range: unknown dst")? {
             VulkanTensor::F32(mut d) => {
-                let s = match self.tensors.get(&src).ok_or("copy_range: unknown src")? {
-                    VulkanTensor::F32(g) => g.clone(),
-                    _ => {
-                        self.put_f32(dst, d);
-                        return Err("copy_range: src/dst dtype mismatch".into());
-                    }
+                let res = match src_f32 {
+                    Some(s) => self.rt.copy_range(&s, src_off, &mut d, dst_off, len),
+                    None => Err("copy_range: src/dst dtype mismatch".into()),
                 };
-                let res = self.rt.copy_range(&s, src_off, &mut d, dst_off, len);
                 self.put_f32(dst, d);
                 res
             }
             VulkanTensor::F16(mut d) => {
-                let s = match self.tensors.get(&src).ok_or("copy_range: unknown src")? {
-                    VulkanTensor::F16(g) => g.clone(),
-                    _ => {
-                        self.put_f16(dst, d);
-                        return Err("copy_range: src/dst dtype mismatch".into());
-                    }
+                let res = match src_f16 {
+                    Some(s) => self.rt.copy_range_f16(&s, src_off, &mut d, dst_off, len),
+                    None => Err("copy_range: src/dst dtype mismatch".into()),
                 };
-                let res = self.rt.copy_range_f16(&s, src_off, &mut d, dst_off, len);
                 self.put_f16(dst, d);
                 res
             }
@@ -3368,6 +3378,27 @@ impl ComputeBackend for VulkanBackend {
     }
 }
 
+/// 设备测试串行锁（仅测试构建存在）。
+///
+/// **为什么需要**：本机只有**一块物理 GPU**，且 `CudaBackend` 的实例契约是
+/// 「多实例共存、同线程顺序使用」（见 `backend_cuda::CUDA_CTX_LOCK` 的文档）——
+/// 但每个后端实例之外还有**进程级共享**的设备资源（cuBLAS 句柄是 `OnceLock`、
+/// sampler 的 pinned 暂存区按行号寻址）。lib 单测默认多线程并行，多个设备测试同时
+/// 跑就会踩这些共享资源，表现为**非确定的数值断言失败**：实测串行 `--test-threads=1`
+/// 77 passed，并行两次分别随机挂 3 个与 4 个（且挂的集合不同：record_tokens /
+/// sample_batch / gemv_int8_rkv_stage1_batch / quant_x_i8 / lowrank_gemm）。
+/// 单个测试单独跑永远绿——这正是「只有并行才复现」的竞争特征。
+///
+/// **用法**：任何要碰设备的测试，第一件事取此锁并把 guard 存活到测试结束
+/// （`let _gpu = gpu_test_guard();`）。跨后端共用同一把锁，因为竞争方是硬件不是模块。
+#[cfg(test)]
+pub(crate) fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 前一个持锁测试 panic 会让锁中毒；这里没有不变量依赖锁保护的数据，
+    // 继续执行即可（否则一次失败会连带拖红后续所有设备测试）。
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3377,6 +3408,7 @@ mod tests {
     /// 走 `ComputeBackend` trait（VulkanBackend），确认抽象层可用。
     #[test]
     fn backend_gemv_f16_ones() {
+        let _gpu = gpu_test_guard();
         let mut b = VulkanBackend::new().expect("create vulkan backend");
         let (m, n, k) = (1024usize, 1usize, 256usize);
 
@@ -3404,6 +3436,7 @@ mod tests {
     /// 走 `ComputeBackend` trait，确认抽象层可用。
     #[test]
     fn backend_norm_matches_reference() {
+        let _gpu = gpu_test_guard();
         let mut b = VulkanBackend::new().expect("create vulkan backend");
         let (c, h, rows) = (256usize, 1usize, 4usize);
         let n = c * h * rows;
@@ -3461,6 +3494,7 @@ mod tests {
     /// `not supported`，客户端池在 Vulkan 上无法追加历史），CUDA 侧作为回归护栏。
     #[test]
     fn backend_upload_u32_part_roundtrip() {
+        let _gpu = gpu_test_guard();
         for kind in [BackendKind::Vulkan, BackendKind::Cuda] {
             if kind == BackendKind::Cuda && !cuda_available() {
                 log::warn!("CUDA 不可用，跳过 Cuda 档");

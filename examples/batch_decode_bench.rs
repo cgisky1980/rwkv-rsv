@@ -351,6 +351,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 log::info!("[STEP B={}] tokens dumped -> {path}", slots);
             }
         }
+
+        // —— SLOT_BENCH=1：把一份状态分发给多个槽的两条做法对比 ——
+        //
+        // 场景是会话 fork / 同一 prompt 多路采样。老做法：`state_slot_back` 下载 + 逐槽
+        // `state_slot_load` 回灌（每个目标 2× 单槽状态大小的 PCIe 往返，且逐层同步等待）；
+        // 新做法：`state_slot_broadcast` 全程设备内拷贝。等价性（逐位相同）由
+        // `tests/batch_parity.rs` 的 `device_slot_broadcast_matches_host_roundtrip` 钉住，
+        // 这里只量时间。
+        if std::env::var("SLOT_BENCH").is_ok_and(|v| v != "0") {
+            let targets: Vec<usize> = (1..slots).collect();
+            let t0 = Instant::now();
+            let d0 = model.state_slot_back(&bstate, 0)?;
+            for &s in &targets {
+                model.state_slot_load(&bstate, s, &d0)?;
+            }
+            let host_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = Instant::now();
+            model.state_slot_broadcast(&bstate, 0, &targets)?;
+            let dev_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            log::info!(
+                "[SLOT_BENCH] 分发到 {} 个槽：宿主往返 {host_ms:.2} ms | 设备内广播 {dev_ms:.2} ms | \
+                 单槽状态 {} B（宿主往返多走 ≈ {} B PCIe）",
+                targets.len(),
+                d0.len() * 4,
+                d0.len() * 4 * targets.len() * 2,
+            );
+        }
     }
 
     Ok(())

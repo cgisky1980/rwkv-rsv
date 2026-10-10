@@ -4618,6 +4618,7 @@ mod tests {
     /// 受控输入 GEMM：A、B 全 1，验证 C[m,n] = K（隔离核心计算）。
     #[test]
     fn gemm_ones() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         for p in &rt.app.properties.cooperative_matrix {
             eprintln!(
@@ -4658,6 +4659,7 @@ mod tests {
     /// 验证 tensor-core GEMM（fp32io16）正确性：C[m,n] = sum_k fp16(A[m,k])*fp16(B[n,k])。
     #[test]
     fn gemm_fp32io16_matches_reference() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         for p in &rt.app.properties.cooperative_matrix {
             eprintln!(
@@ -4755,6 +4757,7 @@ mod tests {
     /// 模型主投影维度 (M=256, N=2560, K=2560)，随机输入。
     #[test]
     fn gemm_determinism() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (256usize, 2560usize, 2560usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();
@@ -4875,6 +4878,7 @@ mod tests {
     /// 诊断性：模型主投影维度 (M=256, N=2560, K=2560)，验证 K 大时无 DEVICE_LOST。
     #[test]
     fn gemm_model_k2560() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (256usize, 2560usize, 2560usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();
@@ -4906,6 +4910,7 @@ mod tests {
     /// 诊断性：ffn_value 维度 (M=256, N=2560, K=10240)。
     #[test]
     fn gemm_ffn_k10240() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (256usize, 2560usize, 10240usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();
@@ -4930,6 +4935,7 @@ mod tests {
     /// 诊断性：gemm_relu2（ffn_key 维度 N=10240）。
     #[test]
     fn gemm_relu2_ffn() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (256usize, 10240usize, 2560usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();
@@ -4959,6 +4965,7 @@ mod tests {
     /// 模型规模随机值 GEMM：M=256, N=2560, K=2560，验证大 K 下 fp32io16 数值正确。
     #[test]
     fn gemm_model_scale_random() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (256usize, 2560usize, 2560usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();
@@ -5002,6 +5009,7 @@ mod tests {
     /// gemm_tanh: C[m,n] = tanh(sum_k fp16(A[m,k])*fp16(B[n,k]))
     #[test]
     fn gemm_bias_tanh_lowrank() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         // 先验证纯 gemm（无 bias）对低秩第一级形状 M=64, N=128, K=2560 是否正确，
         // 隔离是 GEMM 本身问题还是 bias 变体问题。
@@ -5181,6 +5189,7 @@ mod tests {
             Default::default(),
             simplelog::ColorChoice::Auto,
         )]);
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         // (名称, M, N, K, 迭代次数)
         let cases: [(String, usize, usize, usize, usize); 4] = [
@@ -5220,6 +5229,7 @@ mod tests {
     /// 临时诊断：M=64（single-token 场景）的 gemm 与 gemm_add 正确性。
     #[test]
     fn gemm_m64_add_tmp() {
+        let _gpu = crate::backend::gpu_test_guard();
         let mut rt = Runtime::new().expect("create runtime");
         let (m, n, k) = (64usize, 2560usize, 2560usize);
         let a16 = rt.create_tensor_f16(m * k).unwrap();

@@ -11280,6 +11280,11 @@ impl ComputeBackend for CudaBackend {
 mod tests {
     use super::*;
 
+    // ⚠️ 本模块的每个设备测试都必须先 `let _gpu = crate::backend::gpu_test_guard();`：
+    // 进程内共享的设备资源（cuBLAS 句柄是 OnceLock、sampler 走按行寻址的 pinned 暂存区）
+    // 决定了多个 `CudaBackend` 实例不能并发使用（实例契约见 `CUDA_CTX_LOCK` 文档）。
+    // 漏掉就会得到「单独跑全绿、并行随机挂几个」的非确定失败，原因在 `gpu_test_guard` 里。
+
     /// 测试辅助：创建张量（避免闭包捕获 `&mut b` 造成借用冲突）。
     fn mk_tensor(b: &mut CudaBackend, len: usize, dtype: TensorDtype) -> TensorId {
         b.create_tensor(len, dtype).expect("create tensor")
@@ -11300,6 +11305,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping roundtrip test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         // f32 往返
@@ -11342,6 +11348,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_f16 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let m = 8usize;
         let k = 256usize;
@@ -11403,6 +11410,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping norm_lerp6 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let eps = 1e-5f32;
@@ -11486,6 +11494,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping cmix_norm_lerp test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let eps = 1e-5f32;
@@ -11550,6 +11559,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping norm test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let h = 4usize;
@@ -11628,6 +11638,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping norm_lerp6_batch test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let batch = 4usize;
@@ -11717,6 +11728,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping cmix_norm_lerp_batch test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let batch = 4usize;
@@ -11791,6 +11803,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gather_rows test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 256usize;
         let vocab = 1024usize;
@@ -11837,6 +11850,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping sample_batch test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let n = 1024usize;
         let batch = 4usize;
@@ -11908,6 +11922,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping record_tokens test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let batch = 4usize;
         let stride = 8usize;
@@ -11968,6 +11983,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_variant_mb test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let m = 64usize; // M 为 4 的倍数（GEMV_ROWS）
         let k = 256usize; // K 为 128 的倍数（int8 group）
@@ -12089,6 +12105,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping rkv_stage1_batch test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 256usize;
         let vm = 32usize;
@@ -12355,6 +12372,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping segmean test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 512usize;
         let t_pad = 8usize;
@@ -12402,6 +12420,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping fuse_ka_dplr_norm test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let h = 3usize;
         let n = 64usize;
@@ -12612,6 +12631,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_int8_rkv_stage1 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let c = 256usize; // 整除 128(group)/4(打包)/4(ROWS)
         let vm = 2usize;
@@ -12788,6 +12808,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_variant int8 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         // ★ 本门禁压的是 **int8 SIMT** 内核，容差 2e-2 按「fp16 激活」标定。
         // `IMMA_MIN_BATCH = 1` 之后 batch=2 会被 IMMA（W8A8，激活量化误差更大）接走
@@ -12902,6 +12923,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_int8_plain test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         // 同 `gemv_variant_int8_matches_cpu`：把阈值顶回 8，压 int8 SIMT 内核本身。
         b.imma_min_batch_override = Some(8);
@@ -12974,6 +12996,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping ffn_value_sparse test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (c, fh) = (512usize, 256usize);
         const TILE: usize = 128;
@@ -13049,6 +13072,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_lowrank_chain4 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let m = 64usize;
         let kw = 96usize;
@@ -13176,6 +13200,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping argmax test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         // 用例 1：唯一最大值。
@@ -13227,6 +13252,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping sample_deterministic test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         let sample_tok = |b: &mut CudaBackend,
@@ -13301,6 +13327,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping record_token test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let n = 8usize;
         let in_tok = b.create_tensor(1, TensorDtype::F32).expect("create in_tok");
@@ -13338,6 +13365,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gather_row_device_f16 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         let vocab = 64usize;
@@ -13379,6 +13407,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping copy_device_f16 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         let n = 1024usize;
@@ -13441,6 +13470,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping cublas probe");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let drv = match cublas_driver() {
             Some(d) => d,
@@ -13508,6 +13538,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemm_variants test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (m, n, k) = (8usize, 6usize, 16usize);
         let a: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.13).sin()).collect();
@@ -13581,6 +13612,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping copy_device_token test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
         // copy_device：全量 f32 拷贝。
@@ -13622,6 +13654,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping to_f16 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (c, t, m_pad) = (8usize, 4usize, 6usize); // m_pad > t，验证填充行写 0
         let x: Vec<f32> = (0..t * c).map(|i| ((i as f32) * 0.9).sin()).collect();
@@ -13691,6 +13724,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping elementwise test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (c, batch) = (64usize, 3usize);
         let a: Vec<f32> = (0..c * batch).map(|i| ((i as f32) * 0.11).sin()).collect();
@@ -13741,6 +13775,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping fuse_ka_sum_rk test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (h, n, batch) = (2usize, 8usize, 3usize);
         let hn = h * n;
@@ -13844,6 +13879,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping seq_shift_v_first test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (c, t) = (16usize, 8usize);
 
@@ -13896,6 +13932,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping dplr_seq test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (h, n, t) = (2usize, 64usize, 6usize);
         let c = h * n;
@@ -13984,6 +14021,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping gemv_seq test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (m, k, batch) = (6usize, 16usize, 3usize);
         let x_stride = k;
@@ -14021,6 +14059,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping dequant test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (m, k) = (4usize, 128usize); // k 为 128 倍数，满足 int8 分组
         let make_int8 = |b: &mut CudaBackend, idx: &[u32], sz: &[u32]| {
@@ -14101,6 +14140,7 @@ mod tests {
             log::info!("CUDA unavailable, skipping imma probe");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (batch, m_dim, k) = (8usize, 8usize, 256usize);
         assert_eq!(k % 16, 0);
@@ -14202,6 +14242,7 @@ extern "C" __global__ void imma_probe(
             log::info!("CUDA unavailable, skipping quant_x_i8 test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         let (rows, k) = (8usize, 256usize);
         let g = k / QUANT_X_I8_GROUP;
@@ -14329,6 +14370,7 @@ extern "C" __global__ void imma_probe(
             log::info!("CUDA unavailable, skipping imma_gemm test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         // m 不取 tile 整数倍、batch 跨过 BN 边界的档位：把尾部 guard 与 grid.y 一并压到
         imma_gemm_gate(&mut b, 100, 640, 80, 64, None);
@@ -14501,6 +14543,7 @@ extern "C" __global__ void imma_probe(
             log::info!("CUDA unavailable, skipping lowrank_gemm test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         // 小尺寸：C=64（≥8）、batch=40（≥16）、四链 mid/pad 均 64（满足「pad 为 64 倍数」）。
         let (c, batch, pad) = (64usize, 40usize, 64usize);
@@ -14654,6 +14697,7 @@ extern "C" __global__ void imma_probe(
             log::info!("CUDA unavailable, skipping ffn_value_gemm test");
             return;
         }
+        let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
         // 非 tile 整数倍的 batch（40）+ k 为 BK 整数倍（256）；n 取 128。
         let (c, fh, batch) = (128usize, 256usize, 40usize);

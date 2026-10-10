@@ -1134,6 +1134,25 @@ impl GpuModel {
         )
     }
 
+    /// 设备内单 slot 广播（batch State）：把 `from` 行的状态拷到 `to` 的每一行，
+    /// 全程不过 PCIe 总线（对照：`state_slot_back` + `state_slot_load` 的宿主往返，
+    /// 每目标 2× 单槽状态大小的传输 + 逐层同步等待）。
+    pub fn state_slot_broadcast(
+        &mut self,
+        batch_state: &State,
+        from: usize,
+        to: &[usize],
+    ) -> R<()> {
+        batch_state.slot_broadcast(
+            self.backend.as_mut(),
+            from,
+            to,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
     /// 释放外部缓冲（`alloc_u32` 的配对操作）。
     pub fn release_tensor(&mut self, t: TensorId) {
         self.backend.free_tensor(t);
@@ -5152,6 +5171,31 @@ impl State {
             backend.copy_range(s.cmix_x, from * c, s.cmix_x, to * c, c)?;
         }
         backend.copy_range(self.v_first, from * c, self.v_first, to * c, c)?;
+        Ok(())
+    }
+
+    /// 设备内单 slot **广播**：把 `from` 行的状态拷进 `to` 的每一行（会话 fork、
+    /// 同一 prompt 多路采样这类「一份状态分发给多个槽」的场景）。
+    ///
+    /// 存在的理由是与宿主往返对比：`slot_back` + `slot_load` 每个目标要搬
+    /// **2× 单槽状态大小**的 PCIe 数据（单槽 ~15MB，见上面 `slot_back` 的注释），
+    /// 且每层每段都是一次同步 download；全程设备内则一份都不过 PCIe 总线。
+    /// 目标里出现 `from` 或重复项都无害（自拷直接跳过，重复只是多拷一次）。
+    pub fn slot_broadcast(
+        &self,
+        backend: &mut dyn ComputeBackend,
+        from: usize,
+        to: &[usize],
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if from >= self.batch {
+            return Err(format!("slot_broadcast: from {from} >= batch {}", self.batch).into());
+        }
+        for &t in to {
+            self.slot_move(backend, from, t, c, h, n)?;
+        }
         Ok(())
     }
 

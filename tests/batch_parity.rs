@@ -17,6 +17,8 @@
 //!    [`stochastic_reproducibility_repro`]（`#[ignore]` 的复现用例）。
 //! 5. **跨后端**：各后端**内部**两条批量路径必须一致；跨后端之间只报告不判等，实测数字
 //!    与理由写在 [`cross_backend_batch_paths_agree`] 上。
+//! 6. **设备内状态分发**：`state_slot_broadcast` 与「`state_slot_back` + `state_slot_load`」
+//!    的宿主往返必须逐位相同，且只动目标槽（会话 fork / 同 prompt 多路采样走的就是这条）。
 //!
 //! 模型/词表文件缺失或建不出后端时，用例**显式跳过**（打印原因，不算失败）——没有 GPU
 //! 权重的 CI 也能跑这份测试文件。
@@ -356,13 +358,58 @@ fn stochastic_reproducibility_repro() {
     );
 }
 
-/// 跨后端（CUDA vs Vulkan）同 scenario 对拍。**默认跳过**，见文件头的口径说明。
+/// 5：设备内 slot 广播与「下载 + 回灌」的宿主往返必须给出**逐位相同**的状态，且只动
+/// 目标槽（会话 fork / 同 prompt 多路采样的分发口径）。
+#[test]
+fn device_slot_broadcast_matches_host_roundtrip() {
+    let _guard = gpu_lock();
+    let Some((mut model, tokenizer)) = try_load() else {
+        return;
+    };
+    let (batch, _) = prompts(&tokenizer);
+    let pad_to = batch.iter().map(|p| p.len()).max().unwrap();
+    let mut state = model.create_batch_state(SLOTS).unwrap();
+    model.reset_state_of(&state).unwrap();
+    model
+        .forward_seq_batch_padded(&mut state, &batch, pad_to)
+        .unwrap();
+
+    let slot0 = model.state_slot_back(&state, 0).unwrap();
+    // 前提：各槽状态本来互不相同，否则「拷过去了」根本没有判据。
+    for s in 1..SLOTS {
+        assert_ne!(
+            model.state_slot_back(&state, s).unwrap(),
+            slot0,
+            "slot{s} 的初始状态应当与 slot0 不同（各槽 prompt 不同）"
+        );
+    }
+
+    // slot1 走设备内广播，slot2 走宿主往返，两者必须一致。
+    model.state_slot_broadcast(&state, 0, &[1]).unwrap();
+    model.state_slot_load(&state, 2, &slot0).unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let via_device = bits(&model.state_slot_back(&state, 1).unwrap());
+    let via_host = bits(&model.state_slot_back(&state, 2).unwrap());
+    assert_eq!(
+        via_device,
+        via_host,
+        "设备内广播与宿主往返必须逐位相同（{} 个 f32）",
+        via_device.len()
+    );
+    // 没列进目标的槽不受影响。
+    assert_ne!(
+        model.state_slot_back(&state, 3).unwrap(),
+        slot0,
+        "slot3 不在目标列表里，必须保持原状"
+    );
+}
 ///
 /// 断言的是**各后端内部**两条批量路径必须一致（这是正确性口径，跨后端都该成立）；
 /// 跨后端之间只**报告**贪心 token 指纹，不判等：2026-10-10 实测同 SIMT 口径
 /// （`GEMV_IMMA=0 LOWRANK_GEMM=0`）下 cuda=`0xce5f5/0xfb9`、vulkan=`0xcd73a/0x7d96`
 /// 已经分叉，而两侧内部 step-vs-selfloop 全等——即「跨后端逐位一致」从来不是本引擎的
 /// 承诺（两侧是不同的 kernel 实现），把它写成断言只会得到一条永远红的 CI。
+/// 跨后端（CUDA vs Vulkan）同 scenario 对拍。**默认跳过**，见文件头的口径说明。
 #[test]
 fn cross_backend_batch_paths_agree() {
     if !std::env::var("CROSS_BACKEND").is_ok_and(|v| v != "0") {
