@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**, batched prefill 0.79…0.84× (2026-10-11 same-session re-measures, §6.1 / §6.6-§6.8; the older 0.27×-at-B=256 row predates that chain and needs re-measuring).
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.868× (B=8) / 0.711× (B=32) / 0.525× (B=128)**, batched prefill 0.79…0.84× (2026-10-11 same-session re-measures, §6.1 / §6.6-§6.8; the older 0.27×-at-B=256 row predates that chain and needs re-measuring).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -198,6 +198,27 @@ still *widening* with B.
 CUDA again inside its own drift; **Vulkan's own decode fingerprints are unchanged**
 (`0xd0c265`/`0x7b05` at B=8, `0x3460382`/`0x16fa` at B=32, `0xd1b5310`/`0x7bfc` at B=128 — byte-identical
 to the session above), so this is a pure speed change (§6.8).
+
+**Re-measured a third time the same day, after the split-K rule re-tune (§6.8's open item (i), session
+`20261011-045748-40368`, 3 rounds/cell median)**:
+
+| Batch | CUDA tok/s | spread | Vulkan tok/s | spread | Vulkan/CUDA | was (after §6.8) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 617.7 | 1.4% | 536.5 | 0.7% | **0.868** | 0.875 |
+| 32 | 1869.8 | 1.5% | 1330.4 | 1.6% | **0.711** | 0.716 |
+| 128 | 3587.6 | 2.0% | 1881.8 | 1.9% | **0.525** | 0.508 |
+
+Only B=128 moves, and that is exactly what the rule predicts: at B=8/32 the new
+"whole-grid blocks" formula selects the **same** ks as before for every shape (`out` stays 5 because
+the divisibility step drags 8 back down, `value` stays 8, `key` stays 2) — and those two rows confirm
+it with **byte-identical Vulkan fingerprints** to the session above (`0xd0c265`/`0x7b05`,
+`0x3460382`/`0x16fa`), so their ±0.7 % is session drift, not a result. At B=128 the rule takes
+`key` 2→1, `out`/`rkv` 5→4, `value` 8→4, and **Vulkan's fingerprint changes** (`0xd1b5310`/`0x7bfc` →
+`0xd21f6bb`/`0x78b3`, stable over all 3 rounds) because split-K changes the summation order — the
+contract that already covers the v-chain (§6.5): same quantisation, same fp32 accumulation, different
+association. Incidentally the retuned Vulkan lands *closer* to CUDA's token stream at B=128 than the
+in-order variant did: `|0xd21f6bb − 0xd21f638| = 131` versus `435 496` before (§6.8's session), which is
+an observation about one deterministic greedy prompt, not a proof of accuracy.
 
 **Gate snapshot (verbatim, identical for both backends in that session)**: `SEGS=4` `PAD_TO=512`
 `NTOK=32` `WARMUP=1` `SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`;
@@ -836,11 +857,17 @@ their own spread, and **Vulkan decode fingerprints unchanged** (`0xd0c265`/`0x7b
 construction, so this is a pure speed change. Gates: `cargo fmt --all`, `cargo clippy --all-targets
 --release -- -D warnings` clean, `cargo test --release` green (78 + 11 + 1, 3 ignored).
 
-Left on this kernel, in size order: (i) the split-K *rule* was tuned on the old staging and is now
-mistuned for `value` (auto ≈ ks 8 gives 0.512 ms at B=256, forced `VK_IMMA_KSPLIT=2` gives 0.462 ms);
+Left on this kernel, in size order: (i) **done the same day** — the split-K *rule* had been tuned on the
+old staging and was mistuned once staging got cheap: it counted only `M/BM` blocks and ignored
+`grid.z = ceil(batch/(8·NST))`, so large batches over-split (`value` auto ks 8 = 0.512 ms at B=256 versus
+forced ks 2 = 0.462 ms). It now targets **320 whole-grid blocks**; kernel-level −17 % (`key` B=128),
+−20 % (`out` B=256), −7…−11 % (`value` B=128/256), end to end **+3.3 % ratio at B=128** and provably
+zero change at B≤32 (see §6.1's third re-measure and 参考 §九);
 (ii) the remaining 1.2-1.6x per-kernel gap to CUDA is inside the loop (fragment load / epilogue
-structure), not in tile shape - §6.4's fetch-structure work is the template; (iii) the same packing
-argument applies to the fp16 prefill `gemm` (2-byte elements, 2 per word) and is unbilled in §6.6.
+structure), not in tile shape - §6.4's fetch-structure work is the template; (iii) ~~the same packing
+argument applies to the fp16 prefill `gemm`~~ — **checked and voided**: `gemm.comp` already stages
+`shared uvec4` (16 B per store), so there is nothing to pack there; §6.6's prefill gap is a different
+mechanism (see 参考 §七 item 3).
 
 Details: [参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md](参考/2026-10-11-Vulkan-gemm_imma-smem打包staging-实施记录.md).
 

@@ -1496,7 +1496,7 @@ impl Runtime {
         let bm = Self::imma_bm(m);
         debug_assert_eq!(m % bm, 0, "gemm_imma: M 需为 {bm} 整除");
         let nst = Self::imma_nst(batch);
-        let ks = Self::imma_ksplit(m, k, bm, partial.len, batch);
+        let ks = Self::imma_ksplit(m, k, bm, nst, partial.len, batch);
         let spv = format!("shaders/spv/gemm_imma_bm{bm}_nst{nst}.spv");
         // ks == 1：直接写 y、由 kernel 施加 op；ks > 1：写 partial、由归约内核施加 op。
         let out: &GpuTensor = if ks == 1 { y } else { partial };
@@ -1565,7 +1565,7 @@ impl Runtime {
         let ks = if v_off {
             1
         } else {
-            Self::imma_ksplit(m, k, bm, partial.len, batch)
+            Self::imma_ksplit(m, k, bm, nst, partial.len, batch)
         };
         let spv = format!("shaders/spv/gemm_imma_bm{bm}_nst{nst}.spv");
         let spec = [m as u32, k as u32, batch as u32, 3u32, ks as u32];
@@ -1687,11 +1687,33 @@ impl Runtime {
     /// `ffn.key`/`ffn.value`（160/40 块）只有 ~226 GB/s（37%）⇒ **块数才是瓶颈**。
     /// 不增加流量的加块手段只有 split-K：各段读不同的 k 区间 ⇒ 总流量不变。
     ///
-    /// 规则：把总块数抬到 `VK_IMMA_KSPLIT_TARGET`（默认 400 ≈ 6×SM 数），分块数上限
-    /// `VK_IMMA_KSPLIT_MAX`（默认 8），并要求 `(K/128) % ks == 0`（段按量化组对齐）。
+    /// ★ **规则口径（2026-10-11 重定，§6.8 后续）**：凑的是**全 grid 块数**
+    /// `(M/BM) × ceil(batch/(8·NST))`，不是只数 `M/BM`。旧规则漏掉 grid.z 这一维 ⇒
+    /// batch 越大分裂过度：split-K 的代价（partial 写出 + 归约那一趟）随 `ks × batch × M`
+    /// 涨，收益（占用）却已经被 grid.z 拿到了。kernel_bench 逐档实测（packed staging 后）：
+    ///
+    /// | 形状 | batch | 旧规则 ks → ms | 新规则 ks → ms | 差 |
+    /// |---|---|---|---|---|
+    /// | key (10240×2560) | 128 | 2 → 0.2553 | **1 → 0.2111** | −17 % |
+    /// | key | 256 | 2 → 0.4904 | **1 → 0.4195** | −14.5 % |
+    /// | out/rkv (2560×2560) | 256 | 5 → 0.1696 | **2 → 0.1363** | −20 % |
+    /// | value (2560×10240) | 128 | 8 → 0.2745 | **4 → 0.2547** | −7 % |
+    /// | value | 256 | 8 → 0.5208 | **2 → 0.4619** | −11 % |
+    ///
+    /// 目标 320 ≈ 4.7×SM：网格是 `ks ∈ {1,2,4,8}` × `batch ∈ {1,4,8,16,32,64,128,256}`，
+    /// 即 3 个形状 × 8 档 = 24 个组合。**320 这一档在其中 20 个组合上正好命中实测最优 ks**，
+    /// 其余 4 个（key B=16/64、out B=4/128）比最优差 1.2~6.7 %，且没有任何一组比旧规则慢
+    /// （旧规则在这 4 组上要么给出同 ks、要么更差）。
+    /// ⚠️ `head`（M=65536）在任何 batch 下都 ≥ 目标 ⇒ 恒 ks=1，作为本表的噪声对照
+    /// （跨进程复测散布 ≤1.5 %）。
+    ///
+    /// 规则：`ks = ceil(target / 全grid块数)`，上限 `VK_IMMA_KSPLIT_MAX`（默认 8，
+    /// 抬到 10/16 已实测否决 ⇒ 见任务 #31），并要求 `(K/128) % ks == 0`（段按量化组对齐）。
     /// 额外约束：部分和缓冲容量 `cap`（`[KS][batch][M]` f32）装不下就往下缩 —— 保险起见
     /// 由 runtime 按实际容量收口，避免探针/异常形状下越界写。
-    fn imma_ksplit(m: usize, k: usize, bm: usize, cap: usize, batch: usize) -> usize {
+    /// ⚠️ ks 变了 ⇒ 求和结合顺序变 ⇒ 落盘字节不再是旧路径的逐位值（数值契约不变，
+    /// 与 `gemv_lowrank`/v 臂同一条契约）。
+    fn imma_ksplit(m: usize, k: usize, bm: usize, nst: usize, cap: usize, batch: usize) -> usize {
         let max_ks: usize = std::env::var("VK_IMMA_KSPLIT_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1700,7 +1722,7 @@ impl Runtime {
         let forced: Option<usize> = std::env::var("VK_IMMA_KSPLIT")
             .ok()
             .and_then(|v| v.parse().ok());
-        let blocks = m / bm;
+        let blocks = (m / bm).saturating_mul(batch.div_ceil(8 * nst).max(1));
         let ktiles = k / 128;
         let mut ks = match forced {
             Some(v) => v.min(max_ks),
@@ -1708,7 +1730,7 @@ impl Runtime {
                 let target: usize = std::env::var("VK_IMMA_KSPLIT_TARGET")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(400);
+                    .unwrap_or(320);
                 if blocks == 0 || blocks >= target {
                     1
                 } else {
