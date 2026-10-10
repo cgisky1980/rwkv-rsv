@@ -62,6 +62,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let skip_single = std::env::var("SKIP_SINGLE").is_ok_and(|v| v != "0");
     // 逐步采样路径（batch_step_sample）对拍开关。
     let step_mode = std::env::var("STEP").is_ok_and(|v| v != "0");
+    // 惩罚模式：STEP 路径按 token 追加惩罚历史（`write_u32_part`）+ 频率惩罚 > 0。
+    // 只在 STEP=1 时有意义；每步每槽一次小段上传，是正确性探针而非吞吐路径。
+    let penalty = std::env::var("PENALTY").is_ok_and(|v| v != "0");
 
     let vocab = std::fs::read_to_string(&vocab_path)?;
     let tokenizer = Tokenizer::new(&vocab)?;
@@ -78,7 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     log::info!("prompt(0) {} tok", prompt_tokens.len());
 
     log::info!("top_k={topk}（0=兜底 top-p 路径）");
-    let sp = SamplerParams {
+    let mut sp = SamplerParams {
         temperature: temp,
         top_k: topk,
         top_p: 0.2,
@@ -87,6 +90,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         frequency_penalty: 0.0,
         ..Default::default()
     };
+    // PENALTY=1：给**两条**批量路径同时带上频率惩罚（自循环与逐步共用这一份 `sp`），
+    // 这样逐步路径上「每步往 hist 行尾追加一个 token」的增量上传就有了可比的判据：
+    // 与自循环（hist = 本段已生成 token、hist_len = round）仍应逐位一致。
+    if penalty {
+        sp.frequency_penalty = 0.2;
+        log::info!("PENALTY=1：frequency_penalty=0.2，逐步路径按 token 追加惩罚历史");
+    }
 
     // —— 单流基准 ——
     if !skip_single {
@@ -248,11 +258,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let prefill_ms = st_t0.elapsed().as_millis();
 
-            // hist 行宽只占 8：hist_len 恒 0，内核不会读到有效数据以外的位置。
-            let hist_stride = 8usize;
+            // hist 行宽：默认只占 8（hist_len 恒 0，内核不会读到有效数据以外的位置）；
+            // PENALTY=1 时要按自循环的口径复刻「段内已生成 token」，行宽须 ≥ 段长 ntok。
+            let hist_stride = if penalty { ntok.max(8) } else { 8 };
             let hist = model.alloc_u32(slots * hist_stride)?;
             model.write_u32(hist, &vec![0u32; slots * hist_stride])?;
-            let hist_len = vec![0u32; slots];
+            // PENALTY=1 的语义与自循环逐字对齐：每段开头 hist_len 归零，段内第 r 步
+            // hist_len = r（= 本段前 r 步采样出的 token，**不含**本步刚喂进去的那个），
+            // 采样后立刻把新 token 追加到该行第 r 列（`write_u32_part` = 增量上传）。
+            let mut hist_len = vec![0u32; slots];
 
             // seed 口径必须复刻自循环：段初基 = 该槽上一段的末 token，段内第 r 步
             // seed = 基 + r（见 `submit_sample_selfloop_batch` 的 `seeds_r`）。
@@ -264,6 +278,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut st_t1 = Instant::now();
             for seg in 0..warmup + segs {
                 let base = feed.clone();
+                if penalty {
+                    // 段初清零，与 `submit_sample_selfloop_batch` 开头把 token_seq 整段
+                    // upload 成零、且 sampler[7]=round 从 0 起完全同构。
+                    hist_len.iter_mut().for_each(|l| *l = 0);
+                }
                 if seg == warmup {
                     st_t1 = Instant::now();
                 }
@@ -285,6 +304,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     )?;
                     for (s, &t) in out.iter().enumerate() {
                         feed[s] = t;
+                        if penalty {
+                            // 客户端池 `append_hist` 的形状：只写这一格，不重传整行。
+                            model.write_u32_part(hist, s * hist_stride + r, &[t])?;
+                            hist_len[s] = r as u32 + 1;
+                        }
                         if seg >= warmup {
                             st_sum = st_sum.wrapping_add(t as u64);
                             st_xor ^= t as u64;

@@ -59,7 +59,10 @@ pub trait ComputeBackend {
     }
     fn upload_u32(&self, t: TensorId, data: &[u32]) -> R<()>;
     /// 部分上传（u32）：把 data 写入张量 [offset, offset+len) 段（u32 元素偏移），
-    /// 其余部分不动（惩罚历史逐 token 追加用）。
+    /// 其余部分不动（惩罚历史逐 token 追加用）。两后端均已实现。
+    ///
+    /// 对称的 `download_u32_part` **不提供**：trait 里没有这个需求且零调用方
+    /// （历史回读走整行 `download_u32`，惩罚历史从不在热路径上按段读）。
     fn upload_u32_part(&self, t: TensorId, offset: usize, data: &[u32]) -> R<()> {
         let _ = (t, offset, data);
         Err("upload_u32_part not supported by this backend".into())
@@ -1476,6 +1479,17 @@ impl ComputeBackend for VulkanBackend {
             VulkanTensor::F32(g) => self.rt.upload_part(g, offset, data),
             VulkanTensor::F16(g) => self.rt.upload_part_f16(g, offset, data),
             VulkanTensor::U32(_) => Err("upload_part: u32 tensor unsupported".into()),
+        }
+    }
+
+    fn upload_u32_part(&self, t: TensorId, offset: usize, data: &[u32]) -> R<()> {
+        match self
+            .tensors
+            .get(&t)
+            .ok_or("upload_u32_part: unknown tensor")?
+        {
+            VulkanTensor::U32(g) => self.rt.upload_part_u32(g, offset, data),
+            _ => Err("upload_u32_part: t must be u32".into()),
         }
     }
 
@@ -3431,5 +3445,48 @@ mod tests {
             }
         }
         log::info!("backend norm matches reference");
+    }
+
+    /// u32 部分上传（= 并发池惩罚历史逐 token 追加那条路）：整行建基线 → 覆盖中段 →
+    /// 整行回读，断言「覆盖段拿到新值、段外保持原值」；再单独试末元素追加。
+    ///
+    /// 两后端都跑：Vulkan 侧的实现是 2026-10-10 补的（此前落到 trait 默认实现直接报
+    /// `not supported`，客户端池在 Vulkan 上无法追加历史），CUDA 侧作为回归护栏。
+    #[test]
+    fn backend_upload_u32_part_roundtrip() {
+        for kind in [BackendKind::Vulkan, BackendKind::Cuda] {
+            if kind == BackendKind::Cuda && !cuda_available() {
+                log::warn!("CUDA 不可用，跳过 Cuda 档");
+                continue;
+            }
+            let mut b = create_backend(kind).expect("create backend");
+            let len = 24usize;
+            let t = b.create_tensor(len, TensorDtype::U32).unwrap();
+            let base: Vec<u32> = (0..len).map(|i| 1000 + i as u32).collect();
+            b.upload_u32(t, &base).unwrap();
+
+            let off = 7usize;
+            let patch: Vec<u32> = (0..5).map(|i| 9000 + i as u32).collect();
+            b.upload_u32_part(t, off, &patch).unwrap();
+            let got = b.download_u32(t).unwrap();
+            for i in 0..len {
+                let want = if (off..off + patch.len()).contains(&i) {
+                    9000 + (i - off) as u32
+                } else {
+                    base[i]
+                };
+                assert_eq!(
+                    got[i], want,
+                    "{kind:?} 元素 {i} 不符（覆盖段应为新值、段外应保持原值）"
+                );
+            }
+
+            // 行尾追加一个 token（hist 每步的增量写就是这个形状）。
+            b.upload_u32_part(t, len - 1, &[4242]).unwrap();
+            let got = b.download_u32(t).unwrap();
+            assert_eq!(got[len - 1], 4242, "{kind:?} 末元素追加失败");
+            assert_eq!(got[len - 2], base[len - 2], "{kind:?} 末元素邻居被踩");
+            log::info!("backend upload_u32_part roundtrip ok ({kind:?})");
+        }
     }
 }

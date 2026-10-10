@@ -220,6 +220,19 @@ impl Runtime {
         Ok(())
     }
 
+    /// 部分上传（u32 张量）：只写 `[offset, offset+len)` 段（元素偏移），其余不动。
+    /// 惩罚历史逐 token 追加用（`ComputeBackend::upload_u32_part`）。
+    /// 越界由 `copy_from` 自身报 `tensor len too small`；区间拷贝走与 `upload_part`
+    /// 同一条已验证的 `copy_range_standalone` 路径（按 elem=4 自动取字节数）。
+    pub fn upload_part_u32(&self, tensor: &GpuTensorU32, offset: usize, data: &[u32]) -> R<()> {
+        let host = tensor
+            .host
+            .as_ref()
+            .ok_or("upload_part_u32: host dropped")?;
+        host.copy_from(data, offset)?;
+        self.copy_range_standalone(host, offset, &tensor.device, offset, data.len())
+    }
+
     /// 释放 u32 张量的 host（系统内存）缓冲（见 `drop_host`）。
     pub fn drop_host_u32(&self, t: &mut GpuTensorU32) {
         t.host = None;
