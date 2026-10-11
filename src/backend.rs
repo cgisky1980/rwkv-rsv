@@ -694,7 +694,11 @@ pub trait ComputeBackend {
         false
     }
 
-    /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核两级融合，只有 CUDA 实现）。
+    /// 该后端是否支持 `lowrank_gemm_batch`（fp16 张量核低秩链两级 GEMM，只有 CUDA 实现）。
+    /// ⚠️ 「两级融合」≠「一个 kernel」：2026-10-11 读源码（`backend_cuda.rs:3188`/`:3274`/
+    /// `:8872`）确认它是 `cast4_f16` → `lowrank_stage1_gemm`（**四条链合并成一次 launch**，
+    /// `blockIdx.z` 选链）→ 4×`lowrank_stage2_gemm`，两级之间经**全局** `mid16` 传递；CUDA 的
+    /// 优势是一级也在张量核上 + 二级把 epilogue **内联**进 GEMM 的累加器出口，不是 SMEM 融合。
     /// false 时 batch 低秩链走 `gemv_int8_rkv_stage1_batch` + `gemv_lowrank_chain4_batch`
     /// 的 SIMT 路径（Vulkan）。**注意区分两件事**（2026-10-10 订正）：旧记录把这里的原因
     /// 写成「r/k/v 改张量核实测净亏 3.3×」，那句是误记——当时 `gemv_int8_rkv_mid_batch` 的
@@ -904,8 +908,13 @@ pub trait ComputeBackend {
 
     /// 低秩链**第二级** epilogue（fp16 张量核档，Vulkan）：`gemm`/`gemm_bias` 的 f32 累加器
     /// → fp16 输出，四档 `chain` 与 chain4 的链序一致（0 w / 1 a / 2 v / 3 g）。
-    /// 只有 CUDA 的 `lowrank_gemm_batch` 把两级都吃了；Vulkan 的一级留在 SIMT（实测窄 N 深 K
-    /// 的 fp16 coopmat 只有 0.4~0.6 TOPS，见 `参考/` 的 #25 记录），故这里单独出一个二级档。
+    /// 只有 CUDA 的 `lowrank_gemm_batch` 把两级都吃了；Vulkan 的一级留在 SIMT（#25 探针实测窄 N
+    /// 深 K 的 fp16 coopmat 只有 0.4~0.6 TOPS，见 `参考/` 的 #25 记录），故这里单独出一个二级档。
+    /// ⚠️ 2026-10-11 (S30) 订正：那句「CUDA 两级都在一个 kernel 里」不成立（见
+    /// `supports_lowrank_gemm_batch` 的文档）；而 0.4~0.6 TOPS 那个数是**每链单独 launch**
+    /// （16~80 个块喂 68 个 SM）量出来的，CUDA 侧正是靠四链合并 launch 才避开同一坑
+    /// （`backend_cuda.rs:3183-3186`）⇒ 「一级不能上张量核」这条结论**尚未在合并档上验过**，
+    /// 见任务 S31。
     #[allow(clippy::too_many_arguments)]
     fn lowrank_epilogue(
         &mut self,

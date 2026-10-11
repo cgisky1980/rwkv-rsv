@@ -1120,12 +1120,28 @@ fn ablate_hit(drv: &CudaDriver, func: CuFunction) -> bool {
     });
     let Some(names) = set else { return false };
     // func → name：反查驱动内的注册表（≤ 数十项，且仅诊断时执行）。
-    drv.prof
+    let hit = drv
+        .prof
         .lock()
         .unwrap()
         .names
         .get(&(func as usize))
-        .is_some_and(|name| names.contains(name.as_str()))
+        .filter(|name| names.contains(name.as_str()))
+        .cloned();
+    let Some(name) = hit else { return false };
+    // ★ 每个名字**首次命中**打一条日志。没这条日志＝一处都没命中＝「消融后没变化」是假零
+    //   读数（键带几何后缀，如 `gemv_int8_rkv_stage1_batch_g1`、`fuse_ka_dplr_norm_s16_w4`、
+    //   `imma_gemm_batch_b128n64l2s1p0d1k1e0v0_m65536k2560`，写裸名必然落空）。
+    //   实测教训：2026-10-11 跨后端归因首跑四臂全部裸名，校验和与基线逐位相同却看不出来。
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut s) = seen.lock()
+        && s.insert(name.clone())
+    {
+        log::info!("[ABLATE] 命中 {name}（本进程首次；此后该 kernel 不再上卡）");
+    }
+    true
 }
 
 impl CudaBackend {

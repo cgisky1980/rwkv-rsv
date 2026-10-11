@@ -1069,7 +1069,12 @@ impl Runtime {
             std::time::Duration::ZERO
         };
         // GPU 时间戳：dispatch 前写 begin，dispatch 后写 end（仅 PROF_GPU=1 时开启）
-        let gpu_q = if self.prof_gpu && self.prof_gpu_count + 2 <= QUERY_POOL_SIZE as u32 {
+        // `ABLATE=` 命中的 kernel：连时间戳一起跳（不占 ring 槽位），只跳 dispatch 本身。
+        let ablated = ablate_hit(shader_name);
+        let gpu_q = if self.prof_gpu
+            && !ablated
+            && self.prof_gpu_count + 2 <= QUERY_POOL_SIZE as u32
+        {
             let b = self.prof_gpu_count;
             let e = self.prof_gpu_count + 1;
             self.prof_gpu_count += 2;
@@ -1084,9 +1089,11 @@ impl Runtime {
         unsafe {
             // DYNAMIC offset：descriptor 指向 uniform 池的本 dispatch slot。
             kernel.cmd_bind(self.cmd, &[offset as u32]);
-            self.app
-                .device
-                .cmd_dispatch(self.cmd, dispatch.0, dispatch.1, dispatch.2);
+            if !ablated {
+                self.app
+                    .device
+                    .cmd_dispatch(self.cmd, dispatch.0, dispatch.1, dispatch.2);
+            }
         }
         if let Some((b, e)) = gpu_q {
             unsafe {
@@ -4523,6 +4530,60 @@ fn l2_norm_spec(h: usize, n: usize, subgroup_size: u32) -> [u32; 9] {
         (h * n) as u32, // 7: STRIDE_Y_Z
         subgroup_size,  // 8: SUBGROUP_SIZE（跨硬件自适应）
     ]
+}
+
+/// 消融探针（诊断用）：`ABLATE=name1,name2` 列出的 shader 名**只跳过 `cmd_dispatch`**，
+/// pipeline 创建 / uniform slot / barrier / bind 全部照录 ⇒ 基线与消融臂的唯一差别是「这条
+/// dispatch 上不上卡」，端到端位移即该 kernel 在关键路径上的贡献。
+///
+/// 与 CUDA 后端 `backend_cuda.rs` 的同名机制**同语义**（同一个环境变量），因此可以做跨后端
+/// 逐核归因：base / ablate(K) × cuda / vulkan 四臂同会话交错，比 CUDA 那把 event-pair 尺可信
+/// （`PROF_CUDA_KERNEL` 已登记为死仪器：关掉图重放后 event 对把 host 发射间隙算进内核时长）。
+///
+/// ⚠️ 三条读数纪律（照抄 CUDA 侧踩过的坑）：
+/// 1. **数值无意义**——被消融的 kernel 不写输出，下游读陈旧数据；
+/// 2. 读数是「移除收益**上界**」而非干净份额（下游因此变快的部分会算进来）；
+/// 3. **名字必须与 spv 名逐字一致**，写错不会报错、只是一处都不命中（CUDA 侧曾因此得到
+///    「消融后反而更慢」的假读数）⇒ 本实现额外打印首个命中的名字，命中日志没出现即没匹配。
+fn ablate_hit(shader_name: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// `record_kernel` 收到的是 `shaders/spv/<name>.spv`，而 dump/习惯写法是裸名 ⇒ 两边都归一。
+    fn norm(s: &str) -> String {
+        s.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(s)
+            .trim_end_matches(".spv")
+            .to_string()
+    }
+    static SET: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = SET.get_or_init(|| {
+        let v = std::env::var("ABLATE").ok()?;
+        let names: HashSet<String> = v
+            .split(',')
+            .map(|s| norm(s.trim()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            None
+        } else {
+            log::warn!("ABLATE 已启用（诊断模式，数值无意义）: {names:?}");
+            Some(names)
+        }
+    });
+    let Some(set) = set else { return false };
+    let base = norm(shader_name);
+    if !set.contains(&base) {
+        return false;
+    }
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut s) = seen.lock()
+        && s.insert(base.clone())
+    {
+        log::info!("[ABLATE] 命中 {base}（本进程首次；此后该 kernel 不再上卡）");
+    }
+    true
 }
 
 /// 估算单个 kernel 的读写字节数（用于带宽利用率 = est_bytes / 耗时 / 峰值带宽）。
