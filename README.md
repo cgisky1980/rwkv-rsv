@@ -1402,6 +1402,47 @@ is its smallest possible value; the batched chunked path uses multiples of `PAD_
 prompts in the test suite - which previously sat below the gate - now exercise it ⇒ the gate was re-run as
 `BACKEND=vulkan` and `BACKEND=cuda` `cargo test --release` with small-M coverage live (both green). Ledger §6.14.
 
+### 6.15 Device-side batched zero-fill: the chunked-prefill `reset` segment 1409.6 ms → 4.6 ms (2026-10-12)
+
+`State::reset` zeroes 32 layers × 3 tensors + `v_first` = **97 buffers**, and on Vulkan every `upload` is
+"one command buffer + one `queue_wait_idle`". The chunked prefill path resets its small `w=8` state at the
+start of every chunk (each prompt prefills independently from zero), so each chunk paid 97 whole-stream syncs.
+Measured in one session with `PROF_CHUNK=1`: `reset=1409.6ms / total=38928.2ms` = **3.6 %** of the wall
+(~88 ms/chunk, ~0.9 ms per submission - exactly host submit+wait latency).
+
+`ComputeBackend::fill_zeros(&[(TensorId, elems)])`: default implementation = per-tensor zero `upload`
+(**CUDA is byte-for-byte unchanged on purpose**), Vulkan override = `Runtime::fill_zeros`, which records all N
+`vkCmdFillBuffer` commands into **one** command buffer with one submit and one wait.
+
+| B=128, 627-token prompts, w=8 ⇒ 16 chunks, same session | reset | core | xfer | total wall |
+| --- | --- | --- | --- | --- |
+| before | **1409.6 ms** | 37503.8 ms | 14.8 ms | 38928.2 ms |
+| after | **4.6 ms** | 35751.5 ms | 13.9 ms | 35770.0 ms |
+
+**Only the `reset` column is evidence** - it is deterministic (a 300× gap, reproducible within each pass).
+The `core` column moved by -1.75 s on its own (clock/thermal steps; per-chunk core swings 1154~2856 ms inside
+a single run), so this is **not** a "prefill is 8 % faster" claim. What can be booked: **-1.41 s out of 38.9 s
+= 3.6 %** at this prompt length, ~**7 %** when prompts fit `T_pad=512` (halving the chunk body against the same
+fixed cost), and ~**2.8 s** at B=256 (32 chunks).
+
+Zero-risk framing: the bytes written are identical to the old per-tensor zero uploads, so the gate is a
+**bitwise fingerprint**, not a stopwatch - `decode tokens sum=0x13e742 xor=0x79b4` is the same before and after
+(same seed, same config). Two semantic notes worth stating: the fill **does not touch the host mirror** (state is
+always read via `download`, i.e. a device→host copy; `download_host` is only for tensors a kernel writes into,
+which state tensors are not), and `vkCmdFillBuffer` needs a size that is a multiple of 4 bytes - every state
+element count here is even, but `Runtime::fill_zeros` still falls back to per-tensor uploads for the whole batch
+if any item is misaligned, rather than silently taking a wrong path.
+
+⚠️ **CUDA deliberately does not get this** (the counter-intuitive part of the task card stays true): CUDA's own
+`reset` was even more expensive (2.37 s vs 1.907 s), so optimising both sides would *widen* the B=256 gap. This
+rung's value is Vulkan's absolute wall clock plus host memory and submission count (the fill also no longer needs
+the 165 MB host zero buffer).
+⚠️ Instrument trap worth repeating: the first "after" reading matched "before" to the digit because
+`cargo build --release` **does not build examples** - that pass ran the old `batch_decode_bench.exe` (and its
+matching fingerprint was a vacuous pass, not proof). Always `cargo build --release --examples` before a bench A/B
+and bind a reading that can only move with the change. Raw `/c/tmp/ac16/chunk128_{base,fill,fill2}.log`;
+gates `/c/tmp/ac16/fill_gates.log`. Ledger §6.15.
+
 ## 7. Layout
 
 ```

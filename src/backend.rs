@@ -13,7 +13,8 @@
 use std::collections::HashMap;
 
 use crate::runtime::{
-    GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32, StateTensor,
+    FillTarget, GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32,
+    StateTensor,
 };
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
@@ -111,6 +112,22 @@ pub trait ComputeBackend {
     fn upload_bulk_begin(&mut self) {}
     /// 批量上传结束：排空全部未完成 DMA 并释放批量上传资源。默认无操作。
     fn upload_bulk_end(&mut self) {}
+    /// 设备内批量清零：把 `items` 里每条张量的前 `elems` 个**元素**写成全零（不经主机）。
+    ///
+    /// 为什么需要它：`State::reset` 每次要清 32 层 × 3 条 + `v_first` = 97 条，而 Vulkan 侧
+    /// 每一次 `upload` 都是「单独一条 command buffer + 一次 `queue_wait_idle`」（见
+    /// `Runtime::copy_buffer`）⇒ 分块 prefill 的 reset 段实测 **1.41 s / B=128 整轮**
+    /// （`PROF_CHUNK`，台账 §6.15），纯宿主等待、设备侧只占其中 ~2 ms。
+    ///
+    /// 默认实现 = 逐条 `upload` 零 ⇒ 没覆盖的后端（CUDA）**逐字节行为不变**。
+    /// 覆盖它的收益只在**提交次数**（N 次 → 1 次），语义与写零完全等价。
+    /// `elems` 用张量自身的元素 dtype 计数（fp16 张量传半个数，与 `upload` 一致）。
+    fn fill_zeros(&self, items: &[(TensorId, usize)]) -> R<()> {
+        for &(t, elems) in items {
+            self.upload(t, &vec![0.0; elems])?;
+        }
+        Ok(())
+    }
     fn download(&self, t: TensorId) -> R<Vec<f32>>;
     /// 读** kernel 写进 host-visible 缓冲**的结果，不做 device→host 拷贝。
     /// Vulkan 上采样 kernel 的 token 写回落在张量的 host 镜像（自循环闭环就靠它：
@@ -1688,6 +1705,23 @@ impl ComputeBackend for VulkanBackend {
             VulkanTensor::U32(g) => self.rt.upload_u32(g, data),
             _ => Err("upload_u32: t must be u32".into()),
         }
+    }
+
+    /// 设备内清零：**一条 command buffer 记完全部 N 条 `vkCmdFillBuffer` + 一次提交**
+    /// （默认实现是逐条 `upload`，即 N 次「提交 + `queue_wait_idle`」）。
+    /// 收益全在宿主侧：`State::reset` 那 97 条实测 88 ms/chunk（台账 §6.15）。
+    /// 字节对齐不满足时由 `Runtime::fill_zeros` 自己回落逐条零上传，语义不变。
+    fn fill_zeros(&self, items: &[(TensorId, usize)]) -> R<()> {
+        let mut targets: Vec<FillTarget<'_>> = Vec::with_capacity(items.len());
+        for &(t, elems) in items {
+            let target = match self.tensors.get(&t).ok_or("fill_zeros: unknown tensor")? {
+                VulkanTensor::F32(g) => FillTarget::F32(g, elems),
+                VulkanTensor::F16(g) => FillTarget::F16(g, elems),
+                VulkanTensor::U32(g) => FillTarget::U32(g, elems),
+            };
+            targets.push(target);
+        }
+        self.rt.fill_zeros(&targets)
     }
 
     fn download(&self, t: TensorId) -> R<Vec<f32>> {

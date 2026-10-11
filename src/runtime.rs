@@ -52,6 +52,35 @@ pub struct GpuTensorU32 {
     pub len: usize,
 }
 
+/// `Runtime::fill_zeros` 的入参：三种设备缓冲的统一视图（只取 device buffer + 字节数）。
+/// `elems` 按**该张量自身 dtype** 计元素，与 `ComputeBackend::fill_zeros` 的口径一致。
+#[derive(Debug, Clone, Copy)]
+pub enum FillTarget<'a> {
+    F32(&'a GpuTensor, usize),
+    F16(&'a GpuTensor16, usize),
+    U32(&'a GpuTensorU32, usize),
+}
+
+impl FillTarget<'_> {
+    /// 整段清零的 `(device buffer, 字节数)`；`elems == 0` ⇒ 没什么可写，返回 None。
+    fn fill_range(&self) -> Option<(vk::Buffer, u64)> {
+        match self {
+            Self::F32(t, n) => (*n > 0).then_some((t.device.buffer, 4 * *n as u64)),
+            Self::F16(t, n) => (*n > 0).then_some((t.device.buffer, 2 * *n as u64)),
+            Self::U32(t, n) => (*n > 0).then_some((t.device.buffer, 4 * *n as u64)),
+        }
+    }
+
+    /// 回落路径（字节数不是 4 的倍数时）：逐条零上传，语义与 `fill_range` 相同。
+    fn upload_zeros(&self, rt: &Runtime) -> R<()> {
+        match self {
+            Self::F32(t, n) => rt.upload(t, &vec![0.0; *n]),
+            Self::F16(t, n) => rt.upload_f16(t, &vec![0.0; *n]),
+            Self::U32(t, n) => rt.upload_u32(t, &vec![0u32; *n]),
+        }
+    }
+}
+
 /// WKV 状态（`tmix_rnn`）的设备句柄：fp32 或 fp16 存储，由建张量时的 dtype 决定
 /// （`wkv_state_dtype`，与 CUDA 的 `WKV_S16` 档同口径：**fp16 存 + fp32 算**）。
 ///
@@ -368,6 +397,53 @@ impl Runtime {
         let mut data = vec![0.0f32; tensor.len];
         host.copy_to(&mut data)?;
         Ok(data)
+    }
+
+    /// 一条 command buffer 记 N 条 `vkCmdFillBuffer`（全零）+ 一次 submit + 一次
+    /// `queue_wait_idle`，把「N 条独立张量清零」的提交次数从 N 压到 1。
+    ///
+    /// 与逐条 `upload(零)` 的差别只有两点：① 提交次数（这才是收益的来源，见
+    /// `ComputeBackend::fill_zeros` 的文档）；② **不动 host 镜像**——状态的读数走
+    /// `download`（device→host 回拷），`download_host` 那条「kernel 直写 host 缓冲」
+    /// 的路子不适用于状态张量，所以镜像陈旧不影响任何结果。
+    ///
+    /// 任何一条的字节数不是 4 的倍数（`vkCmdFillBuffer` 的硬性要求，fp16 的奇数元素数
+    /// 会踩到）⇒ 整批回落逐条零上传，语义不变。
+    pub fn fill_zeros(&self, items: &[FillTarget<'_>]) -> R<()> {
+        let mut dsts: Vec<(vk::Buffer, u64)> = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some((buffer, bytes)) = item.fill_range() {
+                dsts.push((buffer, bytes));
+            }
+        }
+        if dsts.iter().any(|&(_, bytes)| bytes % 4 != 0) {
+            for item in items {
+                item.upload_zeros(self)?;
+            }
+            return Ok(());
+        }
+        let cmd_buf = self.app.allocate_compute_command_buffers(1)?;
+        let cmd = cmd_buf[0];
+        unsafe {
+            self.app
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.app
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+            for &(buffer, bytes) in &dsts {
+                self.app.device.cmd_fill_buffer(cmd, buffer, 0, bytes, 0);
+            }
+            self.app.device.end_command_buffer(cmd)?;
+            let buffers = [cmd];
+            let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
+            let submits = [submit.build()];
+            self.app
+                .device
+                .queue_submit(self.app.compute.queue, &submits, vk::Fence::null())?;
+            self.app.device.queue_wait_idle(self.app.compute.queue)?;
+        }
+        Ok(())
     }
 
     /// 记录并执行 buffer 拷贝命令（src → dst），使用 compute 队列

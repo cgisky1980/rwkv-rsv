@@ -686,6 +686,53 @@ DPLR batch 版按 lens 截断 T 循环（`:2000-2012`）、状态写入取 `lens
 这一格的证据只有上面那张链尺表（4/4 配对、集合不重叠）。
 Raw：`/c/tmp/ac16/lowM_{64_2048,64_128}.txt`。
 
+### 6.15 设备内批量清零：分块 prefill 的 reset 段 1409.6 ms → 4.6 ms（2026-10-12，任务 #35）
+
+**问题**：`State::reset` 每次要清 32 层 × 3 条 + `v_first` = **97 条**张量，而 Vulkan 侧每一次
+`upload` 都是「单独一条 command buffer + 一次 `queue_wait_idle`」（`src/runtime.rs` 的
+`copy_buffer`）。分块 prefill 每个 chunk 开头都要 reset 一次那个 `w=8` 的小状态
+（每条 prompt 独立从零开始 prefill），于是每 chunk 白付 97 次全流同步。
+**实测（同会话、同命令、`PROF_CHUNK=1`）**：`reset=1409.6ms / total=38928.2ms`（**3.6 %**，
+每 chunk ≈88 ms ⇒ 每条 ≈0.9 ms，量级正好是「一次 submit + wait_idle」的宿主延迟）。
+
+**改法**：`ComputeBackend::fill_zeros(&[(TensorId, elems)])` —— 默认实现 = 逐条 `upload` 零
+（⇒ **CUDA 逐字节不变**，那边历史实测 reset 更贵 2.37 s，故意不动它，见下）；
+Vulkan 覆盖 = `Runtime::fill_zeros` 把 N 条 `vkCmdFillBuffer` 记进**一条** command buffer、
+一次 submit、一次 wait。`State::reset` 改成先把 97 条 `(id, elems)` 收进一个 Vec 再一次提交。
+
+| 口径（B=128，627 tok prompt，w=8 ⇒ 16 chunk，同会话两遍） | reset | core | xfer | total 墙钟 |
+| --- | --- | --- | --- | --- |
+| 改前 | **1409.6 ms** | 37503.8 ms | 14.8 ms | 38928.2 ms |
+| 改后 | **4.6 ms** | 35751.5 ms | 13.9 ms | 35770.0 ms |
+| Δ | **−1405.0 ms（−99.7 %）** | −1752.3 ms（时钟，不记账） | −0.9 ms | −3158.2 ms |
+
+★ **只有 reset 那一格是证据**：它是确定性的（300 倍差距，且两次读数各自内部一致），
+而 `core` 那 −1.75 s 是本会话里常见的时钟/散热台阶（同一次跑里逐 chunk core 就在
+1154~2856 ms 之间摆），**不许**据此报「prefill 快 8 %」。
+按能记账的口径：B=128 这一轮省 **1.41 s / 38.9 s = 3.6 %**；prompt 短到 `T_pad=512`
+（chunk 主体减半）时同一笔固定开销占比 ≈**7 %**；B=256 是 32 个 chunk ⇒ 约 **2.8 s**。
+
+**为什么这是零风险改动**：写进去的字节与逐条零上传完全相同，所以判据用**逐位指纹**而不是秒表——
+`decode tokens sum=0x13e742 xor=0x79b4` **改前改后逐位相同**（同 seed 同配置）。
+两条要说清的语义差别：
+① `fill` **不动 host 镜像**（旧 `upload` 会先把 host 侧写零）。状态的读数全部走
+`download`（device→host 回拷，`State::back`/`slot_back` 都是），`download_host` 那条
+「kernel 直写 host 缓冲」的路子不适用于状态张量 ⇒ 镜像陈旧不可能影响任何结果；
+② `vkCmdFillBuffer` 要求字节数是 4 的倍数：fp16 状态的元素数在这里全是偶数，
+但 `Runtime::fill_zeros` 仍保留「任一条不对齐 ⇒ 整批回落逐条零上传」，不留静默错路。
+
+⚠️ **CUDA 侧故意不做**（任务卡里那条反直觉的话仍然成立）：两边一起省会让 B=256 的
+vs CUDA **变差**（CUDA 的 reset 更贵 2.37 s vs 1.907 s），这一根的价值是 **Vulkan 的绝对墙钟**
+与主机内存/提交次数（顺带：`fill` 不再需要那条 165 MB 的主机零缓冲）。
+⇒ 它的「追平」记账是正的（只有 Vulkan 变快），但别把它当性能杠杆去给 CUDA 也做一遍。
+
+**踩到的一条仪器陷阱（值得单列）**：第一遍「改后」读数与改前**一字不差**（1409.6 vs 1410.9），
+原因不是改动无效，而是 `cargo build --release` **不构建 examples** ⇒
+`target/release/examples/batch_decode_bench.exe` 还是旧二进制，那一遍量的就是改动前的代码
+（它的解码指纹也因此「完美一致」，看着像最强的正确性证据，其实是空转）。
+⇒ bench 前后必须 `cargo build --release --examples`，并绑定一个**只有改动才会变**的读数
+（这里是 reset 段）。Raw：`/c/tmp/ac16/chunk128_{base,fill,fill2}.log`、`/c/tmp/ac16/fill_gates.log`。
+
 
 
 

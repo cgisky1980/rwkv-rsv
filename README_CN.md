@@ -890,6 +890,42 @@ min over 3×40 iters；`KB_BATCH` 在这里就是 M 行数）：
 测试套件里的短 prompt 用例也从「恒关」变成「真的在跑这一档」⇒ 门禁 = 两后端 `cargo test --release`
 在小 M 覆盖下各重跑一遍（全绿）。台账细节见 §6.14。
 
+### 6.10 设备内批量清零：分块 prefill 的 reset 段 1409.6 ms → 4.6 ms（2026-10-12）
+
+`State::reset` 要把 32 层 × 3 条张量 + `v_first` 共 **97 块缓冲**写零，而 Vulkan 每次 `upload` 都是
+「一条 command buffer + 一次 `queue_wait_idle`」。分块 prefill 每个 chunk 开头都要把那 8 槽的小状态
+清零一次（每条 prompt 都从零独立 prefill），于是每个 chunk 白付 97 次全队列同步。
+同会话 `PROF_CHUNK=1` 实测：`reset=1409.6ms / total=38928.2ms` = **3.6 %**（≈88 ms/chunk、
+≈0.9 ms/次提交 —— 正好是主机侧提交+等待的延迟量级）。
+
+`ComputeBackend::fill_zeros(&[(TensorId, elems)])`：默认实现 = 逐张量零 `upload`
+（**CUDA 一侧故意逐字节不变**），Vulkan 覆盖 = `Runtime::fill_zeros`，把 N 条 `vkCmdFillBuffer`
+录进**同一条** command buffer，一次提交、一次等待。
+
+| B=128、627 token prompt、w=8 ⇒ 16 chunk，同会话 | reset | core | xfer | 墙钟 total |
+| --- | --- | --- | --- | --- |
+| 改前 | **1409.6 ms** | 37503.8 ms | 14.8 ms | 38928.2 ms |
+| 改后 | **4.6 ms** | 35751.5 ms | 13.9 ms | 35770.0 ms |
+
+**只有 reset 那一列是证据**——它是确定性的（300 倍差距，每一遍内部可复现）。
+`core` 那一列自己动了 −1.75 s（时钟/温度跳档；单次运行里逐 chunk 的 core 就在 1154~2856 ms 之间摆），
+所以这**不是**「prefill 快了 8 %」那种结论。能入账的是：这一 prompt 长度下 **38.9 s 里省 1.41 s = 3.6 %**，
+prompt 落进 `T_pad=512` 时 ≈**7 %**（chunk 本体减半而固定成本不变），B=256 时 ≈**2.8 s**（32 个 chunk）。
+
+零风险的说法：写进显存的字节与原来的逐张量零上传完全一致 ⇒ 门禁是一把**逐位指纹**而不是秒表——
+`decode tokens sum=0x13e742 xor=0x79b4` 改前改后相同（同 seed 同配置）。两点语义值得写明：清零**不动主机镜像**
+（状态一律经 `download` 读，即设备→主机拷贝；`download_host` 只用于「内核会写进它」的张量，状态张量不是），
+且 `vkCmdFillBuffer` 要求字节数被 4 整除——这里每条状态元素数都是偶数，但只要有任一项不对齐，
+`Runtime::fill_zeros` 就把**整批**回落到逐张量上传，而不是静默走一条错路。
+
+⚠️ **CUDA 故意不发这一档**（任务卡里那句反直觉的话依然成立）：CUDA 自己的 `reset` 更贵
+（2.37 s 对 1.907 s），两边一起优化只会**拉大** B=256 的差距。这一格的价值在 Vulkan 的绝对墙钟，
+以及主机内存与提交次数（清零不再需要那块 165 MB 主机零缓冲）。
+⚠️ 值得重复一遍的仪器坑：第一次「改后」读数与「改前」逐位相同，原因是 `cargo build --release`
+**不构建 examples**——那一遍跑的是过期的 `batch_decode_bench.exe`（它的指纹「相符」是空过，不是证明）。
+bench A/B 之前一律 `cargo build --release --examples`，并且绑一个**只能随改动而动**的读数。
+原始数据 `/c/tmp/ac16/chunk128_{base,fill,fill2}.log`；门禁 `/c/tmp/ac16/fill_gates.log`。台账 §6.15。
+
 ## 7. 目录结构
 
 ```

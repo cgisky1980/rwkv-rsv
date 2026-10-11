@@ -5297,19 +5297,18 @@ impl GpuState {
         })
     }
 
-    /// 重置 RNN 状态为零（用于多次独立 forward）
+    /// 把本层三条状态张量（含各自元素数）追加进 `items`，交给 `State::reset` 一次批量清零。
     fn reset(
         &self,
-        backend: &dyn ComputeBackend,
         c: usize,
         h: usize,
         n: usize,
         batch: usize,
-    ) -> R<()> {
-        backend.upload(self.tmix_x, &vec![0.0; c * batch])?;
-        backend.upload(self.tmix_rnn, &vec![0.0; h * n * n * batch])?;
-        backend.upload(self.cmix_x, &vec![0.0; c * batch])?;
-        Ok(())
+        items: &mut Vec<(TensorId, usize)>,
+    ) {
+        items.push((self.tmix_x, c * batch));
+        items.push((self.tmix_rnn, h * n * n * batch));
+        items.push((self.cmix_x, c * batch));
     }
 }
 
@@ -5874,13 +5873,20 @@ impl State {
         Ok(())
     }
 
-    /// 清零全部状态（含 v_first 缓冲）。
+    /// 清零全部状态（含 v_first 缓冲）：**一次批量设备内清零**，不是 97 次 `upload`。
+    ///
+    /// 为什么要批量：32 层 × 3 条 + `v_first` = 97 条，而 Vulkan 侧每次 `upload` 都是
+    /// 「单独一条 command buffer + 一次 `queue_wait_idle`」⇒ 分块 prefill 每 chunk 光这一段的
+    /// 墙钟实测 **88 ms**、B=128 整轮 **1.41 s**（`PROF_CHUNK`，台账 §6.15），而设备真正写零
+    /// 只要 ~2 ms（82 MiB @ ≈560 GB/s）。`fill_zeros` 把它压成一条 command buffer / 一次提交，
+    /// 写出来的字节与逐条零上传完全相同。
     pub fn reset(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<()> {
+        let mut items: Vec<(TensorId, usize)> = Vec::with_capacity(self.layers.len() * 3 + 1);
         for s in &self.layers {
-            s.reset(backend, c, h, n, self.batch)?;
+            s.reset(c, h, n, self.batch, &mut items);
         }
-        backend.upload(self.v_first, &vec![0.0; c * self.batch])?;
-        Ok(())
+        items.push((self.v_first, c * self.batch));
+        backend.fill_zeros(&items)
     }
 }
 
