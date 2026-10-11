@@ -713,6 +713,17 @@ examples/       自包含示例程序
 - **A/B 之前必须先跑一个丢弃用的进程**（§6.2④）：`vulkan/app.rs` 的 `pipeline_cache` 只在内存、
   驱动盘缓存按 SPIR-V 哈希索引 ⇒ 重编 shader 后的**第一个进程**会在计时区内编译管线。本轮就是
   被这条造出一个 6.4× 的假收益（0.52 → 2.41 条/秒），交错重跑后两档持平。单轮单侧读数一律不用。
+- ★ **配对统计必须用 Δmin，且每根新杠杆先跑空档对照**（2026-10-12，`参考/2026-10-11-Vulkan-mid投影臂向量化-实施记录.md` §22）。
+  本机满载时 SM 时钟是**准静态台阶**（1695~1830 MHz，1 Hz 采样看到整段锁在同一档，一次跳档 ≈7 %），
+  所以中位数配对判不出它：`SKIP_GRAPH` 那档（Vulkan 侧根本不走图捕获，见 §9「批量 decode」条 ⇒
+  **两臂是同一段代码**）读出 **Δ中位 −8.31 %、6/6 同号**，是一根纯粹的假杠杆。换成**每轮取 min 再配对**
+  之后，同一台机器、同一批负载的空档对照（`SKIP_GRAPH=1` 对未设，B=8/32/64/128/256 + 一轮 12 次复测）
+  压到 **−2.3 % ~ +1.6 %** ⇒ **本机 B=128 端到端 A/B 的分辨率下限 ≈2~3 %**，Δ中位的底是 ±10 %。
+  推论两条：① 机制预测收益 <3 % 的杠杆**不要用端到端 A/B 判**，只能靠内核自己的 GPU 时间戳 + 逐位指纹；
+  ② 历史上所有用中位数做的 <5 % 结论都要重新打折看。仪器在 `examples/batch_decode_bench.rs`
+  （`AB_VAR=<门名> AB_A=… AB_B=… AB_ROUNDS/AB_SEGS/AB_WARM/AB_RESTART`）：**模型只加载一次**，
+  两臂在同一进程内交替换档、奇数轮换起始臂，每臂日志回读 env 值作为绑定证据；`AB_RESTART=1` 才让
+  sum/xor 变成数值门（否则两臂起点不同，指纹只可比「是否同尺」）。
 - ~~**Vulkan uniform 池在长批量下需手工扩容**~~ —— **陈旧叙述，已实测证伪**（2026-10-10）。该结论早于 `pool_slots` 批内去重（ba08642，2026-08-25）；去重后池占用是 O(批内不同 params 组合) 而非 O(dispatch 数)。`PROF_POOL=1` 实测高水位：69,080 B（批量 prefill）/ 33,432 B（自循环）/ 31,344 B（`batch_step_sample`）—— **在 B=8/16/32/64 与 NTOK=32/64/256 上一律不变**，含 `SKIP_GRAPH=1`（n 轮全记录进一次 submit）、`STEP=1 PENALTY=1` 与长 prompt。默认 8MB 跑全部批量路径只用掉约 1.2%，`UNIFORM_POOL_MB` 只剩极端形状兜底的意义。
 - **fp16 模型没有批量 decode 路径（但批量 prefill 可用）**：批量 decode 的融合 r/k/v kernel 只有 int8 变体（`gemv_int8_rkv_stage1_batch`），fp16 模型只能逐槽串行 decode；`forward_seq_batch_padded`（批量 prefill）走 seq 并行核、读 fp16/fp32 权重照常工作。⚠️ 本条早前写成「fp16 模型没有批量前向路径」，把 prefill 一并说成了不行——消费方照那句决策会连批量 prefill 都退成逐槽串行，白付代价。`GpuModel::batch_decode_blocker()` 会把「为什么回落串行」以字符串返回，调用方（客户端会话池、mytown 引擎）加载时记一行日志即可，不必再对着一个静默的 `supports_batch_decode() == false` 猜。★ 2026-10-10 起这条路径**有测试钉住**：`tests/batch_parity.rs::fp16_batch_path_reports_reason_not_silently` 用同架构的 `router-0.1B.st` / `router-0.1B-int8.st` 对拍 —— fp16 侧批量 prefill 必须成功且**逐槽与单流口径一致**（证明不是静默垃圾）、批量 decode 必须返回**写明需要 int8** 的错误（不许静默产出垃圾、不许 panic）、单流路径必须照常可用，int8 侧批量 prefill 必须成功，这样「换量化权重就能救」这个结论才是被验证过的。
 - **低秩链是 Vulkan 上唯一还剩 SIMT 半壁的批量链**（二级已于 2026-10-11 上张量核，见英文 README §6.9；此前 `lowrank_gemm_batch` 只有 CUDA 实现。⚠️ 早前这条把 **FFN value** 也算成「只有 SIMT」是**错的**：batch≥16 时 CUDA 走 `ffn_value_gemm_batch` / `ffn_value_imma_batch` 的稠密 tiled 版，Vulkan 走通用 `imma_op_on("val")` 的 `gemm_imma(M=C, K=fh, OP=累加)`，两边都是张量核，只是形状不同形）：其余批量张量核算子（head/out/key/val，**以及 rkv**）默认全开——`VK_IMMA_OPS` 的默认从「除 rkv 外全开」翻成「全开」是 2026-10-10 做的，依据见 §6.3。
