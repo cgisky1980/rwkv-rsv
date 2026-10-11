@@ -2764,7 +2764,7 @@ impl Runtime {
     ) -> R<()> {
         let spec = gemm_spec(&self.app, m, n, k);
         let params = [a.device.address, b.device.address, 0, c.device.address];
-        let (gx, gy) = gemm_grid(&self.app, m, n);
+        let (gx, gy) = gemm_grid(&self.app, m, n, k);
         self.record_kernel(
             "shaders/spv/gemm_f16_f32.spv",
             &spec,
@@ -2797,7 +2797,7 @@ impl Runtime {
             x.device.address,
             y.device.address,
         ];
-        let (gx, gy) = gemm_grid(&self.app, m, n);
+        let (gx, gy) = gemm_grid(&self.app, m, n, k);
         self.record_kernel(
             "shaders/spv/gemm_f16_f32_affine.spv",
             &spec,
@@ -2823,7 +2823,7 @@ impl Runtime {
     ) -> R<()> {
         let spec = gemm_spec(&self.app, m, n, k);
         let params = [a.device.address, b.device.address, 0, c.device.address];
-        let (gx, gy) = gemm_grid(&self.app, m, n);
+        let (gx, gy) = gemm_grid(&self.app, m, n, k);
         self.record_kernel(
             "shaders/spv/gemm_f16_f32_relu2.spv",
             &spec,
@@ -2881,7 +2881,7 @@ impl Runtime {
     ) -> R<()> {
         let spec = gemm_spec(&self.app, m, n, k);
         let params = [a.device.address, b.device.address, 0, c.device.address];
-        let (gx, gy) = gemm_grid(&self.app, m, n);
+        let (gx, gy) = gemm_grid(&self.app, m, n, k);
         self.record_kernel(
             "shaders/spv/gemm_f16_f32_tanh.spv",
             &spec,
@@ -4826,6 +4826,21 @@ fn gemm_shmem(tile_m: u32, tile_n: u32, tile_k: u32) -> u32 {
 /// （n = round_up(mid, 64)，可以恰为 64）：128×128 会往 [M_PAD, 64] 的 v_mid 上多写
 /// 64 列、并越过 v1_16 尾部。整除性在这里保证，内核保持无分支。
 /// 收缩只会**降低**共享内存需求，故与上面的上限校验不冲突。
+///
+/// 但「整除」只保证**安全**，不保证**干活**，这里还压着两条硬约束：
+///
+/// 1. **结构下界**：`gemm.comp` 的 tile-load 循环 trip count 是
+///    `TILE_M * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE`（fp16 下 = `TILE_M*TILE_K/2048`），
+///    所以 `TILE_M*TILE_K` 与 `TILE_N*TILE_K` 都必须 **≥ 2048**，否则该侧一片都不载入
+///    ⇒ 累加器全零被原样写出，内核照样「成功」返回。实测 (64,32,32) 报 0.034 ms
+///    而 `sum(y)=0.0000`（2026-10-11），是 12 倍假胜利；`gemm_tile` 的共享内存兜底
+///    `(64,32,16)` 同样落在这里面。抬 `TILE_K` 是唯一不破坏整除性的修法。
+/// 2. **占用率**：整除收缩只会「往下找能整除的档」，从不考虑块数。低秩一级（mid 投影）
+///    是窄 N 深 K 的形状（M=128 批行 × N=64..320 × K=2560），128×128 收到 (128,64,32)
+///    后只剩 **1..5 个块喂 68 个 SM** ⇒ 实测 0.43~0.45 ms/层，比 SIMT 的一级（0.274）
+///    还慢，于是 #25 得出「一级上不了张量核」的结论。换 (64,32,64)（4..20 块）后同一
+///    形状同一权重 = **0.029 ms/次**（`sum(y)` 有效）⇒ 那条结论是**块数饥饿的产物**，
+///    不是张量核的天花板。故块数不足时按「先切 N、再切 M、K 抬到刚过下界」重选。
 fn gemm_tile_for(app: &App, m: usize, n: usize, k: usize) -> (u32, u32, u32) {
     let (tm, tn, tk) = gemm_tile(app);
     let shrink = |t: u32, len: usize, floor: u32| -> u32 {
@@ -4836,14 +4851,78 @@ fn gemm_tile_for(app: &App, m: usize, n: usize, k: usize) -> (u32, u32, u32) {
         t
     };
     // M 维下界 64（= 4·MAT_M，见上），N 维下界 32（= 2·MAT_N），K 维下界 16（= MAT_K）。
-    (shrink(tm, m, 64), shrink(tn, n, 32), shrink(tk, k, 16))
+    let mut tile = (shrink(tm, m, 64), shrink(tn, n, 32), shrink(tk, k, 16));
+    let max_shmem = app.properties.limits.max_compute_shared_memory_size;
+    // 合法 = 结构下界 + 放进共享内存 + K 仍整除（`NUM_TILE_K = K / TILE_K` 是定长循环，
+    // 不整除就是**静默丢尾**，同样只由 `sum(y)` 类指纹才看得见）。
+    let legal = |(a, b, c): (u32, u32, u32)| -> bool {
+        a * c >= 2048
+            && b * c >= 2048
+            && (k as u32).is_multiple_of(c)
+            && gemm_shmem(a, b, c) <= max_shmem
+    };
+
+    // ① 结构下界：整除收缩可能把 K 压到 16/32 而 M/N 还很小 ⇒ 空转档。只抬 K。
+    if !legal(tile) {
+        let mut fixed = tile;
+        while !legal(fixed) && fixed.2 * 2 <= 256 {
+            fixed.2 *= 2;
+        }
+        if legal(fixed) {
+            tile = fixed;
+        } else {
+            log::warn!(
+                "GEMM 形状 M={m} N={n} K={k} 无合法瓦片（下界 2048 / K 整除 / 共享内存 {max_shmem}），\
+                 保留 ({},{},{}) ⇒ 结果可能静默失真",
+                tile.0,
+                tile.1,
+                tile.2
+            );
+        }
+    }
+
+    // ② 占用率：块数不足时切细 M/N 并重抬 K。`GEMM_MIN_BLOCKS=0` 关掉这一档（A/B 用）。
+    //   门限 32 是量出来的（2026-10-11，同一二进制只翻 env、交错+反序各 2 轮，B=128，
+    //   记录 §10）：1..5 块的低秩一级 0.085~0.131 → **0.029** ms/次（2.9~4.5×）；
+    //   20 块的低秩二级 0.0190/0.0165/0.0234 → 0.0163/0.0151/0.0174（持平到 −27 %）；
+    //   深 K 窄 N 的 `pf_value`（20 块）0.520 → **0.267**（1.94×）；
+    //   而 80 块的 `pf_key` 切细**慢 3 %**（0.373 → 0.386）⇒ 门限必须 ≤ 80。
+    //   ⇒ 可用区间 (20, 80]，取 32。
+    let min_blocks: usize = std::env::var("GEMM_MIN_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let blocks = m.div_ceil(tile.0 as usize) * n.div_ceil(tile.1 as usize);
+    if blocks < min_blocks {
+        // 候选从最细到当前档：先 N→32，再 M→64（两者都到不了就退回 (64,64)/(128,32)）。
+        let cands = [(64u32, 32u32), (64, 64), (128, 32), (tile.0, tile.1)];
+        for (cm, cn) in cands {
+            // 切细必须仍整除形状，否则宁可保持整除安全。
+            if !(m as u32).is_multiple_of(cm) || !(n as u32).is_multiple_of(cn) {
+                continue;
+            }
+            // K 取「满足下界的最小档」：更大的 K 会让每块 K 循环更深、实测更慢
+            // （(64,32,128) 0.040 vs (64,32,64) 0.029）。
+            let mut ck = 16u32;
+            while ck < 256 && (cm * ck < 2048 || cn * ck < 2048) {
+                ck *= 2;
+            }
+            let cand = (cm, cn, ck);
+            if legal(cand) && (cm, cn) != (tile.0, tile.1) {
+                tile = cand;
+                break;
+            }
+        }
+    }
+    tile
 }
 
 /// 由瓦片尺寸计算 dispatch 网格（M/TILE_M × N/TILE_N）。
-/// 瓦片取 `gemm_tile_for`（与 `gemm_spec` 同一处决议；TILE_M/TILE_N 只依赖 M/N，
-/// 故两处必然一致，不会出现「spec 用 128、grid 用 64」这类错位）。
-fn gemm_grid(app: &App, m: usize, n: usize) -> (u32, u32) {
-    let (tm, tn, _) = gemm_tile_for(app, m, n, 0);
+/// 瓦片取 `gemm_tile_for`，且**必须传真实的 k**：`TILE_N` 现在同时受结构下界
+/// （`TILE_N*TILE_K ≥ 2048`）与占用率档约束，两者都依赖 k ⇒ 若这里传 0，
+/// grid 会算出与 spec 不同的 `TILE_N`，表现为「输出少写/多写若干列」的静默错位。
+fn gemm_grid(app: &App, m: usize, n: usize, k: usize) -> (u32, u32) {
+    let (tm, tn, _) = gemm_tile_for(app, m, n, k);
     (
         m.div_ceil(tm as usize).max(1) as u32,
         n.div_ceil(tn as usize).max(1) as u32,
@@ -4862,6 +4941,26 @@ fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 42] {
     let m = m as u32;
     let n = n as u32;
     let k = k as u32;
+    // ★ 每次建管线打一行「这张 pipeline 实际绑定的瓦片与块数」——两件事：
+    //   ① `GEMM_TILE_*` 的 A/B 必须有绑定标记（跨进程比读数只是方向性的）；
+    //   ② `GEMM_TILE_*` 是**直接覆盖**，会绕过 `gemm_tile_for` 的结构下界
+    //      （TILE_M≥64、TILE_N≥32）。一旦 SUBTILE < MAT，`NUM_MAT_SUBTILE_*=0`，
+    //      内核一个元素都不写却照样「成功」返回——2026-10-11 的 234 TOPS 假胜利
+    //      （fp16 张量峰值的 4.3 倍）就是这么来的。这里把它当场喊出来。
+    if SUBTILE_M < MAT_M || SUBTILE_N < MAT_N {
+        log::warn!(
+            "GEMM 瓦片 ({TILE_M},{TILE_N},{TILE_K}) 非法：SUBTILE < MAT ⇒ 静默空转（grid {}×{}）",
+            m.div_ceil(TILE_M).max(1),
+            n.div_ceil(TILE_N).max(1)
+        );
+    } else {
+        log::info!(
+            "GEMM 瓦片 ({TILE_M},{TILE_N},{TILE_K}) M={m} N={n} K={k} ⇒ grid {}×{} = {} 块",
+            m.div_ceil(TILE_M).max(1),
+            n.div_ceil(TILE_N).max(1),
+            m.div_ceil(TILE_M).max(1) * n.div_ceil(TILE_N).max(1)
+        );
+    }
     [
         MAT_M,           // 0: MAT_M
         MAT_N,           // 1: MAT_N

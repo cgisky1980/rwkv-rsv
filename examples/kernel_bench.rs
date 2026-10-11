@@ -326,6 +326,19 @@ fn main() {
     println!("口径：每轮 iters 次调用 + 一次同步，取 repeats 轮的最小值；抖动 = (最大-最小)/最小");
     println!();
 
+    // `KB_LOG=1` 打开库内日志。为什么需要：`GEMM_TILE_*` 这类 env 是**跨进程 A/B**，
+    // 而库里的实际决议发生在 `gemm_spec`（含「收缩到整除形状」的逻辑）⇒ 没有
+    // 「这张 pipeline 到底绑了哪档瓦片/几个块」的标记，两个臂比的是两个未知量。
+    // （2026-10-11 的教训形状：非法档会静默空转并报出 234 TOPS 的假胜利。）
+    if std::env::var("KB_LOG").map(|v| v != "0").unwrap_or(false) {
+        let _ = simplelog::TermLogger::init(
+            log::LevelFilter::Info,
+            simplelog::Config::default(),
+            simplelog::TerminalMode::Stderr,
+            simplelog::ColorChoice::Never,
+        );
+    }
+
     let backend = match create_backend(detect_backend()) {
         Ok(b) => b,
         Err(e) => {
