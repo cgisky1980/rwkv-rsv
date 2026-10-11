@@ -12,10 +12,10 @@
 // 每个 workgroup 处理一个 (batch, head)，BLOCK_SIZE = 128。
 //
 // subgroup-per-row 映射（对标 CUDA 版 warp-per-row，跨硬件自适应）：
-//   行分派：subgroup sg 串行处理 row ≡ sg (mod NUM_SUBGROUPS) 的状态行；
-//   列分派：sgid ↔ 连续列（j = sgid + m*SUBGROUP_SIZE）——state 行访问在
-//   subgroup 内地址连续（100% coalesced；旧映射 row=t/2 隔行分片时每 2 线程
-//   才 8B 连续，仅 25% sector 利用率）。
+//   行分派：subgroup sg 串行处理 row ≡ sg (mod NUM_SUBGROUPS) 的状态行（一次交错两行）；
+//   列分派：sgid ↔ 相邻列对（列 2p/2p+1，p = sgid + m*SUBGROUP_SIZE）——每 lane 一次
+//   4B 访存取两个元素，warp 一条指令 128 B 全合并（上一代标量连续列映射每指令 64 B；
+//   更早的 row=t/2 隔行分片每 2 线程才 8B 连续，仅 25% sector 利用率）。
 //   sa/y 行内归约用 subgroupAdd（subgroup 内隐式同步，行循环内零 barrier）。
 //
 //   Phase 0: L2 范数 inv_norm = 1/sqrt(sum_j (k_j*k_k_j)^2)（128 线程冗余树归约，
@@ -55,13 +55,16 @@ shared float inv_std;
 shared float s_acc;
 
 // 状态存储 dtype：计算全程 fp32，只在载入/回存降位（与 CUDA 的 `WKV_S16` 档同口径）。
+// 访存一律走**列对**视图（S_VEC）：fp16 档一次 4B 取两个相邻 half，fp32 档一次 8B 取两个。
 #ifdef WKV_S16
 #define S_TYPE float16_t
+#define S_VEC  f16vec2
 #else
 #define S_TYPE float
+#define S_VEC  vec2
 #endif
 
-layout(buffer_reference) buffer BufS  { S_TYPE data[]; }  buf_s;
+layout(buffer_reference) buffer BufS  { S_VEC data[]; }  buf_s;   // [..][N][N] 列对视图
 layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;   // k
 layout(buffer_reference) buffer BufKK { float data[]; }  buf_kk;  // k_k
 layout(buffer_reference) buffer BufA  { float16_t data[]; }  buf_a;   // a (fp16)
@@ -157,34 +160,75 @@ void main() {
         buf_km.data[v_base + t] = sh_k[t];
     }
 
-    // Phase 2+3: subgroup-per-row 行循环——sgid ↔ 连续列（j = sgid + m*SUBGROUP_SIZE），
-    // S 行元素寄存器化（每 invocation N/SUBGROUP_SIZE 个），一遍读一遍写；
-    // sa/y 行内归约用 subgroupAdd（行循环内零 barrier）。
-    float sreg[CPI_MAX];
-    for (uint row = sg; row < N; row += NUM_SUBGROUPS) {
-        const uint s_row_base = s_base + row * N;
-        const float v_i = float(buf_v.data[v_base + row]);
-        // 读入本 sgid 的列块（subgroup 内连续地址，coalesced）并算 sa 部分和
-        float sa_part = 0.0;
+    // Phase 2+3: subgroup-per-row 行循环 + **相邻列对**访存 + **两行交错**。
+    //
+    // 列对：lane 与列的对应关系是 `p = sgid + m*SUBGROUP_SIZE` ↔ 列 (2p, 2p+1)，
+    // 一次 4B 访存覆盖两个相邻元素（fp16 档两个 half，fp32 档两个 float），
+    // warp 一条指令 128 B 全合并（旧的标量映射每指令只有 64 B）。
+    // ⚠️ 代价：列↔lane 的划分变了 ⇒ `subgroupAdd` 的求和结合顺序变了，**不逐位**。
+    //    这与 §6.3 的 split-K 重定同性质，判据用逐元素 logits rmse（见实施记录），
+    //    不用 token 指纹（分叉率会被贪心级联放大到饱和）。
+    //
+    // 两行交错（对标 CUDA 版同一内核的 `#pragma unroll 2`）：每行是一条
+    // 「载入 S → 蝶形归约 sa → 逐列更新 → 存回 → 蝶形归约 y」的延迟链，交错两行 ⇒
+    // 一次迭代有两条相互独立的链在飞。这一半**单独实测过**：内核 per-avg
+    // 0.2219 → 0.2131 ms（−4.0 %），逐位性由 logits dump 的 md5 逐位一致证明。
+    S_VEC sregA[CPI_MAX];
+    S_VEC sregB[CPI_MAX];
+    const uint NH = N / 2u;
+    for (uint row = sg; row < N; row += 2u * NUM_SUBGROUPS) {
+        const uint rowB = row + NUM_SUBGROUPS;
+        const bool hasB = rowB < N;
+        const uint row_i = hasB ? rowB : row;   // 无第二行时读本行（结果丢弃，不改内存）
+        const uint s_row_baseA = (s_base + row * N) / 2u;
+        const uint s_row_baseB = (s_base + row_i * N) / 2u;
+        const float v_iA = float(buf_v.data[v_base + row]);
+        const float v_iB = float(buf_v.data[v_base + row_i]);
+        // 读入本 sgid 的列对块（一条指令 128 B 全合并）并算两行的 sa 部分和
+        float saA = 0.0;
+        float saB = 0.0;
         uint cnt = 0;
-        for (uint j = sgid; j < N; j += SUBGROUP_SIZE) {
-            sreg[cnt] = float(buf_s.data[s_row_base + j]);
-            sa_part = fma(sreg[cnt], sh_a[j], sa_part);
+        for (uint p = sgid; p < NH; p += SUBGROUP_SIZE) {
+            const uint j = 2u * p;
+            sregA[cnt] = buf_s.data[s_row_baseA + p];
+            sregB[cnt] = buf_s.data[s_row_baseB + p];
+            saA = fma(float(sregA[cnt].x), sh_a[j], saA);
+            saA = fma(float(sregA[cnt].y), sh_a[j + 1u], saA);
+            saB = fma(float(sregB[cnt].x), sh_a[j], saB);
+            saB = fma(float(sregB[cnt].y), sh_a[j + 1u], saB);
             cnt++;
         }
-        const float sa_val = subgroupAdd(sa_part);
-        // 更新 S[row,j] = S*w[j] + sa*b[j] + v*k_mod[j] 并写回，求 y[row] 部分和
-        float y_part = 0.0;
+        const float sa_valA = subgroupAdd(saA);
+        const float sa_valB = subgroupAdd(saB);
+        // 更新 S[row,j] = S*w[j] + sa*b[j] + v*k_mod[j] 并写回，求各行 y 部分和
+        float yA = 0.0;
+        float yB = 0.0;
         cnt = 0;
-        for (uint j = sgid; j < N; j += SUBGROUP_SIZE) {
-            float ns = sreg[cnt] * sh_w[j] + sa_val * sh_b[j] + v_i * sh_k[j];
-            buf_s.data[s_row_base + j] = S_TYPE(ns);
-            y_part = fma(ns, sh_r[j], y_part);
+        for (uint p = sgid; p < NH; p += SUBGROUP_SIZE) {
+            const uint j = 2u * p;
+            const S_VEC nsA = S_VEC(
+                S_TYPE(sregA[cnt].x * sh_w[j] + sa_valA * sh_b[j] + v_iA * sh_k[j]),
+                S_TYPE(sregA[cnt].y * sh_w[j + 1u] + sa_valA * sh_b[j + 1u] + v_iA * sh_k[j + 1u]));
+            buf_s.data[s_row_baseA + p] = nsA;
+            yA = fma(float(nsA.x), sh_r[j], yA);
+            yA = fma(float(nsA.y), sh_r[j + 1u], yA);
+            const S_VEC nsB = S_VEC(
+                S_TYPE(sregB[cnt].x * sh_w[j] + sa_valB * sh_b[j] + v_iB * sh_k[j]),
+                S_TYPE(sregB[cnt].y * sh_w[j + 1u] + sa_valB * sh_b[j + 1u] + v_iB * sh_k[j + 1u]));
+            if (hasB) {
+                buf_s.data[s_row_baseB + p] = nsB;
+            }
+            yB = fma(float(nsB.x), sh_r[j], yB);
+            yB = fma(float(nsB.y), sh_r[j + 1u], yB);
             cnt++;
         }
-        const float y_sum = subgroupAdd(y_part);
+        const float y_sumA = subgroupAdd(yA);
+        const float y_sumB = subgroupAdd(yB);
         if (sgid == 0) {
-            yv[row] = y_sum;
+            yv[row] = y_sumA;
+            if (hasB) {
+                yv[rowB] = y_sumB;
+            }
         }
     }
     barrier();

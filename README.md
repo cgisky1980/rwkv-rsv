@@ -972,6 +972,64 @@ extend the win downward. Also possible: merge the 8 cast/epilogue dispatches int
 ms/layer. **Cross-backend standing after this lever** (§6.1's 4th re-measure): **0.874× (B=8) /
 0.740× (B=32) / 0.627× (B=128)** — B=128 was 0.525× before this lever and the fp16-state arm.
 
+### 6.10 State kernel: access width + two-row interleave (2026-10-11): shipped, **and the lever is closed**
+
+`fuse_ka_dplr_norm{,_s16}` was the second biggest single kernel (15-17.7 % of B=128 decode) and the
+last SIMT one nobody had touched this round. Two independent edits to
+`assets/shaders/src/fuse_ka_dplr_norm.comp` - which one spv serves **both** the single-token and the
+batch path (`runtime.rs:3320` / `:3398`, only `grid.z` differs), so one edit covers both:
+
+1. **two-row interleaving** in the subgroup-per-row loop (mirrors the CUDA kernel's `#pragma
+   unroll 2`): each row is a pure latency chain (load S → `subgroupAdd` sa → per-column update →
+   store → `subgroupAdd` y), and written one-row-at-a-time adjacent chains cannot overlap. Two rows
+   in flight = two independent chains. **Per-row arithmetic and reduction structure unchanged
+   verbatim ⇒ bit-identical by construction.**
+2. **column pairs**: `BufS` reinterpreted as `f16vec2` / `vec2`, so lane `sgid` owns columns
+   `2p, 2p+1` instead of `p, p+32` - half the memory instructions, 128 B per warp instruction
+   instead of 64. Alignment rests on `N` even (64) and `s_base + row·N` even (`N²=4096`). This one
+   *does* change the `subgroupAdd` summation partition, so it needed the element-wise gate below.
+
+**The measurement is the finding.** `PROF_GPU` per-avg for the *same* spv spread ±12 % across process
+batches (0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms), so the first two A/B passes (−4.0 %,
+−4.7 %) had to be downgraded to "direction only". The citable design is a **same-session, four-arm,
+order-reversed** sweep (spv hot-swapped between `C:\tmp\spv-base2|spv-pairs`, `{base,pairs} ×
+{fp16,fp32}`, 2 rounds each order, every arm logging the md5 of the spv it actually bound):
+
+| arm (mean of 4 rounds) | per-avg | vs base |
+|---|---:|---:|
+| base fp16 | 0.18945 ms | — |
+| **pairs fp16** | **0.18760 ms** | **−0.98 %** |
+| base fp32 | 0.33650 ms | — |
+| pairs fp32 | 0.32915 ms | −2.18 % |
+
+fp32 moves exactly **2× the bytes and takes 1.77× the time** ⇒ the kernel is **DRAM-bound, not
+instruction-issue bound**, which falsifies the §1 hypothesis this lever started from. Position on the
+roof: state traffic per dispatch = `B·H·N·N·2B·(r+w) = 83.9 MB` at B=128 (the profiler's `est` column
+reads 0.1 MiB because it does not count `buffer_reference` traffic - ignore it) ⇒ 447 GB/s =
+**72.5 % of this card's 616 GB/s**. A pure read+write stream on Turing tops out around 80-85 %, so
+what is left here is ≤15 % of the kernel = **≤2 % of the decode window**, not the 2× anyone hoped for.
+
+**Correctness (the admission gate)**: `STEP=1 PROBE=1 DUMP_LG` logits, 2 097 152 elements —
+
+| comparison | logit rmse | bit-identical |
+|---|---:|---:|
+| pairs vs base | **0.000e+0** | **100 %** (dump md5 identical, `F47EBB40…`) |
+| calibration control: base vs `LOWRANK_GEMM2=0` (already-shipped perturbation) | 1.103e+0 = 6.558 % | 0 % |
+
+The control proves the probe *can* see a rounding-level change of the kind being made here, so 0.000 %
+is a measurement, not a broken probe - the reassociated fp32 sums differ by ~1 ulp and the state is
+stored back as fp16, which absorbs it. Multi-step decode fingerprints are bit-identical across all four
+arms (`0x32c026/0x18ea` at fp16, `0x32a50a/0x18ea` at fp32). Gates: `cargo fmt --all`, `clippy -D
+warnings`, `BACKEND=vulkan cargo test --release` (10 passed / 0 failed in the batch suite).
+
+Both edits are kept (positive, bit-identical, correct access structure, right starting point for
+anything further), but **no end-to-end gain is claimed**: the honest number is ~0.1 % of the decode
+window, inside the ±1-2 % throughput band, so §6.1's standing ratios (0.874/0.740/0.627) are unchanged
+by this lever and were not re-measured for it. Details:
+[参考/2026-10-11-Vulkan-状态核访存宽度与行交错-实施记录.md](参考/2026-10-11-Vulkan-状态核访存宽度与行交错-实施记录.md).
+**Next lever by these measurements**: `gemm_imma` (≈48 % of the same dump, still in the 14-22 TOPS band
+against ~107 TOPS int8 peak) - the state kernel is done.
+
 ## 7. Layout
 
 ```
@@ -1007,6 +1065,19 @@ Inspired by both, this repository has since evolved independently, adding capabi
 - **prefill dequant overhead ~10%** (int8 vs fp16 at T=512): full removal needs cooperative-matrix fused dequant+GEMM (Marlin-style zero-copy), a long-term direction.
 - **prefill time grows ~quadratically with T** (T=256: 0.33ms → T=512: 0.81ms, WKV parallel intra-chunk term); consider WKV chunking for long prompts.
 - **Vulkan dplr_seq occupancy is low** (40 workgroups × 64 threads + 2 barriers per token, ~10ms in steady prefill): could adopt the CUDA structure (parallel-row blocks + shuffle reduction).
+- **The batched state kernel `fuse_ka_dplr_norm` is closed as a lever — it is DRAM-bound** (2026-10-11, §6.10): two-row
+  interleave + adjacent-column-pair access are both shipped and bit-identical, and the same-session order-reversed
+  four-arm sweep says the width change buys only **−0.98 %** at fp16. The kernel sits at 83.9 MB / 0.1876 ms =
+  **447 GB/s = 72.5 % of this card's peak**, and fp32 state (2× the bytes) takes 1.77× the time — i.e. time tracks
+  bytes, not memory-instruction count. Remaining headroom to a realistic copy-kernel ceiling (80-85 %) is ≤15 % of a
+  kernel that is ~12.5 % of the decode window ⇒ **≤2 % end-to-end, not worth another round**. Byte count is
+  irreducible at fp16 (the state must be read and written in full each token); going below fp16 would break the
+  numerics contract. The next lever by these measurements is `gemm_imma` (≈48 % of the same dump, 14-22 TOPS against
+  ~107 TOPS int8 peak).
+- **Measurement trap found while closing it**: `PROF_GPU` per-avg for the *same* spv spread **±12 %** across process
+  batches (0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms). Any kernel-level A/B that compares two *different*
+  processes is therefore direction-only. Citable design = same session, arms interleaved, **order reversed** between
+  rounds, each arm logging the md5 of the spv it actually bound.
 - **First prefill of a new length bucket pays pipeline creation** (kernel cache now decouples uniforms via a shared pool + DYNAMIC offsets keyed on (shader, spec): 1722 → ~30 entries; the remainder is the inherent first-appearance cost of each spec): eliminable via startup warmup. ★ Measured 2026-10-10 (`BUCKET_BENCH=1 SLOTS=8`, 3B int8, fresh bucket = `PAD_TO+128`) - and it is **more** than pipeline creation: switching length rebuilds all 45 `[bt,·]` seq buffers, which costs *seconds*, not ms - cold-bucket first request 1809.0 ms vs same-bucket repeat 942.7 ms on CUDA (864.1 ms saved), 3641.0 vs 2493.2 ms on Vulkan (1152.2 ms saved). `warmup_len_buckets` moves that wait from the user to startup; **total cost is unchanged** (warmup itself costs 1845.3 / 3623.4 ms ≈ the cold first request), and because `SeqBuffers` caches **one** shape only, just the last bucket in the warmup list stays resident - requests that alternate lengths need a fixed `pad_to` or one model per bucket.
 - ~~**Vulkan uniform pool must be sized by hand for long batches**~~ — **stale, verified resolved** (2026-10-10). The claim predates `pool_slots` dedup (ba08642, 2026-08-25), which made pool use O(distinct params per batch) rather than O(dispatches). Measured high-water with `PROF_POOL=1`: 69,080 B (batched prefill) / 33,432 B (self-loop) / 31,344 B (`batch_step_sample`) — **flat across B=8/16/32/64 and NTOK=32/64/256**, including `SKIP_GRAPH=1` (all n rounds in one submit), `STEP=1 PENALTY=1` and long prompts. Default 8 MB therefore runs every batch path with ~1.2 % of the pool; `UNIFORM_POOL_MB` is only an extreme-shape fallback.
 - **fp16 models have no batched *decode* path (batched prefill does work)**: the batched decode r/k/v kernels exist only in int8 variants (`gemv_int8_rkv_stage1_batch`), so an fp16 model falls back to per-slot single-sequence decode; `forward_seq_batch_padded` (batched prefill) uses the seq-parallel kernels and reads fp16/fp32 weights fine - verified on both backends 2026-10-10 by comparing the **per-slot state after batched prefill against the single-stream state, bitwise identical** (that is the assertion that actually pins "pad rows never enter the state"; the seeds the call returns are each slot's *last prompt token*, i.e. the decode seed, **not** a next-token prediction - comparing them to single-stream argmax is a category error, and an earlier version of this test did exactly that). `GpuModel::batch_decode_blocker()` returns the reason as a string so callers (client session pool, mytown engine) can log *why* they went serial instead of reading a silent `supports_batch_decode() == false` - and instead of over-reacting to "no batched forward path" and serializing prefill too.
