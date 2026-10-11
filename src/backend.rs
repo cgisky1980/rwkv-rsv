@@ -45,6 +45,45 @@ pub struct Int8Handle {
     pub k: usize,
 }
 
+/// 把 int8 权重索引缓冲从模型文件的**行主序** `[M][K/4]`（uint32 为单位）置换成**组主序**
+/// `[K/128][M][32]`：同一量化组内所有行连续，一次 `BM × 128 B` 的 staging 读的是连续段。
+///
+/// 为什么要它：`gemm_imma` 小批量档的耗时 100 % 在权重全局载入流上，而实测 achieved 带宽
+/// 由「时间上相邻地址的连续段长度」决定（128 B ⇒ 408 GB/s，≥512 B ⇒ 560 GB/s = 本机实用上限）。
+/// 同会话探针实测：head −24 %、key/value −18…19 %（B=1…16），零改动即可拿到，
+/// 因为它是**布局**问题而不是算术问题。详见
+/// `参考/2026-10-11-Vulkan-gemm_imma取数结构-实施记录.md` §6.8。
+///
+/// 只换存放顺序、不加副本 ⇒ 显存不变；模型文件格式不变（置换只发生在上传时）。
+pub fn int8_idx_to_group_major(src: &[u32], m: usize, k: usize) -> Vec<u32> {
+    let (kv, kg) = (k / 4, k / 128);
+    assert_eq!(src.len(), m * kv, "int8 idx 长度应为 m*k/4");
+    let mut dst = vec![0u32; src.len()];
+    let par = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(kg.max(1));
+    let span = kg.div_ceil(par).max(1);
+    std::thread::scope(|s| {
+        // dst 先按 `span` 个组切成交错不相交的段（各段起点 = lo*m*32），再各给一个线程。
+        for (gi, d) in dst.chunks_mut(span * m * 32).enumerate() {
+            let (lo, hi) = (gi * span, gi * span + span);
+            let hi = hi.min(kg);
+            let src = &*src;
+            s.spawn(move || {
+                for g in lo..hi {
+                    let d = &mut d[(g - lo) * m * 32..(g - lo + 1) * m * 32];
+                    for row in 0..m {
+                        // src 读按行跨步（步长 kv），每段 128 B 连续。
+                        let s0 = row * kv + g * 32;
+                        d[row * 32..row * 32 + 32].copy_from_slice(&src[s0..s0 + 32]);
+                    }
+                }
+            });
+        }
+    });
+    dst
+}
+
 /// 算子级后端抽象。首期抽象张量管理与 decode（单 token）路径全部算子。
 /// 所有张量以平台无关 `TensorId` 传递；量化权重以 `Int8Handle` 组合句柄传递。
 pub trait ComputeBackend {
@@ -471,6 +510,18 @@ pub trait ComputeBackend {
     /// W8A8 int8 张量核路径是否可用（激活也量化成 int8 + cooperative matrix）。
     /// 默认 false（仅 Vulkan 在设备满足条件时返回 true）。
     fn supports_int8_imma(&self) -> bool {
+        false
+    }
+
+    /// int8 权重的**设备缓冲**是否按组主序 `[K/128][M][32]` 存放（上传时置换，见
+    /// [`int8_idx_to_group_major`]）。默认 false = 行主序 `[M][K/4]`（模型文件本来的顺序）。
+    ///
+    /// ★ 这个开关决定的是**缓冲的物理布局**，不是「走不走张量核」：Vulkan 侧所有读 `idx`
+    /// 的内核（`gemm_imma` 两臂 + SIMT `gemv_int8*` 家族 + `dequant_int8_f16`）都按同一份
+    /// 缓冲工作，所以它们的地址数学必须与上传端**一次性同时**切换 ⇒ Vulkan 无条件 `true`，
+    /// 与 `supports_int8_imma()` 无关（没有 cooperative matrix 的设备走 SIMT 臂，读的仍是
+    /// 同一块组主序缓冲）。CUDA 侧内核按行主序写死 ⇒ 保持默认 `false`，数值与性能都不变。
+    fn int8_idx_group_major(&self) -> bool {
         false
     }
 
@@ -2133,6 +2184,10 @@ impl ComputeBackend for VulkanBackend {
         // 需 cooperative matrix（int8 档）+ shaderIntegerDotProduct；两者都在建 device 时
         // 按设备查询结果门控（见 vulkan/app.rs）。
         self.rt.supports_int8_imma()
+    }
+
+    fn int8_idx_group_major(&self) -> bool {
+        true
     }
 
     fn quant_x_i8(

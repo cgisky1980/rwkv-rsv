@@ -46,7 +46,11 @@ const uint KG               = K / 128;  // 每行 group 数（group=128）
 // M=2560（ffn.value）在 ROWS=4 下只有 640 个 workgroup（63 个 SM 分不到 10 个/SM），
 // 权重读取总量不变，但延迟掩盖不足；ROWS=2 把 workgroup 数翻倍、累加器减半。
 layout(constant_id = 12) const uint ROWS = 4;
-const uint ROW_IDX          = STRIDE_A_Y / 4;  // 行步长（uint32 idx 单位）
+const uint ROW_IDX          = STRIDE_A_Y / 4;  // 行主序时的行步长（uint32 idx 单位）
+// ★ idx 的设备布局是**组主序** `[K/128][M][32]`（上传时置换，见 `backend::int8_idx_to_group_major`
+//   / `ComputeBackend::int8_idx_group_major`）⇒ 组内行步长恒为 32 个字，组间步长 `IDX_GS = M*32`。
+//   与 `gemm_imma.comp` 同一份缓冲、同一套地址数学。
+const uint IDX_GS           = M * 32u;
 
 // ★ BGRP：单个 workgroup 同时处理的槽数（batch 维）。权重 A 跨槽共享（STRIDE_A_Z=0），
 // 若一格只算一个槽（BGRP=1，旧行为），B 组 workgroup 会把同一份权重各读一遍 ⇒ 零摊薄
@@ -98,8 +102,7 @@ void main() {
     InputX   input_x                    = params.input_x;
     Output   output_y                   = params.output_y;
 
-    // 权重跨槽共享（STRIDE_A_Z 恒为 0，见 runtime::gemv_spec），故 a_base 不含槽偏移。
-    const uint a_base = first_row * ROW_IDX;
+    // 权重跨槽共享（STRIDE_A_Z 恒为 0，见 runtime::gemv_spec），故行号即 `first_row + r`。
 
     // Phase 0: 协作加载本组 ROWS 行的 scale/zero 到 shared。
     if (index < ROWS * 16) {
@@ -133,7 +136,7 @@ void main() {
         float w[ROWS][4];
         [[unroll]]
         for (uint r = 0; r < ROWS; r++) {
-            const uint ip = input_idx.data[a_base + r * ROW_IDX + k];
+            const uint ip = input_idx.data[g * IDX_GS + (first_row + r) * 32u + (k & 31u)];
             const float sc = s_scale[r][g];
             const float zr = s_zero[r][g];
             w[r][0] = sc * float(ip & 0xFFu) + zr;

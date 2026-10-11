@@ -43,7 +43,10 @@ layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
 const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
 const uint KV               = K / 4;    // 4 个 uint8 权重打包为 1 个 uint32
 const uint KG               = K / 128;  // 每组 128 权重对应一组 scale/zero
-const uint ROW_IDX          = STRIDE_A_Y / 4; // 每行 uint32 数
+const uint ROW_IDX          = STRIDE_A_Y / 4; // 行主序时的每行 uint32 数
+// ★ idx 的设备布局 = 组主序 `[K/128][M][32]`（与 `gemm_imma.comp` 同一份缓冲、同一套地址数学；
+//   置换在上传时做，见 `backend::int8_idx_to_group_major`）⇒ 组内行步长 32，组间步长 `IDX_GS`。
+const uint IDX_GS           = M * 32u;
 // ROWS 做成特化常量（同 gemv_int8.comp：小 M 时换并行度）。
 layout(constant_id = 12) const uint ROWS = 4;
 
@@ -97,8 +100,7 @@ void main() {
     Output   output_y                   = params.output_y;
 
     // A 单位换算：STRIDE_A 按 fp16 元素计，打包索引每 uint32 含 4 个权重。
-    // 权重跨槽共享（STRIDE_A_Z 恒为 0，见 runtime::gemv_spec），故不含槽偏移。
-    const uint a_base = first_row * ROW_IDX;
+    // 权重跨槽共享（STRIDE_A_Z 恒为 0，见 runtime::gemv_spec），故行号即 `first_row + r`。
 
     // Phase 0: 协作加载本 workgroup ROWS 行的 scale/zero 到 shared memory。
     [[unroll]]
@@ -127,7 +129,7 @@ void main() {
         float w[ROWS][4];
         [[unroll]]
         for (uint r = 0; r < ROWS; r++) {
-            const uint ipack = input_idx.data[a_base + r * ROW_IDX + k];
+            const uint ipack = input_idx.data[g * IDX_GS + (first_row + r) * 32u + (k & 31u)];
             const float sc = s_scale[r][g];
             const float zr = s_zero[r][g];
             w[r][0] = sc * float(ipack & 0xFFu)         + zr;

@@ -24,6 +24,10 @@ layout(constant_id = 1) const uint K = 4096;        // 列数（收缩维）
 const uint BLOCK_SIZE = 256;
 const uint KV = K / 4;    // 每行 uint32 数（4 个 uint8 权重/uint32）
 const uint KG = K / 128;  // 每行 group 数
+// ★ idx 的设备布局 = 组主序 `[K/128][M][32]`（与 `gemm_imma.comp` 同一份缓冲，置换在上传时做，
+//   见 `backend::int8_idx_to_group_major`）。本核的**线程↔输出**映射仍是行主序（输出 fp16 缓冲
+//   必须行主序，且 smem 收拢写全依赖它），只有读地址换成组主序数学。
+const uint IDX_GS = M * 32u;
 
 shared uint sh[BLOCK_SIZE * 2];  // 每线程 4 fp16 = 2 uint32
 
@@ -57,7 +61,7 @@ void main() {
         const float sc = szv.x;
         const float zr = szv.y;
 
-        const uint ipack = input_idx.data[linear];
+        const uint ipack = input_idx.data[g * IDX_GS + m * 32u + (kk & 31u)];
 
         const float b0 = float(ipack & 0xFFu);
         const float b1 = float((ipack >> 8) & 0xFFu);

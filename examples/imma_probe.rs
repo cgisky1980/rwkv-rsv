@@ -124,7 +124,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let a_idx = mk_u32(&mut *b, idx_words)?;
     let a_sz = mk_u32(&mut *b, m * g)?;
-    b.upload_u32(a_idx, &idx)?;
+    // 上传按后端的布局偏好置换：Vulkan 的 `gemm_imma` 读**组主序** `[K/128][M][32]`（见
+    // `backend::int8_idx_to_group_major`），而下面的 CPU 参照始终按行主序 `idx[r*(k/4)+…]` 取
+    // 字节 ⇒ 这里只做一份显存侧的副本，参照数学不变。
+    let idx_dev = if b.int8_idx_group_major() {
+        rwkv_rsv::backend::int8_idx_to_group_major(&idx, m, k)
+    } else {
+        idx.clone()
+    };
+    b.upload_u32(a_idx, &idx_dev)?;
     b.upload_u32(a_sz, &sz)?;
     let a = Int8Handle {
         idx: a_idx,

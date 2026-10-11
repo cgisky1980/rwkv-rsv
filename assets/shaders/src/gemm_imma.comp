@@ -21,6 +21,16 @@
 //   `y += s[m,g]·(sx·S + 128·sx·Σq) + z[m,g]·Σx`（S = 张量核的 int32 结果）一次性还原。
 //   组宽 128 与量化组对齐 ⇒ **每个 k-tile 恰好是一组**，flush 天然落在 tile 末尾。
 //
+// ★ 权重索引缓冲 `in_idx` 的**设备布局 = 组主序 `[K/128][M][32 uint]`**（模型文件仍是行主序
+//   `[M][K/4]`，置换在上传时由 `backend::int8_idx_to_group_major` 做，开关 =
+//   `ComputeBackend::int8_idx_group_major`）。原因：本 kernel 小批量档的耗时 100 % 在权重的
+//   全局载入流上，而 achieved 带宽由「时间上相邻地址的连续段长度」决定 —— 行主序下一个 warp
+//   指令只能凑到 128 B（一行的一组 = 32 个 uint），换组要跳 `K4` 个字；组主序下同一 block 的
+//   `BM` 行在同一组内**首尾相接**，连续段与整行等价。同会话探针实测（字节集合、smem、warp 数、
+//   mma 数全同，只改地址时序）：head −24 %、key/value −18…19 %（B=1…16）。
+//   ⇒ 权重读地址一律 `gr * (M*32) + row * 32 + (i & 31)`；激活 `in_xq` **不变**（仍是
+//   `[batch][K/4]` 行主序，它不是带宽瓶颈）。
+//
 // 布局：block = `(BM/16)·SW·32` 线程（每 warp 一个 16×8 int32 输出块，coopmat m16n8k32；
 //   行维 `RW=BM/16` 个 warp，槽组维 `SW=min(NST,2)` 个 warp，见下方 `SW` 的注释）。
 //   - 行：`grid.x = M/IM_BM`，每 block IM_BM 行；
@@ -188,7 +198,7 @@ void main() {
                 const uint i = index + (c / NGW) * BLOCK_SIZE;
                 const uint s = c % NGW;
                 const uint src = min(row0 + (i >> 5u), M - 1u);
-                wr[t] = params.in_idx.data[src * K4 + (kt >> 2u) + s * 32u + (i & 31u)];
+                wr[t] = params.in_idx.data[(gr + s) * (M * 32u) + src * 32u + (i & 31u)];
             }
             [[unroll]]
             for (uint t = 0u; t < CH; t++) {
@@ -230,7 +240,7 @@ void main() {
         for (uint n = 0u; n < NLD; n++) {
             const uint i = index + n * BLOCK_SIZE;
             const uint src = min(row0 + (i >> 5u), M - 1u);
-            wr[n] = params.in_idx.data[src * K4 + (kt >> 2u) + (i & 31u)];
+            wr[n] = params.in_idx.data[gr * (M * 32u) + src * 32u + (i & 31u)];
         }
         uint xr[NLDX];
         [[unroll]]

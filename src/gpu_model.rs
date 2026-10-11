@@ -626,10 +626,19 @@ impl GpuModel {
         let head_a8 = if st.tensor("head.weight.int8_idx").is_ok() {
             let idx_t = st.tensor("head.weight.int8_idx")?; // U8 [vocab, C]
             let sz_t = st.tensor("head.weight.int8_sz")?; // U32 [vocab, C/128]
-            let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+            let idx_row: &[u32] = bytemuck::cast_slice(idx_t.data());
             let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-            assert_eq!(idx_u32.len(), vocab * n_embd / 4, "head.int8_idx 形状不符");
+            assert_eq!(idx_row.len(), vocab * n_embd / 4, "head.int8_idx 形状不符");
             assert_eq!(sz_u32.len(), vocab * n_embd / 128, "head.int8_sz 形状不符");
+            // 与 `load_int8` 同一布局契约（Vulkan 上传前置换成组主序）。
+            let idx_grouped = if backend.int8_idx_group_major() {
+                Some(crate::backend::int8_idx_to_group_major(
+                    idx_row, vocab, n_embd,
+                ))
+            } else {
+                None
+            };
+            let idx_u32: &[u32] = idx_grouped.as_deref().unwrap_or(idx_row);
             let idx_gpu = backend.create_tensor(vocab * n_embd / 4, TensorDtype::U32)?;
             backend.upload_u32(idx_gpu, idx_u32)?;
             let sz_gpu = backend.create_tensor(vocab * n_embd / 128, TensorDtype::U32)?;
@@ -4815,10 +4824,18 @@ impl GpuLayer {
             }
             let idx_t = st.tensor(&format!("{key}.int8_idx"))?; // U8 [M, K]
             let sz_t = st.tensor(&format!("{key}.int8_sz"))?; // U32 [M, K/128]
-            let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+            let idx_row: &[u32] = bytemuck::cast_slice(idx_t.data());
             let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-            assert_eq!(idx_u32.len(), m * k / 4, "{key}.int8_idx 形状不符");
+            assert_eq!(idx_row.len(), m * k / 4, "{key}.int8_idx 形状不符");
             assert_eq!(sz_u32.len(), m * k / 128, "{key}.int8_sz 形状不符");
+            // ★ 上传前按后端的布局偏好置换索引缓冲（Vulkan = 组主序，见
+            // `int8_idx_to_group_major`）。模型文件永远是行主序，置换只在显存侧。
+            let idx_grouped = if backend.int8_idx_group_major() {
+                Some(crate::backend::int8_idx_to_group_major(idx_row, m, k))
+            } else {
+                None
+            };
+            let idx_u32: &[u32] = idx_grouped.as_deref().unwrap_or(idx_row);
             let idx_gpu = backend.create_tensor(m * k / 4, TensorDtype::U32)?;
             backend.upload_u32(idx_gpu, idx_u32)?;
             let sz_gpu = backend.create_tensor(m * k / 128, TensorDtype::U32)?;

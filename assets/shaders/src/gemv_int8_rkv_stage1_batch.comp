@@ -40,7 +40,10 @@ const uint ROWS           = 4;
 const uint BLOCK_SIZE     = 128;
 layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
 const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
-const uint KV             = C / 4;
+const uint KV             = C / 4;   // 行主序时每行 uint32 idx 数
+// ★ idx 的设备布局 = 组主序 `[C/128][C][32]`（与 `gemm_imma.comp` 同一套地址数学，置换在
+//   上传时做，见 `backend::int8_idx_to_group_major`）⇒ 组内行步长 32、组间步长 IDX_GS。
+const uint IDX_GS         = C * 32u;
 const uint KG             = C / 128;
 const uint XSLOT          = C / 4;   // 每 slot 的 vec4 数（x 输入）
 const uint XSLOT_F16      = C / 2;   // 每 slot 的 f16vec2 数（fp16 x 输入）
@@ -152,7 +155,7 @@ void main() {
             vec4 w[ROWS];
             [[unroll]]
             for (uint r = 0; r < ROWS; r++) {
-                const uint ip = (ABLATE == 1u) ? 0x7Fu : widx.data[(row_base + r) * KV + k];
+                const uint ip = (ABLATE == 1u) ? 0x7Fu : widx.data[g * IDX_GS + (row_base + r) * 32u + (k & 31u)];
                 const float sc = s_scale[r][g];
                 const float zr = s_zero[r][g];
                 w[r] = vec4(

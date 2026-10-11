@@ -45,7 +45,10 @@ const uint BLOCK_SIZE     = 128;
 // 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（128 % 32/64/16 均整除）。
 layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
 const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
-const uint KV             = C / 4;    // 每行 uint32 idx 数（4 个 uint8 权重打包为 1 个 uint32）
+const uint KV             = C / 4;    // 行主序时每行 uint32 idx 数（4 个 uint8 权重打包为 1 个 uint32）
+// ★ idx 的设备布局 = 组主序 `[C/128][C][32]`（r/k/v 都是 C×C；与 `gemm_imma.comp` 同一套地址
+//   数学，置换在上传时做，见 `backend::int8_idx_to_group_major`）⇒ 组内行步长 32、组间步长 IDX_GS。
+const uint IDX_GS         = C * 32u;
 const uint KG             = C / 128;  // 每行 group 数（group=128）
 
 shared float sketch_dot[ROWS][3][NUM_SUBGROUPS]; // r/k/v 归约（每行一组）
@@ -161,7 +164,7 @@ void main() {
             const uint g = k / 32;
             [[unroll]]
             for (uint r = 0; r < ROWS; r++) {
-                const uint irow = (row_base + r) * KV + k;
+                const uint irow = g * IDX_GS + (row_base + r) * 32u + (k & 31u);
                 const uint pr = r_idx.data[irow];
                 const uint pk = k_idx.data[irow];
                 const uint pv = v_idx.data[irow];
