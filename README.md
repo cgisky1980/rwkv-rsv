@@ -320,12 +320,15 @@ From the **4th** session onward two more gates are unset-but-ON and both are Vul
    that stays SIMT on Vulkan while CUDA runs it on int8 tensor cores (`VK_IMMA_OPS` defaults to
    everything but rkv), but **no per-op ablation was run** to pin that down, so it is offered as a
    consistent explanation, not a proven one.
-   ⚠️ **Two corrections from §6.2 (2026-10-10)**: (i) the premise inside that explanation — "tensor-core rkv
+   ⚠️ **Three corrections from §6.2 / §6.1's 5th re-measure**: (i) the premise inside that explanation — "tensor-core rkv
    would be slower on Vulkan" — is false; once its crash is fixed it is faster at every batch
    (+27.9 % … +42.9 %), so the recoverable share of this gap is much larger than assumed, it is just
    blocked on an unvalidated numeric contract rather than on speed; (ii) **the B=256 cell is not a clean
    kernel-quality reading** — at B ≥ 192 the Vulkan side fills VRAM and WDDM spills to system memory
-   (sampler 0.87 ms → 68 ms per call, §6.2③), so 0.27× mixes in a capacity effect. B=64/128 are unaffected.
+   (sampler 0.87 ms → 68 ms per call, §6.2③), so 0.27× mixes in a capacity effect. B=64/128 are unaffected;
+   (iii) **and (ii)'s 0.27× no longer reproduces at all** — the 5th re-measure gets B=256 = **0.688×**, sitting
+   on the same monotone curve as B=64/128, so that cell had been measuring a stale build rather than a
+   capacity cliff (see the B=256 note under the tables).
 2. **Absolute values must never be quoted across sessions**: CUDA's *own* spread reaches **12.6% /
    19.4%** in the B=32/64 cells (3 rounds, same backend, same parameters — comparing still needs
    ~20% headroom). The card doubles as the desktop display. Any quoted reading needs a same-session,
@@ -472,6 +475,9 @@ sampler's four `[batch, vocab]` workspaces (67 MB each at B=256) become PCIe tra
   (`supports_f16_wkv_state() = true`, `_s16` spv variants, `WKV_STATE_F16=0` to switch back), measured
   **−1290 MiB of registered tensors at B=128** (7788 → 6498 MiB) and **+3.5 % decode** same-session
   interleaved; ⇒ ~2.6 GB back at B=256. `WorkBuffers` is untouched.
+  ⚠️ **The premise of this bullet is retired** (5th re-measure, 2026-10-11): B=256 is **0.688×** and monotone
+  with B=64/128, so the 0.27× was a stale build, not a capacity effect — the "cliff at large batch" story
+  has now been retracted four times and the footprint work above stands on its own merits (VRAM, not ratio).
 
 Also exposed by ③: `log_vram` printed "registered tensors 0 MiB" throughout the B=256 run — **the VRAM
 accounting is broken**, which is why a 13 GB footprint and a full card were invisible in our own logs and
@@ -1155,10 +1161,33 @@ Inspired by both, this repository has since evolved independently, adding capabi
   in full each token); going below fp16 would break the numerics contract.
 - **`gemm_imma` was the next lever by those measurements, and it has since been taken** (2× in one day): the packed
   smem staging + split-K retune (§6.8) and the **group-major int8 weight layout** `[K/128][M][32]` (§6.6-§6.9 of the
-  `gemm_imma` record, commit `0f4dbeb`), which is what moved B=32 from 0.740× to 0.824× and B=128 from 0.627× to
-  0.690×. What the 5th table leaves is ≈31 pt at B=128/256, and where those points sit is now an *open measurement
-  question*, not an assumption: the per-kernel classes on both backends have to be dumped in one session
-  (`PROF_GPU` vs `PROF_CUDA_KERNEL` + `NO_SELFLOOP_GRAPH=1`) before another kernel-level lever is picked.
+  `gemm_imma` record, commit `0f4dbeb`). ⚠️ Its credit is the **+6.8…9.3 %** same-session two-arm A/B, *not* the
+  0.740→0.824 / 0.627→0.690 ratio steps between the 4th and 5th tables — those two cells moved mostly because
+  CUDA's own absolutes dropped that session (§6.1, "read the absolutes before the ratios"). What the 5th table leaves
+  is ≈31 pt at B=128/256.
+- **S27 tried to attribute those points across backends and found the instruments cannot meet in the middle**
+  (2026-10-11, one session, `batch_decode_bench`, B=64/128, data `C:/tmp/prof128-be-*.log`):
+  - **`PROF_CUDA_KERNEL` absolutes are unusable in exactly the configuration it requires.** With
+    `NO_SELFLOOP_GRAPH=1` the decode becomes host-launch-bound, and a non-sync event pair brackets *host submission*
+    whenever the queue is empty ⇒ CUDA's dump sums to **6 249 ms** for a run whose wall clock decode window is
+    ≈150 ms (≈41×), and its `avg` ranks are dominated by launch count, not GPU work (`to_f16` 3 568 launches,
+    `dequant_int8` 3 072, `elementwise_sigmoid` 2 032). Two further tells: the same `fuse_ka` shows `avg` 1.17 ms
+    at B=128 and 1.20 ms at B=64 (a kernel whose traffic doubles with batch cannot cost the same), and the dump
+    prints a **partial flush per event-pool fill** (`SUM 368 → 6 249 ms` in 30+ growing lines) rather than per step.
+    ⇒ cross-backend per-kernel attribution needs `PROF_GAPS`/ablation-style arms, not these two instruments. Registered
+    as a dead instrument path.
+  - **Vulkan's own dump is self-consistent and does rank what is left** at B=128 (NTOK=1, SKIP_GRAPH=1,
+    `SUM 46.6 ms` GPU over 1 349 kernels against 55.7 ms/step unprofiled ⇒ ~84 % accounted, the rest is inter-dispatch):
+    `gemm_imma_bm64_nst8` **22.70 ms (48.6 %)**, `gemv_int8_rkv_stage1_batch` **8.76 ms (18.8 %)**,
+    `fuse_ka_dplr_norm_s16` **6.42 ms (13.8 %)**, `gemm_imma_reduce` 2.04, `sample` 1.91, `gemm_f16_f32` 1.64,
+    `quant_x_i8` 1.44, `norm_lerp6_batch` 1.21, everything else <0.5 each. The state kernel is at
+    **418 GB/s = 68 % of the 616 peak** (83.9 MB/layer at 0.2008 ms) — i.e. already on the roof §6.10 concluded.
+    **The new #2 is not `gemm_imma` and not the state kernel: it is the mid-projection arm** (with r/k/v on tensor
+    cores this kernel reduces to `v1/w1/a1/g1`, fp32 weights, `dispatch = (VM+WM+AM+GM, ceil(batch/BGRP))`, one row
+    per block ⇒ the 5.9 MB/层 mid weight set is re-read `batch/BGRP` = **16×** at the default BGRP=8). §6.2①'s
+    "BGRP>8 spills" verdict was measured on the *int8 r/k/v* accumulator (`float acc[ROWS][BGRP]`), which this arm no
+    longer runs, so **BGRP 16/32 has never been tried on the mid arm and is numerically bit-identical to try** —
+    that is task #51 (S28), probe in flight.
 - **Measurement trap found while closing it**: `PROF_GPU` per-avg for the *same* spv spread **±12 %** across process
   batches (0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms). Any kernel-level A/B that compares two *different*
   processes is therefore direction-only. Citable design = same session, arms interleaved, **order reversed** between
