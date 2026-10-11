@@ -1223,15 +1223,22 @@ everywhere (`GEMM_SWZ=16`) costs +3.7 % over the rule - the per-K choice is real
 ignored, ffn_sparse 1, 0 failures). Details:
 [参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md](参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md) §六.
 
-Remaining: ffn-down (deep K, narrow N) is **0.52×** of cuBLAS - at K=10240 one tile column is already
-2.6 MB, so the clamp pins g=4 and the group's A footprint (10.5 MB) still exceeds L2. **Follow-up shipped
-the same day** (ledger §6.8-§6.10): the clamp *floor* was an artifact of only having scanned g∈{4,8,16} -
-the formula's own value for K=10240 is 2, and a same-session 4-round paired scan gives ffn-down at the
-shipping 4096-row chunk **7.571 → 7.270 ms (−4.0 %, 4/4 non-overlapping)**, so the floor is now
-`rows/TILE_M ≥ 16 ⇒ 2, else 4` (1024 rows measured +3.8 % at g=2, kept at 4; K=2560 shapes give 8 and are
-untouched; `sum(y)` bit-identical throughout). Two other deep-K candidates are **dead**: TILE_M=64 in any
-group (best cell still +24 %) and TILE_K=64 to halve the K-chain (+3.0 % at best - so the 26 TOPS is not
-per-iteration overhead; the remaining lever is the coopmat inner-loop structure itself, not a knob).
+Remaining: ffn-down (deep K, narrow N). At §6.5 it was **0.52×** of cuBLAS - at K=10240 one tile column is
+already 2.6 MB, so the clamp pinned g=4 and the group's A footprint (10.5 MB) still exceeded L2.
+**Follow-ups shipped the same day** (ledger §6.8-§6.11): the clamp *floor* was an artifact of only having
+scanned g∈{4,8,16} - the formula's own value for K=10240 is 2, and a same-session 4-round paired scan
+gives ffn-down at the shipping 4096-row chunk **7.571 → 7.270 ms (−4.0 %, 4/4 non-overlapping)**, so the
+floor is now `rows/TILE_M ≥ 16 ⇒ 2, else 4` (1024 rows measured +3.8 % at g=2, kept at 4; K=2560 shapes
+give 8 and are untouched; `sum(y)` bit-identical throughout). Three further deep-K candidates are **dead**:
+TILE_M=64 in any group (best cell still +24 %), TILE_K=64 to halve the K-chain (+3.0 % at best - so the
+~26 TOPS is not per-iteration overhead), and TILE_N=64 to buy occupancy (15.4 KB of shared memory ⇒ 3
+blocks/SM) at **+8.5…+17.7 %**. A static count explains the last two: every subgroup does the same
+12 `coopMatLoad` + 16 mma per K-step *regardless of K*, so ffn-down and attn-out have byte-identical inner
+loops - only the per-step global stride (K·2 B = 20 KB vs 5 KB) and the grid width differ.
+**All four tunables (`GROUP_SWZ`, `TILE_M`, `TILE_K`, `TILE_N`) are now swept**: 7.261 ms / 29.6 TOPS is
+the fp16 coopmat floor for that shape against cuBLAS' 3.907 ms / 55.0 TOPS in the same session
+(**0.54×**, up from 0.45× pre-swizzle), and what is left is a weight-layout / DRAM-locality question →
+the int8 tensor-core prefill line (§9).
 That −4 % is ≈−11 ms per chunk = −1.1 % end to end, below this machine's 2-3 % resolution, so it is
 banked at kernel level only. Decode is untouched by this lever (its GEMMs are `gemm_imma`, and the
 batched-decode low-rank fp16 shapes are all below the A>L2 gate).
