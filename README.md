@@ -298,6 +298,39 @@ What the table does establish on its own: **B=1 (0.900) and B=64 (0.765) enter i
 25.8 % (readings 2 588 / 2 058 / 2 556 — round 2 is an outlier of the same family the 4th session recorded
 there); excluding it the cell is 0.688–0.697.
 
+**Two more paired sessions ran after that, and they redefine the 口径 (measurement settings) — read this
+before using any number above.** The 6th (`20261011-225925-17792`) was taken with the GPU **clock-locked**
+(`nvidia-smi -lgc`, which in fact pins SM at **1860 MHz** against a 2100 MHz max, power limit still the
+250 W default); the 7th (`20261012-004233-91772`) was taken after the **power limit was raised to 300 W**.
+Because both sides of a pair must share one environment, the table below is now the **canonical level for
+the 300 W 口径**, and everything above it belongs to 250 W sessions:
+
+| Batch | CUDA tok/s | spread | CUDA ms/step | Vulkan tok/s | spread | Vulkan ms/step | Vulkan/CUDA |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 85.7 | 9.2% | 11.67 | 80.6 | 7.7% | 12.40 | **0.941** |
+| 8 | 575.9 | 8.8% | 13.89 | 544.0 | 7.8% | 14.71 | **0.945** |
+| 32 | 1 735.9 | 9.7% | 18.43 | 1 399.8 | 12.7% | 22.86 | **0.806** |
+| 64 | 2 558.7 | 4.0% | 25.01 | 1 866.8 | 10.8% | 34.28 | **0.730** |
+| 128 | 3 170.6 | 2.5% | 40.37 | 2 186.8 | 3.0% | 58.53 | **0.690** |
+| 256 | 3 344.6 | 6.3% | 76.54 | 2 547.7 | 2.2% | 100.48 | **0.762** |
+
+All twelve fingerprints are byte-identical to the clock-locked session (`0x1acbfa`/`0xd02e16`/`0x345e198`/
+`0x68f1ce4`/`0xd21f638`/`0x1a49f841` on CUDA, `0x1a747c`/`0xcfde9a`/`0x3488a87`/`0x690a7d1`/`0xd2150da`/
+`0x1a45b4d4` on Vulkan) ⇒ same build, so the moves against the locked 250 W run are pure environment:
+**B=1 0.865 → 0.941** (Vulkan 76.9 → 80.6 while CUDA 89.0 → 85.7 — the "single-stream regression" I
+reported mid-session was the 1860 MHz pin plus that cell's own ±17 % round spread, not code: the two
+gates that landed are `batch >= 32/64` and split-K is off by default, so B=1 executes identical kernels),
+**B=32 0.715 → 0.806** (Vulkan +160.5 tok/s, 25.82 → 22.86 ms/step), but **B=128 0.733 → 0.690**
+(Vulkan −141.9, 54.97 → 58.53 ms/step while CUDA moved only −7.6) and B=256 −225.0. 1 Hz sampling over
+that session (774 points) explains the split: with the wall at 300 W the card draws up to **310.9 W** and
+reaches **82 °C**, and the SM clock is no longer pinned — it floats **1680…1845** (mean 1795). So raising
+the limit buys the mid-width cells (which were power-capped) and costs the heaviest cells (which are now
+thermal-capped), and Vulkan's large-batch path is the more heat-sensitive of the two. ★ Discipline: from
+now on every §6.1 row states its **power 档 + clock 档**, and a cell may only be compared against rows
+measured in the same 档. Consequence for the ledger: the level-1 coopmat arm keeps its own accounting
+(§15: +8.8 % at B=128 from a same-session two-arm A/B at 1860 MHz/250 W) — do **not** recompute it from
+this table, where the same build reads 58.53 ms/step because the GPU is hot.
+
 **Gate snapshot (verbatim, identical for both backends in that session)**: `SEGS=4` `PAD_TO=512`
 `NTOK=32` `WARMUP=1` `SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`;
 `LOWRANK_GEMM` / `FFN_VALUE_GEMM` / `GEMV_IMMA` **all unset = ON** (CUDA low-rank 4-chain / FFN value
