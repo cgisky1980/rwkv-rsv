@@ -315,6 +315,20 @@ the 300 W 口径**, and everything above it belongs to 250 W sessions:
 | 128 | 3 170.6 | 2.5% | 40.37 | 2 186.8 | 3.0% | 58.53 | **0.690** |
 | 256 | 3 344.6 | 6.3% | 76.54 | 2 547.7 | 2.2% | 100.48 | **0.762** |
 
+★ **The first paired run taken with the Δmin statistic (2026-10-12, ninth re-measure, ledger §25) says
+nothing about progress and a lot about the ruler.** Same shipping code — the four decode fingerprints are
+byte-identical to the table above (Vulkan `0xd2150da` / `0x1a45b4d4`, CUDA `0xd21f638` / `0x1a49f841`) —
+but pairing per-round **minima** instead of 3-round medians reads **B=128 = 48.13 vs 35.89 ms/step ⇒
+0.746** and **B=256 = 93.75 vs 73.72 ⇒ 0.786** (prefill 0.900 / 0.859, which *does* agree with the 0.89 /
+0.86 above because a prefill cell runs 20-48 s and the clock steps average out). ⇒ **0.690 → 0.746 is not
+a +8 % win**: it is the statistic changing plus the session, and it retires the one loophole left in
+discipline item 2 — **ratios are cross-session incomparable too**, only same-session two-arm readings speak.
+The table above stays (it is the median-口径 historical baseline); **every future paired re-measure uses
+Δmin with ≥4 rounds** — this run's own within-arm spread (Vulkan B=128: 48.13 / 55.17 = 14.6 %) is the
+reason 2 rounds is still thin. The more useful absolute now: **the same-session Δmin gap at B=128 is
+12.24 ms/step**, while §24's kernel table puts `gemm_imma` alone at 23.90 ms ⇒ the whole gap is *smaller
+than one kernel's share*, so it needs no multi-kernel explanation and the target is unambiguous.
+
 All twelve fingerprints are byte-identical to the clock-locked session (`0x1acbfa`/`0xd02e16`/`0x345e198`/
 `0x68f1ce4`/`0xd21f638`/`0x1a49f841` on CUDA, `0x1a747c`/`0xcfde9a`/`0x3488a87`/`0x690a7d1`/`0xd2150da`/
 `0x1a45b4d4` on Vulkan) ⇒ same build, so the moves against the locked 250 W run are pure environment:
