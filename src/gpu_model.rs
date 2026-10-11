@@ -124,27 +124,31 @@ fn prefill_chunk_slots() -> usize {
 /// ffn key 的下游本来就只吃 `r2_16`（`gemm_relu2` 写 f32 再 `to_f16` 转一遍），
 /// 换过去等于**同时**省掉累加器的四分之三宽度与那条转换 pass，dtype 契约不用改。
 ///
-/// 为什么敢默认开（两把尺，都在**同一次进程内**成对测，见 §6.13）：
+/// 为什么敢默认开（两把尺，都在**同一次进程内**成对测，数字见 §6.13）：
 /// · 链尺（`kernel_bench` `pf_key32`/`pf_key16`，4096 行 × 4 轮交替）：5.1024 → 3.7644 ms，
 ///   **−1.34 ms/call（−26.2 %）**，4/4 不重叠，抖动 ≤1.5 %；
 /// · 现场尺（`PROF_GPU` 逐 dispatch 时间戳，真实 forward 内 6 个 round-pair）：单发
-///   4.92~5.60 → 4.17~4.38 ms，**12/12 不重叠（均值 −1.02 ms）**，整块 GPU busy
-///   6/6 配对为负（保守 −56 ms/块 ≈ −5 %）。
+///   4.92~5.60 → 4.17~4.38 ms，**12/12 不重叠（均值 −1.02 ms/dispatch = −32.6 ms/块）**，
+///   加上被消掉的那 512 发 `to_f16`（−16.8 ms/块）⇒ 可归因 **−49 ms/块 ≈ −4.7 %**。
 /// 端到端墙钟之所以此前判不动（Δmin 读成 +0.08 %「打平」）是**仪器伪影**：AB 档每轮固定
 /// 先跑 A ⇒ A 永远拿到最冷的一次采样，Δmin 被 SM 时钟台阶（±10 %）按顺序偏置。
 ///
 /// 质量：`DUMP_LG` rmse 1.128 = logits rms 的 6.70 %，与已发货的 fp16 档同一量级
-/// （1.10~1.15 / 6.6~6.9 %），top1 8/8。
+/// （1.10~1.15 / 6.6~6.9 %），top1 8/8。误差大小只取决于 K（=2560，这条链上恒定），与 M 无关
+/// ⇒ 下面把门放宽到小 M 时**不引入新的数值档位**。
 ///
-/// 形状门 `m_pad >= 2048`：上面的数字全是 4096 行（= 发货 chunk 形状）口径，小 M 没测过
-/// 也不在那个口径上结账 ⇒ 不开（#68 扫完低 M 再议）。
+/// 形状门 `m_pad >= 256`（原先是 2048，任务 #68 扫完了低 M）：链尺在 M ∈ {64,128,256,512,1024,2048}
+/// 上**每个 M 都是 4/4 配对为负、两臂集合互不重叠**（min 对：−6.6 / −10.1 / −15.7 / −19.8 / −23.4 / −25.6 %），
+/// 收益比例随 M 单调缩小但没有任何一格翻号；绝对量在小 M 缩得更快（256 行 −0.0715 ms/发 ⇒
+/// 一条最短序列 32 层 ≈ −2.3 ms）。门限取 256 = 单序列路径的量化下限（`m_pad = t.div_ceil(256)*256`），
+/// 再往下这棵树里根本产生不出来；批量分块路径的 `m_pad` 是 512 的倍数 ⇒ 不受这一改动影响。
 fn prefill_acc16(m_pad: usize) -> bool {
-    if m_pad < 2048 || std::env::var("PREFILL_ACC16").is_ok_and(|v| v == "0") {
+    if m_pad < 256 || std::env::var("PREFILL_ACC16").is_ok_and(|v| v == "0") {
         return false;
     }
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!("[ACC16] ffn key 走 fp16 累加器档（默认开，m_pad>=2048；PREFILL_ACC16=0 关）");
+        log::info!("[ACC16] ffn key 走 fp16 累加器档（默认开，m_pad>=256；PREFILL_ACC16=0 关）");
     }
     true
 }
@@ -2085,8 +2089,8 @@ impl GpuModel {
             .copy_token_batch(sb.ln2, state.layers[i].cmix_x, lens, c, t_pad, batch)?;
 
         // FFN key/value（token 并行 GEMM）
-        // §6.12 路 ②：`acc16` 时 ffn key 一条 `gemm_f16_f16_relu2` 直写 `r2_16`，
-        // 既省掉累加器宽度、又省掉 `to_f16(r2 → r2_16)` 那一遍；默认档（env 未设）逐字节不变。
+        // §6.13 定稿：`acc16` 时 ffn key 一条 `gemm_f16_f16_relu2` 直写 `r2_16`，
+        // 既省掉累加器宽度、又省掉 `to_f16(r2 → r2_16)` 那一遍；这就是**默认档**（`PREFILL_ACC16=0` 才回退）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
         if let Some(fka8) = &layer.ffn_key_a8 {
             self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
@@ -4757,7 +4761,8 @@ impl GpuModel {
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn start");
         }
-        // §6.12 路 ②：同 `forward_seq_layer_batch`，默认档（env 未设）逐字节不变。
+        // §6.13 定稿：同 `forward_seq_layer_batch`（默认档 = fp16 累加器直写 `r2_16`）。
+        // 这一条链在**单序列**路径上也开了 ⇒ 门限从 2048 放到 256 才是不留空隙的写法（#68）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
         if let Some(fka8) = &layer.ffn_key_a8 {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;

@@ -771,7 +771,7 @@ fn gating_json() -> serde_json::Value {
         "PROF_LOW": knob("PROF_LOW", "关 —— 每次 forward 第 0 层打一条 gemm/stage2/stage1/lr_rows 标记"),
         "PREFILL_ACC16": knob(
             "PREFILL_ACC16",
-            "开（=0 才关）—— prefill ffn key 走 fp16 累加器 + fp16 落盘（m_pad>=2048 才生效），见记录 §6.13。\
+            "开（=0 才关）—— prefill ffn key 走 fp16 累加器 + fp16 落盘（m_pad>=256 才生效），见记录 §6.13。\
              ⚠️ 用它做 `AB_VAR` 对照时，OFF 臂必须显式给 `AB_A=0`：空串是 `remove_var` = 默认 = ON"
         ),
         "GEMM_MIN_BLOCKS": knob("GEMM_MIN_BLOCKS", "32 —— coopmat 瓦片占用率档下限（0 关掉）"),

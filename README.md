@@ -1365,6 +1365,43 @@ kernel family in a chunk - 64 dispatches, 324.98 ms ≈ **35 %** - but it writes
 attention output feed fp32 state, same reason. The four mid projections' `to_f16` save only ~0.015 ms/dispatch, below
 the floor. Ledger §6.13; raw `/c/tmp/ac16/{chain1.txt,pg/pg.log,r*.txt,lg_*.txt}`.
 
+### 6.14 The shape gate goes 2048 → 256 (2026-10-12): every low-M rung is a win
+
+§6.13 kept `m_pad >= 2048` because small M had never been measured. Same chain ruler, `env BACKEND=vulkan`,
+arms interleaved 4× per rung, min of 3×40 iters (`KB_BATCH` is the M here):
+
+| M rows | fp32 accum min (ms) | fp16 accum min | Δ | pairing |
+| --- | --- | --- | --- | --- |
+| 64 | 0.3281 | **0.3063** | -0.0218 (-6.6 %) | 4/4 negative, sets disjoint |
+| 128 | 0.3695 | **0.3323** | -0.0372 (-10.1 %) | 4/4 negative, sets disjoint |
+| 256 | 0.4539 | **0.3824** | -0.0715 (-15.7 %) | 4/4 negative, sets disjoint |
+| 512 | 0.6883 | **0.5520** | -0.1363 (-19.8 %) | 4/4 negative, sets disjoint |
+| 1024 | 1.2493 | **0.9568** | -0.2925 (-23.4 %) | 4/4 negative, sets disjoint |
+| 2048 | 2.4431 | **1.8184** | -0.6247 (-25.6 %) | 4/4 negative, sets disjoint |
+| 4096 (§6.13, other session) | 5.1024 | **3.7644** | -1.3380 (-26.2 %) | 4/4 negative, sets disjoint |
+
+64/128 got an independent longer confirmation (`KB_ITERS=60 KB_REPEATS=5`): 0.3327 → **0.3080** (-7.4 %) and
+0.3775 → **0.3356** (-11.1 %), again 4/4 negative with disjoint sets. **32 of 32 pairs negative, no rung flips
+sign.** The percentage grows monotonically with M (-6.6 % → -25.6 %) and the absolute win shrinks faster
+(256 rows: -0.0715 ms/dispatch → **2.29 ms per 32-layer single-sequence prefill**; at 64 rows only
+-0.022 ms/dispatch). 256 is exactly the shortest shape the single-sequence path can produce, which is why the
+gate sits there.
+⚠️ An earlier version of this table read -18.7 % / -22.2 % at 64/128 rows and is **void**: in that pass the
+fp32 arm (always scheduled first) read 0.3802 at M=64 against 0.3281 in these two passes, while the fp16 arm
+agreed across passes (0.3092 vs 0.3063) - an ordering/cold-sample artifact of the ruler, not of the shape
+(see ledger §6.13 on the A-first bias). Re-measured, the small-M percentages shrink; the decision does not
+change, because every rung is still negative.
+
+**Why the gate is 256 and not 64 - it is the quantisation floor of the reachable shape**, not a "where does it stop
+paying" threshold: the single-sequence path computes `m_pad = t.div_ceil(256) * 256` (`SeqBuffers::m_pad`), so 256
+is its smallest possible value; the batched chunked path uses multiples of `PAD_TO=512` and is therefore
+**unchanged by this edit**. The 64/128 rungs cannot be produced by this tree - they are measured only to close the
+"does it flip sign below 256?" question in advance.
+**Numerical risk does not depend on M** (the fp16 accumulation dimension is K=2560), so the error band stays the
+§6.13 rmse 1.128 / 6.70 %. What is genuinely new: single-sequence prefill now goes through this arm, and the short
+prompts in the test suite - which previously sat below the gate - now exercise it ⇒ the gate was re-run as
+`BACKEND=vulkan` and `BACKEND=cuda` `cargo test --release` with small-M coverage live (both green). Ledger §6.14.
+
 ## 7. Layout
 
 ```
