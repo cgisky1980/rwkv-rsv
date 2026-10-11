@@ -2835,6 +2835,50 @@ impl Runtime {
         Ok(())
     }
 
+    /// tensor-core GEMM，**累加器与落盘都是 fp16**：C16[M,N] = act(A[M,K] @ B[N,K]^T)。
+    ///
+    /// 机制与实测：README §6.12 / 台账 §6.12。coopmat 的累加器换成半精度后，Turing 的张量核
+    /// 名义 mma 速率翻倍 ⇒ K=2560 那一族 prefill 形状内核级 **−21 %**（同会话 4 轮 Δmin，
+    /// `pf_key` 5.0648 → 3.9674 ms）。
+    ///
+    /// ★ 为什么只在「输出本来就是 fp16」的调用点上可用：`gemm.comp` 里累加器类型与落盘类型是
+    /// 同一个 `C_TYPE`（`coopMatStore` 要求矩阵元素类型 = 缓冲元素类型，而转换入口
+    /// `coopMatConvert` 在 glslang 15.2 的 `GL_KHR_cooperative_matrix` 下没有可用重载），
+    /// 所以这一档 **C 必须是 F16 缓冲**，否则写进去的是按 half 解释的错数据（探针就是这么把
+    /// `sum(y)` 从 4195.4004 打成 62.8091 的）。
+    ///
+    /// `act`：0 = 无激活、1 = relu²、2 = tanh（三条模块都在 `build.rs` 的变体矩阵里）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_acc(
+        &mut self,
+        a: &GpuTensor16,
+        b: &GpuTensor16,
+        c: &mut GpuTensor16,
+        m: usize,
+        n: usize,
+        k: usize,
+        act: u32,
+    ) -> R<()> {
+        let shader = match act {
+            0 => "shaders/spv/gemm_f16_f16.spv",
+            1 => "shaders/spv/gemm_f16_f16_relu2.spv",
+            2 => "shaders/spv/gemm_f16_f16_tanh.spv",
+            _ => return Err(format!("gemm_f16_acc: bad act {act}").into()),
+        };
+        let spec = gemm_spec(&self.app, m, n, k);
+        let params = [a.device.address, b.device.address, 0, c.device.address];
+        let (gx, gy) = gemm_grid(&self.app, m, n, k);
+        self.record_kernel(
+            shader,
+            &spec,
+            &params,
+            (gx, gy, 1),
+            &[a.device.buffer, b.device.buffer],
+            &[c.device.buffer],
+        )?;
+        Ok(())
+    }
+
     /// tensor-core GEMM + bias 向量：C[M,N] = A[M,K] @ B[N,K]^T + bias[N]（fp32io16）。
     /// bias 按输出列索引（行广播），用于低秩投影的仿射（w1/w2/a1/a2/v1/v2/g1/g2）。
     /// 注意：bias 不能在 gemm.comp 内用 coopmat 下标 result[i] 施加——coopmat 的 [i] 访问

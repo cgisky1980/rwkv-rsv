@@ -741,6 +741,19 @@ pub trait ComputeBackend {
         false
     }
 
+    /// 该 backend 是否有 **fp16 累加器** 的 coopmat GEMM 档（`gemm_f16_f16*.spv`，默认否）。
+    ///
+    /// 机制与实测见 README §6.12 / `参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md`
+    /// §6.12：Turing 上 coopmat 的累加器换成半精度，名义 mma 速率翻倍 ⇒ K=2560 那一族
+    /// prefill 形状内核级 −21 %。
+    ///
+    /// ★ 为什么它只作用在「输出本来就是 fp16」的调用点上：GLSL 里累加器类型与落盘类型是
+    /// 同一个 `C_TYPE`（`coopMatStore` 要求矩阵元素类型 = 缓冲元素类型，转换入口
+    /// `coopMatConvert` 在 glslang 15.2 下无匹配重载），**所以开了这一档，C 缓冲就必须是 F16**。
+    fn supports_gemm_f16_acc(&self) -> bool {
+        false
+    }
+
     // —— batch 并发算子（单实例多序列，权重共享读一次算 B 份）——
     // 布局约定：所有 per-slot 张量为 [batch, ...]（slot 主序）；权重张量跨 slot 共享。
     // CUDA 与 Vulkan 均已实现本代 decode/prefill 所需的全套算子（由
@@ -1297,6 +1310,24 @@ pub trait ComputeBackend {
         n: usize,
         k: usize,
     ) -> R<()>;
+    /// C16[M,N] = act(A[M,K] @ B[N,K]^T)（fp16 输入，**fp16 累加 + fp16 输出**）。
+    ///
+    /// `act`：0 = 无激活、1 = relu²、2 = tanh。只有 `supports_gemm_f16_acc()` 为真的后端可用，
+    /// 且 **`c` 必须是 F16 张量**（累加器与落盘类型在这一档是一体的，机制见该方法文档）。
+    /// 默认实现返回 Err —— 调用点一律先查能力位，不会走到这里。
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_f16_acc(
+        &mut self,
+        _a: TensorId,
+        _b: TensorId,
+        _c: TensorId,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _act: u32,
+    ) -> R<()> {
+        Err("gemm_f16_acc not supported by this backend".into())
+    }
     /// C[M,N] = tanh(A[M,K] @ B[N,K]^T)（fp16 输入，f32 输出）。
     #[allow(clippy::too_many_arguments)]
     fn gemm_tanh(
@@ -2855,6 +2886,29 @@ impl ComputeBackend for VulkanBackend {
         let b_g = self.get_f16(b, "gemm_relu2")?;
         let res = self.rt.gemm_relu2(&a_g, &b_g, &mut c_o, m, n, k);
         self.put_f32(c, c_o);
+        res
+    }
+
+    fn supports_gemm_f16_acc(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_f16_acc(
+        &mut self,
+        a: TensorId,
+        b: TensorId,
+        c: TensorId,
+        m: usize,
+        n: usize,
+        k: usize,
+        act: u32,
+    ) -> R<()> {
+        let mut c_o = self.take_f16(c, "gemm_f16_acc")?;
+        let a_g = self.get_f16(a, "gemm_f16_acc")?;
+        let b_g = self.get_f16(b, "gemm_f16_acc")?;
+        let res = self.rt.gemm_f16_acc(&a_g, &b_g, &mut c_o, m, n, k, act);
+        self.put_f16(c, c_o);
         res
     }
 

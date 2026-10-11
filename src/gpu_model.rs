@@ -113,6 +113,42 @@ fn prefill_chunk_slots() -> usize {
     })
 }
 
+/// §6.12 路 ② → §6.13 定稿：ffn key 投影走「fp16 累加 + fp16 落盘」的 coopmat 档，
+/// **默认开**（`PREFILL_ACC16=0` 才是关）。
+///
+/// **每次 forward 都重读**（不是 `OnceLock`）——这是 `AB_VAR` 进程内换档 A/B 的硬要求，
+/// 缓存了就会变成一台量不出东西的空门（台账 §22 那条假杠杆的成因）。
+///
+/// 为什么只挑这一条链：这一档的累加器类型与落盘类型在 GLSL 里是同一个 `C_TYPE`
+/// （见 `ComputeBackend::supports_gemm_f16_acc` 的文档），所以 C 必须是 F16 缓冲；
+/// ffn key 的下游本来就只吃 `r2_16`（`gemm_relu2` 写 f32 再 `to_f16` 转一遍），
+/// 换过去等于**同时**省掉累加器的四分之三宽度与那条转换 pass，dtype 契约不用改。
+///
+/// 为什么敢默认开（两把尺，都在**同一次进程内**成对测，见 §6.13）：
+/// · 链尺（`kernel_bench` `pf_key32`/`pf_key16`，4096 行 × 4 轮交替）：5.1024 → 3.7644 ms，
+///   **−1.34 ms/call（−26.2 %）**，4/4 不重叠，抖动 ≤1.5 %；
+/// · 现场尺（`PROF_GPU` 逐 dispatch 时间戳，真实 forward 内 6 个 round-pair）：单发
+///   4.92~5.60 → 4.17~4.38 ms，**12/12 不重叠（均值 −1.02 ms）**，整块 GPU busy
+///   6/6 配对为负（保守 −56 ms/块 ≈ −5 %）。
+/// 端到端墙钟之所以此前判不动（Δmin 读成 +0.08 %「打平」）是**仪器伪影**：AB 档每轮固定
+/// 先跑 A ⇒ A 永远拿到最冷的一次采样，Δmin 被 SM 时钟台阶（±10 %）按顺序偏置。
+///
+/// 质量：`DUMP_LG` rmse 1.128 = logits rms 的 6.70 %，与已发货的 fp16 档同一量级
+/// （1.10~1.15 / 6.6~6.9 %），top1 8/8。
+///
+/// 形状门 `m_pad >= 2048`：上面的数字全是 4096 行（= 发货 chunk 形状）口径，小 M 没测过
+/// 也不在那个口径上结账 ⇒ 不开（#68 扫完低 M 再议）。
+fn prefill_acc16(m_pad: usize) -> bool {
+    if m_pad < 2048 || std::env::var("PREFILL_ACC16").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!("[ACC16] ffn key 走 fp16 累加器档（默认开，m_pad>=2048；PREFILL_ACC16=0 关）");
+    }
+    true
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
@@ -2049,28 +2085,45 @@ impl GpuModel {
             .copy_token_batch(sb.ln2, state.layers[i].cmix_x, lens, c, t_pad, batch)?;
 
         // FFN key/value（token 并行 GEMM）
+        // §6.12 路 ②：`acc16` 时 ffn key 一条 `gemm_f16_f16_relu2` 直写 `r2_16`，
+        // 既省掉累加器宽度、又省掉 `to_f16(r2 → r2_16)` 那一遍；默认档（env 未设）逐字节不变。
+        let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
         if let Some(fka8) = &layer.ffn_key_a8 {
             self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
             self.backend
                 .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
-            self.backend
-                .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
+            if acc16 {
+                self.backend
+                    .gemm_f16_acc(sb.xb16, sb.w_scratch, sb.r2_16, m_pad, fh, c, 1)?;
+            } else {
+                self.backend
+                    .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
+            }
         } else {
             self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
             let fk16 = layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?;
-            self.backend
-                .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
+            if acc16 {
+                self.backend
+                    .gemm_f16_acc(sb.xb16, *fk16, sb.r2_16, m_pad, fh, c, 1)?;
+            } else {
+                self.backend
+                    .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
+            }
         }
         if let Some(fva8) = &layer.ffn_value_a8 {
-            self.backend
-                .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            if !acc16 {
+                self.backend
+                    .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            }
             self.backend
                 .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
             self.backend
                 .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else {
-            self.backend
-                .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            if !acc16 {
+                self.backend
+                    .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+            }
             let fv16 = layer
                 .ffn_value_w16
                 .as_ref()
@@ -4704,26 +4757,42 @@ impl GpuModel {
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn start");
         }
+        // §6.12 路 ②：同 `forward_seq_layer_batch`，默认档（env 未设）逐字节不变。
+        let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
         if let Some(fka8) = &layer.ffn_key_a8 {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             self.backend
                 .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
-            self.backend
-                .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
+            if acc16 {
+                self.backend
+                    .gemm_f16_acc(sb.xb16, sb.w_scratch, sb.r2_16, m_pad, fh, c, 1)?;
+            } else {
+                self.backend
+                    .gemm_relu2(sb.xb16, sb.w_scratch, sb.r2, m_pad, fh, c)?;
+            }
         } else {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             let fk16 = layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?;
-            self.backend
-                .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
+            if acc16 {
+                self.backend
+                    .gemm_f16_acc(sb.xb16, *fk16, sb.r2_16, m_pad, fh, c, 1)?;
+            } else {
+                self.backend
+                    .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
+            }
         }
         if let Some(fva8) = &layer.ffn_value_a8 {
-            self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+            if !acc16 {
+                self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+            }
             self.backend
                 .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
             self.backend
                 .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else {
-            self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+            if !acc16 {
+                self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
+            }
             let fv16 = layer
                 .ffn_value_w16
                 .as_ref()

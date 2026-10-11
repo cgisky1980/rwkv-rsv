@@ -1243,6 +1243,128 @@ That −4 % is ≈−11 ms per chunk = −1.1 % end to end, below this machine's
 banked at kernel level only. Decode is untouched by this lever (its GEMMs are `gemm_imma`, and the
 batched-decode low-rank fp16 shapes are all below the A>L2 gate).
 
+### 6.12 A fifth tunable: accumulator width (2026-10-12) - the K=2560 prefill shapes are accumulator-bound (**5.065 -> 3.967 ms**), ffn-down is not
+
+Prompt from reading [cryscan/rosalia@ember](https://github.com/cryscan/rosalia/tree/ember): source-level, that engine
+has no block-order swizzle, no split-K and no int8 in prefill, and its decode GEMV re-reads the weights per slot with
+no slot grouping - **behind us on both surfaces**. The one mechanism worth taking is its
+`C_TYPE=float16_t` cooperative-matrix **accumulator** (Turing doubles the nominal mma rate for a half accumulator:
+54.4 -> 108.8 TFLOPS fp16). Ours was **already compiled and never wired**: `build.rs` runs `C_BITS`/`C_TYPE` as
+variant dimensions and emits `gemm_f16_f16{,_relu2,_tanh,_affine,...}.spv` (6 files), while `record_kernel` only ever
+names the `gemm_f16_f32*` ones. (`C_BITS` is not referenced by `gemm.comp` at all, and `C_TYPE` sets the accumulator
+*and* the store type - `Output { C_TYPE data[] }` - which is the whole problem below.)
+
+Zero-code probe: `VK_SPV_DIR` at a directory where those six f16 modules are renamed over the six f32 ones
+(`/c/tmp/f16acc/{base,h16}`, md5 `06d24cd0…` vs `872da250…`). 4 rotated rounds, same session, 4096 rows, Δmin
+(`env BACKEND=vulkan` - see the footgun paragraph):
+
+| shape | f32-acc ms | f16-acc ms | Δ | TOPS |
+| --- | --- | --- | --- | --- |
+| ffn-up / merged-proj class 10240×2560 | 5.0648 | **3.9674** | −21.7 % | 42.4 → 54.1 |
+| attn-out class 2560×2560 | 1.2966 | **1.0256** | −20.9 % | 41.4 → 52.3 |
+| ffn-down 2560×10240 | 7.9841 | **7.6733** | −3.9 % | 26.9 → 27.4 |
+
+Every round of the half arm is below every round of the base arm (4/4, all three shapes); this session ran ~10 % slow
+(ffn-down *base* reads 7.98 against §6.11's shipped 7.261), so read the pairs, not the absolutes.
+**Two readings**: ① ffn-down's 0.54× floor is **not** mma-rate or accumulator bound - §6.11's layout/DRAM-locality
+verdict stands and #26 (int8 prefill) stays its home. ② The K=2560 family **is** accumulator-bound: +28 % throughput,
+from 78 % of the fp32-accumulate peak to a number that happens to equal it (54.1 of 54.4) while sitting at 50 % of the
+fp16-accumulate peak. So the 2× never materialised, but the accumulator chain costs a quarter of the time there.
+Upper bound on how much of that was the halved **store**: ffn-up writes 4096×10240×4 B = 168 MB, so −84 MB ≈ 0.15 ms
+= 3.0 % of 5.065 (attn-out ≈ 2.9 % same reasoning) - the accumulator itself is worth ≈18 %.
+
+★ **Instrument footgun found on the way (this is the reusable part)**: `detect_backend()` prefers CUDA whenever a CUDA
+device exists, and `VK_SPV_DIR` is only consulted by the Vulkan backend - so a `VK_SPV_DIR` A/B run **without
+`BACKEND=vulkan` compares one cuBLAS path against itself** and happily reports a 1.6× "win" with byte-identical
+fingerprints. Reproduced three ways before root-causing it (a module with every byte corrupted = same `sum(y)`; a
+16-byte header-only module = still correct; file deleted = still ran). Second half of the trap: `kernel_bench` prints
+`pf_value batch=4096 失败: …` and **still exits 0**, so an empty table looks like success - grep `^pf_|失败`.
+Checked back: every historical Vulkan pf arm (`/c/tmp/pfv/arm3.sh:21`) did pass `BACKEND=vulkan`, so §6.6-§6.11 are
+clean.
+
+**Why this is not shippable yet, and what the shippable shape is**: the probe changes the *store* dtype too
+(`sum(y)` moved: 4195.4004 → 62.8091, 1049.0018 → 0.0007), so it times a variant that cannot be used. Splitting
+accumulator from store is not expressible in current GLSL (`coopMatStore` requires the matrix element type to equal
+the buffer's, and all 8 plausible `coopMatConvert` signatures fail to resolve in glslang 15.2 under
+`GL_KHR_cooperative_matrix` - `/c/tmp/acc16/`). What *is* expressible with zero dtype churn: on the dense Vulkan
+prefill path, ffn-key is `gemm_relu2 → r2 (f32)` followed by `to_f16 → r2_16`, and only `r2_16` is consumed - so one
+`gemm_f16_f16_relu2` writing straight into `r2_16` takes both the −1.10 ms accumulator win **and** the ~0.45 ms
+`to_f16` pass: ≈**−1.55 ms/layer = −50 ms per 981 ms chunk (−5 %)**, which is above this machine's 2-3 % end-to-end
+resolution. The price is unmeasured: accumulating K=2560 in fp16 is a ~2 % relative-error class change, so the gate is
+`cargo test --release` + `DIAG=1` + token equivalence, not a stopwatch. Ledger §6.12.
+
+### 6.13 Path ② shipped as the default (2026-10-12): ffn-key on the fp16 accumulator = **-49 ms per chunk**
+
+The prediction above was measured and is now **on by default** (`PREFILL_ACC16=0` turns it off; gate =
+`supports_gemm_f16_acc() && m_pad >= 2048`, so the CUDA backend and small shapes are untouched).
+`src/gpu_model.rs:2090` (batched chunked prefill) and `:4761` (single sequence):
+`gemm_relu2 → r2 f32` + `to_f16 → r2_16` became one `gemm_f16_acc(…, act=relu²)` writing `r2_16` directly. Nothing else
+reads `r2` on the prefill path, so no dtype contract changed.
+
+**Why the end-to-end wall clock could not be used as the verdict** (the reusable finding): one chunk ≈1 s, one round
+=16 chunks ≈16 s, and the SM clock moves in **quasi-static steps** (1695-1830 MHz, 1830/1710 = 1.07) on that exact
+timescale, so ±5 % levers are buried under ±7-10 % drift. Worse, the in-process `AB_VAR` instrument is **structurally
+biased**: every round runs arm A first, so `min(arm A)` always holds the coldest sample - which is how the same log
+read "prefill +0.08 % = a wash" and "arm B decodes 14 % slower". **Both were artefacts.** Paired stats on this lever
+must be per-dispatch, not per-block.
+
+Ruler 1 - chain (`kernel_bench`, new paired ops `pf_key32`/`pf_key16`, 4096 rows = shipping chunk shape, alternating
+inside one process, `env BACKEND=vulkan`, min of 3×40 iters, 4 rounds):
+
+| arm | ms/call | TOPS |
+| --- | --- | --- |
+| `pf_key32` (fp32 accum + separate `to_f16`) | 5.1024 / 5.1144 / 5.1182 / 5.1326 | 41.8-42.1 |
+| `pf_key16` (fp16 accum straight to fp16) | **3.7644 / 3.7772 / 3.7792 / 3.7880** | 56.7-57.0 |
+
+= **-1.338 ms/call (-26.2 %)**, 4/4 with the two sets *fully* disjoint, jitter ≤1.5 %. (Bigger than §6.12's -21.7 %
+because the `to_f16` pass is inside this arm's cost.) The trailing `sum(y)` values (268.5 vs 281.0) are **not** a
+quality gate - synthetic all-positive input is the worst case for fp16 accumulation bias; they only prove the two arms
+bind.
+
+Ruler 2 - in-situ (`PROF_GPU=1`, engine-internal per-dispatch GPU timestamps, 6 round-pairs in the real forward,
+`AB_RESTART=1` so each arm re-prefills from the same state; each arm reads the mean over *its own* 512 dispatches =
+16 chunks × 32 layers):
+
+| round | OFF avg ms/dispatch | ON avg | Δ |
+| --- | --- | --- | --- |
+| r0 | 4.9230 | 4.1702 | -0.753 |
+| r1 | 5.2056 | 4.2313 | -0.974 |
+| r2 | 5.2989 | 4.2822 | -1.017 |
+| r3 | 5.3374 | 4.3822 | -0.955 |
+| r4 | 5.4367 | 4.2560 | -1.181 |
+| r5 | 5.6016 | 4.3756 | -1.226 |
+
+= **6/6 negative, mean -1.018 ms/dispatch**, sets fully disjoint (max ON 4.382 < min OFF 4.923); the A-first and
+B-first subsets average -0.983 / -1.052 ⇒ position bias is ~nil for a ratio statistic taken inside each arm's own
+round. Per chunk: -1.018 × 32 = **-32.6 ms**. The deleted pass counts itself: OFF issues 3824 `to_f16` dispatches per
+round (425-438 ms), ON issues 3312 (156-161 ms) - the difference is exactly 512 = 16 × 32, i.e. **-16.8 ms/chunk**.
+Attributable total ≈ **-49 ms/chunk ≈ -4.7 %** of a ~1050 ms chunk, matching the -50 ms / -5 % forecast. Whole-chunk
+GPU busy paired Δ (5 clean rounds): -98.8 / -89.7 / -47.1 / -57.4 / -102.0 ms, 5/5 negative - the excess over -49 is
+co-drift, so it goes in the upper bound, not into the lever.
+Side correction to §5.1: per-chunk `[PROF_GPU] SUM` 904 ms vs wall `core` 944 ms ⇒ chunked prefill is **~96 %
+GPU-bound**; the old "1.3 s host gap" narrative is dead since device-side state write-back.
+
+★ **Second parser footgun**: the aggregator matched `$i=="count="`, but the field prints `%3d` right-aligned, so
+three-digit counts come out as `count=318` with **no space** ⇒ the biggest labels (`gemm_f16_f32_affine`,
+`gemm_f16_f32`) were silently dropped, which produced a fake "chunk is only 61 % GPU" and the wrong conclusion
+"prefill is 39 % host-bound". Parse both widths and self-check the denominator against `SUM over N kernels`.
+
+**Quality gate** (this, not the stopwatch, is what justifies the default): `DUMP_LG` rmse **1.128** = 6.70 % of
+logits rms 16.84 - the same band as the shipped fp16 levers (1.10-1.15 / 6.6-6.9 %); noise floor 0.000; top1 8/8,
+top3 6/8; decode token fingerprints differ between arms (A `0x149ca7/0x1b4f` vs B `0x149b27/0x14cf`) = binding marker
+holds. `BACKEND=vulkan cargo test --release` 77+10+1 passed / 0 failed, CUDA suite green, plus a `PREFILL_ACC16=0`
+run to prove the escape hatch works. ⚠️ Prove the switch with the **per-dispatch label**
+(`gemm_f16_f16_relu2` vs `gemm_f16_f32_relu2`), not the one-shot `[ACC16]` log line - the test suite prints neither
+(no logger installed, and test prompts are short enough that `m_pad < 2048`). ⚠️ When using this knob as an `AB_VAR`
+pair, the OFF arm must be **`AB_A=0`** -
+an empty value means `remove_var` = default = ON.
+
+**Three shapes deliberately not wired** (checked): `gemm_f16_f32_affine` (fused-residual `gemm_add`) is the largest
+kernel family in a chunk - 64 dispatches, 324.98 ms ≈ **35 %** - but it writes the fp32 residual, and one GLSL
+`C_TYPE` couples accumulator with store ⇒ not eligible; its home is #26 (int8 tensor-core prefill). r/k/v and the
+attention output feed fp32 state, same reason. The four mid projections' `to_f16` save only ~0.015 ms/dispatch, below
+the floor. Ledger §6.13; raw `/c/tmp/ac16/{chain1.txt,pg/pg.log,r*.txt,lg_*.txt}`.
+
 ## 7. Layout
 
 ```

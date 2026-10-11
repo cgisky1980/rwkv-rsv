@@ -769,6 +769,11 @@ fn gating_json() -> serde_json::Value {
         "LOWRANK_GEMM2": knob("LOWRANK_GEMM2", "开（batch>=32 且形状整除）—— Vulkan 低秩二级 coopmat fp16"),
         "LOWRANK_GEMM1": knob("LOWRANK_GEMM1", "开（随二级门）—— Vulkan 低秩一级 coopmat fp16，SIMT mid 臂整条退役"),
         "PROF_LOW": knob("PROF_LOW", "关 —— 每次 forward 第 0 层打一条 gemm/stage2/stage1/lr_rows 标记"),
+        "PREFILL_ACC16": knob(
+            "PREFILL_ACC16",
+            "开（=0 才关）—— prefill ffn key 走 fp16 累加器 + fp16 落盘（m_pad>=2048 才生效），见记录 §6.13。\
+             ⚠️ 用它做 `AB_VAR` 对照时，OFF 臂必须显式给 `AB_A=0`：空串是 `remove_var` = 默认 = ON"
+        ),
         "GEMM_MIN_BLOCKS": knob("GEMM_MIN_BLOCKS", "32 —— coopmat 瓦片占用率档下限（0 关掉）"),
         "GEMM_SK": knob(
             "GEMM_SK",

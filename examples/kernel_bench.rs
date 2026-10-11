@@ -16,6 +16,8 @@
 //!   `KB_OPS`     逗号分隔算子，默认 `relu2,mul_add,plain,add`；可加 `f16`（fp16 权重）
 //!                与 `imma_key,imma_out,imma_value,imma_head`（W8A8 张量核）、
 //!                `pf_out,pf_key,pf_value`（批量 prefill 的稠密 fp16 GEMM）、
+//!                `pf_key32,pf_key16`（prefill ffn key 的**两条完整链**：前者 `gemm_relu2`+`to_f16`，
+//!                后者 `gemm_f16_acc(act=1)` 一条直写 fp16 ⇒ 同进程交替即 §6.12 路 ② 的速度与数值尺）、
 //!                `lrb_w,lrb_v,lr_g`（低秩链第二级的四个 fp16 GEMM 形状之一，
 //!                w/a 共用 k=128 ⇒ 读数 ×2）
 //!   `KB_BATCH`   逗号分隔 batch，默认 `1,8,16`
@@ -248,6 +250,21 @@ fn main() {
                 xgate: false,
                 pf16: true,
             },
+            // ---- prefill ffn key 的**两条完整链**（§6.12 路 ② 的判决尺）----
+            //      `pf_key32` = `gemm_relu2`（fp32 累加落 fp32）+ `to_f16` 那一遍；
+            //      `pf_key16` = `gemm_f16_acc(act=1)` 一条直写 fp16。
+            //      为什么要成对：端到端在 16 s 粒度上被 ±10 % 的 SM 时钟台阶支配，
+            //      跨进程两轮不肯重复、进程内配对读不出 −5 % ⇒ 只能在**同一次进程里**
+            //      逐迭代对拍单条链的 ms/call，并顺带取两链输出的数值差。
+            "pf_key32" | "pf_key16" => Case {
+                op: op.clone(),
+                m: fh,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: true,
+            },
             // ---- 低秩链**第二级**的四个形状（decode：rows = 槽数，n = C，k = mid 补长）----
             //      w/a 同为 k=128（只量一次，读数 ×2 计），v 为 k=64，g 为 k=320 且无 bias。
             //      `lrb_*` 走 `gemm_bias`（引擎的 w/a/v 链就是它），`lr_g` 走 `gemm`。
@@ -312,7 +329,7 @@ fn main() {
                 eprintln!(
                     "未知算子 '{other}'（可选 relu2/mul_add/plain/add/f16 \
                      与 imma_key/imma_out/imma_value/imma_head、pf_out/pf_key/pf_value、\
-                     lrb_w/lrb_v/lr_g 与 lr1_w/lr1_v/lr1_g）"
+                     pf_key32/pf_key16、lrb_w/lrb_v/lr_g 与 lr1_w/lr1_v/lr1_g）"
                 );
                 std::process::exit(2);
             }
@@ -385,6 +402,12 @@ fn main() {
                 eprintln!("跳过 {}：本后端 supports_int8_imma() = false", case.op);
                 continue;
             }
+        }
+        // `pf_key16` 这一档要后端有能力位（CUDA 的 `gemm_f16_acc` 默认实现直接 Err，
+        // 与 `supports_int8_imma` 同理：跳过并把原因打出来，不要混进失败行）。
+        if case.op == "pf_key16" && !b.supports_gemm_f16_acc() {
+            eprintln!("跳过 {}：本后端 supports_gemm_f16_acc() = false", case.op);
+            continue;
         }
         for &batch in &batches {
             if case.pf16 && batch % 64 != 0 {
@@ -490,6 +513,17 @@ fn run_case(
     let y = b.create_tensor(batch * m, TensorDtype::F32)?;
     b.upload(y, &vec![0.0f32; batch * m])?;
 
+    // `pf_key*` 链的输出张量（fp16）。两条链都写它，指纹也从它读回 ⇒ 指纹差 = 两链的
+    // 数值差（累加器宽度 + 落盘舍入），与引擎里 `r2_16` 的下游口径一致。
+    let chain = case.op == "pf_key32" || case.op == "pf_key16";
+    let y16 = if chain {
+        let t = b.create_tensor(batch * m, TensorDtype::F16)?;
+        b.upload(t, &vec![0.0f32; batch * m])?;
+        Some(t)
+    } else {
+        None
+    };
+
     // `lrb_*` 的偏置 [m] f32（低秩链 w/a/v 的 `gemm_bias` 才需要；`lr_g` 无 bias）。
     let bias = if case.op.starts_with("lrb") {
         let t = b.create_tensor(m, TensorDtype::F32)?;
@@ -527,6 +561,13 @@ fn run_case(
                 // `gemm(a, w, out, rows, n, k)`：`case.m` 在这里是**输出特征数 n**。
                 b.gemm(a16.unwrap(), w16.unwrap(), y, batch, m, k)
             }
+            // 链 ①：引擎现状的两遍（fp32 累加落盘 + 转 fp16）。
+            "pf_key32" => {
+                b.gemm_relu2(a16.unwrap(), w16.unwrap(), y, batch, m, k)?;
+                b.to_f16(y, y16.unwrap(), m, batch, batch, m, m)
+            }
+            // 链 ②：一条直写 fp16（累加器与落盘同为 fp16）。
+            "pf_key16" => b.gemm_f16_acc(a16.unwrap(), w16.unwrap(), y16.unwrap(), batch, m, k, 1),
             // 低秩链第二级的 GEMM 部分（`gemm_bias` = GEMM + 逐列加偏置；Vulkan 是两次
             // dispatch，CUDA 融合成一次 ⇒ 这里量到的是**引擎真实会付的**成本）。
             "lrb_w" | "lrb_v" => {
@@ -592,8 +633,9 @@ fn run_case(
         b.end_batch()?;
         b.synchronize()?;
         let mut chunk = 1usize << 16; // 先试 65536 元素
+        let out_fp = if chain { y16.unwrap() } else { y };
         loop {
-            match b.download_part(y, 0, chunk) {
+            match b.download_part(out_fp, 0, chunk) {
                 Ok(v) => {
                     sum = v.iter().take(4096).map(|&x| x as f64).sum();
                     break;
@@ -640,6 +682,7 @@ fn run_case(
     // 释放临时张量（避免注册表膨胀）。
     let mut all: Vec<TensorId> = vec![y];
     all.extend([x, g, a16].into_iter().flatten());
+    all.extend(y16);
     all.extend([xq, xaux, partial].into_iter().flatten());
     if let Some(h) = a8 {
         all.push(h.idx);
