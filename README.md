@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.874× (B=8) / 0.740× (B=32) / 0.627× (B=128)**, batched prefill 0.79…0.84× (2026-10-11 same-session re-measures through the 4th round, §6.1 / §6.6-§6.9; the older 0.27×-at-B=256 row predates that chain and needs re-measuring).
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.900× (B=1) / 0.972× (B=8) / 0.824× (B=32) / 0.765× (B=64) / 0.690× (B=128) / 0.688× (B=256)** — ⚠️ in that 5th session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side; credit the group-major layout with its own same-session A/B (**+6.8…9.3 %**), see §6.1 "read the absolutes before the ratios", batched prefill 0.79…0.84× (2026-10-11 same-session re-measures through the 5th round, §6.1 / §6.6-§6.9; the older 0.27×-at-B=256 row predates that chain and was already stale when written — the 5th round measures B=256 directly).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -68,6 +68,7 @@ Key env vars (see [src/main.rs](src/main.rs)):
 | `DIAG` | Three-way check (seq / tok / CPU) + dequant validation |
 | `PROF_GPU` / `PROF_HOST` | GPU / host-side profiling |
 | `UNIFORM_POOL_MB` | Vulkan uniform pool capacity in MB (default 8; usage is O(distinct params per batch) — measured peak 69 KB, so this is a fallback knob, not something to tune) |
+| `VK_SPV_DIR` | **Shader A/B instrument.** Load every `*.spv` from this flat directory instead of the embedded copy. Required because release builds bake `assets/shaders/spv/*.spv` into the binary (`#[derive(RustEmbed)]` in [src/vulkan/asset.rs](src/vulkan/asset.rs)) — copying new bytes onto disk does **not** change what a running exe executes, so without this knob you silently benchmark the old kernels while believing you swapped them (this is what voided §6.10's numbers). Point it at a directory holding one variant's bytes and log the md5 of each spv actually bound. |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | Override cross-hardware adaptation |
 
 ### 4.1 Examples (web-rwkv style)
@@ -240,6 +241,62 @@ kernels dominate a cheaper step). Vulkan's fingerprints all changed (`0xd0c265` 
 `0x3460382` → `0x34dc29f`, `0xd21f6bb` → `0xd23806b`) — two numeric levers landed since, and both are
 covered by their own element-wise accuracy gates (§4.3 here, §9's four-way gate for the state arm).
 ⚠️ So this table's *delta* is the two levers combined; the isolated §6.9 attribution is §5.2/§5.3, not here.
+
+**Re-measured a fifth time, after the int8 weight **group-major layout** (`参考/2026-10-11-Vulkan-gemm_imma取数结构-实施记录.md`
+§6.6-§6.9, commit `0f4dbeb`; session `20261011-110103-83952`, same harness/protocol, 3 rounds/cell median,
+and for the first time in this chain **all six batches** including B=1/64/256)**:
+
+| Batch | CUDA tok/s | spread | Vulkan tok/s | spread | Vulkan/CUDA | was (4th) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 89.5 | 0.8% | 80.6 | 3.2% | **0.900** | (never in this table) |
+| 8 | 577.2 | 6.9% | 561.3 | 0.9% | **0.972** | 0.874 |
+| 32 | 1 731.5 | 5.7% | 1 427.6 | 5.0% | **0.824** | 0.740 |
+| 64 | 2 593.1 | 2.9% | 1 982.8 | 1.5% | **0.765** | (never in this table) |
+| 128 | 3 329.9 | 1.5% | 2 296.0 | 2.0% | **0.690** | 0.627 |
+| 256 | 3 713.8 | 5.1% | 2 556.1 | 25.8% | **0.688** | 0.27 (2026-10-10, stale) |
+
+**CUDA is again a static reference**: its B=8/32/128 fingerprints are byte-identical to the 4th session
+(`0xd02e16` / `0x345e198` / `0xd21f638`), which is what makes the ratio moves readable —
+`int8_idx_group_major()` is Vulkan-only, so CUDA never saw the permutation.
+⚠️ **Vulkan's fingerprints all moved** (`0xd03618`→`0xcfde9a`, `0x34dc29f`→`0x3488a87`,
+`0xd23806b`→`0xd1e3a7b`), and that is expected rather than alarming: **three** commits landed between
+the 4th session and this build — `07ba7dc` (state-kernel adjacent-column pairs + two-row interleave,
+which *changes the `subgroupAdd` summation partition*, so it is ulp-level different, not bit-identical),
+`0c1fae4` (the `VK_SPV_DIR` instrument + a probe tile that is off by default, numerics-neutral) and
+`0f4dbeb` (the layout itself, a pure permutation of the same bytes ⇒ numerics-neutral by construction:
+`int8_idx_to_group_major` writes `dst[g·M·32 + m·32 + j] = src[m·(K/4) + g·32 + j]` and every reader's
+address math is the exact inverse). The gate that actually covers this is the test suite, not the
+fingerprint: `cargo test --release` passes (11 + 1 tests, incl. the batch-path parity and the sparse-FFN
+vs-CPU check). ⚠️ What it *cannot* prove is bitwise identity with the pre-layout build — and the two
+cross-backend gates I tried first are not discriminators here: `CROSS_BACKEND=1` at *default* gates reports
+first divergence at step 0 (expected — the two backends run different kernel sets, so it only becomes
+meaningful once the SIMT 口径 env knobs are aligned), and `DIAG=1` against the CPU fp32 reference on the
+3B **int8** model is a wide band on both sides (Vulkan seq-vs-CPU `max_abs = 0.319`, CUDA's own
+`0.428`, `tok` paths up to `5.17`, all agreeing on top-1 with a 45/46 rank swap). So the correctness
+argument for the layout is **structural + suite-green**: the permutation is a bijection, every reader's
+address math is its exact inverse, and a `grep` audit over `assets/shaders/src/*.comp` finds **no** kernel
+that reads `input_idx`/`widx` without the matching `IDX_GS` math. ⚠️ Note the corollary for §6.10: the pairs/interleave commit *is* in this build, but its measured
+"−0.98 %" was produced by the broken instrument, so it contributes nothing to these cells — the layout
+does, and its isolated effect is the same-session two-arm end-to-end A/B (+6.8…9.3 % at B=1/8/32).
+
+**Read the absolutes before the ratios.** CUDA's fingerprints being byte-identical proves its *code* is
+unchanged — it does **not** make its throughput comparable across sessions, and this session is the first
+of the five where that mattered: CUDA came in **6.4…7.7 % below its own 4th-session values at all three
+shared cells** (616.7 → 577.2, 1 875.6 → 1 731.5, 3 600.8 → 3 329.9) while Vulkan came in **above** them
+(538.8 → 561.3, 1 388.0 → 1 427.6, 2 257.2 → 2 296.0). So the ratio jumps (0.874 → 0.972, 0.740 → 0.824,
+0.627 → 0.690) are roughly **one third Vulkan-side and two thirds a CUDA session effect** — and the reason
+the 2nd/3rd/4th tables could be compared across sessions is simply that CUDA's absolutes happened to sit
+within 1 % of each other there, not because cross-session ratios are safe. ★ New discipline for §6.1:
+**a ratio is only citable against the session that measured both arms; to credit a lever with a ratio
+move, cite the lever's own same-session A/B** (here: +6.8…9.3 %), and use the canonical table only for
+the level. Consistency check that the two do agree: the A/B's NEW arm at B=32 (1 432-1 467 tok/s) brackets
+this session's 1 427.6 ✓.
+
+What the table does establish on its own: **B=1 (0.900) and B=64 (0.765) enter it for the first time**, and
+**B=256 is 0.688, not 0.27** — the §9 0.27× row measured a long-superseded build, which retires the
+"capacity cliff at large batch" story for the fourth time. ⚠️ Caveat on that cell: its 3-round spread is
+25.8 % (readings 2 588 / 2 058 / 2 556 — round 2 is an outlier of the same family the 4th session recorded
+there); excluding it the cell is 0.688–0.697.
 
 **Gate snapshot (verbatim, identical for both backends in that session)**: `SEGS=4` `PAD_TO=512`
 `NTOK=32` `WARMUP=1` `SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`;
@@ -989,25 +1046,41 @@ batch path (`runtime.rs:3320` / `:3398`, only `grid.z` differs), so one edit cov
    instead of 64. Alignment rests on `N` even (64) and `s_base + row·N` even (`N²=4096`). This one
    *does* change the `subgroupAdd` summation partition, so it needed the element-wise gate below.
 
-**The measurement is the finding.** `PROF_GPU` per-avg for the *same* spv spread ±12 % across process
-batches (0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms), so the first two A/B passes (−4.0 %,
-−4.7 %) had to be downgraded to "direction only". The citable design is a **same-session, four-arm,
-order-reversed** sweep (spv hot-swapped between `C:\tmp\spv-base2|spv-pairs`, `{base,pairs} ×
-{fp16,fp32}`, 2 rounds each order, every arm logging the md5 of the spv it actually bound):
+**The measurement is the finding** — and then it turned out to be a measurement *of the profiler*.
+`PROF_GPU` per-avg for the *same* spv spread ±12 % across process batches
+(0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms), so the first two A/B passes (−4.0 %,
+−4.7 %) had to be downgraded to "direction only". The citable design was meant to be a
+**same-session, four-arm, order-reversed** sweep (spv hot-swapped between `C:\tmp\spv-base2|spv-pairs`,
+`{base,pairs} × {fp16,fp32}`, 2 rounds each order, every arm logging the md5 of the spv it actually
+bound):
 
-| arm (mean of 4 rounds) | per-avg | vs base |
-|---|---:|---:|
-| base fp16 | 0.18945 ms | — |
-| **pairs fp16** | **0.18760 ms** | **−0.98 %** |
-| base fp32 | 0.33650 ms | — |
-| pairs fp32 | 0.32915 ms | −2.18 % |
+| arm (mean of 4 rounds) | per-avg | vs base | valid? |
+|---|---:|---:|---|
+| base fp16 | 0.18945 ms | — | |
+| **pairs fp16** | 0.18760 ms | ~~**−0.98 %**~~ | ❌ **void** |
+| base fp32 | 0.33650 ms | — | |
+| pairs fp32 | 0.32915 ms | ~~−2.18 %~~ | ❌ **void** |
 
-fp32 moves exactly **2× the bytes and takes 1.77× the time** ⇒ the kernel is **DRAM-bound, not
-instruction-issue bound**, which falsifies the §1 hypothesis this lever started from. Position on the
-roof: state traffic per dispatch = `B·H·N·N·2B·(r+w) = 83.9 MB` at B=128 (the profiler's `est` column
-reads 0.1 MiB because it does not count `buffer_reference` traffic - ignore it) ⇒ 447 GB/s =
+⚠️ **Correction (2026-10-11, after §6.8's instrument post-mortem)**: `base` and `pairs` are two
+byte-strings of the **same spv file name**, and a release build **embeds** `assets/shaders/spv/*.spv`
+into the executable (`vulkan/asset.rs`, `#[derive(RustEmbed)]`) - so hot-swapping the file on disk
+never changed what the running process executed. Those two rows compare one arm with itself; the
+−0.98 % / −2.18 % is profiler drift, and **how much the column-pair edit actually buys has never been
+measured.** Re-measuring it is not worth a round: the pre-edit bytes no longer exist anywhere
+(`spv-all`, `spv-new`, `spv-cur` and the repo all carry the *post*-edit md5s, `171b91a36e` /
+`ec23c548f3`), so it would first mean rebuilding the `.comp` from `07ba7dc^`. Use `VK_SPV_DIR` (§6.1
+of the fetch-structure record) for any future shader A/B - it is the only way to swap shader bytes
+inside one executable.
+
+What **is** valid from that same table is the *cross-width* comparison, because fp16 and fp32 pick
+**different file names** (`fuse_ka_dplr_norm_s16` vs `fuse_ka_dplr_norm`, `runtime.rs:59`) and both are
+embedded: fp32 moves exactly **2× the bytes and takes 1.77× the time** ⇒ the kernel is **DRAM-bound,
+not instruction-issue bound**, which falsifies the §1 hypothesis this lever started from. Position on
+the roof: state traffic per dispatch = `B·H·N·N·2B·(r+w) = 83.9 MB` at B=128 (the profiler's `est`
+column reads 0.1 MiB because it does not count `buffer_reference` traffic - ignore it) ⇒ 447 GB/s =
 **72.5 % of this card's 616 GB/s**. A pure read+write stream on Turing tops out around 80-85 %, so
 what is left here is ≤15 % of the kernel = **≤2 % of the decode window**, not the 2× anyone hoped for.
+**That ceiling - not the void Δ - is why the lever is closed.**
 
 **Correctness (the admission gate)**: `STEP=1 PROBE=1 DUMP_LG` logits, 2 097 152 elements —
 
@@ -1022,13 +1095,15 @@ stored back as fp16, which absorbs it. Multi-step decode fingerprints are bit-id
 arms (`0x32c026/0x18ea` at fp16, `0x32a50a/0x18ea` at fp32). Gates: `cargo fmt --all`, `clippy -D
 warnings`, `BACKEND=vulkan cargo test --release` (10 passed / 0 failed in the batch suite).
 
-Both edits are kept (positive, bit-identical, correct access structure, right starting point for
-anything further), but **no end-to-end gain is claimed**: the honest number is ~0.1 % of the decode
-window, inside the ±1-2 % throughput band, so §6.1's standing ratios (0.874/0.740/0.627) are unchanged
-by this lever and were not re-measured for it. Details:
+Both edits are kept (bit-identical, and they double the bytes each warp instruction covers - which
+§6.8's layout lever went on to prove is the right direction on this card), but **no end-to-end gain is
+claimed for them, because none was ever measured**: the ceiling argument above (≤2 % of the decode
+window even at the kernel's own 15 % headroom) is the reason to stop, not a number. §6.1's standing
+ratios are therefore unchanged by this lever. Details (including the void-reading banner):
 [参考/2026-10-11-Vulkan-状态核访存宽度与行交错-实施记录.md](参考/2026-10-11-Vulkan-状态核访存宽度与行交错-实施记录.md).
 **Next lever by these measurements**: `gemm_imma` (≈48 % of the same dump, still in the 14-22 TOPS band
-against ~107 TOPS int8 peak) - the state kernel is done.
+against ~107 TOPS int8 peak) - which is exactly what §6.8/§6.9 then did, and what actually moved
+end-to-end decode by **+6.8…9.3 %**.
 
 ## 7. Layout
 
@@ -1054,7 +1129,7 @@ This project initially referenced two existing RWKV inference implementations:
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
 | Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
 | Relative gap (CUDA batched decode) | baseline | **ahead** — that same-session pair gave parity at B=1 and +11% to +26% at B=8–256; Albatross is gone from this machine, so **the column cannot be refreshed and must not be divided into §6.1's CUDA column** |
-| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1). ⚠️ **Updated 2026-10-11**: that row's "but rkv" is stale (§6.3 put r/k/v on W8A8 tensor cores by default), and after §6.3-§6.5 + §6.8 the same-session medians are **0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**; **re-measured a 4th time the same day, after §6.9 + the fp16-state arm: 0.874× / 0.740× / 0.627×** (CUDA columns byte-identical, B=8 is the control because §6.9's gate is `batch >= 32`). B=256 has not been re-measured since. |
+| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1). ⚠️ **Updated 2026-10-11**: that row's "but rkv" is stale (§6.3 put r/k/v on W8A8 tensor cores by default), and after §6.3-§6.5 + §6.8 the same-session medians are **0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**; **re-measured a 4th time the same day, after §6.9 + the fp16-state arm: 0.874× / 0.740× / 0.627×** (CUDA columns byte-identical, B=8 is the control because §6.9's gate is `batch >= 32`). B=256 has not been re-measured since. ★ **Re-measured a 5th time the same day, after the group-major int8 weight layout — for the first time across all six batches: 0.900× (B=1) / 0.972× (B=8) / 0.824× (B=32) / 0.765× (B=64) / 0.690× (B=128) / 0.688× (B=256)**, CUDA fingerprints again byte-identical — ⚠️ **but not its throughput**: that session's CUDA absolutes sat 6.4…7.7 % below its own 4th-session values at all three shared cells while Vulkan's sat above, so most of the ratio move versus the 4th table is a reference-side session effect. The layout's own credit is its same-session two-arm A/B, **+6.8…9.3 %** (B=1/8/32, shrinking with batch — at large batch the weights are already amortized across slots). **The 0.27× at B=256 in this row is retired** — it measured a stale build; B=256 is now monotone with the rest of the curve (its 3-round spread is 25.8 %, one outlier round; excluding it the cell is 0.688–0.697). Shape of what is left: ≈2.8 pt at B=8, ≈17.6 pt at B=32, ≈31 pt at B=128/256. |
 
 The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path was brought to the same level *at the same SIMT 口径*: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is throughput-neutral against CUDA **when CUDA is held to the same kernel sequence** while keeping cross-vendor reach. Against CUDA's *default* tensor-core path Vulkan is not neutral — the r/k/v batched kernel is the one op Vulkan keeps on SIMT by default (`VK_IMMA_OPS`), and that is where most of the B-scaling gap lives (see §6.1, 口径 paragraph). ⚠️ That last sentence is the 2026-10-10 pre-flip state: §6.3 (same day) moved r/k/v onto the W8A8 tensor-core path by default, and §6.4/§6.5/§6.8 then re-measured the remaining gap as sitting inside `gemm_imma` and the low-rank chain, not in r/k/v being SIMT.
 
@@ -1066,14 +1141,24 @@ Inspired by both, this repository has since evolved independently, adding capabi
 - **prefill time grows ~quadratically with T** (T=256: 0.33ms → T=512: 0.81ms, WKV parallel intra-chunk term); consider WKV chunking for long prompts.
 - **Vulkan dplr_seq occupancy is low** (40 workgroups × 64 threads + 2 barriers per token, ~10ms in steady prefill): could adopt the CUDA structure (parallel-row blocks + shuffle reduction).
 - **The batched state kernel `fuse_ka_dplr_norm` is closed as a lever — it is DRAM-bound** (2026-10-11, §6.10): two-row
-  interleave + adjacent-column-pair access are both shipped and bit-identical, and the same-session order-reversed
-  four-arm sweep says the width change buys only **−0.98 %** at fp16. The kernel sits at 83.9 MB / 0.1876 ms =
-  **447 GB/s = 72.5 % of this card's peak**, and fp32 state (2× the bytes) takes 1.77× the time — i.e. time tracks
-  bytes, not memory-instruction count. Remaining headroom to a realistic copy-kernel ceiling (80-85 %) is ≤15 % of a
-  kernel that is ~12.5 % of the decode window ⇒ **≤2 % end-to-end, not worth another round**. Byte count is
-  irreducible at fp16 (the state must be read and written in full each token); going below fp16 would break the
-  numerics contract. The next lever by these measurements is `gemm_imma` (≈48 % of the same dump, 14-22 TOPS against
-  ~107 TOPS int8 peak).
+  interleave + adjacent-column-pair access are both shipped, **but no end-to-end gain is claimed for either, because
+  none was ever measured** — the four-arm sweep that produced "−0.98 % at fp16" compared two `VK_SPV_DIR` arms that
+  turned out to hold the *same embedded bytes* (release builds bake the spv into the binary; see §4's `VK_SPV_DIR`
+  row), so those percentages are void. ⚠️ And "bit-identical" was wrong too: the pairs edit changes the `subgroupAdd`
+  summation partition, and Vulkan's decode fingerprints did move with it (§6.1's 5th table) — the gate that covers it
+  is `cargo test --release`, which passes. What survives from that session is the *qualitative* judgment, which came
+  from a valid comparison (fp32 vs fp16 state are different **file names**, selected per dispatch): the kernel sits at
+  83.9 MB / 0.1876 ms = **447 GB/s ≈ 72.5 % of this card's peak** (absolute reading, ±10 % cross-process), and
+  **fp32 state (2× the bytes) takes 1.77× the time** — time tracks bytes, not memory-instruction count. Remaining
+  headroom to a realistic copy-kernel ceiling (80-85 %) is ≤15 % of a kernel that is ~12.5 % of the decode window ⇒
+  **≤2 % end-to-end, not worth another round**. Byte count is irreducible at fp16 (the state must be read and written
+  in full each token); going below fp16 would break the numerics contract.
+- **`gemm_imma` was the next lever by those measurements, and it has since been taken** (2× in one day): the packed
+  smem staging + split-K retune (§6.8) and the **group-major int8 weight layout** `[K/128][M][32]` (§6.6-§6.9 of the
+  `gemm_imma` record, commit `0f4dbeb`), which is what moved B=32 from 0.740× to 0.824× and B=128 from 0.627× to
+  0.690×. What the 5th table leaves is ≈31 pt at B=128/256, and where those points sit is now an *open measurement
+  question*, not an assumption: the per-kernel classes on both backends have to be dumped in one session
+  (`PROF_GPU` vs `PROF_CUDA_KERNEL` + `NO_SELFLOOP_GRAPH=1`) before another kernel-level lever is picked.
 - **Measurement trap found while closing it**: `PROF_GPU` per-avg for the *same* spv spread **±12 %** across process
   batches (0.2219/0.2131/0.1982/0.1854/0.1888/0.1935/0.1901 ms). Any kernel-level A/B that compares two *different*
   processes is therefore direction-only. Citable design = same session, arms interleaved, **order reversed** between
