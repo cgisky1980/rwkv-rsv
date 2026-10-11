@@ -926,6 +926,37 @@ prompt 落进 `T_pad=512` 时 ≈**7 %**（chunk 本体减半而固定成本不�
 bench A/B 之前一律 `cargo build --release --examples`，并且绑一个**只能随改动而动**的读数。
 原始数据 `/c/tmp/ac16/chunk128_{base,fill,fill2}.log`；门禁 `/c/tmp/ac16/fill_gates.log`。台账 §6.15。
 
+### 6.11 批量状态读回/回灌：一次会话换手只花 1 次同步，不是 97 次（2026-10-12）
+
+与 §6.10 同一根杠杆，方向相反。`State::back`（整态存盘）与 `State::slot_back`（单槽存盘）每次要搬
+**97 段**（32 层 × 3 张量 + `v_first`），`load`/`slot_load` 再把同样的 97 段搬回去。Vulkan 上每条
+`download_part`/`upload_part` 都是「建一条 command buffer + 提交 + `queue_wait_idle`」；而旧的 `State::back`
+更亏——它**每个槽都把整张量重下一遍**再切出那一行。
+
+`ComputeBackend::download_parts(&[(张量, 元素偏移, 元素数)]) -> Vec<f32>` /
+`upload_parts(&[(张量, 元素偏移, &[f32])])`：默认实现就是逐段循环 ⇒ 不覆盖的后端语义不变；Vulkan 两条都覆盖成
+`Runtime::download_parts` / `Runtime::upload_parts`，把全部 N 段区间拷贝录进**同一条** command buffer，
+一次提交、一次等待（`upload_parts` 先把每段 memcpy 进各自的主机镜像再提交 ⇒ 与 `fill_zeros` 不同，
+**镜像保持同步**）。f32 与 fp16 状态张量都支持（`IoTensor`），偏移先做边界检查，拼接出来的布局与旧的逐字节相同。
+
+| 同会话、同一把探针、每档取 reps 的 `min` | batch=1 load | batch=1 back | batch=8 load | batch=8 back |
+| --- | --- | --- | --- | --- |
+| 改前 | 15.0 ms | 24.2 ms | 119.4 ms | **819.0 ms** |
+| 改后 | **6.9 ms** | **9.2 ms** | **57.1 ms** | **77.0 ms** |
+
+两档的指纹改前改后**逐位相同**（batch=1 `sum=0x2b3b4523b71a9b xor=0x66c33dd`，
+batch=8 `sum=0x159da230e933117 xor=0xe1d839d`）——这是必需的门禁，因为这次改动只是搬运方式的重组。
+batch=8 的 back 那一列是 **10.6 倍**：8 槽 × 97 段原本是 8 × 21.6 MiB 的**整张量**重复下载，外加 776 次队列等待，
+现在是 776 段一次提交搬完。batch=1 那两列是纯同步次数效应（24.2 → 9.2 ms ≈ 97 × 0.15 ms 的提交+等待被消掉）。
+
+⚠️ 与 §6.10 不同，**CUDA 那一侧的路径确实变了**，但只往安全方向变：它仍是每段一次调用（同步次数与旧 `back`
+相同），不再传 (batch−1)× 的冗余字节；`State::load` 的 `batch == 1` 特例（整张量 `upload`）也没了，
+因为「偏移 0 + 全长」本来就只是另一段。这条由 `BACKEND=cuda cargo test --release` 把关，不是秒表
+（CUDA 侧没打探针）。
+📌 这根杠杆上的下一格是 `State::slot_move` / `slot_broadcast`：97 次设备内 `copy_range`，每次都是自己的
+提交+等待——连续批调度的槽位紧凑化每迁一次槽就付一遍。台账 §6.16，
+原始数据 `/c/tmp/ac16/sio_{base,fill}.log`，门禁 `/c/tmp/ac16/sio_gates.log`。
+
 ## 7. 目录结构
 
 ```

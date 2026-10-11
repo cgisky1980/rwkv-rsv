@@ -81,6 +81,39 @@ impl FillTarget<'_> {
     }
 }
 
+/// 一段「设备缓冲 ↔ 它自己的 host 镜像」的搬运，dtype 由张量决定。
+/// 状态张量只有 f32 / f16 两档（`tmix_rnn` 随 `wkv_state_dtype` 落 f16），故不含 u32。
+#[derive(Debug, Clone, Copy)]
+pub enum IoTensor<'a> {
+    F32(&'a GpuTensor),
+    F16(&'a GpuTensor16),
+}
+
+impl IoTensor<'_> {
+    fn elems(&self) -> usize {
+        match self {
+            Self::F32(t) => t.len,
+            Self::F16(t) => t.len,
+        }
+    }
+}
+
+/// 读回一段（设备 → host 镜像）：`offset`/`len` 为**元素**偏移与长度。
+#[derive(Debug, Clone, Copy)]
+pub struct IoPart<'a> {
+    pub t: IoTensor<'a>,
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// 回灌一段（host 镜像 → 设备）：`data` 一律 f32，f16 张量在写镜像时转换。
+#[derive(Debug, Clone, Copy)]
+pub struct IoWrite<'a> {
+    pub t: IoTensor<'a>,
+    pub offset: usize,
+    pub data: &'a [f32],
+}
+
 /// WKV 状态（`tmix_rnn`）的设备句柄：fp32 或 fp16 存储，由建张量时的 dtype 决定
 /// （`wkv_state_dtype`，与 CUDA 的 `WKV_S16` 档同口径：**fp16 存 + fp32 算**）。
 ///
@@ -433,6 +466,177 @@ impl Runtime {
                 .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
             for &(buffer, bytes) in &dsts {
                 self.app.device.cmd_fill_buffer(cmd, buffer, 0, bytes, 0);
+            }
+            self.app.device.end_command_buffer(cmd)?;
+            let buffers = [cmd];
+            let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
+            let submits = [submit.build()];
+            self.app
+                .device
+                .queue_submit(self.app.compute.queue, &submits, vk::Fence::null())?;
+            self.app.device.queue_wait_idle(self.app.compute.queue)?;
+        }
+        Ok(())
+    }
+
+    /// 一条 command buffer 记 N 段 **device→host 区间拷贝** + 一次提交 + 一次等待，
+    /// 然后把各段从自己的 host 镜像按 `parts` 顺序拼成一个 `Vec<f32>` 返回。
+    ///
+    /// 存在的理由与 `fill_zeros` 是同一条：`State::back` / `slot_back` 每次要搬 97 段
+    /// （batch>1 时还 ×batch），而逐条 `download_part` = 每段一次 `queue_wait_idle`。
+    /// 探针实测（任务 #70，`BACKEND=vulkan`）：batch=1 整态读回 **24.2 ms**、
+    /// batch=8 **819 ms**（后者还叠了旧实现「每槽重下整张量」的带宽浪费，本函数按段取数
+    /// 顺带把它消掉）。语义与逐条读**完全一致**，且与 `fill_zeros` 不同——**镜像是同步的**
+    /// （读的就是那块镜像）。
+    pub fn download_parts(&self, parts: &[IoPart<'_>]) -> R<Vec<f32>> {
+        for p in parts {
+            if p.offset + p.len > p.t.elems() {
+                return Err(format!(
+                    "download_parts: {}+{} 超出 {}",
+                    p.offset,
+                    p.len,
+                    p.t.elems()
+                )
+                .into());
+            }
+        }
+        let total: usize = parts.iter().map(|p| p.len).sum();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let cmd_buf = self.app.allocate_compute_command_buffers(1)?;
+        let cmd = cmd_buf[0];
+        unsafe {
+            self.app
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.app
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+            for p in parts {
+                if p.len == 0 {
+                    continue;
+                }
+                // dst = 该张量自己的 host 镜像，src = 设备缓冲；同偏移（与 `download_part` 一致）。
+                match p.t {
+                    IoTensor::F32(t) => {
+                        let host = t.host.as_ref().ok_or("download_parts: host dropped")?;
+                        let _ = host.cmd_copy_from_range(
+                            cmd,
+                            &t.device,
+                            p.offset as u64 * 4,
+                            p.offset as u64 * 4,
+                            p.len as u64 * 4,
+                        );
+                    }
+                    IoTensor::F16(t) => {
+                        let host = t.host.as_ref().ok_or("download_parts: host dropped")?;
+                        let _ = host.cmd_copy_from_range(
+                            cmd,
+                            &t.device,
+                            p.offset as u64 * 2,
+                            p.offset as u64 * 2,
+                            p.len as u64 * 2,
+                        );
+                    }
+                }
+            }
+            self.app.device.end_command_buffer(cmd)?;
+            let buffers = [cmd];
+            let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
+            let submits = [submit.build()];
+            self.app
+                .device
+                .queue_submit(self.app.compute.queue, &submits, vk::Fence::null())?;
+            self.app.device.queue_wait_idle(self.app.compute.queue)?;
+        }
+        // 等设备写完再读镜像（host 内存是 HOST_COHERENT，与 `download_part` 同口径）。
+        let mut out = vec![0.0f32; total];
+        let mut pos = 0usize;
+        for p in parts {
+            match p.t {
+                IoTensor::F32(t) => {
+                    let host = t.host.as_ref().ok_or("download_parts: host dropped")?;
+                    host.copy_to_at(&mut out[pos..pos + p.len], p.offset)?;
+                }
+                IoTensor::F16(t) => {
+                    let host = t.host.as_ref().ok_or("download_parts: host dropped")?;
+                    let mut f16s = vec![f16::from_f32(0.0); p.len];
+                    host.copy_to_at(&mut f16s, p.offset)?;
+                    for (o, v) in out[pos..pos + p.len].iter_mut().zip(f16s) {
+                        *o = v.to_f32();
+                    }
+                }
+            }
+            pos += p.len;
+        }
+        Ok(out)
+    }
+
+    /// `download_parts` 的反方向：先把各段写进各自的 host 镜像（纯 memcpy），再用
+    /// **一条** command buffer 记完 N 段 host→device 拷贝 + 一次提交一次等待。
+    /// 与逐条 `upload_part` 语义一致（镜像同样被更新）。
+    pub fn upload_parts(&self, writes: &[IoWrite<'_>]) -> R<()> {
+        for w in writes {
+            if w.offset + w.data.len() > w.t.elems() {
+                return Err(format!(
+                    "upload_parts: {}+{} 超出 {}",
+                    w.offset,
+                    w.data.len(),
+                    w.t.elems()
+                )
+                .into());
+            }
+        }
+        if writes.iter().all(|w| w.data.is_empty()) {
+            return Ok(());
+        }
+        // 第一趟：全部数据进各自镜像（f16 张量在这里转换，与 `upload_part_f16` 同口径）。
+        for w in writes {
+            if w.data.is_empty() {
+                continue;
+            }
+            match w.t {
+                IoTensor::F32(t) => {
+                    let host = t.host.as_ref().ok_or("upload_parts: host dropped")?;
+                    host.copy_from(w.data, w.offset)?;
+                }
+                IoTensor::F16(t) => {
+                    let host = t.host.as_ref().ok_or("upload_parts: host dropped")?;
+                    let conv: Vec<f16> = w.data.iter().map(|&v| f16::from_f32(v)).collect();
+                    host.copy_from(&conv, w.offset)?;
+                }
+            }
+        }
+        let cmd_buf = self.app.allocate_compute_command_buffers(1)?;
+        let cmd = cmd_buf[0];
+        unsafe {
+            self.app
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.app
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+            for w in writes {
+                if w.data.is_empty() {
+                    continue;
+                }
+                let (off, len) = (w.offset as u64, w.data.len() as u64);
+                // dst = 设备缓冲，src = 刚写好镜像。
+                match w.t {
+                    IoTensor::F32(t) => {
+                        let host = t.host.as_ref().ok_or("upload_parts: host dropped")?;
+                        let _ = t
+                            .device
+                            .cmd_copy_from_range(cmd, host, off * 4, off * 4, len * 4);
+                    }
+                    IoTensor::F16(t) => {
+                        let host = t.host.as_ref().ok_or("upload_parts: host dropped")?;
+                        let _ = t
+                            .device
+                            .cmd_copy_from_range(cmd, host, off * 2, off * 2, len * 2);
+                    }
+                }
             }
             self.app.device.end_command_buffer(cmd)?;
             let buffers = [cmd];

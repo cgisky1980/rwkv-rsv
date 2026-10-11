@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 
 use crate::runtime::{
-    FillTarget, GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, R, Runtime, SAMPLER_ROW_F32,
-    StateTensor,
+    FillTarget, GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, IoPart, IoTensor, IoWrite, R,
+    Runtime, SAMPLER_ROW_F32, StateTensor,
 };
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
@@ -125,6 +125,29 @@ pub trait ComputeBackend {
     fn fill_zeros(&self, items: &[(TensorId, usize)]) -> R<()> {
         for &(t, elems) in items {
             self.upload(t, &vec![0.0; elems])?;
+        }
+        Ok(())
+    }
+    /// 批量部分读回：按 `items` 的 `(张量, 元素偏移, 元素数)` 顺序读出并**拼接**成一个 Vec。
+    ///
+    /// 存在的理由与 `fill_zeros` 同一条：`State::back`（整态存盘）与 `State::slot_back`
+    /// （单槽存盘）每次要搬 97 段（batch>1 时还 ×batch），而逐条 `download_part` = 每段
+    /// 一次「提交 + 等待」。Vulkan 实测（任务 #70 探针）：batch=1 **24.2 ms**、batch=8
+    /// **819 ms**，其中绝大部分是宿主同步与「每槽重下整张量」的冗余带宽。
+    ///
+    /// 默认实现 = 逐条 `download_part` ⇒ 没覆盖的后端（CUDA）**行为不变**（但同样躲不开
+    /// 每段一次同步）。覆盖它的收益只在提交次数；拼接顺序、分段口径与逐条完全一致。
+    fn download_parts(&self, items: &[(TensorId, usize, usize)]) -> R<Vec<f32>> {
+        let mut out = Vec::new();
+        for &(t, offset, len) in items {
+            out.extend(self.download_part(t, offset, len)?);
+        }
+        Ok(out)
+    }
+    /// 批量部分回灌：把每段写进 `[offset, offset+len)`。默认实现 = 逐条 `upload_part`。
+    fn upload_parts(&self, items: &[(TensorId, usize, &[f32])]) -> R<()> {
+        for &(t, offset, data) in items {
+            self.upload_part(t, offset, data)?;
         }
         Ok(())
     }
@@ -1637,6 +1660,20 @@ impl VulkanBackend {
             k: a.k,
         })
     }
+
+    /// `TensorId` → 「设备缓冲 + 它自己的 host 镜像」的统一视图（批量 I/O 专用）。
+    /// u32 张量不参与状态搬运（状态只有 f32/f16 两档，见 `wkv_state_dtype`）。
+    fn io_tensor(&self, t: TensorId, ctx: &str) -> R<IoTensor<'_>> {
+        match self
+            .tensors
+            .get(&t)
+            .ok_or_else(|| format!("{ctx}: unknown tensor"))?
+        {
+            VulkanTensor::F32(g) => Ok(IoTensor::F32(g)),
+            VulkanTensor::F16(g) => Ok(IoTensor::F16(g)),
+            VulkanTensor::U32(_) => Err(format!("{ctx}: u32 tensor unsupported").into()),
+        }
+    }
 }
 
 impl ComputeBackend for VulkanBackend {
@@ -1722,6 +1759,36 @@ impl ComputeBackend for VulkanBackend {
             targets.push(target);
         }
         self.rt.fill_zeros(&targets)
+    }
+
+    /// 批量读回：**一条 command buffer 记完全部 N 段 device→host 区间拷贝 + 一次提交**
+    /// （默认实现是逐条 `download_part`，即 N 次「提交 + `queue_wait_idle`」）。
+    /// 探针实测 batch=1 24.2 ms、batch=8 819 ms（任务 #70，台账 §6.16）。
+    /// 旧实现里 `State::back` 每个槽都重下一遍**整张量**再切一段，这里按段取数 ⇒ 顺带把
+    /// 那 (batch-1)× 的冗余带宽也消掉。
+    fn download_parts(&self, items: &[(TensorId, usize, usize)]) -> R<Vec<f32>> {
+        let mut parts: Vec<IoPart<'_>> = Vec::with_capacity(items.len());
+        for &(t, offset, len) in items {
+            parts.push(IoPart {
+                t: self.io_tensor(t, "download_parts")?,
+                offset,
+                len,
+            });
+        }
+        self.rt.download_parts(&parts)
+    }
+
+    /// 批量回灌：同一条 command buffer 的反方向（先 memcpy 进各自镜像，再一次提交全部拷贝）。
+    fn upload_parts(&self, items: &[(TensorId, usize, &[f32])]) -> R<()> {
+        let mut writes: Vec<IoWrite<'_>> = Vec::with_capacity(items.len());
+        for &(t, offset, data) in items {
+            writes.push(IoWrite {
+                t: self.io_tensor(t, "upload_parts")?,
+                offset,
+                data,
+            });
+        }
+        self.rt.upload_parts(&writes)
     }
 
     fn download(&self, t: TensorId) -> R<Vec<f32>> {

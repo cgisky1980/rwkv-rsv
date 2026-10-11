@@ -733,6 +733,47 @@ vs CUDA **变差**（CUDA 的 reset 更贵 2.37 s vs 1.907 s），这一根的�
 ⇒ bench 前后必须 `cargo build --release --examples`，并绑定一个**只有改动才会变**的读数
 （这里是 reset 段）。Raw：`/c/tmp/ac16/chunk128_{base,fill,fill2}.log`、`/c/tmp/ac16/fill_gates.log`。
 
+### 6.16 批量状态读回/回灌（§6.15 同一根杠杆的反方向，2026-10-12，任务 #70）
+
+**问题**：`State::back`（整态存盘）/ `slot_back`（单槽存盘）各搬 **97 段**（32 层 × 3 + `v_first`），
+`load` / `slot_load` 反向同样 97 段；Vulkan 侧每一段都是「一条 command buffer + 一次
+`queue_wait_idle`」。更亏的是旧 `back` 的实现：**每个槽都重下整张量再切一行** ⇒ 同步次数与
+冗余带宽都按 batch 线性放大。
+**复现（临时探针 `examples/state_io_probe.rs`，同一会话改前/改后各一遍，取 reps 最小值）**：
+
+| 口径（BACKEND=vulkan） | batch=1 load | batch=1 back | batch=8 load | batch=8 back |
+| --- | --- | --- | --- | --- |
+| 改前 | 15.0 ms | 24.2 ms | 119.4 ms | **819.0 ms** |
+| 改后 | **6.9 ms** | **9.2 ms** | **57.1 ms** | **77.0 ms** |
+| Δ | −8.1 ms | −15.0 ms | −62.3 ms | **−742.0 ms（10.6×）** |
+
+**改法**：`ComputeBackend::download_parts(&[(id, elem_offset, elems)]) -> Vec<f32>` 与
+`upload_parts(&[(id, elem_offset, &[f32])])`。默认实现 = 逐条 `download_part` / `upload_part`
+⇒ 不覆盖的后端语义不变；Vulkan 两条都覆盖 = `Runtime::download_parts` / `Runtime::upload_parts`，
+把全部 N 段区间拷贝记进**一条** command buffer、一次 submit、一次 wait。
+`upload_parts` 先把每段 memcpy 进各自的 host 镜像再提交 ⇒ 与 `fill_zeros` 不同，**这里镜像保持同步**。
+f32 / fp16 两档状态张量都支持（`IoTensor`），所有段先做边界检查，拼接顺序与分段口径与旧逐条路径一致。
+
+**判据是逐位指纹**（改动只是搬运方式重组，字节不该变）：batch=1 `sum=0x2b3b4523b71a9b xor=0x66c33dd`、
+batch=8 `sum=0x159da230e933117 xor=0xe1d839d` —— **改前改后逐位相同**，两档都对得上。
+
+**batch=1 那两列是纯同步次数效应**：24.2 → 9.2 ms = 15.0 ms / 97 段 ≈ **0.155 ms/次**，
+正好是「一次 submit + wait_idle」的宿主延迟（与 §6.15 那条 0.9 ms/条同量级、偏小是因为段拷贝比
+整张量上传轻）。**batch=8 那一列两笔账一起收**：8×97=776 次等待 ⇒ 1 次，且不再按槽重下整张量
+（8 槽 × 21.6 MiB 的冗余）。
+
+⚠️ **与 §6.15 相反：这一根 CUDA 那侧的路径确实变了**，但只往安全方向变——
+① `back` 仍是每段一次调用（同步次数与旧实现相同，只是不再传 (batch−1)× 冗余字节）；
+② `State::load` 的 `batch == 1` 特例（整张量 `upload`）删掉了，「偏移 0 + 全长」本来就只是另一段。
+⇒ CUDA 侧**没有秒表证据**（没打探针），把关的是 `BACKEND=cuda cargo test --release`。
+文档里别写「CUDA 逐字节不变」——那句只在 `fill_zeros` 成立。
+
+📌 **这根杠杆上剩下的格**（下次入口）：`State::slot_move` / `slot_broadcast` 是 **97 次设备内
+`copy_range`**，每次一条 command buffer + 一次 submit/wait ⇒ 连续批调度每迁移一个槽付一遍；
+把它接成「一条 command buffer 记 97 段设备拷贝」是与 §6.15/§6.16 同形的第三根，且不需要主机内存。
+Raw：`/c/tmp/ac16/sio_{base,fill}.log`、门禁 `/c/tmp/ac16/sio_gates.log`。探针已按工作区纪律删除。
+
+
 
 
 

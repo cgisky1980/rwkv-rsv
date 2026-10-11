@@ -1443,6 +1443,41 @@ matching fingerprint was a vacuous pass, not proof). Always `cargo build --relea
 and bind a reading that can only move with the change. Raw `/c/tmp/ac16/chunk128_{base,fill,fill2}.log`;
 gates `/c/tmp/ac16/fill_gates.log`. Ledger §6.15.
 
+### 6.16 Batched state readback / writeback: handing a session over costs 1 sync, not 97 (2026-10-12)
+
+Same lever as §6.15, other direction. `State::back` (serialize the whole state) and `State::slot_back`
+(serialize one slot) each move **97 segments** (32 layers × 3 tensors + `v_first`), and `load`/`slot_load`
+move the same segments back. On Vulkan every `download_part`/`upload_part` is "allocate a command buffer +
+submit + `queue_wait_idle`" - and `State::back` made it worse by downloading **each whole tensor once per
+slot** and then slicing out one row.
+
+`ComputeBackend::download_parts(&[(TensorId, elem_offset, elems)]) -> Vec<f32>` /
+`upload_parts(&[(TensorId, elem_offset, &[f32])])`: the defaults are per-segment loops, so a backend that
+does not override them keeps its semantics; Vulkan overrides both with `Runtime::download_parts` /
+`Runtime::upload_parts`, which record **all** N interval copies into **one** command buffer with one submit
+and one wait (`upload_parts` first memcpy's every segment into its own host mirror, then submits - so unlike
+`fill_zeros` the mirror stays in sync). f32 and fp16 state tensors are both supported (`IoTensor`), bounds
+are checked up front, and the concatenated output layout is byte-for-byte the old one.
+
+| same session, same probe, `min` of reps | batch=1 load | batch=1 back | batch=8 load | batch=8 back |
+| --- | --- | --- | --- | --- |
+| before | 15.0 ms | 24.2 ms | 119.4 ms | **819.0 ms** |
+| after | **6.9 ms** | **9.2 ms** | **57.1 ms** | **77.0 ms** |
+
+Fingerprints identical before/after at both widths (`sum=0x2b3b4523b71a9b xor=0x66c33dd` at batch=1,
+`sum=0x159da230e933117 xor=0xe1d839d` at batch=8) - the required gate, since the change is a pure transport
+rearrangement. The batch=8 `back` column is **10.6×**: 8 slots × 97 segments were 8 × 21.6 MiB of *whole-tensor*
+re-downloads plus 776 queue waits, now it is 776 segments in one submission. The batch=1 columns are the pure
+sync-count effect (24.2 → 9.2 ms ≈ 97 × 0.15 ms of submit+wait removed).
+
+⚠️ Unlike §6.15, **CUDA's path does change here** - but only in the safe direction: it still does one call per
+segment (same sync count as the old `back`), it no longer transfers (batch-1)× redundant bytes, and
+`State::load`'s `batch == 1` special case (whole-tensor `upload`) is gone, since offset 0 + full length is just
+another segment. Verified by `BACKEND=cuda cargo test --release`, not by a stopwatch (no CUDA probe was run).
+📌 The next rung on this same lever is `State::slot_move` / `slot_broadcast`: 97 device-side `copy_range` calls,
+each its own submit+wait - continuous-batching slot compaction pays it per migration. Ledger §6.16,
+raw `/c/tmp/ac16/sio_{base,fill}.log`, gates `/c/tmp/ac16/sio_gates.log`.
+
 ## 7. Layout
 
 ```

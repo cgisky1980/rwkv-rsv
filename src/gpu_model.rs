@@ -5626,24 +5626,24 @@ impl State {
 
     /// 把整态下载到 CPU 为连续 `Vec<f32>`（布局见 `load`）。
     /// batch>1 时返回 [batch] 份单序列布局顺序拼接（slot 主序）。
+    ///
+    /// **一次批量读回**，不是 97×batch 次 `download`：旧实现每槽都把**整张量**重下一遍再切
+    /// 一段，于是同步次数与冗余带宽都随 batch 线性放大（探针实测 batch=1 24.2 ms、
+    /// batch=8 **819 ms**，任务 #70 / 台账 §6.16）。现在按段取数 ⇒ 97×batch 段一次提交搬完，
+    /// 输出布局与旧实现逐字节相同。
     pub fn back(&self, backend: &dyn ComputeBackend, c: usize, h: usize, n: usize) -> R<Vec<f32>> {
-        let per_layer = c + h * n * n + c;
-        let mut out = Vec::with_capacity(self.batch * (self.layers.len() * per_layer + c));
+        let rnn = h * n * n;
+        let mut items: Vec<(TensorId, usize, usize)> =
+            Vec::with_capacity(self.batch * (self.layers.len() * 3 + 1));
         for b in 0..self.batch {
-            let off_x = b * c;
-            let off_rnn = b * h * n * n;
             for s in &self.layers {
-                let x = backend.download(s.tmix_x)?;
-                out.extend_from_slice(&x[off_x..off_x + c]);
-                let rnn = backend.download(s.tmix_rnn)?;
-                out.extend_from_slice(&rnn[off_rnn..off_rnn + h * n * n]);
-                let cx = backend.download(s.cmix_x)?;
-                out.extend_from_slice(&cx[off_x..off_x + c]);
+                items.push((s.tmix_x, b * c, c));
+                items.push((s.tmix_rnn, b * rnn, rnn));
+                items.push((s.cmix_x, b * c, c));
             }
-            let vf = backend.download(self.v_first)?;
-            out.extend_from_slice(&vf[b * c..b * c + c]);
+            items.push((self.v_first, b * c, c));
         }
-        Ok(out)
+        backend.download_parts(&items)
     }
 
     /// 从 CPU 数据回灌整态（与 `back` 布局一一对应）。
@@ -5656,39 +5656,28 @@ impl State {
         n: usize,
     ) -> R<()> {
         let per = c + h * n * n + c;
+        let rnn = h * n * n;
         let expect = self.batch * (self.layers.len() * per + c);
         if data.len() != expect {
             return Err(format!("State::load 长度不符: 得 {} 期望 {expect}", data.len()).into());
         }
-        if self.batch == 1 {
-            // 单序列：整段覆盖上传（Vulkan/CUDA 通用线上路径）。
-            let mut pos = 0usize;
-            for s in &self.layers {
-                backend.upload(s.tmix_x, &data[pos..pos + c])?;
-                pos += c;
-                backend.upload(s.tmix_rnn, &data[pos..pos + h * n * n])?;
-                pos += h * n * n;
-                backend.upload(s.cmix_x, &data[pos..pos + c])?;
-                pos += c;
-            }
-            backend.upload(self.v_first, &data[pos..pos + c])?;
-            return Ok(());
-        }
-        // batch：逐 slot 段上传（`upload_part` 两后端均已实现）。
+        // 一次批量回灌（同 `back`：97×batch 段 ⇒ 一条 command buffer / 一次提交）。
+        let mut items: Vec<(TensorId, usize, &[f32])> =
+            Vec::with_capacity(self.batch * (self.layers.len() * 3 + 1));
         let mut pos = 0usize;
         for b in 0..self.batch {
             for s in &self.layers {
-                backend.upload_part(s.tmix_x, b * c, &data[pos..pos + c])?;
+                items.push((s.tmix_x, b * c, &data[pos..pos + c]));
                 pos += c;
-                backend.upload_part(s.tmix_rnn, b * h * n * n, &data[pos..pos + h * n * n])?;
-                pos += h * n * n;
-                backend.upload_part(s.cmix_x, b * c, &data[pos..pos + c])?;
+                items.push((s.tmix_rnn, b * rnn, &data[pos..pos + rnn]));
+                pos += rnn;
+                items.push((s.cmix_x, b * c, &data[pos..pos + c]));
                 pos += c;
             }
-            backend.upload_part(self.v_first, b * c, &data[pos..pos + c])?;
+            items.push((self.v_first, b * c, &data[pos..pos + c]));
             pos += c;
         }
-        Ok(())
+        backend.upload_parts(&items)
     }
 
     /// 单 slot 状态下载（batch 布局）：返回该 slot 的单序列布局数据。
@@ -5703,16 +5692,18 @@ impl State {
         if slot >= self.batch {
             return Err(format!("slot_back: slot {slot} >= batch {}", self.batch).into());
         }
-        // 只下载该 slot 的行段（整表下载在 batch=16 时 ~260MB，单行 ~15MB）。
+        // 只下载该 slot 的行段（整表下载在 batch=16 时 ~260MB，单行 ~15MB），且**一次提交**
+        // —— 97 段逐条 `download_part` 就是 97 次队列等待（同 `back`，任务 #70）。
         let rnn = h * n * n;
-        let mut out = Vec::with_capacity(self.layers.len() * (2 * c + rnn) + c);
+        let mut items: Vec<(TensorId, usize, usize)> =
+            Vec::with_capacity(self.layers.len() * 3 + 1);
         for s in &self.layers {
-            out.extend_from_slice(&backend.download_part(s.tmix_x, slot * c, c)?);
-            out.extend_from_slice(&backend.download_part(s.tmix_rnn, slot * rnn, rnn)?);
-            out.extend_from_slice(&backend.download_part(s.cmix_x, slot * c, c)?);
+            items.push((s.tmix_x, slot * c, c));
+            items.push((s.tmix_rnn, slot * rnn, rnn));
+            items.push((s.cmix_x, slot * c, c));
         }
-        out.extend_from_slice(&backend.download_part(self.v_first, slot * c, c)?);
-        Ok(out)
+        items.push((self.v_first, slot * c, c));
+        backend.download_parts(&items)
     }
 
     /// 设备内单 slot 行迁移：把 slot `from` 的全部状态行拷到 slot `to`
@@ -5860,17 +5851,21 @@ impl State {
                 format!("State::slot_load 长度不符: 得 {} 期望 {expect}", data.len()).into(),
             );
         }
+        // 一次批量回灌（同 `slot_back`：97 段 ⇒ 一条 command buffer / 一次提交）。
+        let rnn = h * n * n;
+        let mut items: Vec<(TensorId, usize, &[f32])> =
+            Vec::with_capacity(self.layers.len() * 3 + 1);
         let mut pos = 0usize;
         for s in &self.layers {
-            backend.upload_part(s.tmix_x, slot * c, &data[pos..pos + c])?;
+            items.push((s.tmix_x, slot * c, &data[pos..pos + c]));
             pos += c;
-            backend.upload_part(s.tmix_rnn, slot * h * n * n, &data[pos..pos + h * n * n])?;
-            pos += h * n * n;
-            backend.upload_part(s.cmix_x, slot * c, &data[pos..pos + c])?;
+            items.push((s.tmix_rnn, slot * rnn, &data[pos..pos + rnn]));
+            pos += rnn;
+            items.push((s.cmix_x, slot * c, &data[pos..pos + c]));
             pos += c;
         }
-        backend.upload_part(self.v_first, slot * c, &data[pos..pos + c])?;
-        Ok(())
+        items.push((self.v_first, slot * c, &data[pos..pos + c]));
+        backend.upload_parts(&items)
     }
 
     /// 清零全部状态（含 v_first 缓冲）：**一次批量设备内清零**，不是 97 次 `upload`。
