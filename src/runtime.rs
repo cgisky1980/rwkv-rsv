@@ -1115,10 +1115,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// 加载嵌入的 SPIR-V 着色器
+    /// 加载着色器字节（嵌入 or `VK_SPV_DIR` 磁盘覆盖，见 `vulkan::asset::shader_bytes`）
     fn load_shader(name: &str) -> R<Cow<'static, [u8]>> {
-        let file = asset::Asset::get(name).ok_or_else(|| format!("shader not found: {name}"))?;
-        Ok(file.data)
+        Ok(asset::shader_bytes(name)?)
     }
 
     // ===== GEMV 算子 =====
@@ -1532,7 +1531,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let bm = Self::imma_bm(m);
+        let bm = Self::imma_bm(m, k);
         debug_assert_eq!(m % bm, 0, "gemm_imma: M 需为 {bm} 整除");
         let nst = Self::imma_nst(batch);
         let ks = Self::imma_ksplit(m, k, bm, nst, partial.len, batch);
@@ -1592,7 +1591,7 @@ impl Runtime {
     ) -> R<()> {
         debug_assert_eq!(a.m, m);
         debug_assert_eq!(a.k, k);
-        let bm = Self::imma_bm(m);
+        let bm = Self::imma_bm(m, k);
         let nst = Self::imma_nst(batch);
         // 门禁用单变量开关：`VK_IMMA_V_KSPLIT=1` 关掉 v 臂 split-K，回到 ks=1 直写路径
         // （= 未接入 split-K 的提交版行为）。只支持「关」：强行指定任意 ks 需满足
@@ -1680,16 +1679,31 @@ impl Runtime {
 
     /// `gemm_imma` 的 BM 选择：默认 64（小 batch 时 `grid = M/BM` 是唯一加块手段，
     /// 与 CUDA `IMMA_BM_SMALL` 同源）；`VK_IMMA_BM=128` 可切大 tile 做 A/B。
-    fn imma_bm(m: usize) -> usize {
+    ///
+    /// ★ 2026-10-11：`VK_IMMA_BM=16` = **宽 k 窗口档**（`BKW=512`，同一 staging 沿 k 连读
+    /// 4 个量化组）。依据：小批量档的时间**全部**在权重的全局载入流上（删光 mma/flush
+    /// 时间不变），而该流按行走位时每段只有 128 B ⇒ 408 GB/s；把段拉长到 512 B ⇒ 563
+    /// （SIMT 平坦核同形状 558 = 本机实际上限）。窄档（64/128）不动：大 batch 是算力受限的。
+    fn imma_bm(m: usize, k: usize) -> usize {
         let want = std::env::var("VK_IMMA_BM")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64);
         if want == 128 && m.is_multiple_of(128) {
             128
+        } else if want == 16 && m.is_multiple_of(16) && (k / 128).is_multiple_of(Self::imma_ngw(16))
+        {
+            // 宽窗口要求 `K` 按 512 字节对齐（否则最后一个窗口越出 K）。
+            16
         } else {
             64
         }
+    }
+
+    /// `BM=16` 档一个 k 窗口覆盖的量化组数（必须与 `gemm_imma.comp` 的 `NGW` 一致）。
+    /// host 侧用它约束 split-K：段必须按**窗口**对齐，否则 kernel 的 `kt` 循环越出本段。
+    fn imma_ngw(bm: usize) -> usize {
+        if bm == 16 { 4 } else { 1 }
     }
 
     /// `gemm_imma` 的每 block 槽组数 `NST`：让**权重对任意 batch 都只读一遍**。
@@ -1763,6 +1777,9 @@ impl Runtime {
             .and_then(|v| v.parse().ok());
         let blocks = (m / bm).saturating_mul(batch.div_ceil(8 * nst).max(1));
         let ktiles = k / 128;
+        // 宽窗口档（`BM=16`）：一个 staging 窗口吃 `NGW` 个量化组，kernel 的 `kt` 循环按
+        // `BKW` 步进 ⇒ 每段必须是**整数个窗口**，否则本段越界读到邻段的 k。
+        let ngw = Self::imma_ngw(bm);
         let mut ks = match forced {
             Some(v) => v.min(max_ks),
             None => {
@@ -1778,8 +1795,8 @@ impl Runtime {
             }
         };
         while ks > 1
-            && (!ktiles.is_multiple_of(ks)
-                || k / ks < 128
+            && (!ktiles.is_multiple_of(ks * ngw)
+                || k / ks < 128 * ngw
                 || ks.saturating_mul(batch).saturating_mul(m) > cap)
         {
             ks -= 1;

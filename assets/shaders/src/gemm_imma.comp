@@ -47,6 +47,9 @@
 #ifndef IM_NST
 #define IM_NST 1
 #endif
+// 宽窗口档开关：只有 `BM=16` 采用「沿 k 分组」的 staging；其余档**文本上保持原结构**
+// （⇒ `gemm_imma_bm64/128_*.spv` 与改造前逐字节相同，大 batch 那条已量化的曲线不受影响）。
+#define IM_WIDE (IM_BM == 16)
 
 layout(constant_id = 0) const uint M     = 10240;  // 输出行数
 layout(constant_id = 1) const uint K     = 2560;   // 收缩维（须为 128 整除）
@@ -59,8 +62,21 @@ const uint NST  = IM_NST;   // 每 block 的 slot 组数（每组 BN = 8 槽）
 const uint BN   = 8;        // coopmat 的 N
 const uint SLOT = BN * NST; // 每 block 覆盖的槽数
 const uint BK   = 128;      // k 分块 = 量化组宽（flush 粒度与之对齐）
-const uint WS   = BK + 16;  // smem 行跨距（字节）：+16 让行首错开 4 个 bank
-const uint WPU  = WS / 4u;  // 同一跨距按 **uint** 计（smem 是 packed 的，见下方声明）
+// ★ 2026-10-11 **小批量档的 k 窗口宽度**（`BM=16` 档 = 宽窗口档）。
+//   实测（同会话、`VK_SPV_DIR` 换 spv、纯读探针：字节集合/grid/指令条数全同，只改每 warp 的
+//   **地址顺序**）：连续段 128 B ⇒ 408 GB/s，512 B ⇒ 563，2560 B ⇒ 565；而 SIMT 平坦核
+//   在同形状上 558 GB/s。⇒ 旧结构每个 k-tile「读 128 B 就换行」让 DRAM 页反复重开，
+//   小批量档 `gemm_imma` 的时间差**全部**来自这里（删光 mma/flush 时间不变，见记录 §六）。
+//   窗口变宽用 `BM` 变小付账：`BM×BKW` 与旧的 `64×BK` 同量级 ⇒ smem/占用不塌。
+//   `NGW = 1` 的档（`BM=64/128`）保持原结构：大 batch 是算力受限的，宽窗口只会多占 smem。
+#if IM_WIDE
+const uint BKW  = 512u;  // 一次 staging 覆盖的 k 字节数
+#else
+const uint BKW  = BK;
+#endif
+const uint NGW  = BKW / BK;                 // 每窗口的量化组数（= 1 时完全等于旧行为）
+const uint WS   = BKW + 16;  // smem 行跨距（字节）：+16 让行首错开 4 个 bank
+const uint WPU  = WS / 4u;   // 同一跨距按 **uint** 计（smem 是 packed 的，见下方声明）
 const uint WR   = 16;       // 每 warp 的输出行数（coopmat 的 M）
 const uint RW   = BM / WR;  // 行 warp 数
 // ★ 2026-10-11：槽组也分到 warp（`SW`），每 warp 只跑 `RPG = NST/SW` 组。
@@ -72,9 +88,11 @@ const uint RW   = BM / WR;  // 行 warp 数
 const uint SW   = (BM == 64u) ? (NST < 2u ? NST : 2u) : 1u;
 const uint RPG  = NST / SW; // 每 warp 的槽组数
 const uint BLOCK_SIZE = RW * SW * 32u;
-const uint NLD  = BM * 32u / BLOCK_SIZE;                        // 每线程的权重载入条数
-const uint XW   = SLOT * 32u;                                   // 每 k-tile 的激活字数
-const uint NLDX = (XW + BLOCK_SIZE - 1u) / BLOCK_SIZE;          // 每线程的激活载入条数
+const uint NLD  = BM * 32u / BLOCK_SIZE;                        // 每线程·每组 的权重载入条数
+const uint NW   = NLD * NGW;                                    // 每线程·每窗口 的权重载入条数
+const uint CH   = (NW < 16u) ? NW : 16u;                        // 同时在飞的载入条数（寄存器预算）
+const uint XW   = SLOT * 32u;                                   // 每组（BK=128）的激活字数
+const uint NLDX = (XW + BLOCK_SIZE - 1u) / BLOCK_SIZE;          // 每线程·每组 的激活载入条数
 
 layout(buffer_reference) buffer WIdx { uint data[]; };    // int8 权重 [M, K/4]（4 个 uint8/uint32）
 layout(buffer_reference) buffer WSz  { uint data[]; };    // fp16(尺度|零点) [M, K/128]
@@ -106,8 +124,8 @@ shared uint xs[SLOT * WPU];             // 本 k-tile 的激活（有符号 int8
 shared int    tile[RW * SW][WR * BN];   // 每 warp 的 int32 累加块（coopMatStore 落地）
                                         // 第一维 = 本档的 warp 数（写成字面量 8 会在
                                         // `SW` 提到 4 时静默越界 ⇒ 由构造绑定 `RW*SW`）
-shared uint   szs[BM];                  // 本组的权重尺度/零点（每行一份）
-shared vec4   xas[SLOT];                // 本组的激活统计（每槽一份）
+shared uint   szs[BM * NGW];            // 本窗口的权重尺度/零点（每行 × 每组一份）
+shared vec4   xas[SLOT * NGW];          // 本窗口的激活统计（每槽 × 每组一份）
 
 /// 取 packed smem 里第 `byte` 个字节并**按 int8 符号扩展**（只服务 OP=9/10 诊断路径）。
 /// 写成宏而不是函数：GLSL 的数组形参必须带尺寸，而 `ws`/`xs` 的尺寸按档位不同。
@@ -150,13 +168,63 @@ void main() {
     const uint ksp = gl_WorkGroupID.y;
     const uint kb  = K / KS;
 
-    for (uint kt = ksp * kb; kt < (ksp + 1u) * kb; kt += BK) {
-        const uint gr = kt >> 7u;   // 组号
+    for (uint kt = ksp * kb; kt < (ksp + 1u) * kb; kt += BKW) {
+        const uint gr = kt >> 7u;   // 组号（宽窗口档：本窗口的**首个**量化组）
 
-        // —— 落 smem（每个 k-tile 一次）：权重 + **全部 NST 组**的激活 + 本组统计 ——
+        // —— 落 smem（每个 k 窗口一次）：权重 + **全部 NST 组**的激活 + 本组统计 ——
         // ★ 关键：**先把全部全局载入取到寄存器，再统一落 smem**：本 kernel 的块数有限，
         //   没有第二个 block 帮忙掩盖延迟；若「LDG → STS」逐对发出，每对都要等一次
         //   ~600 cycle 的全局延迟。寄存器预取后所有载入并发在飞。
+#if IM_WIDE
+        // 宽窗口档（`BM=16` ⇒ `BKW=512`）：**沿 k 走**的分组 staging。同一行连续读 `NGW`
+        // 个组 = `BKW` 字节的连续段（128 B 段 408 GB/s vs 512 B 段 563，见 `BKW` 注释）。
+        // ⚠️ 外层 `cg` **不能** `[[unroll]]`：一 unroll 就是把 `NW` 条载入全钉在寄存器上
+        //    （本档 `NW=64` ⇒ 必然溢出到本地内存，比旧结构更慢）。
+        uint wr[CH];
+        for (uint cg = 0u; cg < NW; cg += CH) {
+            [[unroll]]
+            for (uint t = 0u; t < CH; t++) {
+                const uint c = cg + t;
+                const uint i = index + (c / NGW) * BLOCK_SIZE;
+                const uint s = c % NGW;
+                const uint src = min(row0 + (i >> 5u), M - 1u);
+                wr[t] = params.in_idx.data[src * K4 + (kt >> 2u) + s * 32u + (i & 31u)];
+            }
+            [[unroll]]
+            for (uint t = 0u; t < CH; t++) {
+                const uint c = cg + t;
+                const uint i = index + (c / NGW) * BLOCK_SIZE;
+                const uint s = c % NGW;
+                ws[(i >> 5u) * WPU + s * 32u + (i & 31u)] = wr[t] ^ 0x80808080u;
+            }
+        }
+        [[unroll]]
+        for (uint s = 0u; s < NGW; s++) {
+            uint xr[NLDX];
+            [[unroll]]
+            for (uint n = 0u; n < NLDX; n++) {
+                const uint i = index + n * BLOCK_SIZE;
+                if (i < XW && s0base + (i >> 5u) < BATCH) {
+                    xr[n] = params.in_xq.data[(s0base + (i >> 5u)) * K4 + (kt >> 2u) + s * 32u + (i & 31u)];
+                }
+            }
+            [[unroll]]
+            for (uint n = 0u; n < NLDX; n++) {
+                const uint i = index + n * BLOCK_SIZE;
+                // 激活：写 `xs` 不是 `ws`（2026-10-04 曾误写权重数组 ⇒ B 恒为 0）。
+                if (i < XW && s0base + (i >> 5u) < BATCH) {
+                    xs[(i >> 5u) * WPU + s * 32u + (i & 31u)] = xr[n];
+                }
+            }
+            if (index < BM) {
+                const uint src = min(row0 + index, M - 1u);
+                szs[s * BM + index] = params.in_sz.data[src * G + gr + s];
+            }
+            if (index < SLOT && s0base + index < BATCH) {
+                xas[s * SLOT + index] = params.in_aux.data[(s0base + index) * G + gr + s];
+            }
+        }
+#else
         uint wr[NLD];
         [[unroll]]
         for (uint n = 0u; n < NLD; n++) {
@@ -193,49 +261,54 @@ void main() {
         if (index < SLOT && s0base + index < BATCH) {
             xas[index] = params.in_aux.data[(s0base + index) * G + gr];
         }
+#endif
         barrier();  // (1) staging 完成
 
-        // —— 权重片段一次性载入寄存器（本 k-tile 内本 warp 的 RPG 组共用）——
-        // 偏移 0/8/16/24 = 一个 32 字节 k 切片 = 8 个 uint。
-        const uint wrow = (row_warp * WR) * WPU;
-        coopMatLoad(a0, ws, wrow + 0u, WPU, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a1, ws, wrow + 8u, WPU, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a2, ws, wrow + 16u, WPU, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(a3, ws, wrow + 24u, WPU, gl_CooperativeMatrixLayoutRowMajor);
-
-        // —— 逐 slot 组复用同一份权重（本 warp 只跑 `slot_warp` 那一段）——
+        // —— 逐量化组推进窗口（`NGW==1` 时就是这个循环只转一圈 = 旧行为）——
+        // 权重片段先载进寄存器、本组内被全部 NST 组复用；组序**升序** ⇒ 与旧结构逐位同序。
         [[unroll]]
-        for (uint gg = 0u; gg < RPG; gg++) {
-            const uint g = slot_warp * RPG + gg;   // block 内的全局槽组号（xs/xas 用它）
-            ci = coopmat<int32_t, gl_ScopeSubgroup, WR, BN, gl_MatrixUseAccumulator>(0);
+        for (uint s = 0u; s < NGW; s++) {
+            // 偏移 0/8/16/24 = 一个 32 字节 k 切片 = 8 个 uint。
+            const uint wrow = (row_warp * WR) * WPU + s * 32u;
+            coopMatLoad(a0, ws, wrow + 0u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, ws, wrow + 8u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a2, ws, wrow + 16u, WPU, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a3, ws, wrow + 24u, WPU, gl_CooperativeMatrixLayoutRowMajor);
 
-            // 4 次 mma（本组 K = 128 = 4 × 32）；B：激活 k×槽
-            // （ColMajor：(k,s) 在 xs[(g*BN+s)*WPU + ks*8 + k/4]）
-            const uint xrow = (g * BN) * WPU;
-            coopMatLoad(xf, xs, xrow + 0u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
-            ci = coopMatMulAdd(a0, xf, ci);
-            coopMatLoad(xf, xs, xrow + 8u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
-            ci = coopMatMulAdd(a1, xf, ci);
-            coopMatLoad(xf, xs, xrow + 16u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
-            ci = coopMatMulAdd(a2, xf, ci);
-            coopMatLoad(xf, xs, xrow + 24u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
-            ci = coopMatMulAdd(a3, xf, ci);
-
-            // flush：int32 → fp32 尺度还原 + 零点修正
-            // ⚠️ `tile[wid]` 是**本 warp 私有**的（每 warp 只读写自己那一片），故组间同步
-            //    只需 subgroup 级；跨 warp 的 `ws`/`xs` 复用由 k-tile 末尾的 barrier 兜住。
-            coopMatStore(ci, tile[wid], 0u, BN, gl_CooperativeMatrixLayoutRowMajor);
-            subgroupBarrier();
+            // —— 逐 slot 组复用同一份权重（本 warp 只跑 `slot_warp` 那一段）——
             [[unroll]]
-            for (uint i = 0u; i < 4u; i++) {
-                // `r` 是**本 warp 的局部行号**（tile[wid] 只有 WR 行）⇒ 取 szs 要加行基址。
-                const uint r = frow + i * 4u;
-                const int32_t S = tile[wid][r * BN + fcol];
-                const vec2 szv = unpackFloat2x16(szs[row_warp * WR + r]);
-                const vec4 au = xas[g * BN + fcol];
-                acc[gg][i] += szv.x * (au.x * float(S) + au.y) + szv.y * au.z;
+            for (uint gg = 0u; gg < RPG; gg++) {
+                const uint g = slot_warp * RPG + gg;   // block 内的全局槽组号（xs/xas 用它）
+                ci = coopmat<int32_t, gl_ScopeSubgroup, WR, BN, gl_MatrixUseAccumulator>(0);
+
+                // 4 次 mma（本组 K = 128 = 4 × 32）；B：激活 k×槽
+                // （ColMajor：(k,s) 在 xs[(g*BN+s)*WPU + ks*8 + k/4]）
+                const uint xrow = (g * BN) * WPU + s * 32u;
+                coopMatLoad(xf, xs, xrow + 0u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
+                ci = coopMatMulAdd(a0, xf, ci);
+                coopMatLoad(xf, xs, xrow + 8u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
+                ci = coopMatMulAdd(a1, xf, ci);
+                coopMatLoad(xf, xs, xrow + 16u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
+                ci = coopMatMulAdd(a2, xf, ci);
+                coopMatLoad(xf, xs, xrow + 24u, WPU, gl_CooperativeMatrixLayoutColumnMajor);
+                ci = coopMatMulAdd(a3, xf, ci);
+
+                // flush：int32 → fp32 尺度还原 + 零点修正
+                // ⚠️ `tile[wid]` 是**本 warp 私有**的（每 warp 只读写自己那一片），故组间同步
+                //    只需 subgroup 级；跨 warp 的 `ws`/`xs` 复用由 k 窗口末尾的 barrier 兜住。
+                coopMatStore(ci, tile[wid], 0u, BN, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupBarrier();
+                [[unroll]]
+                for (uint i = 0u; i < 4u; i++) {
+                    // `r` 是**本 warp 的局部行号**（tile[wid] 只有 WR 行）⇒ 取 szs 要加行基址。
+                    const uint r = frow + i * 4u;
+                    const int32_t S = tile[wid][r * BN + fcol];
+                    const vec2 szv = unpackFloat2x16(szs[s * BM + row_warp * WR + r]);
+                    const vec4 au = xas[s * SLOT + g * BN + fcol];
+                    acc[gg][i] += szv.x * (au.x * float(S) + au.y) + szv.y * au.z;
+                }
+                subgroupBarrier();
             }
-            subgroupBarrier();
         }
         barrier();  // (2) 所有 warp 读完 ws/xs 后才允许下一轮 staging
     }

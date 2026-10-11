@@ -420,6 +420,16 @@ fn main() {
             IM_BM => [def(64, "bm64"), def(128, "bm128")],
             IM_NST => [def(1, "nst1"), def(2, "nst2"), def(4, "nst4"), def(8, "nst8"), def(16, "nst16")],
         },
+        // ★ 2026-10-11 **宽 k 窗口档**（`BM=16` ⇒ kernel 里 `BKW=512`，见 `gemm_imma.comp`
+        // 的 `BKW` 注释）：小批量 decode 的 time 全在权重全局载入流上，而该流的**连续段长度**
+        // 决定实得带宽（128 B ⇒ 408 GB/s，512 B ⇒ 563 = 本机实际上限）。行块压到 16 行、
+        // 换成沿 k 连读 4 组，段长就到 512 B 而 smem 不塌（13.9 KB/块 ⇒ 4 块/SM）。
+        // 只编 nst1/2/4：本档只服务 `batch ≤ 32`（`imma_nst` 给出 1/2/4），再大的槽数由
+        // `BM=64` 档负责 —— 那里权重已被 NST 组均摊，不是访存受限。
+        "gemm_imma" => "src/gemm_imma.comp" => {
+            IM_BM => [def(16, "bm16")],
+            IM_NST => [def(1, "nst1"), def(2, "nst2"), def(4, "nst4")],
+        },
         // split-K 的确定性归约（`gemm_imma` 配套）。
         "gemm_imma_reduce" => "src/gemm_imma_reduce.comp" => {
             TYPE => [none("")],
