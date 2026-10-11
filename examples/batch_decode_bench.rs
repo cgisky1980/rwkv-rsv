@@ -574,6 +574,12 @@ fn gating_json() -> serde_json::Value {
         "GEMV_IMMA": knob("GEMV_IMMA", "开 —— CUDA r/k/v 走 int8 张量核"),
         "LOWRANK_GEMM": knob("LOWRANK_GEMM", "开 —— CUDA 低秩四条走 int8 张量核"),
         "FFN_VALUE_GEMM": knob("FFN_VALUE_GEMM", "开 —— CUDA FFN value 走 int8 张量核"),
+        // ★ Vulkan 低秩链的两级张量核档 + 门控绑定标记。缺这三条就会重演 2026-10-11 ①-b v1
+        // 那次「两臂读数完全相同、其实两臂都没在 Vulkan 上跑」的空转。
+        "LOWRANK_GEMM2": knob("LOWRANK_GEMM2", "开（batch>=32 且形状整除）—— Vulkan 低秩二级 coopmat fp16"),
+        "LOWRANK_GEMM1": knob("LOWRANK_GEMM1", "开（随二级门）—— Vulkan 低秩一级 coopmat fp16，SIMT mid 臂整条退役"),
+        "PROF_LOW": knob("PROF_LOW", "关 —— 每次 forward 第 0 层打一条 gemm/stage2/stage1/lr_rows 标记"),
+        "GEMM_MIN_BLOCKS": knob("GEMM_MIN_BLOCKS", "32 —— coopmat 瓦片占用率档下限（0 关掉）"),
         "VK_IMMA_OPS": knob("VK_IMMA_OPS", "全开（含 rkv，2026-10-10 翻转）"),
         "VK_IMMA": knob("VK_IMMA", "开 —— Vulkan W8A8 张量核 GEMM；但受 `imma_ok` 的 batch 门约束，见下"),
         "VK_IMMA_NST": knob("VK_IMMA_NST", "按 batch 自动（≥ceil(batch/8) 的最小 2 的幂，上限 8）"),

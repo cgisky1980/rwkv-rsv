@@ -346,6 +346,11 @@ impl SelfloopBufs {
 ///（TensorId 全 Copy，Clone 零开销——batch 路径取副本避开 &self 与 &mut self 借用冲突）
 #[derive(Clone)]
 pub struct WorkBuffers {
+    /// 张量核档的补长行数：`batch >= 16` 时 = `round_up(batch, 64)`，否则 = `batch`
+    /// （门控 `batch >= 32` 的档永远落在前者；小批宽不补长以省显存，见 `WorkBuffers::new`）。
+    /// ⚠️ 所有 `[lr_rows; *]` 缓冲的**写侧必须传这个值**，不能就地算
+    /// `batch.div_ceil(64)*64` —— batch < 16 时两者不同，会越界写。
+    lr_rows: usize,
     // [C] 大小
     x: TensorId,
     ln1: TensorId,
@@ -356,10 +361,18 @@ pub struct WorkBuffers {
     xa: TensorId,
     xg: TensorId,
     prev_x: TensorId,
-    // fp16 副本（r/k/v 融合核读 fp16 x，流量减半）
+    /// fp16 副本（r/k/v 融合核读 fp16 x，流量减半；v 还要喂低秩一级张量核）。
+    /// ⚠️ 行维是 `lr_rows` 不是 `batch`：`to_f16_triple` 一次写三张、共享同一个 `m_pad`，
+    /// 而一级档的 `gemm` 要求 M 整除 TILE_M（见下方 `xw16` 的注）。SIMT 融合核只读前
+    /// `batch` 行，补出来的行恒为 0。
     xr16: TensorId,
     xk16: TensorId,
     xv16: TensorId,
+    /// 低秩链**一级** mid 投影的 fp16 张量核档（`LOWRANK_GEMM1`，S31 ①-b）：A 操作数
+    /// `[lr_rows, C]`。与 `SeqBuffers` 的同名字段同语义，只是行维补到 64 而非 256。
+    xw16: TensorId,
+    xa16: TensorId,
+    xg16: TensorId,
     r: TensorId,
     k: TensorId,
     v: TensorId,
@@ -396,6 +409,13 @@ pub struct WorkBuffers {
     a_mid16: TensorId,
     v_mid16: TensorId,
     g_mid16: TensorId,
+    /// 低秩链**一级** fp16 张量核档（`LOWRANK_GEMM1`）的 f32 累加器 `[lr_rows, mid_pad]`。
+    /// 上面的 `*_mid` 是 SIMT 臂的产物，列维 = 真实 mid（不补长）⇒ 张量核档不能复用，
+    /// 二级档的 `to_f16` 在一级档开启时改从这里读。
+    v_mid_tc: TensorId,
+    w_mid_tc: TensorId,
+    a_mid_tc: TensorId,
+    g_mid_tc: TensorId,
     r2: TensorId, // [FFN_HIDDEN]
     /// W8A8 张量核路径的量化激活与每组统计。**固定按 8 槽容量分配**：IMMA 的 BN=8 一次覆盖
     /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma.comp` 按 BATCH 守卫丢弃输出）。
@@ -2367,8 +2387,9 @@ impl GpuModel {
         )?;
 
         // r/k/v 融合核读 fp16 x（流量减半）：把 xr/xk/xv 转 fp16 到 xr16/xk16/xv16。
+        // xv16 还兼作低秩一级张量核档 v 链的 A 操作数 ⇒ 行维按 `lr_rows` 补长（补出来的是 0）。
         self.backend.to_f16_triple(
-            bb.xr, bb.xk, bb.xv, bb.xr16, bb.xk16, bb.xv16, c, batch, batch, c, c,
+            bb.xr, bb.xk, bb.xv, bb.xr16, bb.xk16, bb.xv16, c, batch, bb.lr_rows, c, c,
         )?;
 
         // r/k/v + mid 融合 gemv（batch 版；fp16 权重模型暂不支持 batch 路径）。
@@ -2408,13 +2429,46 @@ impl GpuModel {
             && std::env::var("LOWRANK_GEMM2")
                 .map(|v| v != "0")
                 .unwrap_or(true);
+        // ★ S31 ①-b（2026-10-11）：一级 mid 投影（xv@V1 / xw@W1 / xa@A1 / xg@G1）也上
+        // coopmat fp16 张量核，把 SIMT 的 mid 臂（`gemv_int8_rkv_mid_batch`，0.274 ms/层 =
+        // ≈8.9 ms/步）整个退役。#25 当年判「一级上不了张量核」是**块饥饿**造成的误读
+        // （窄 N 深 K 只落到 1..5 个块喂 68 个 SM），`gemm_tile_for` 的占用率档修好之后
+        // 同一形状 0.029 ms/次、四链 ≈0.118 ms/层 = SIMT 的 2.3 倍快（记录 §10.4）。
+        // 依赖 `lowrank_stage2`：mid 的 f32 累加器在这里是 `[lr_rows, mid_pad]` 的补长副本，
+        // 二级档的 `to_f16` 直接接走；SIMT 二级（chain4）读的是 `[batch, mid]`，两者不通用。
+        // 语义与 SIMT 臂逐式对应（`gemv_int8_rkv_stage1_batch.comp` 头注）：w 用 `gemm_tanh`
+        // 内联 tanh，v/a/g 用 `gemm`，g 的 sigmoid 留在 mid 上做（原本就在 chain4 里做）。
+        // ★ 门限 **`batch >= 64`**，比二级的 32 高一档——这是量出来的（2026-10-11，
+        // `PREFILL_SLOTS=8` 干净口径，交错 + 反序，`C:/tmp/s31b_gate8.out`，口径教训见记录 §11.5）：
+        // B=32 两对都**净亏**（每步 1453 → 1559 ms、1432 → 1576 ms ⇒ −7.3 % / −10.1 %），
+        // B=64 打平（2058 → 2051 ms），B=128 净赢（3712 → 3290 ms = **+12.8 %**）。
+        // 机制与 §11.3 的瓦片读数一致：一级 `rows` 补到 64 之后张量核半边的工作量不随批宽降，
+        // 而 `(64,32,64)` 瓦片在 N=64/128/320 上只有 **4/8/20 个块**喂 68 个 SM；batch=32 时
+        // SIMT mid 臂本来就只做 32 行（≈2.7 ms/步），张量核那份固定开销盖不住。
+        // B=64 记为「打平所以纳入」，安静会话复测后可以把这档单独挪到 128。
+        let lowrank_stage1 = lowrank_stage2
+            && batch >= 64
+            && std::env::var("LOWRANK_GEMM1")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        // ★ 与性能无关的**绑定标记**（GPU 测量纪律）：2026-10-11 的 ①-b 首探两臂 logits
+        // 逐字节相同、日志零条 GEMM 瓦片行——查下来是探针脚本没设 `BACKEND=vulkan`，
+        // 两臂都跑在 CUDA 上（`lowrank_gemm` 为真 ⇒ stage1/2 恒假）。门开没开必须能
+        // 在同一份日志里读出来，不能靠「结果没变」反推。
+        if i == 0 && std::env::var("PROF_LOW").is_ok_and(|v| v != "0") {
+            log::info!(
+                "[低秩档] batch={batch} lr_rows={} gemm={lowrank_gemm} stage2={lowrank_stage2} stage1={lowrank_stage1}",
+                bb.lr_rows
+            );
+        }
         if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
             &self.layers[i].receptance_a8,
             &self.layers[i].key_a8,
             &self.layers[i].value_a8,
         ) {
-            // LOWRANK_GEMM 时 mid 伪行数传 0 ⇒ `gemv_int8_rkv_stage1_batch` 只发 r/k/v。
-            let (mvm, mwm, mam, mgm) = if lowrank_gemm {
+            // LOWRANK_GEMM / LOWRANK_GEMM1 时 mid 伪行数传 0 ⇒ `gemv_int8_rkv_stage1_batch`
+            // 只发 r/k/v。
+            let (mvm, mwm, mam, mgm) = if lowrank_gemm || lowrank_stage1 {
                 (0, 0, 0, 0)
             } else {
                 (vm, wm, am, gm)
@@ -2527,26 +2581,30 @@ impl GpuModel {
                         batch,
                     )?;
                 }
-                self.backend.gemv_int8_rkv_mid_batch(
-                    self.layers[i].v1,
-                    self.layers[i].w1,
-                    self.layers[i].a1,
-                    self.layers[i].g1,
-                    bb.xv,
-                    bb.xw,
-                    bb.xa,
-                    bb.xg,
-                    bb.v_mid,
-                    bb.w_mid,
-                    bb.a_mid,
-                    bb.g_mid,
-                    c,
-                    mvm,
-                    mwm,
-                    mam,
-                    mgm,
-                    batch,
-                )?;
+                // SIMT 的 mid 臂只在还有链没搬上张量核时才发（全 0 = 一级已由
+                // `lowrank_stage1` 代劳；0 行数会让 grid 退化成 0 个工作组，Vulkan 非法）。
+                if mvm != 0 || mwm != 0 || mam != 0 || mgm != 0 {
+                    self.backend.gemv_int8_rkv_mid_batch(
+                        self.layers[i].v1,
+                        self.layers[i].w1,
+                        self.layers[i].a1,
+                        self.layers[i].g1,
+                        bb.xv,
+                        bb.xw,
+                        bb.xa,
+                        bb.xg,
+                        bb.v_mid,
+                        bb.w_mid,
+                        bb.a_mid,
+                        bb.g_mid,
+                        c,
+                        mvm,
+                        mwm,
+                        mam,
+                        mgm,
+                        batch,
+                    )?;
+                }
             } else {
                 self.backend.gemv_int8_rkv_stage1_batch(
                     r_a8,
@@ -2627,22 +2685,50 @@ impl GpuModel {
                 gmp,
             )?;
         } else if lowrank_stage2 {
-            // #25：一级 mid 已由上面的 `gemv_int8_rkv_stage1_batch` 算好（f32，步长=真实 mid），
-            // 这里只做「降位补长 → 二级 GEMM → epilogue 落 fp16」，四段 epilogue 与 chain4
-            // 逐式对应（见 `lowrank_epilogue.comp`）。
-            let rows = batch.div_ceil(64) * 64; // = `WorkBuffers::lr_rows`
-            self.backend
-                .to_f16(bb.w_mid, bb.w_mid16, wm, batch, rows, wm, wmp)?;
-            self.backend
-                .to_f16(bb.a_mid, bb.a_mid16, am, batch, rows, am, amp)?;
-            self.backend
-                .to_f16(bb.v_mid, bb.v_mid16, vm, batch, rows, vm, vmp)?;
-            // g 链的 sigmoid 在 chain4 里本来就在 mid 上做（`out = sigmoid(xg) @ G2`），
-            // 这里提前到 f32 的 mid 上，再降位。
-            self.backend
-                .elementwise_sigmoid_inplace(bb.g_mid, gm, batch)?;
-            self.backend
-                .to_f16(bb.g_mid, bb.g_mid16, gm, batch, rows, gm, gmp)?;
+            // #25：二级做「降位补长 → 二级 GEMM → epilogue 落 fp16」，四段 epilogue 与 chain4
+            // 逐式对应（见 `lowrank_epilogue.comp`）。一级 mid 从哪儿来取决于 `LOWRANK_GEMM1`：
+            // 关 = 上面的 SIMT `gemv_int8_rkv_mid_batch` 写好（f32，列维 = 真实 mid）；
+            // 开 = 这里的 coopmat 四链 GEMM 写 `[lr_rows, mid_pad]` 的 f32 累加器（列维补长）。
+            let rows = bb.lr_rows;
+            if lowrank_stage1 {
+                let lr = &self.layers[i];
+                // 一级四链：v/a/g 是纯投影，w 的 tanh 由 `gemm_tanh` 内联，g 的 sigmoid 仍留在
+                // mid 上做（与 SIMT 臂 / prefill 档逐式一致）。
+                self.backend.to_f16_triple(
+                    bb.xw, bb.xa, bb.xg, bb.xw16, bb.xa16, bb.xg16, c, batch, rows, c, c,
+                )?;
+                self.backend
+                    .gemm(bb.xv16, lr.v1_16, bb.v_mid_tc, rows, vmp, c)?;
+                self.backend
+                    .gemm_tanh(bb.xw16, lr.w1_16, bb.w_mid_tc, rows, wmp, c)?;
+                self.backend
+                    .gemm(bb.xa16, lr.a1_16, bb.a_mid_tc, rows, amp, c)?;
+                self.backend
+                    .gemm(bb.xg16, lr.g1_16, bb.g_mid_tc, rows, gmp, c)?;
+                self.backend
+                    .elementwise_sigmoid_inplace(bb.g_mid_tc, gmp, rows)?;
+                self.backend
+                    .to_f16(bb.v_mid_tc, bb.v_mid16, vmp, rows, rows, vmp, vmp)?;
+                self.backend
+                    .to_f16(bb.w_mid_tc, bb.w_mid16, wmp, rows, rows, wmp, wmp)?;
+                self.backend
+                    .to_f16(bb.a_mid_tc, bb.a_mid16, amp, rows, rows, amp, amp)?;
+                self.backend
+                    .to_f16(bb.g_mid_tc, bb.g_mid16, gmp, rows, rows, gmp, gmp)?;
+            } else {
+                self.backend
+                    .to_f16(bb.w_mid, bb.w_mid16, wm, batch, rows, wm, wmp)?;
+                self.backend
+                    .to_f16(bb.a_mid, bb.a_mid16, am, batch, rows, am, amp)?;
+                self.backend
+                    .to_f16(bb.v_mid, bb.v_mid16, vm, batch, rows, vm, vmp)?;
+                // g 链的 sigmoid 在 chain4 里本来就在 mid 上做（`out = sigmoid(xg) @ G2`），
+                // 这里提前到 f32 的 mid 上，再降位。
+                self.backend
+                    .elementwise_sigmoid_inplace(bb.g_mid, gm, batch)?;
+                self.backend
+                    .to_f16(bb.g_mid, bb.g_mid16, gm, batch, rows, gm, gmp)?;
+            }
             let l = &self.layers[i];
             let (w2_16, a2_16, v2_16, g2_16) = (l.w2_16, l.a2_16, l.v2_16, l.g2_16);
             let (w0, a0, v0) = (l.w0, l.a0, l.v0);
@@ -5729,6 +5815,7 @@ impl WorkBuffers {
         };
 
         Ok(Self {
+            lr_rows,
             x: mk_c(&mut *backend)?,
             ln1: mk_c(&mut *backend)?,
             xr: mk_c(&mut *backend)?,
@@ -5738,9 +5825,12 @@ impl WorkBuffers {
             xa: mk_c(&mut *backend)?,
             xg: mk_c(&mut *backend)?,
             prev_x: mk_c(&mut *backend)?,
-            xr16: mk_c16(&mut *backend)?,
-            xk16: mk_c16(&mut *backend)?,
-            xv16: mk_c16(&mut *backend)?,
+            xr16: mk_lr16(&mut *backend, c)?,
+            xk16: mk_lr16(&mut *backend, c)?,
+            xv16: mk_lr16(&mut *backend, c)?,
+            xw16: mk_lr16(&mut *backend, c)?,
+            xa16: mk_lr16(&mut *backend, c)?,
+            xg16: mk_lr16(&mut *backend, c)?,
             r: mk_c(&mut *backend)?,
             k: mk_c(&mut *backend)?,
             v: mk_c16(&mut *backend)?,
@@ -5777,6 +5867,10 @@ impl WorkBuffers {
             w_mid16: mk_lr16(&mut *backend, cfg.w_mid_pad)?,
             a_mid16: mk_lr16(&mut *backend, cfg.a_mid_pad)?,
             g_mid16: mk_lr16(&mut *backend, cfg.g_mid_pad)?,
+            v_mid_tc: mk_lr(&mut *backend, cfg.v_mid_pad)?,
+            w_mid_tc: mk_lr(&mut *backend, cfg.w_mid_pad)?,
+            a_mid_tc: mk_lr(&mut *backend, cfg.a_mid_pad)?,
+            g_mid_tc: mk_lr(&mut *backend, cfg.g_mid_pad)?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
             // W8A8 路径的量化激活/辅助缓冲：容量按 **实际批宽 `bsz`** 算。
             // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
@@ -5824,6 +5918,12 @@ impl WorkBuffers {
             self.xa,
             self.xg,
             self.prev_x,
+            self.xr16,
+            self.xk16,
+            self.xv16,
+            self.xw16,
+            self.xa16,
+            self.xg16,
             self.r,
             self.k,
             self.v,
@@ -5856,6 +5956,10 @@ impl WorkBuffers {
             self.w_mid16,
             self.a_mid16,
             self.g_mid16,
+            self.v_mid_tc,
+            self.w_mid_tc,
+            self.a_mid_tc,
+            self.g_mid_tc,
             self.r2,
             self.xb_q,
             self.xb_aux,

@@ -710,10 +710,13 @@ pub trait ComputeBackend {
         false
     }
 
-    /// 该后端是否支持「一级 SIMT + 二级 fp16 张量核」的低秩链拆法
-    /// （`lowrank_epilogue` + `gemm_bias`/`gemm`，Vulkan 独有）。
-    /// 与 `supports_lowrank_gemm_batch` **互斥使用**：CUDA 两级都在一个 kernel 里，Vulkan 的
-    /// coopmat 只在二级形状上划算（一级窄 N 深 K 实测 0.4~0.6 TOPS，比 SIMT 还慢）。
+    /// 该后端是否支持「低秩链拆到 fp16 张量核」的档（`lowrank_epilogue` +
+    /// `gemm_bias`/`gemm`，Vulkan 独有）。
+    /// 与 `supports_lowrank_gemm_batch` **互斥使用**：CUDA 两级都在一个 kernel 里。
+    /// ⚠️ 老注释说「coopmat 只在二级形状上划算（一级窄 N 深 K 实测 0.4~0.6 TOPS，比 SIMT 还慢）」
+    /// ——那是**块饥饿**的误读：一级形状当时只有 1..5 个块喂 68 个 SM。`gemm_tile_for` 的占用率档
+    /// 修好后同一形状 0.029 ms/次 ≈ 0.118 ms/层，比 SIMT 的 0.274 快 2.3× ⇒ 一级现在也走这里
+    /// （`LOWRANK_GEMM1`，见 `gpu_model.rs::forward_layer_batch` 与记录 §11）。
     fn supports_lowrank_gemm_stage2(&self) -> bool {
         false
     }
