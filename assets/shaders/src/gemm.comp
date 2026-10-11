@@ -62,6 +62,8 @@ layout(constant_id = 38) const uint STRIDE_C_TILE_W = 1048576;
 layout(constant_id = 39) const uint STRIDE_A_BATCH = 0;
 layout(constant_id = 40) const uint STRIDE_B_BATCH = 0;
 layout(constant_id = 41) const uint STRIDE_C_BATCH = 0;
+// 一个 wave 覆盖多少个 m 瓦片；0 ⇒ 保持原来的线性序（x 最快）。
+layout(constant_id = 42) const uint GROUP_SWZ = 0;
 
 #define DIV_CEIL(A, B)          ((A) + (B) - 1) / (B)
 
@@ -182,8 +184,24 @@ uint layout_index_iota(uvec4 shape, uvec4 stride, uint index) {
 
 void main() {
     const uint batch            = gl_WorkGroupID.z;
-    const uint tile_m           = gl_WorkGroupID.x;
-    const uint tile_n           = gl_WorkGroupID.y;
+    uint tile_m                 = gl_WorkGroupID.x;
+    uint tile_n                 = gl_WorkGroupID.y;
+    // 块序 swizzle：启动线性序（x 最快）不动，只把线性 id 重解码成 `group x N` 的蛇形，
+    // 于是一个 wave 同时覆盖 `GROUP_SWZ` 个 m 瓦片与 `wave/GROUP_SWZ` 个 n 瓦片 ⇒ A、B
+    // 两侧**都**在 L2 里被复用。原线性序沿 M 走满一整条才换列，A（rows×K，fp16 可达
+    // 84 MB）被整体重读 `NUM_TILE_N/波宽` 次 —— 这就是 `pf_*` 深 K 形状离屋顶远的原因。
+    // 每个输出元素仍由唯一一个块、按同样的 k 升序算 ⇒ **数值逐位不变**（只有块与块的
+    // 先后关系变了）。host 侧让「一个 group 的 A 足迹 ≈ L2」，并在 A 本来就放得进 L2、
+    // 或 grid 不足两波时置 0（实测那两档反而亏）。
+    if (GROUP_SWZ > 0u) {
+        const uint swz_pid = gl_WorkGroupID.x + gl_WorkGroupID.y * NUM_TILE_M;
+        const uint swz_gsz = min(GROUP_SWZ, NUM_TILE_M);
+        const uint swz_base = (swz_pid / (swz_gsz * NUM_TILE_N)) * swz_gsz;
+        const uint swz_gw = min(swz_gsz, NUM_TILE_M - swz_base);
+        const uint swz_rem = swz_pid - swz_base * NUM_TILE_N;
+        tile_m = swz_base + (swz_rem % swz_gw);
+        tile_n = swz_rem / swz_gw;
+    }
     const uint subtile_m        = layout_iota(uvec2(NUM_SUBTILE_TILE_M, NUM_SUBTILE_TILE_N), gl_SubgroupID).x;
     const uint subtile_n        = layout_iota(uvec2(NUM_SUBTILE_TILE_M, NUM_SUBTILE_TILE_N), gl_SubgroupID).y;
     const uint local_index      = gl_LocalInvocationIndex;

@@ -34,7 +34,11 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.941× (B=1) / 0.945× (B=8) / 0.806× (B=32) / 0.730× (B=64) / 0.690× (B=128) / 0.762× (B=256)** — ★ 8th same-session re-measure, 2026-10-12, 口径 = `power.limit` 300 W with SM clocks drifting 1680…1845; absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54, so the gap is 0.7–1.0 ms/step at low concurrency and 18.2 / 24.0 ms/step at B=128/256. ⚠️ Rows above this one in §6.1 are the 250 W 档 and **cannot be subtracted across 档** (the 5th round read 0.900 / 0.972 / 0.824 / 0.765 / 0.690 / 0.688; in that session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side — credit the group-major layout with its own same-session A/B, **+6.8…9.3 %**, see §6.1 "read the absolutes before the ratios"). Batched prefill is **not** monotonically behind (8th-round same-session six-width pair, §20.2): Vulkan **leads** at B=1/8/32 (2.47× / 1.44× / 1.085×) and trails 6.1 / 12.4 / 16.5 % at B=64/128/256 (0.94 / 0.89 / 0.86×) — the older "0.79…0.84×" was a large-width-only reading. ⇒ **the gap is decode-only; the two stages have different bottlenecks** (§6.1 / §6.6-§6.9).
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.941× (B=1) / 0.945× (B=8) / 0.806× (B=32) / 0.730× (B=64) / 0.690× (B=128) / 0.762× (B=256)** — ★ 8th same-session re-measure, 2026-10-12, 口径 = `power.limit` 300 W with SM clocks drifting 1680…1845; absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54, so the gap is 0.7–1.0 ms/step at low concurrency and 18.2 / 24.0 ms/step at B=128/256. ⚠️ Rows above this one in §6.1 are the 250 W 档 and **cannot be subtracted across 档** (the 5th round read 0.900 / 0.972 / 0.824 / 0.765 / 0.690 / 0.688; in that session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side — credit the group-major layout with its own same-session A/B, **+6.8…9.3 %**, see §6.1 "read the absolutes before the ratios"). Batched prefill is **not** monotonically behind (8th-round same-session six-width pair, §20.2): Vulkan **leads** at B=1/8/32 (2.47× / 1.44× / 1.085×) and trails 6.1 / 12.4 / 16.5 % at B=64/128/256 (0.94 / 0.89 / 0.86×) — the older "0.79…0.84×" was a large-width-only reading. ★ **Superseded in part by §6.11 (same day)**: a
+block-order swizzle in the fp16 GEMM (A panel re-read once per N column under the old linear order) takes
+the clean chunk-loop wall at B=128 from **17.23 → 15.69 s (−8.9 %)** vs a same-session CUDA of 12.98 s,
+i.e. 0.753× → **0.828×**; the six-width ratio row above was taken before it shipped and has not been
+re-run. ⇒ **the gap is decode-only; the two stages have different bottlenecks** (§6.1 / §6.6-§6.9).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -873,7 +877,10 @@ the fixed cost instead of trading chunk count against VRAM. The linked memory it
 
 Remaining: `pf_value` (deep-K, narrow-N: n=2560 gives only 20 blocks along N while k=10240 streams 320
 K-tiles per block) is the one prefill shape still 2.2x behind, and int8 tensor-core prefill is demoted
-behind it - dequant is only 0.9% of the chunk, and fp16 is now at parity. Details:
+behind it - dequant is only 0.9% of the chunk, and fp16 is now at parity. ★ **Update 2026-10-12 (§6.11)**:
+the K=2560 shapes turned out to be bandwidth-bound by the *linear block order*, not by the tile - fixing
+the order moved 4096-row ffn-up 5.667 -> 4.544 ms and killed the row-count cliff entirely. `pf_value` is
+still the open one (0.47 -> 0.52x of cuBLAS). Details:
 [参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md](参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md).
 
 ### 6.7 Chunked-prefill state hand-back on the device (2026-10-11): B=256 0.67x -> **0.79x** of CUDA
@@ -1169,6 +1176,56 @@ ratios are therefore unchanged by this lever. Details (including the void-readin
 **Next lever by these measurements**: `gemm_imma` (≈48 % of the same dump, still in the 14-22 TOPS band
 against ~107 TOPS int8 peak) - which is exactly what §6.8/§6.9 then did, and what actually moved
 end-to-end decode by **+6.8…9.3 %**.
+
+### 6.11 Batched-prefill GEMM block order (2026-10-12): the A panel re-read once per column - prefill chunk **1 077 -> 981 ms**
+
+`gemm.comp` launches `(NUM_TILE_M, NUM_TILE_N)` blocks and the driver dispatches them in linear order
+`pid = x + y·NUM_TILE_M` (x fastest), so one wave (68 SMs here) covers **one full M band before it
+switches N columns**. The A panel (`rows × K × 2 B`) is therefore streamed from DRAM once per N column -
+at 8 192 rows × K=2560 that is 41.9 MB × 80 columns ≈ 3.4 GB of traffic for 430 GFLOP of work, and the
+kernel runs at **23.3 TOPS = 43 % of the card's fp16 tensor peak (≈54)**. The fix is a Triton-style
+group swizzle: `GROUP_SWZ` (spec constant 42) re-decodes that same linear id so a wave spans
+`GROUP_SWZ` M-tiles and `wave/GROUP_SWZ` N-tiles - **both** panels then get reused in L2. Every output
+element still has exactly one writer summing k in the same ascending order ⇒ **bit-identical by
+construction**, and the shipped `g0` (GROUP_SWZ folded to 0) is byte-for-byte the pre-change module.
+
+The host rule has one scale - this card's **6 MB L2**: `g = clamp(floor_pow2(L2/(TILE_M·K·2)), 4, 16)`,
+enabled only when the shape divides, when `A > L2` (nothing to save if A already fits) and when the grid
+spans ≥ 2 waves; `GEMM_SWZ=<n>` is the standing A/B / portability override. It reproduces the measured
+per-shape optimum in all 15 scan cells (g8 for K=2560, g4 for K=10240).
+
+Kernel level (same binary, same module bytes, `GEMM_SWZ=0` vs default, 3 rounds, Δmin - `/c/tmp/swz/ship2`):
+
+| rows | shape | off ms | on ms | Δ | TOPS off -> on | CUDA (same session) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4096 | ffn up 10240×2560 | 5.667 | **4.544** | −19.8 % | 37.9 → 47.3 | 3.815 / 56.3 |
+| 4096 | attn out 2560×2560 | 1.473 | **1.221** | −17.1 % | 36.5 → 44.0 | 1.017 / 52.8 |
+| 4096 | ffn down 2560×10240 | 8.393 | **7.468** | −11.0 % | 25.6 → 28.8 | 3.907 / 55.0 |
+| 8192 | ffn up | 18.435 | **9.078** | −50.8 % | 23.3 → 47.3 | 7.481 / 57.4 |
+| 8192 | attn out | 4.477 | **2.320** | −48.2 % | 24.0 → 46.3 | 2.020 / 53.2 |
+| 8192 | ffn down | 19.339 | **16.501** | −14.7 % | 22.2 → 26.0 | 7.642 / 56.2 |
+
+The six cells the rule deliberately leaves alone (512 rows, plus K=2560 at 1024 rows where
+A = 5.2 MB < L2) moved −0.2…+0.6 % ⇒ that is the null control. `pf_key`'s *off* arm is the mechanism
+proof: 46.5 TOPS at 1024 rows, 37.9 at 4096, 23.3 at 8192 - the cliff is exactly where A crosses L2,
+and the swizzled arm is flat (46.6 / 47.2 / 47.3). **Throughput no longer decays with row count.**
+
+End to end (`PROF_CHUNK` chunk-loop wall, B=128 / PAD_TO=512 / PREFILL_SLOTS=8 ⇒ 4096-row chunks,
+two rounds with rotated order, same-session CUDA at the end): core **17 228.9 -> 15 690.8 ms (−8.9 %)**
+= **−96 ms per chunk**, total 18 535.7 -> 17 055.5 ms, so **Vulkan/CUDA 0.753× -> 0.828×** (the bench's
+contaminated prefill column reads 0.793× -> 0.857× - same direction, and not comparable to §6.7's 0.84×
+because that session's CUDA absolute was 15.3 s vs 16.8 s here). `prefill seeds sum=0x1b9664 xor=0x0` in
+**all six Vulkan runs and both CUDA runs** ⇒ real-weights bit-exactness, and forcing one group size
+everywhere (`GEMM_SWZ=16`) costs +3.7 % over the rule - the per-K choice is real. Gates: `cargo fmt
+--all`, `clippy --all-targets -D warnings`, `BACKEND=vulkan cargo test --release` (batch_parity 10/1
+ignored, ffn_sparse 1, 0 failures). Details:
+[参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md](参考/2026-10-11-Vulkan-prefill-fp16-GEMM瓦片档修正-实施记录.md) §六.
+
+Remaining: ffn-down (deep K, narrow N) is **0.52×** of cuBLAS - at K=10240 one tile column is already
+2.6 MB, so the clamp pins g=4 and the group's A footprint (10.5 MB) still exceeds L2. The next candidate
+is letting the tile chooser and the swizzle cooperate (TILE_M=64 on deep-K shapes makes the formula give
+g=16 and the slab really fit). Decode is untouched by this lever (its GEMMs are `gemm_imma`, and the
+batched-decode low-rank fp16 shapes are all below the A>L2 gate).
 
 ## 7. Layout
 

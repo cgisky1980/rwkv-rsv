@@ -5019,8 +5019,48 @@ fn gemm_grid(app: &App, m: usize, n: usize, k: usize) -> (u32, u32) {
 }
 
 #[allow(non_snake_case)]
-fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 42] {
+fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 43] {
     let (TILE_M, TILE_N, TILE_K) = gemm_tile_for(app, m, n, k);
+    // `GROUP_SWZ` = 一个 wave 覆盖多少个 m 瓦片（0 = 关，保持原线性序）。机制见 `gemm.comp`：
+    // 原序沿 M 走满一整条才换列 ⇒ A（rows×K，fp16）被整体重读「列方向波数」次。档位的唯一
+    // 尺度是**本机 L2 = 6 MB**（改过的 2080 Ti；换卡用 `GEMM_SWZ` 覆盖）：
+    // ① g = `L2 /(TILE_M·K·2)` 向下取 2 的幂、夹到 [4,16] —— 让「一个 group 的 A 足迹 ≈ L2」。
+    //    实测两个 K 的最优档都被它复现：K=2560 ⇒ 8（6.0/0.66=9.2→8），K=10240 ⇒ 4（夹住的）。
+    // ② 只有 A **放不下** L2 才有重读问题（`m·k·2 > L2`）。否则原线性序本来就在 L2 里命中，
+    //    swizzle 只多花反解码：rows=1024/2048 的 pf_key/pf_out（A=5.2/10.5 MB，K=2560）
+    //    在 6 MB 线以下时 +1.6…+3.3 %。
+    // ③ grid 必须跨多波（块数 ≥ 2·68 SM）：不足一波时「沿列重读 A」这回事根本不存在
+    //    —— rows=512 的 pf_value A=10.5 MB 已过线，但只有 80 块 ⇒ +0.5…+1.2 %。
+    // 形状不整除时一律关：内核没有边界检查，而 swizzle 用 `M/TILE_M`（向下取整）反解码，
+    // 与 `div_ceil` 的 grid 会在尾块错开。**env 覆盖也受这条守卫约束**（不整除 ⇒ 恒 0）。
+    let swz_safe = (m as u32).is_multiple_of(TILE_M) && (n as u32).is_multiple_of(TILE_N);
+    const L2_BYTES: usize = 6_000_000;
+    const SM: usize = 68;
+    let group_swz = if !swz_safe {
+        0
+    } else {
+        let blocks = (m / TILE_M as usize) * (n / TILE_N as usize);
+        if m * k * 2 > L2_BYTES && blocks >= 2 * SM {
+            let target = (L2_BYTES / (TILE_M as usize * k * 2).max(1)) as u32;
+            let g = if target == 0 {
+                0
+            } else {
+                1u32 << (31 - target.leading_zeros())
+            };
+            g.clamp(4, 16)
+        } else {
+            0
+        }
+    };
+    // A/B 开关：`GEMM_SWZ=0` 关（恒等序）、`GEMM_SWZ=<g>` 强制某档 —— 同进程换档，不必重编译。
+    let group_swz = if swz_safe {
+        std::env::var("GEMM_SWZ")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(group_swz)
+    } else {
+        0
+    };
     const MAT_M: u32 = 16;
     const MAT_N: u32 = 16;
     const MAT_K: u32 = 16;
@@ -5044,7 +5084,7 @@ fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 42] {
         );
     } else {
         log::info!(
-            "GEMM 瓦片 ({TILE_M},{TILE_N},{TILE_K}) M={m} N={n} K={k} ⇒ grid {}×{} = {} 块",
+            "GEMM 瓦片 ({TILE_M},{TILE_N},{TILE_K}) M={m} N={n} K={k} swz={group_swz} ⇒ grid {}×{} = {} 块",
             m.div_ceil(TILE_M).max(1),
             n.div_ceil(TILE_N).max(1),
             m.div_ceil(TILE_M).max(1) * n.div_ceil(TILE_N).max(1)
@@ -5093,6 +5133,7 @@ fn gemm_spec(app: &App, m: usize, n: usize, k: usize) -> [u32; 42] {
         0,               // 39: STRIDE_A_BATCH
         0,               // 40: STRIDE_B_BATCH
         0,               // 41: STRIDE_C_BATCH
+        group_swz,       // 42: GROUP_SWZ
     ]
 }
 
