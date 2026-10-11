@@ -10,6 +10,9 @@
 //!   DUMP_TOK_STEP=<路径>：STEP 路径逐 token 落盘，格式同 DUMP_TOK。
 //!   SLOT_BENCH=1：量「把一份状态分发给多个槽」的两条做法（宿主往返 vs 设备内广播）。
 //!   BUCKET_BENCH=1：量长度桶预热把多少用户可见延迟挪到启动期（见该块注释）。
+//!   AB_VAR=<门名>：**进程内换档 A/B**（同一进程一次加载模型，按段交替两档测吞吐；
+//!   配 AB_A/AB_B/AB_ROUNDS/AB_SEGS/AB_WARM/AB_RESTART，见该块注释）——建它是为了绕开
+//!   「一档一子进程」那种形态在本机上的 ±8~17 % 进程级交替噪声。
 //!   BENCH_JSON=<路径>：把本次**读数 + 完整门控**追加成一行 JSON（JSONL）。
 //!
 //! ## 为什么有 BENCH_JSON（基准可信度）
@@ -468,6 +471,193 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "warmup_wall_ms": warm_cost_ms,
                 "warmed_first_request_ms": warmed_req_ms,
                 "user_visible_saving_ms": cold_ms - warmed_req_ms,
+            }));
+        }
+
+        // —— 进程内换档 A/B（`AB_VAR=<环境变量名>`）——
+        //
+        // 为什么要有它：`bench_ab` 的形态是「一档一个子进程」，而本机实测存在**按进程交替的
+        // ±8~17 % GPU 时钟态**（2026-10-12 台账 §21：同一二进制只换 env，四臂读数单调走
+        // 47.1→50.0→52.4→57.4 ms/步，连**同档相邻两臂都差 4.8 %**）⇒ 进程级 A/B 的分辨率
+        // 被噪声底吃掉，3~8 % 量级的杠杆根本判不动。这里改成**一个进程、一次模型加载、一次
+        // prefill** 之内按段交替两档：换档粒度 ≈2~4 s，漂移在段尺度上一阶抵消，奇数轮反序、
+        // 两档轮数严格相等（这才叫配对）。
+        //
+        // | 变量 | 默认 | 说明 |
+        // |---|---|---|
+        // | `AB_VAR` | 关 | 要 A/B 的环境变量名（一次一个；必须是**每次 forward 读**的门） |
+        // | `AB_A` / `AB_B` | 空 | 两档取值；空串 = 撤销该变量走默认 |
+        // | `AB_ROUNDS` | 6 | 轮数（每轮 = 两档各一次，奇数轮反序） |
+        // | `AB_SEGS` | 1 | 每档测量几段（每段 NTOK token/槽） |
+        // | `AB_WARM` | 2 | 换档后丢弃几段（图重捕获/缓存回暖） |
+        // | `AB_RESTART` | 0 | 1 = 每档测量前 reset+重 prefill ⇒ 两档从**同一状态**出发，sum/xor 可当数值门 |
+        //
+        // ⚠️ 默认档（不重启）只量**吞吐**：状态在两档之间连续推进，指纹因起点不同而不可比，
+        // 这不是缺陷而是口径 —— 要数值门就 `AB_RESTART=1`（慢约 4×，prefill 占大头）或走 `DUMP_LG`。
+        // ⚠️ 用之前先确认这个门在**本后端真的被读到**：`SKIP_GRAPH` 在 Vulkan 上是空门
+        // （`supports_graph_capture()` 默认 false，只有 CUDA 覆盖），拿它做对照就量到了下面
+        // 那条「中位数把时钟台阶算成档位效应」的假象（空档表见 2026-10-12 台账 §22）。
+        if let Some(name) = std::env::var("AB_VAR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let vals = [
+                std::env::var("AB_A").unwrap_or_default(),
+                std::env::var("AB_B").unwrap_or_default(),
+            ];
+            let rounds: usize = std::env::var("AB_ROUNDS")
+                .unwrap_or_else(|_| "6".into())
+                .parse()?;
+            let ab_segs: usize = std::env::var("AB_SEGS")
+                .unwrap_or_else(|_| "1".into())
+                .parse()?;
+            let ab_warm: usize = std::env::var("AB_WARM")
+                .unwrap_or_else(|_| "2".into())
+                .parse()?;
+            let restart = std::env::var("AB_RESTART").is_ok_and(|v| v != "0");
+            let mut arm_ms: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            let mut arm_fp: [String; 2] = [String::new(), String::new()];
+            for r in 0..rounds {
+                let order = if r % 2 == 0 { [0usize, 1] } else { [1, 0] };
+                for &ai in order.iter() {
+                    let v = &vals[ai];
+                    // SAFETY: 本 example 全程单线程，且此刻没有 forward 在飞（上一次
+                    // `collect_*_batch` 已把 `end_batch()` 收完）；被测门是每次 forward 读，
+                    // 改写点在两段之间 ⇒ 不存在并发读者。
+                    unsafe {
+                        if v.is_empty() {
+                            std::env::remove_var(&name);
+                        } else {
+                            std::env::set_var(&name, v);
+                        }
+                    }
+                    // 绑定标记：回读必须等于要设的值，否则「档位」根本没切上去。
+                    let got = std::env::var(&name).unwrap_or_default();
+                    if got != *v {
+                        log::warn!("[AB] 环境变量回读不一致 want={v:?} got={got:?}");
+                    }
+                    // 起点：重启档 = 重新 prefill（两档同状态），否则接上上一档的末 token。
+                    let mut seeds = if restart {
+                        model.reset_state_of(&bstate)?;
+                        model.forward_seq_batch_padded(&mut bstate, &prompts, pad_to)?
+                    } else {
+                        seg_seed_next.clone()
+                    };
+                    for _ in 0..ab_warm {
+                        let ticket =
+                            model.submit_sample_selfloop_batch(&mut bstate, &seeds, ntok, &sp)?;
+                        let outs = model.collect_sample_selfloop_batch(ticket, slots)?;
+                        for (slot, out) in outs.iter().enumerate() {
+                            if let Some(last) = out.last() {
+                                seeds[slot] = *last;
+                            }
+                        }
+                    }
+                    let t = Instant::now();
+                    let (mut s, mut x) = (0u64, 0u64);
+                    let mut total = 0usize;
+                    for _ in 0..ab_segs {
+                        let ticket =
+                            model.submit_sample_selfloop_batch(&mut bstate, &seeds, ntok, &sp)?;
+                        let outs = model.collect_sample_selfloop_batch(ticket, slots)?;
+                        for (slot, out) in outs.iter().enumerate() {
+                            if let Some(last) = out.last() {
+                                seeds[slot] = *last;
+                            }
+                        }
+                        for &tk in outs.iter().flat_map(|o| o.iter()) {
+                            s = s.wrapping_add(tk as u64);
+                            x ^= tk as u64;
+                        }
+                        total += outs.iter().map(|o| o.len()).sum::<usize>();
+                    }
+                    if !restart {
+                        seg_seed_next = seeds;
+                    }
+                    let secs = t.elapsed().as_secs_f64();
+                    let ms_step = secs * 1000.0 / (total as f64 / slots as f64);
+                    arm_ms[ai].push(ms_step);
+                    arm_fp[ai] = format!("{s:#x}/{x:#x}");
+                    log::info!(
+                        "[AB r{r}{}] {name}={v:?} {ms_step:.2} ms/步（{total} tok / {:.0} ms）\
+                         sum/xor={s:#x}/{x:#x}",
+                        if ai == 0 { " A" } else { " B" },
+                        secs * 1000.0
+                    );
+                }
+            }
+            let med = |v: &[f64]| {
+                let mut s = v.to_vec();
+                s.sort_by(|a, b| a.total_cmp(b));
+                if s.is_empty() {
+                    f64::NAN
+                } else if s.len() % 2 == 1 {
+                    s[s.len() / 2]
+                } else {
+                    (s[s.len() / 2 - 1] + s[s.len() / 2]) / 2.0
+                }
+            };
+            let (ma, mb) = (med(&arm_ms[0]), med(&arm_ms[1]));
+            // ★ **配对统计量取 `min`，不是中位**（2026-10-12 用空档对照实测出来的）：
+            // 两档跑**同一段代码**（`SKIP_GRAPH` 在 Vulkan 上是空门——`supports_graph_capture()`
+            // 默认 false，只有 CUDA 覆盖）的对照读数是 B=8 −2.3 % / B=32 −9.7 % / B=64 −4.0 % /
+            // B=128 −8.3 %（6/6 同号）/ B=256 −0.2 %，而同一 75 s 窗口的 `dmon` 显示 SM 时钟在
+            // **1695~1830 MHz 之间准静态跳变**（1830/1710 = 1.070）⇒ 一次「换档」能维持几十秒，
+            // 于是**中位数把时钟态的台阶算成了档位效应**。改成每档取多轮最小值 = 两档都比
+            // 「各自最好的时钟态」，同一批空档对照立刻降到 −2.3/−2.2/+1.6/−0.6/−0.2 %。
+            // 中位与各轮散布仍然打印——那是时钟态与热的诊断，不是效应量。
+            let min_of = |v: &[f64]| v.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            let (na, nb) = (min_of(&arm_ms[0]), min_of(&arm_ms[1]));
+            let pair_min: Vec<String> = arm_ms[0]
+                .iter()
+                .zip(arm_ms[1].iter())
+                .map(|(a, b)| format!("{:.2}/{:.2}", a, b))
+                .collect();
+            let diffs: Vec<String> = arm_ms[0]
+                .iter()
+                .zip(arm_ms[1].iter())
+                .map(|(a, b)| format!("{:+.1} %", (b - a) * 100.0 / a))
+                .collect();
+            let same_fp = restart && arm_fp[0] == arm_fp[1];
+            log::info!(
+                "[AB 汇总] {name}：A={:?} B={:?} ⇒ **Δmin {:+.2} %**（A {na:.2} / B {nb:.2} ms/步，\
+                 逐轮 min 配对 {}）｜中位 A {ma:.2} / B {mb:.2} ⇒ Δ中位 {:+.2} %（逐轮配对差 {}）\
+                 ｜指纹 {}",
+                vals[0],
+                vals[1],
+                (nb - na) * 100.0 / na,
+                pair_min.join(", "),
+                (mb - ma) * 100.0 / ma,
+                diffs.join(", "),
+                if restart {
+                    if same_fp {
+                        "两档一致（数值门通过）"
+                    } else {
+                        "**两档不一致**（该门改变数值）"
+                    }
+                } else {
+                    "不可比（未重启状态，只量吞吐）"
+                }
+            );
+            bench_json_line(serde_json::json!({
+                "kind": "inproc_ab",
+                "ts": chrono::Local::now().to_rfc3339(),
+                "session": std::env::var("BENCH_SESSION").unwrap_or_else(|_| "solo".into()),
+                "model": model_path,
+                "params": {
+                    "slots": slots, "ntok": ntok, "pad_to": pad_to, "top_k": topk, "temp": temp,
+                    "ab_var": name, "ab_a": vals[0], "ab_b": vals[1], "rounds": rounds,
+                    "segs_per_arm": ab_segs, "warm_per_arm": ab_warm, "restart": restart,
+                },
+                "gating": gating_json(),
+                "readings": {
+                    "a_min_ms_step": na, "b_min_ms_step": nb,
+                    "delta_min_pct": (nb - na) * 100.0 / na,
+                    "a_median_ms_step": ma, "b_median_ms_step": mb,
+                    "delta_median_pct": (mb - ma) * 100.0 / ma,
+                    "a_ms_step": arm_ms[0], "b_ms_step": arm_ms[1],
+                    "a_fp": arm_fp[0], "b_fp": arm_fp[1], "fp_equal": same_fp,
+                },
             }));
         }
 

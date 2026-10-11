@@ -3187,7 +3187,10 @@ impl GpuModel {
         // device 缓冲——两者都零 host↔GPU 同步。
         let use_async = n <= self.backend.sampler_async_rows() / batch.max(1);
         // `SELFLOOP_CHUNK=<k>`（k>0）：非 graph 后端把整段 n 轮**拆成每 k 轮一次 submit**。
-        // 诊断/规避「超长 command buffer 上每步耗时超线性增长」（见 §5K）。
+        // 诊断用（默认 0 = 整段一条 command buffer）。⚠️ 「切段能赚」这一假设已被实测否掉：
+        // NTOK=32 段长上 0 vs 8/16 的进程内 Δmin 配对 = +0.4 %/−0.5 %（B=128）、−0.8 %（B=32），
+        // 全在空档底 ±2 % 内 ⇒ 每 k 轮多付一次 `end_batch/begin_batch` 等待正好抵掉短缓冲的好处
+        // （2026-10-12 台账 §22.6）。要在更长段（NTOK≥128）上重开此题才谈得上改默认。
         let chunk: usize = std::env::var("SELFLOOP_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
