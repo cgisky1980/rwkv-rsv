@@ -59,7 +59,13 @@ layout(constant_id = 4) const uint MASK_WORD_STRIDE = 0; // 0 = 未 specialize�
 // 只有 8 个 workgroup（8 个 SM）。BLOCK_SIZE=256 ⇒ 8 warp/SM（占用率 ~12%）⇒ 每趟全词表
 // 扫描被串行延迟拖到 0.16ms（1.6GB/s，仅为峰值 1/300）。CUDA 侧同源笔记：「不是带宽受限，
 // 而是每次迭代的成本（指令数 + 依赖链）受限」。这里直接加大 workgroup 换取更多 warp。
-const uint BLOCK_SIZE = 256;
+// ★ 块宽可用 `-DSAMPLE_BLOCK=N` 覆盖（A/B 用）：一个 workgroup 只服务一个槽 ⇒ 单槽成本与
+// 批宽**无关**（2026-10-12：256 档 0.574 ms/次，512 档 0.334，B=1 与 B=8 同值）。默认仍 256
+// = 已发货字节；加宽没发货，因为 1.6 % 的预测收益在本机 ±8 % 的每进程交替噪声之下（台账 §21）。
+#ifndef SAMPLE_BLOCK
+#define SAMPLE_BLOCK 256
+#endif
+const uint BLOCK_SIZE = SAMPLE_BLOCK;
 const uint MAX_TOP_P_ITERS = 512;  // top-p 累积迭代上限（防路径退化时死循环）
 const uint SAMP_STRIDE = 10;       // 每 slot 每轮 10 个 f32
 
