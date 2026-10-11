@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.900× (B=1) / 0.972× (B=8) / 0.824× (B=32) / 0.765× (B=64) / 0.690× (B=128) / 0.688× (B=256)** — ⚠️ in that 5th session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side; credit the group-major layout with its own same-session A/B (**+6.8…9.3 %**), see §6.1 "read the absolutes before the ratios", batched prefill 0.79…0.84× (2026-10-11 same-session re-measures through the 5th round, §6.1 / §6.6-§6.9; the older 0.27×-at-B=256 row predates that chain and was already stale when written — the 5th round measures B=256 directly).
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.941× (B=1) / 0.945× (B=8) / 0.806× (B=32) / 0.730× (B=64) / 0.690× (B=128) / 0.762× (B=256)** — ★ 8th same-session re-measure, 2026-10-12, 口径 = `power.limit` 300 W with SM clocks drifting 1680…1845; absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54, so the gap is 0.7–1.0 ms/step at low concurrency and 18.2 / 24.0 ms/step at B=128/256. ⚠️ Rows above this one in §6.1 are the 250 W 档 and **cannot be subtracted across 档** (the 5th round read 0.900 / 0.972 / 0.824 / 0.765 / 0.690 / 0.688; in that session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side — credit the group-major layout with its own same-session A/B, **+6.8…9.3 %**, see §6.1 "read the absolutes before the ratios"). Batched prefill is **not** monotonically behind (8th-round same-session six-width pair, §20.2): Vulkan **leads** at B=1/8/32 (2.47× / 1.44× / 1.085×) and trails 6.1 / 12.4 / 16.5 % at B=64/128/256 (0.94 / 0.89 / 0.86×) — the older "0.79…0.84×" was a large-width-only reading. ⇒ **the gap is decode-only; the two stages have different bottlenecks** (§6.1 / §6.6-§6.9).
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
 - **Research-oriented**: CPU fp32 reference, DIAG three-way check, logits comparison, teacher-forced Top-1 agreement, and more.
@@ -184,7 +184,8 @@ Vulkan B=128 decode went 967.4 -> **1 626.9 tok/s (+68 %)** while CUDA stayed in
 (3 367.6 -> 3 440.8), so the 2026-10-11 chain (§6.3 rkv flip + §6.4 `gemm_imma` fetch structure + §6.5
 v-chain split-K) is worth **+0.18x** at B=128 and **+0.20x** at B=32. Cross-backend fingerprints still
 diverge (expected - different kernel implementations, see the 口径 note in
-`tests/batch_parity.rs`). **Decode remains the largest open gap** (prefill is at 0.79x, §6.7), and it is
+`tests/batch_parity.rs`). **Decode remains the largest open gap** (prefill now *leads* at B≤32 and is
+0.86–0.94× at B≥64, §20.2 of the 2026-10-11 ledger), and it is
 still *widening* with B.
 
 **Re-measured again the same day after §6.8** (packed `gemm_imma` smem staging; session
