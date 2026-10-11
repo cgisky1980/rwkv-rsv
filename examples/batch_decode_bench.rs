@@ -580,6 +580,14 @@ fn gating_json() -> serde_json::Value {
         "LOWRANK_GEMM1": knob("LOWRANK_GEMM1", "开（随二级门）—— Vulkan 低秩一级 coopmat fp16，SIMT mid 臂整条退役"),
         "PROF_LOW": knob("PROF_LOW", "关 —— 每次 forward 第 0 层打一条 gemm/stage2/stage1/lr_rows 标记"),
         "GEMM_MIN_BLOCKS": knob("GEMM_MIN_BLOCKS", "32 —— coopmat 瓦片占用率档下限（0 关掉）"),
+        "GEMM_SK": knob(
+            "GEMM_SK",
+            "关（未设 = ks=1，一级 coopmat 不分块）—— 安静窗实测是 wash，只在被抢占的慢窗赚 34~41 %，见记录 §12.3"
+        ),
+        "LOWRANK_MIN": knob(
+            "LOWRANK_MIN",
+            "64 —— 一级 coopmat 档的批宽门限（只是「批宽该不该收进来」的 A/B 仪器）"
+        ),
         "VK_IMMA_OPS": knob("VK_IMMA_OPS", "全开（含 rkv，2026-10-10 翻转）"),
         "VK_IMMA": knob("VK_IMMA", "开 —— Vulkan W8A8 张量核 GEMM；但受 `imma_ok` 的 batch 门约束，见下"),
         "VK_IMMA_NST": knob("VK_IMMA_NST", "按 batch 自动（≥ceil(batch/8) 的最小 2 的幂，上限 8）"),

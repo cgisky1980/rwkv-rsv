@@ -227,6 +227,14 @@ fn main() {
             AFFINE => [none(""), flag("affine")],
             ACTIVATION => [none(""), def(1, "relu2"), def(2, "tanh")],
         },
+        // split-K coopmat fp16 GEMM（低秩一级那类「窄 N、深 K」形状的加块臂）+ 它的确定性归约。
+        // 类型写死在 .comp 里（fp16 进 / fp32 出），故只出一条 spv，不进 gemm 的变体矩阵。
+        "gemm_splitk" => "src/gemm_splitk.comp" => {
+            TYPE => [none("")],
+        },
+        "gemm_splitk_reduce" => "src/gemm_splitk_reduce.comp" => {
+            TYPE => [none("")],
+        },
         "gemm_bias" => "src/gemm_bias.comp" => {
             TYPE => [none("")],
         },

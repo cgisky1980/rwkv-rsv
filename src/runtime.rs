@@ -2893,6 +2893,95 @@ impl Runtime {
         Ok(())
     }
 
+    /// split-K 的 k 分块数（`gemm_splitk` 用）。★ **默认不分块**（`GEMM_SK` 未设 ⇒ ks=1）：
+    /// 2026-10-11 ② 在安静窗的同会话三对 A/B 判定这条臂**不是吞吐杠杆**（记录 §12.3）——
+    /// B=128 `ks=4` vs 不分块 = +1.2 % / −0.6 % / +6.7 %（噪声底 ±3 %），B=64 = +2.9 % /
+    /// −3.0 % / +8.2 %（符号都不一致），而自动档 `ks=8` 在 B=128 上还有两对是**净亏**
+    /// （−16.6 % / +3.3 %）。块饥饿在这块卡上买不回来：多出来的 partial 写出 + 归约那一趟
+    /// 与省下的串行 k 循环同量级，还倒贴 4 条 dispatch/层（本仓与 CUDA 的差距之一正是
+    /// dispatch 数）。
+    /// 唯一测到的收益区是**被抢占的慢窗**：同形状在干扰期 `ks=4` 快 34~41 %（块多 ⇒ 抢占后
+    /// 重新铺满更快）⇒ 保留为按负载切换的档位，而不是默认。
+    /// `GEMM_SK=n` 强制 ks=n（`n ≥ 2`；仍受两条安全约束——`nk % n == 0` 且 `blocks < 32`，
+    /// 不满足就退回不分块，因为这两种情况下切开只多花一趟 partial）。`GEMM_SK=0` = 显式不分块。
+    fn gemm_splitk_ks(blocks: usize, nk: usize) -> usize {
+        let want = std::env::var("GEMM_SK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        if want <= 1 || blocks >= 32 || nk < want || !nk.is_multiple_of(want) {
+            return 1;
+        }
+        want
+    }
+
+    /// split-K 版 tensor-core GEMM：`C = op(A[M,K] @ B[N,K]^T)`，窄形状时沿 K 加块。
+    ///
+    /// `op`：0 = 覆盖写、1 = tanh。`ks == 1` 时**整条退回** `gemm`/`gemm_tanh`（不发 reduce）；
+    /// `ks > 1` 时 GEMM 把部分和写进 `partial[ks][M][N]`，由 `gemm_splitk_reduce.spv` 按 ks
+    /// 升序求和并在**求和之后**施加 op（这是它与「每段各自 tanh 再相加」的本质区别）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_splitk(
+        &mut self,
+        a: &GpuTensor16,
+        b: &GpuTensor16,
+        partial: &mut GpuTensor,
+        c: &mut GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        op: u32,
+    ) -> R<()> {
+        let (tm, tn, tk) = gemm_tile_for(&self.app, m, n, k);
+        let blocks = m.div_ceil(tm as usize).max(1) * n.div_ceil(tn as usize).max(1);
+        let ks = Self::gemm_splitk_ks(blocks, k / tk.max(1) as usize);
+        if ks <= 1 {
+            return if op == 1 {
+                self.gemm_tanh(a, b, c, m, n, k)
+            } else {
+                self.gemm(a, b, c, m, n, k)
+            };
+        }
+        let mut spec = [0u32; 43];
+        spec[..42].copy_from_slice(&gemm_spec(&self.app, m, n, k));
+        // ★ STRIDE_C_BATCH 在这里不是批 stride，而是**一个 partial 槽的元素数**（M×N），
+        //   且槽号 = `gl_WorkGroupID.z` 原值（grid.z = ks，批维恒 0）。
+        spec[41] = (m * n) as u32;
+        spec[42] = ks as u32;
+        let params = [
+            a.device.address,
+            b.device.address,
+            0,
+            partial.device.address,
+        ];
+        let gx = m.div_ceil(tm as usize).max(1) as u32;
+        let gy = n.div_ceil(tn as usize).max(1) as u32;
+        // 绑定标记（GPU 测量纪律）：这条臂开没开必须能在同一份日志里读出来。
+        log::info!(
+            "[split-K] M={m} N={n} K={k} 瓦片 ({tm},{tn},{tk}) 块 {blocks} ⇒ ks={ks} = {} 块 + reduce(op={op})",
+            blocks * ks
+        );
+        self.record_kernel(
+            "shaders/spv/gemm_splitk.spv",
+            &spec,
+            &params,
+            (gx, gy, ks as u32),
+            &[a.device.buffer, b.device.buffer],
+            &[partial.device.buffer],
+        )?;
+        let elems = m * n;
+        let rspec = [elems as u32, ks as u32, op];
+        let rparams = [partial.device.address, c.device.address];
+        self.record_kernel(
+            "shaders/spv/gemm_splitk_reduce.spv",
+            &rspec,
+            &rparams,
+            (elems.div_ceil(256).max(1) as u32, 1, 1),
+            &[partial.device.buffer],
+            &[c.device.buffer],
+        )
+    }
+
     // ===== Norm 算子 =====
 
     /// Layer/Group Norm with affine（gamma、beta 跨 batch 共享）

@@ -1308,6 +1308,31 @@ pub trait ComputeBackend {
         n: usize,
         k: usize,
     ) -> R<()>;
+    /// C[M,N] = op(A[M,K] @ B[N,K]^T)（fp16 进 / f32 出），**窄形状时沿 K 加块**。
+    ///
+    /// 存在的唯一理由是中低秩投影那类「N 很小、K 很深」的形状：瓦片切到最细也只有几个块，
+    /// 喂不满 SM（记录 §11.3：一级四条链在 `(64,32,64)` 下只有 4/8/20 块）。后端可以自行
+    /// 决定分不分块；分块时 `partial` 作 `[ks][M][N]` 的部分和暂存（容量需 ≥ ks×M×N），
+    /// 求和之后才施加 `op`。`op`：0 = 覆盖写、1 = tanh。
+    /// 默认实现 = 不分块（直接 `gemm`/`gemm_tanh`），语义逐位等价于 `ks = 1`。
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_splitk(
+        &mut self,
+        a: TensorId,
+        b: TensorId,
+        _partial: TensorId,
+        c: TensorId,
+        m: usize,
+        n: usize,
+        k: usize,
+        op: u32,
+    ) -> R<()> {
+        if op == 1 {
+            self.gemm_tanh(a, b, c, m, n, k)
+        } else {
+            self.gemm(a, b, c, m, n, k)
+        }
+    }
     /// y = exp(a * b[0])（b 为每 batch 一个标量；f32）。
     #[allow(clippy::too_many_arguments)]
     fn elementwise_scale_exp(
@@ -2847,6 +2872,30 @@ impl ComputeBackend for VulkanBackend {
         let b_g = self.get_f16(b, "gemm_tanh")?;
         let res = self.rt.gemm_tanh(&a_g, &b_g, &mut c_o, m, n, k);
         self.put_f32(c, c_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_splitk(
+        &mut self,
+        a: TensorId,
+        b: TensorId,
+        partial: TensorId,
+        c: TensorId,
+        m: usize,
+        n: usize,
+        k: usize,
+        op: u32,
+    ) -> R<()> {
+        let mut c_o = self.take_f32(c, "gemm_splitk")?;
+        let mut p_o = self.take_f32(partial, "gemm_splitk")?;
+        let a_g = self.get_f16(a, "gemm_splitk")?;
+        let b_g = self.get_f16(b, "gemm_splitk")?;
+        let res = self
+            .rt
+            .gemm_splitk(&a_g, &b_g, &mut p_o, &mut c_o, m, n, k, op);
+        self.put_f32(c, c_o);
+        self.put_f32(partial, p_o);
         res
     }
 

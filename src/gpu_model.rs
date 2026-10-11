@@ -416,6 +416,10 @@ pub struct WorkBuffers {
     w_mid_tc: TensorId,
     a_mid_tc: TensorId,
     g_mid_tc: TensorId,
+    /// 一级 coopmat 档 split-K 的部分和暂存（`[ks][lr_rows][mid_pad]`，容量按 ks=8 与最宽
+    /// mid_pad 一次到位 ≈1.3 MB）。四条链**串行**共用这一张（GEMM 写完立刻由归约读走，
+    /// 同一队列线性顺序 ⇒ 复用安全），与 `imma_partial` 分开是为了让两条臂各自可独立关掉。
+    lr_pk: TensorId,
     r2: TensorId, // [FFN_HIDDEN]
     /// W8A8 张量核路径的量化激活与每组统计。**固定按 8 槽容量分配**：IMMA 的 BN=8 一次覆盖
     /// 全部槽，batch < 8 时多读的槽是陈旧数据（`gemm_imma.comp` 按 BATCH 守卫丢弃输出）。
@@ -2446,8 +2450,14 @@ impl GpuModel {
         // 而 `(64,32,64)` 瓦片在 N=64/128/320 上只有 **4/8/20 个块**喂 68 个 SM；batch=32 时
         // SIMT mid 臂本来就只做 32 行（≈2.7 ms/步），张量核那份固定开销盖不住。
         // B=64 记为「打平所以纳入」，安静会话复测后可以把这档单独挪到 128。
+        // 门限可由 `LOWRANK_MIN=n` 就地改档——它是「批宽该不该收进来」这一个问题唯一的仪器
+        // （每试一个批宽重构建一次太贵；接了 split-K 之后 32/48 这两档值得重测，见记录 §12.3）。
+        let stage1_min_batch = std::env::var("LOWRANK_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
         let lowrank_stage1 = lowrank_stage2
-            && batch >= 64
+            && batch >= stage1_min_batch
             && std::env::var("LOWRANK_GEMM1")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -2697,14 +2707,46 @@ impl GpuModel {
                 self.backend.to_f16_triple(
                     bb.xw, bb.xa, bb.xg, bb.xw16, bb.xa16, bb.xg16, c, batch, rows, c, c,
                 )?;
-                self.backend
-                    .gemm(bb.xv16, lr.v1_16, bb.v_mid_tc, rows, vmp, c)?;
-                self.backend
-                    .gemm_tanh(bb.xw16, lr.w1_16, bb.w_mid_tc, rows, wmp, c)?;
-                self.backend
-                    .gemm(bb.xa16, lr.a1_16, bb.a_mid_tc, rows, amp, c)?;
-                self.backend
-                    .gemm(bb.xg16, lr.g1_16, bb.g_mid_tc, rows, gmp, c)?;
+                self.backend.gemm_splitk(
+                    bb.xv16,
+                    lr.v1_16,
+                    bb.lr_pk,
+                    bb.v_mid_tc,
+                    rows,
+                    vmp,
+                    c,
+                    0,
+                )?;
+                self.backend.gemm_splitk(
+                    bb.xw16,
+                    lr.w1_16,
+                    bb.lr_pk,
+                    bb.w_mid_tc,
+                    rows,
+                    wmp,
+                    c,
+                    1,
+                )?;
+                self.backend.gemm_splitk(
+                    bb.xa16,
+                    lr.a1_16,
+                    bb.lr_pk,
+                    bb.a_mid_tc,
+                    rows,
+                    amp,
+                    c,
+                    0,
+                )?;
+                self.backend.gemm_splitk(
+                    bb.xg16,
+                    lr.g1_16,
+                    bb.lr_pk,
+                    bb.g_mid_tc,
+                    rows,
+                    gmp,
+                    c,
+                    0,
+                )?;
                 self.backend
                     .elementwise_sigmoid_inplace(bb.g_mid_tc, gmp, rows)?;
                 self.backend
@@ -5871,6 +5913,15 @@ impl WorkBuffers {
             w_mid_tc: mk_lr(&mut *backend, cfg.w_mid_pad)?,
             a_mid_tc: mk_lr(&mut *backend, cfg.a_mid_pad)?,
             g_mid_tc: mk_lr(&mut *backend, cfg.g_mid_pad)?,
+            // split-K 暂存：ks 上限 8 × 最宽 mid_pad × lr_rows（`mk_lr` 的行维就是这个）。
+            lr_pk: mk_lr(
+                &mut *backend,
+                8 * cfg
+                    .v_mid_pad
+                    .max(cfg.w_mid_pad)
+                    .max(cfg.a_mid_pad)
+                    .max(cfg.g_mid_pad),
+            )?,
             r2: mk(&mut *backend, cfg.ffn_hidden)?,
             // W8A8 路径的量化激活/辅助缓冲：容量按 **实际批宽 `bsz`** 算。
             // K 取 `max(c, ffn_hidden)`——ffn.value 的收缩维是 fh（10240），比 c 长。
@@ -5960,6 +6011,7 @@ impl WorkBuffers {
             self.w_mid_tc,
             self.a_mid_tc,
             self.g_mid_tc,
+            self.lr_pk,
             self.r2,
             self.xb_q,
             self.xb_aux,
