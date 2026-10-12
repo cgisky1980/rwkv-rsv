@@ -11,20 +11,22 @@
 
 ## At a glance (2026-10-12)
 
-Same-session, paired, 4 interleaved rounds (order reversed between rounds), `power.limit` 300 W, RWKV-7 Goosed g1h-3B int8. **Absolute numbers; the ratio is derived from them, not the other way round.**
+Same-session, paired, 4 interleaved rounds (order reversed between rounds), `power.limit` 300 W, RWKV-7 Goosed g1h-3B int8. **Throughput in tokens/s (the number a user feels); ms/step stays in §6.2 as the engineering gap. Absolute numbers first - the ratio is derived from them, not the other way round.**
 
-| Path | Vulkan | CUDA | Vulkan / CUDA | Plain verdict |
+| Path | Vulkan tok/s | CUDA tok/s | Vulkan / CUDA | Plain verdict |
 |---|---|---|---|---|
-| **Single stream, 1 token at a time** (what the desktop client does) | **8.842 ms/token** | 10.131 ms/token | **1.15×** | Vulkan is faster |
-| Batched decode B=1 | 9.85 ms/step | 11.37 ms/step | **1.16×** | faster |
-| Batched decode B=8 | 11.73 ms/step | 14.11 ms/step | **1.20×** | faster |
-| Batched decode B=32 | 18.23 ms/step | 18.41 ms/step | **1.01×** | tie |
-| Batched decode B=64 | 29.07 ms/step | 24.52 ms/step | 0.84× | 4.55 ms/step behind |
-| Batched decode B=128 | 52.61 ms/step | 39.77 ms/step | 0.76× | 12.84 ms/step behind |
-| Batched decode B=256 | 96.64 ms/step | 75.86 ms/step | 0.79× | 20.78 ms/step behind |
-| Batched prefill B=1 … 256 | 768 / 2 373 / 5 613 / 9 994 / 19 350 / 39 195 ms | 2 721 / 4 284 / 8 123 / 12 445 / 22 084 / 42 561 ms | **3.55× … 1.09×** | faster at **all six** widths |
+| **Single stream, 1 token at a time** (what the desktop client does) | **113.1** | 98.7 | **1.15×** | **+14.4 tok/s** |
+| Batched decode B=1 | **101.6** | 87.9 | **1.16×** | +13.7 tok/s |
+| Batched decode B=8 | **681.6** | 566.9 | **1.20×** | +114.7 tok/s |
+| Batched decode B=32 | **1 754.8** | 1 737.8 | **1.01×** | +17.0 tok/s (tie) |
+| Batched decode B=64 | 2 201.1 | 2 610.5 | 0.84× | −409.4 tok/s |
+| Batched decode B=128 | 2 432.4 | 3 218.3 | 0.76× | −785.9 tok/s |
+| Batched decode B=256 | 2 648.9 | 3 374.7 | 0.78× | −725.8 tok/s |
+| Batched prefill B=1 / 8 / 32 / 64 / 128 / 256 | **667 / 1 726 / 2 919 / 3 279 / 3 387 / 3 344** | 188 / 956 / 2 017 / 2 633 / 2 968 / 3 080 | **3.55× / 1.81× / 1.45× / 1.25× / 1.14× / 1.09×** | faster at **all six** widths |
 
-So: **one stream and small batches are won; long prompts are won; wide-batch decode is still behind, and it is behind by one kernel.** At B=128 the int8 tensor-core GEMM alone costs 23.90 ms of a 46.19 ms GPU-busy step — more than the entire 12.84 ms gap. Details: §6.
+⚠️ The prefill column divides the **padded** token count (every slot is computed to `T_pad=512`) by the whole preparation window, which also contains batch-state creation and one warmup segment - so it is a **floor**, on a protocol identical for both backends. The prompts themselves are 104 - 139 tokens, so 4 - 5× of that work is padding (§9).
+
+So: **one stream and small batches are won; long prompts are won; wide-batch decode is still behind, and it is behind by one kernel.** At B=128 the int8 tensor-core GEMM alone costs 23.90 ms of a 46.19 ms GPU-busy step — more than the entire 12.84 ms/step gap that the −785.9 tok/s comes from. Details: §6.
 
 ## Contents
 
@@ -53,9 +55,9 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 ## 2. Design Goals
 
 - **Portability first, with the cost stated honestly.** Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured on the same card, in the same session, against this repo's own CUDA backend:
-  - **Low concurrency — where real apps live — Vulkan is ahead**: 1.15× on the single-stream path the desktop client uses, 1.16× / 1.20× at B=1 / B=8, a tie at B=32.
-  - **Wide-batch decode it is behind**: 0.84× / 0.76× / 0.79× at B=64 / 128 / 256.
-  - **Batched prefill it is ahead at every width** (3.55× → 1.09×), with byte-identical seeds between backends.
+  - **Low concurrency — where real apps live — Vulkan is ahead**: 113.1 vs 98.7 tok/s (+14.4) on the single-stream path the desktop client uses, +13.7 / +114.7 tok/s at B=1 / B=8 (1.15× / 1.20×), a tie at B=32.
+  - **Wide-batch decode it is behind**: −409 / −786 / −726 tok/s at B=64 / 128 / 256 (0.84× / 0.76× / 0.79×). Vulkan's decode throughput stops climbing at ~2 650 tok/s while CUDA reaches 3 375.
+  - **Batched prefill it is ahead at every width** (667 vs 188 tok/s at B=1 up to 3 344 vs 3 080 at B=256; 3.55× → 1.09×), with byte-identical seeds between backends.
   - The remainder is **not** spread across the engine: §6.6 attributes it to a single kernel.
 - **Two quantization paths coexist**: fp16 (lossless reference) / int8 (near-lossless), auto-routed by model file, one binary for all.
 - **Runtime-compiled shaders**: `build.rs` compiles `*.comp` → SPIR-V via `glslangValidator` at build time; `constant_id` enables cross-hardware adaptation.
@@ -158,7 +160,7 @@ Hardware for every number here: one **RTX 2080 Ti** (68 SM, 616 GB/s measured DR
 
 **Which quantization path to pick**: int8 — 41 % less VRAM, 98.8 % top-1 agreement versus the CPU fp32 reference (§6.4), and it is the path every tensor-core and batched-decode arm is built on (an fp16 model cannot do batched decode at all, §9). fp16 stays the lossless reference and the format a plain `.st` loads as. The old head-to-head throughput pair (2026-08, not interleaved) read int8 ≈ **+32 % (Vulkan) / +36 % (CUDA)** over fp16; it has not been re-measured since, so treat it as orientation, not as a current number.
 
-All rows below are **same-session, both backends interleaved, order reversed between rounds, ≥ 4 rounds, matched-round medians** unless stated. Ratios are CUDA/Vulkan throughput, so **> 1.0 means Vulkan is faster**. `power.limit` 300 W (that is the shipping 档).
+All rows below are **same-session, both backends interleaved, order reversed between rounds, ≥ 4 rounds, matched-round medians** unless stated. Ratios are **Vulkan tok/s ÷ CUDA tok/s**, so **> 1.0 means Vulkan is faster**. `power.limit` 300 W (that is the shipping 档).
 
 ### 6.1 The path the desktop client actually uses (one stream)
 
@@ -166,8 +168,8 @@ The six-width table in §6.2 runs *B=1 through the batched kernel*; the desktop 
 
 | 口径 | Vulkan | CUDA | ratio |
 |---|---|---|---|
-| matched-round median (4 rounds) | **8.842 ms/token** (113.1 tok/s) | 10.131 ms/token (98.7 tok/s) | **1.146×** |
-| Δmin (best-of-rounds) | 8.696 ms/token | 10.070 ms/token | 1.158× |
+| matched-round median (4 rounds) | **113.1 tok/s** (8.842 ms/token) | 98.7 tok/s (10.131 ms/token) | **1.146×** |
+| Δmin (best-of-rounds) | 115.0 tok/s (8.696 ms/token) | 99.3 tok/s (10.070 ms/token) | 1.158× |
 | round-to-round spread | **1.9 %** | 14.9 % | — |
 
 **Vulkan is ahead by 1.29 – 1.37 ms per token**, every one of the 4 rounds ≥ 1.14×, so the direction does not depend on one cell. All 8 arms printed the **same order-sensitive fingerprint** `sum=0x278a9c xor=0x7354 mix=0xcfeeb6baaf81b753` ⇒ the two backends are bit-identical on this path. CUDA's 14.9 % spread was one round reading 86.4 tok/s while the card moved 46 → 62 ℃.
@@ -178,14 +180,16 @@ For orientation only (**cross-session, never subtractable**): this same cell rea
 
 Build = archive §6.23's windowed submits **on by default**. Protocol: `SEGS=4 NTOK=32 PAD_TO=512 WARMUP=1 SKIP_SINGLE=1 PROMPT_REPEAT=6 TOPK=1 PREFILL_SLOTS=8 TEMP=1`, six widths × 4 rounds, all 48 arms clean.
 
-| Width | Vulkan ms/step | CUDA ms/step | Δ (Vulkan − CUDA) | CUDA / Vulkan | vs 11th round |
-|---|---|---|---|---|---|
-| B=1 | **9.85** | 11.37 | **−1.52** | **1.155** | 0.914 → 1.155 |
-| B=8 | **11.73** | 14.11 | **−2.38** | **1.202** | 0.971 → 1.202 |
-| B=32 | **18.23** | 18.41 | **−0.18** | **1.010** | 0.808 → 1.010 |
-| B=64 | 29.07 | 24.52 | +4.55 | 0.843 | 0.741 → 0.843 |
-| B=128 | 52.61 | 39.77 | +12.84 | 0.756 | 0.708 → 0.756 |
-| B=256 | 96.64 | 75.86 | +20.78 | 0.785 | 0.753 → 0.785 |
+| Width | Vulkan tok/s | CUDA tok/s | Vulkan / CUDA | Vulkan ms/step | CUDA ms/step | Δ ms/step | 11th → 12th (ratio) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| B=1 | **101.6** | 87.9 | **1.155** | **9.85** | 11.37 | **−1.52** | 0.914 → 1.155 |
+| B=8 | **681.6** | 566.9 | **1.202** | **11.73** | 14.11 | **−2.38** | 0.971 → 1.202 |
+| B=32 | **1 754.8** | 1 737.8 | **1.010** | **18.23** | 18.41 | **−0.18** | 0.808 → 1.010 |
+| B=64 | 2 201.1 | 2 610.5 | 0.843 | 29.07 | 24.52 | +4.55 | 0.741 → 0.843 |
+| B=128 | 2 432.4 | 3 218.3 | 0.756 | 52.61 | 39.77 | +12.84 | 0.708 → 0.756 |
+| B=256 | 2 648.9 | 3 374.7 | 0.785 | 96.64 | 75.86 | +20.78 | 0.753 → 0.785 |
+
+The tok/s column is the log's own aggregate (`segs × NTOK × B` tokens over the measured decode window); ms/step is the same reading divided by steps, and it is the column the gap analysis uses, because the gap is a fixed cost per step. **Vulkan's throughput saturates at ~2 650 tok/s from B=64 on while CUDA keeps climbing to 3 375** — that plateau, not a per-token penalty, is what "0.76×" means.
 
 **The three low widths crossed 1.0 inside one session** (every round ≥ 1.12 at B=1, ≥ 1.18 at B=8, three positive + one tie at B=32). That is exactly the signature the lever predicts: a **fixed** ms/step saved on host recording is ~20 % of a 9.9 ms step and ~4 % of a 96 ms one.
 
@@ -199,9 +203,13 @@ No code changed for this round; the numbers are the same-session pair behind §6
 
 | Width | B=1 | B=8 | B=32 | B=64 | B=128 | B=256 |
 |---|---|---|---|---|---|---|
-| Vulkan (ms) | **768** | **2 373** | **5 613** | **9 994** | **19 350** | **39 195** |
-| CUDA (ms) | 2 721 | 4 284 | 8 123 | 12 445 | 22 084 | 42 561 |
+| Vulkan **tok/s** | **667** | **1 726** | **2 919** | **3 279** | **3 387** | **3 344** |
+| CUDA **tok/s** | 188 | 956 | 2 017 | 2 633 | 2 968 | 3 080 |
+| Vulkan ms (raw window) | **768** | **2 373** | **5 613** | **9 994** | **19 350** | **39 195** |
+| CUDA ms (raw window) | 2 721 | 4 284 | 8 123 | 12 445 | 22 084 | 42 561 |
 | Vulkan / CUDA | **3.55×** | **1.81×** | **1.45×** | **1.25×** | **1.14×** | **1.09×** |
+
+tok/s here = `B × 512` padded tokens over the whole preparation window (batch-state creation and one warmup segment included) ⇒ a **floor**, same protocol both arms. Since the prompts are 104 - 139 tokens but padded to 512, most of this throughput is spent on padding (§9); the shape of the curve - Vulkan rising to ~3 400 tok/s while CUDA reaches 3 080 - is the honest part, not the absolute.
 
 Vulkan leads at **every** width, and the six prefill seed fingerprints are **byte-identical** between backends (`0x4021` / `0x1bd0d` / `0x6e599` / `0xdcb32` / `0x1b9664` / `0x372cc8`). This retires two older framings ("prefill lags further than decode", "CUDA takes over at B ≥ 64") — the crossover was fixed by one tile-selection change plus a block-order swizzle (archive §6.6, §6.13 – §6.15).
 
