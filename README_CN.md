@@ -1045,11 +1045,58 @@ B=1 刚好在地板边上 ⇒ 这一格发货的依据是**结构判据（4 次�
 ⚠️ 顺带一条同样重要的事实（也是这件事值得做的理由）：**逐步路径天生比自循环慢**
 （B=1：合并后 12.0 ms/步，而 §6.1 的自循环口径 11.62 ms/步）—— 每一步都要付一次宿主往返。
 这一格修掉的不是「要不要付」，而是它以前**要付四遍**。
-📌 同一根杠杆上还剩的格（按体量）：`State::slot_move` / `slot_broadcast`（97 次设备内 `copy_range`，
-每次一条 command buffer + 一次提交/等待 —— 连续批调度每迁移一个槽付一遍）、自循环里的批内采样器上传
-（`gpu_model.rs:3360`）、变长 seq 路径那对 `upload_u32`（`lens_t` + `tok`，`gpu_model.rs:1418`/`1422`）。
+📌 同一根杠杆上还剩的格：`State::slot_move` / `slot_broadcast`（97 次设备内 `copy_range`，每次一条
+command buffer + 一次提交/等待 —— 连续批调度每迁移一个槽付一遍）—— **已由本文 §6.13 做完**；
+变长 seq 路径那对 `upload_u32`（`lens_t` + `tok`，`gpu_model.rs:1418`/`1422`）。
+⚠️ 这一节最初列的第三格「自循环里的批内采样器上传（`gpu_model.rs:3360`）」**在 Vulkan 上不存在**：
+那一行是 `!use_async` 的兜底分支，而 Vulkan 的 `sampler_async_rows()` = `usize::MAX / 64` ⇒ `use_async`
+恒为真，采样器参数是直接写进 host-visible 行的（`store_sampler_row`），**一次提交都不付**。
 英文 README §6.17；原始数据 `/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`，窗口计数
 `/c/tmp/ac16/profsub_{1,0}.log`，台账 §6.17。
+
+### 6.13 槽位迁移/广播：97×目标数 次提交 → 1 次（2026-10-12，任务 #73）
+
+宿主同步这根杠杆的第四格（§6.10 清零 → §6.11 读回/回灌 → §6.12 逐步解码 → 这一格）。
+`State::slot_move` = `3·层数 + 1` = **97** 次设备内 `copy_range`；往 *k* 个目标做 `slot_broadcast`
+以前是 *k* 次独立的 `slot_move` ⇒ **97·k** 次提交，每次都是「一个临时 command buffer +
+`queue_submit` + `queue_wait_idle`」（`Runtime::copy_range_standalone`）。这一格不在 §6.1 的 decode 路径上
+——它是并发池里**一次会话 fork / 一次槽位紧凑化**的代价，实测 7 个目标 ≈40 ms、31 个目标 ≈176 ms。
+
+- **`ComputeBackend::copy_ranges(&[(src, src_off, dst, dst_off, len)])`**，并把「逐条来」那圈循环单列成
+  `copy_ranges_each`。trait 默认实现 = 那圈循环 ⇒ **CUDA 一侧逐字节不变**（它的 `copy_range` 是 stream
+  上的一次 launch、本来就不带同步，没有东西可合）。Vulkan 覆盖 = 查门 → `begin_batch` → 记完 97·k 条
+  → `end_batch` = **一次**提交 + 等待。两个守卫都是承重的：
+  ① `if self.rt.recording()`（新加的只读访问器）时在窗内就**记进调用者的窗** —— 窗内嵌套 `begin_batch`
+  会把正在记录的那条 command buffer `reset` 掉，**把已经记进去的 dispatch 全丢了**；
+  ② 某条拷贝报错也照样收窗（`res.and(end)`），不然 `recording` 一直挂着，下一批会把这些拷贝一起带出去。
+- **`State::push_slot_rows`** 现在独占「行布局」这件事（`tmix_x`/`tmix_rnn`/`cmix_x`/`v_first` 分别在
+  `slot·c` / `slot·rnn`），`slot_move` 与 `slot_broadcast` 因此不会再各自漂移；`slot_broadcast` 把**所有**
+  目标合成一个 item 列表，而不是每目标一窗。它的 `t >= batch` 越界校验从原来间接调的 `slot_move`
+  移了进来（同一句错误信息形状）。
+- `COPY_ONE_SUBMIT=0` = 对照臂（逐条提交，即改动前的行为）；**默认合并**。
+  ⚠️ `State::copy_rows_from`（分块 prefill 的状态回灌）本来就自己开了一个窗，这一格没动它 ——
+  但它**没有** `recording()` 守卫，所以它必须继续只作顶层调用。
+
+**实测**（`SLOT_BENCH=1 SLOT_AB_REPS=<n>` = 新增的进程内配对块：门是**每次调用**读的 ⇒ 一个进程、
+一次加载模型、一次 prefill；奇数轮换序；广播是幂等的 —— 同样的字节反复拷同样的东西，两臂除了时间
+不会有别的东西不同）：
+
+| 目标数 | 拷贝条数 | 逐条提交 Δmin ms | 合并 Δmin ms | 逐轮配对均值 Δ（逐条 − 合并） | 符号检验 | 倍数 |
+|---:|---:|---:|---:|---:|---|---:|
+| 7 | 679 | 38.56（均值 41.22） | **2.26**（均值 2.40） | **+38.2 ms**（+44.1 +37.4 +36.3 +38.3 +38.8 +38.1） | 6/6 | 17.1× |
+| 31 | 3 007 | 175.97（均值 178.99） | **10.50**（均值 11.07） | **+167.9 ms**（+165.5 +169.9 +168.7 +167.6） | 4/4 | 16.8× |
+
+这一格**不在尺子地板之下**：那段时间是孤立测的、内容是纯宿主往返、效果是 16~17 倍且 10/10 配对同号、
+两臂区间零重叠。合并臂剩下的那点是**真实设备流量**（31 个目标 ≈335 MB 读 + 写在 10.5 ms 里），
+不是提交次数 —— 这也是为什么它随目标数线性走，而对照臂随 `97·目标数` 次往返走
+（这里每次往返 ≈0.057 ms，比 §6.11 的 0.155 ms 便宜，但架不住有 3 007 次）。
+形态 sanity 锚点：同一个块里 7 个目标的**宿主往返**做法是 48.74 ms，设备内广播 **2.26 ms**。
+
+**正确性门禁**：`tests/batch_parity.rs::device_slot_broadcast_matches_host_roundtrip`
+（广播 vs `slot_back`+`slot_load` 的逐位对拍）+ 整个 `batch_parity` 套件，
+`BACKEND=vulkan` 与 `BACKEND=cuda` 的 `cargo test --release`（各 77+10+1）全绿，
+`cargo fmt` + `cargo clippy --release --all-targets -- -D warnings` 干净。
+英文 README §6.18；台账 §6.18；原始数据 `/c/tmp/ac16/slot_ab_s{8,32}.log`。
 
 ## 7. 目录结构
 

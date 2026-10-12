@@ -908,6 +908,15 @@ impl Runtime {
         }
     }
 
+    /// 当前是否处在 `begin_batch`..`end_batch` 窗内。
+    ///
+    /// 给「只在窗外自己开一个窗」的合并原语当守卫用（`ComputeBackend::copy_ranges`）：
+    /// 在窗内嵌套 `begin_batch` 会 **reset 掉正在记录的 command buffer**，把已记录的
+    /// dispatch 全丢掉，所以必须先问一句。
+    pub fn recording(&self) -> bool {
+        self.recording
+    }
+
     /// 开启一次批处理记录：reset 并 begin 持久 command buffer，清空待提交资源
     pub fn begin_batch(&mut self) -> R<()> {
         unsafe {

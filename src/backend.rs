@@ -357,6 +357,28 @@ pub trait ComputeBackend {
         Err("copy_range not supported by this backend".into())
     }
 
+    /// 逐条 `copy_range` 的那圈循环 —— `copy_ranges` 的默认实现，也是后端在
+    /// 「已经在窗内」或「对照臂」时要复用的分支，故单列一个方法。
+    fn copy_ranges_each(&mut self, items: &[(TensorId, usize, TensorId, usize, usize)]) -> R<()> {
+        for &(src, src_off, dst, dst_off, len) in items {
+            self.copy_range(src, src_off, dst, dst_off, len)?;
+        }
+        Ok(())
+    }
+
+    /// **一批**设备侧区间拷贝：`(src, src_off, dst, dst_off, len)` 的列表。
+    ///
+    /// 默认实现 = 逐条 `copy_range` ⇒ 没有批窗概念的后端（CUDA：内核/拷贝直接在 stream 上，
+    /// 每条都不带同步）**逐字节不变**。存在的理由与 `fill_zeros` / `download_parts` 同一根
+    /// 杠杆（任务 #70/#72 的那条）：Vulkan 侧每条窗外的 `copy_range` 都是「一个临时
+    /// command buffer + 一次 submit + `queue_wait_idle`」≈0.155 ms 纯宿主空等，而
+    /// `State::slot_move` 一次就是 `3·n_layer + 1` = 97 条、`slot_broadcast` 再乘目标数
+    /// ⇒ 一份状态 fork 到 7 个槽要付 679 次同步 ≈ 105 ms，全是空等而不是字节。
+    /// 覆盖成「一条窗记完 97×N 条拷贝 + 一次提交」；数据与顺序都不变 ⇒ 逐位不变。
+    fn copy_ranges(&mut self, items: &[(TensorId, usize, TensorId, usize, usize)]) -> R<()> {
+        self.copy_ranges_each(items)
+    }
+
     // —— 核心算子（RWKV-7 decode 路径）——
     /// y = x @ A（fp16 权重，f32 输入/输出）；w=m*k, x=k*n, y=m*n
     #[allow(clippy::too_many_arguments)] // 算子签名沿用 Runtime 的扁平参数约定
@@ -1927,6 +1949,23 @@ impl ComputeBackend for VulkanBackend {
                 Err("copy_range: u32 tensor unsupported".into())
             }
         }
+    }
+
+    fn copy_ranges(&mut self, items: &[(TensorId, usize, TensorId, usize, usize)]) -> R<()> {
+        // `COPY_ONE_SUBMIT=0` = 对照臂：回到逐条独立提交（= 改动前的行为），只给 A/B 用。
+        if std::env::var("COPY_ONE_SUBMIT").is_ok_and(|v| v == "0") {
+            return self.copy_ranges_each(items);
+        }
+        // 已经在窗里 ⇒ 记进当前窗（在窗内嵌套 `begin_batch` 会 reset 掉正在记录的
+        // command buffer，把已记录的 dispatch 全丢掉）。
+        if self.rt.recording() {
+            return self.copy_ranges_each(items);
+        }
+        self.rt.begin_batch()?;
+        let res = self.copy_ranges_each(items);
+        // 出错也要收窗：不然 `recording` 一直挂着，下一批把这些拷贝一起带出去。
+        let end = self.rt.end_batch();
+        res.and(end)
     }
 
     fn begin_batch(&mut self) -> R<()> {

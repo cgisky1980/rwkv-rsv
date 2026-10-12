@@ -1582,11 +1582,63 @@ all**; the binding evidence at that width is the window count and the identical 
 ⚠️ Also true, and the reason this is worth doing at all: the per-token path is **slower than the
 self-loop by construction** (B=1: 12.0 ms/step merged vs 11.62 ms/step on §6.1's self-loop 口径) — every
 step pays a host round-trip. What was fixed here is that it used to pay **four**.
-📌 Next rungs on the same lever, in size order: `State::slot_move` / `slot_broadcast` (97 device-side
-`copy_range` calls, each its own submit+wait — continuous-batching slot compaction pays it per migration),
-the self-loop's in-batch sampler upload (`gpu_model.rs:3360`), and the seq-path `upload_u32` pair
-(`lens_t` + `tok`, `gpu_model.rs:1418`/`1422`). Ledger §6.17, raw `/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`,
+📌 Next rungs on the same lever: `State::slot_move` / `slot_broadcast` (97 device-side `copy_range` calls,
+each its own submit+wait — continuous-batching slot compaction pays it per migration) — **done by §6.18**;
+the seq-path `upload_u32` pair (`lens_t` + `tok`, `gpu_model.rs:1418`/`1422`).
+⚠️ The rung this section first listed as "the self-loop's in-batch sampler upload (`gpu_model.rs:3360`)"
+**does not exist on Vulkan**: that line is the `!use_async` fallback, and Vulkan's `sampler_async_rows()` is
+`usize::MAX / 64`, so `use_async` is always true there and the sampler goes to a host-visible row
+(`store_sampler_row`) with **no** submit at all. Ledger §6.17, raw `/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`,
 window counts `/c/tmp/ac16/profsub_{1,0}.log`.
+
+### 6.18 Slot move / broadcast: 97×targets submissions → 1 (2026-10-12)
+
+The fourth rung on the host-sync lever (§6.15 zero-fill → §6.16 readback/writeback → §6.17 per-token
+decode → this). `State::slot_move` = `3·n_layer + 1` = **97** device-side `copy_range` calls; a
+`slot_broadcast` to *k* targets was *k* separate `slot_move` calls ⇒ **97·k** submissions, each one a
+temporary command buffer + `queue_submit` + `queue_wait_idle` (`Runtime::copy_range_standalone`). This is
+not the §6.1 decode path at all — it is what a **session fork / slot compaction** costs in the concurrent
+pool, and it was ~40 ms for 7 targets and ~176 ms for 31.
+
+- **`ComputeBackend::copy_ranges(&[(src, src_off, dst, dst_off, len)])`**, with
+  `copy_ranges_each` broken out as the "loop it one by one" half. Trait default = that loop ⇒ **CUDA is
+  byte-identical** (its `copy_range` is a stream launch with no sync, so there is nothing to merge).
+  The Vulkan override: gate check → `begin_batch` → record all 97·k copies → `end_batch` = **one** submit +
+  wait. Two guards, both load-bearing:
+  ① `if self.rt.recording()` (new accessor) the copies are recorded into the *caller's* window instead —
+  nesting `begin_batch` would `reset_command_buffer` the one being recorded and **drop the dispatches
+  already in it**;
+  ② the window is closed even when a copy returns an `Err` (`res.and(end)`), so a failure cannot leave
+  `recording = true` and smuggle those copies into the next batch.
+- **`State::push_slot_rows`** now owns the row layout (`tmix_x`/`tmix_rnn`/`cmix_x`/`v_first` at
+  `slot·c` / `slot·rnn`) so `slot_move` and `slot_broadcast` cannot drift apart, and `slot_broadcast`
+  builds **one** item list for all targets instead of one window per target. Its `t >= batch` validation
+  moved here from the `slot_move` call it no longer makes (same error, same message shape).
+- `COPY_ONE_SUBMIT=0` = control arm (per-copy submits, i.e. pre-change behaviour). **Default = merged.**
+  ⚠️ `State::copy_rows_from` (chunked-prefill write-back) already opened its own window and is unchanged
+  — but note it has no `recording()` guard, so it must stay a top-level call.
+
+**Measured** (`SLOT_BENCH=1 SLOT_AB_REPS=<n>`, new in-process pairing block: the gate is read per call, so
+one process, one model load, one prefill; odd rounds reverse the order; the broadcast is idempotent — the
+same bytes are copied every time, so the two arms cannot differ in anything but time):
+
+| targets | copies | per-copy-submit Δmin ms | merged Δmin ms | paired per-round mean Δ (legacy − merged) | sign test | speed-up |
+|---:|---:|---:|---:|---:|---|---:|
+| 7 | 679 | 38.56 (mean 41.22) | **2.26** (mean 2.40) | **+38.2 ms** (+44.1 +37.4 +36.3 +38.3 +38.8 +38.1) | 6/6 | 17.1× |
+| 31 | 3 007 | 175.97 (mean 178.99) | **10.50** (mean 11.07) | **+167.9 ms** (+165.5 +169.9 +168.7 +167.6) | 4/4 | 16.8× |
+
+This one is **not** below the ruler: the phase is measured in isolation, it is pure host round-tripping, and
+the effect is 16–17× with 10/10 same-sign pairs and no overlap between the arms. The residual in the merged
+arm is real device traffic (31 targets ≈ 335 MB read + written in 10.5 ms), not submissions — which is also
+why it scales linearly with `targets` while the legacy arm scales with `97·targets` round-trips
+(≈0.057 ms each here, i.e. *cheaper per round-trip than §6.16's 0.155 ms but 3 007 of them).
+Sanity anchor for the shape of the win: at 7 targets the host round-trip alternative in the same block is
+48.74 ms, device-broadcast **2.26 ms**.
+
+**Correctness gate**: `tests/batch_parity.rs::device_slot_broadcast_matches_host_roundtrip` (bitwise
+broadcast vs `slot_back`+`slot_load`) plus the whole `batch_parity` suite, `BACKEND=vulkan` and
+`BACKEND=cuda` `cargo test --release` (77+10+1 each), `cargo fmt` + `cargo clippy --release --all-targets
+-- -D warnings`. Ledger §6.18, raw `/c/tmp/ac16/slot_ab_s{8,32}.log`.
 
 ## 7. Layout
 

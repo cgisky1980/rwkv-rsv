@@ -830,10 +830,78 @@ Raw：`/c/tmp/ac16/sio_{base,fill}.log`、门禁 `/c/tmp/ac16/sio_gates.log`。�
 3. **每一臂的 decode 指纹与自循环对拍相同**（`[对拍 B=] ... => 一致`，B=1/8/32/128 全过），
    且合并臂 = 对照臂 = §6.1 表里同档的值 ⇒ 这次改动**数值零影响**，它没有、也不该有指纹变化。
 
-📌 还剩的格（同形，按体量）：`slot_move`/`slot_broadcast`（97 次设备内 `copy_range` 各自一条
-command buffer + 提交/等待）、自循环里的批内采样器上传（`gpu_model.rs:3360`）、变长 seq 路径的
+📌 还剩的格（同形）：`slot_move`/`slot_broadcast`（97 次设备内 `copy_range` 各自一条
+command buffer + 提交/等待）—— **已由 §6.18 做完**；变长 seq 路径的
 `upload_u32(lens_t)` + `upload_u32(tok)`（`gpu_model.rs:1418`/`1422`）。
+⚠️ 本节初稿列的第三格「自循环里的批内采样器上传（`gpu_model.rs:3360`）」**在 Vulkan 上是死分支**：
+那一行只在 `!use_async` 时走，而 Vulkan 的 `sampler_async_rows()` = `usize::MAX / 64`
+（`backend.rs`，注释明说「此处只需保证最终 use_async 判定为真」），`use_async` 的判据是
+`n <= sampler_async_rows() / batch` ⇒ **恒为真**，采样参数走 `store_sampler_row`（写 host-visible 行，
+一次提交都不付）。⇒ 那一格不要再当待办。
 Raw：`/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`、窗口计数 `/c/tmp/ac16/profsub_{1,0}.log`。
+
+---
+
+## §6.18 槽位迁移/广播：97×目标数 次提交 → 1 次（2026-10-12，任务 #73 = S45）
+
+同一根杠杆（「少提交在这块卡上有肉」，§6.15 立的）的第四格。这一格不在 §6.1 的 decode 记分板上，
+它量的是**连续批调度里一次 fork / 一次槽位紧凑化**的代价 —— 也就是说前面三格都在削「每步」，
+这一格削的是「每次换手」，而用户可见的那一段（新请求接上老会话）恰好是后者。
+
+### 6.18.1 事实底
+
+- `State::slot_move` = 每层 3 条 + `v_first` 1 条 = **97** 条设备内 `copy_range`；
+  `slot_broadcast(from, to)` 以前 = `for t in to { slot_move(...) }` ⇒ **97 × |to|** 条。
+- 每一条在 Vulkan 上走 `Runtime::copy_range_standalone`（窗外 ⇒ 临时 command buffer + submit +
+  `queue_wait_idle`）。窗内本来就已经是记录的（`copy_range` 自己会看 `self.recording`），
+  **从来没有人把这一族调用放进窗里** —— 而 `copy_rows_from`（分块 prefill 回灌）早就这么做了，
+  它是这一格的现成模板。
+- CUDA 侧 `copy_range` = stream 上一次 launch、不带同步 ⇒ **没有东西可合**，所以合并必须是
+  后端覆盖，不能改默认实现。
+
+### 6.18.2 改动
+
+- `ComputeBackend::copy_ranges(&[(TensorId, usize, TensorId, usize, usize)])`：默认实现 =
+  逐条 `copy_range`（单列成 `copy_ranges_each` 供覆盖方复用）⇒ **CUDA 逐字节不变**；
+  Vulkan 覆盖 = 查 `COPY_ONE_SUBMIT` → 查 `self.rt.recording()` → `begin_batch` → 记完 → `end_batch`。
+- 新只读访问器 `Runtime::recording()`。存在的理由是**嵌套会毁数据**：`begin_batch` 第一件事就是
+  `reset_command_buffer(self.cmd)`，窗内再开一窗 = 把调用者已记录的 dispatch 整条丢掉。
+- 出错也收窗（`let res = …; let end = self.rt.end_batch(); res.and(end)`）：否则 `recording` 挂在真上，
+  下一批把这些拷贝一起带出去 —— 那类 bug 只会以「偶发的错 token」的形式出现，不值得留。
+- `State::push_slot_rows` 独占行布局（`tmix_x`/`cmix_x`/`v_first` 在 `slot·c`、`tmix_rnn` 在 `slot·rnn`），
+  `slot_move` 与 `slot_broadcast` 共用 ⇒ 两处不会再漂移；`slot_broadcast` 把所有目标合成**一个** item
+  列表（一窗），并把 `t >= batch` 的越界校验从间接调用移到自己身上。
+- 仪器：`SLOT_BENCH=1` + `SLOT_AB_REPS=<n>`（门每次调用都读 ⇒ 进程内换档、一次加载模型、幂等重放，
+  奇数轮换序）。
+
+### 6.18.3 读数（`/c/tmp/ac16/slot_ab_s{8,32}.log`，300 W、时钟 1875→1860）
+
+| 目标 | 拷贝条数 | 逐条 min/均值 | 合并 min/均值 | 逐轮配对（逐条 − 合并） | 倍数 |
+|---|---|---|---|---|---|
+| 7（SLOTS=8） | 679 | 38.56 / 41.22 ms | **2.26 / 2.40 ms** | +44.1 +37.4 +36.3 +38.3 +38.8 +38.1（6/6） | 17.1× |
+| 31（SLOTS=32） | 3 007 | 175.97 / 178.99 ms | **10.50 / 11.07 ms** | +165.5 +169.9 +168.7 +167.6（4/4） | 16.8× |
+
+判读三条：
+1. **这一格远高于尺子地板**（§23 的 ≈2~3 % 端到端下限、以及 #72 那根 0.24 ms 的尴尬都不存在）：
+   相位孤立计时 + 10/10 同号 + 两臂零重叠 ⇒ 这是这台仪器上「少提交」这根杠杆到目前为止**最大的一格**。
+2. 每次往返 ≈**0.057 ms**（38.56/679），比 §6.11 记的 0.155 ms **便宜** ⇒ 「单次 `queue_wait_idle` 的代价
+   不是一个常数，而是随那条命令的体量/队列状态变」—— 引用历史单价前先看清楚它是在哪种提交上量的。
+3. 合并臂剩下的不是提交：31 目标 = ≈335 MB 读 + 写落在 10.5 ms 里 ⇒ 那是真实设备流量，
+   所以它随目标数**线性**，而对照臂随 `97×目标` 次往返。⇒ 这一格的下界已经落到「搬字节」本身，
+   再想压只能改状态布局（不是宿主同步问题了）。
+- 形态 sanity：同一个块里「宿主往返」做法在 7 目标上是 **48.74 ms**，设备内合并广播 **2.26 ms**。
+
+### 6.18.4 门禁
+
+`tests/batch_parity.rs::device_slot_broadcast_matches_host_roundtrip`（逐位：广播 vs
+`slot_back`+`slot_load`）+ 整个 `batch_parity` 套件；`BACKEND=vulkan`（77+10+1）与 `BACKEND=cuda`（77+10+1）
+`cargo test --release` 全绿；`cargo fmt --all` + `cargo clippy --release --all-targets -- -D warnings` 干净。
+逐位不变 ⇒ 秒表只是佐证，**指纹/对拍才是门**。
+
+📌 同形还剩：变长 seq 路径的 `upload_u32(lens_t)` + `upload_u32(tok)`（`gpu_model.rs:1418`/`1422`）
+= 每步 2 次窗外提交（与 #72 同类，只是那条路是单序列）。宿主同步这根杠杆到这里基本见底：
+每步 1 窗（#72）、每次换手 1 窗（#70/#71/#73）、清零 1 窗（#35）。
+**剩下的差距是 GPU 侧的**（§6.1：B=128 差 12.78 ms/步，`gemm_imma` 一家 23.90 ms）。
 
 
 

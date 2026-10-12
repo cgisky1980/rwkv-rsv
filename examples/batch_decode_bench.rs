@@ -12,6 +12,8 @@
 //!   奇数轮反序，统计量取每档多轮最小）——上面那个 `AB_VAR` 块只覆盖自循环路径，量不到
 //!   「每步几次宿主提交」这类杠杆。见 §STEP 块注释。
 //!   SLOT_BENCH=1：量「把一份状态分发给多个槽」的两条做法（宿主往返 vs 设备内广播）。
+//!   SLOT_BENCH=1 + SLOT_AB_REPS=<n>：再给**设备内广播**做进程内配对 A/B（门
+//!   `COPY_ONE_SUBMIT` 每次调用都读 ⇒ 同一进程换档，广播是幂等的）。
 //!   BUCKET_BENCH=1：量长度桶预热把多少用户可见延迟挪到启动期（见该块注释）。
 //!   AB_VAR=<门名>：**进程内换档 A/B**（同一进程一次加载模型，按段交替两档测吞吐；
 //!   配 AB_A/AB_B/AB_ROUNDS/AB_SEGS/AB_WARM/AB_RESTART，见该块注释）——建它是为了绕开
@@ -521,6 +523,63 @@ fn main() -> Result<(), Box<dyn Error>> {
                 d0.len() * 4,
                 d0.len() * 4 * targets.len() * 2,
             );
+
+            // —— SLOT_AB_REPS=<n>：设备内广播的「一次提交」vs「逐条提交」进程内配对 ——
+            //
+            // 门 `COPY_ONE_SUBMIT` 是**每次调用**读的 ⇒ 同一进程、同一份状态里换档就行，
+            // 不用重加载模型（这是 #58 那台仪器在这里的形态）。广播是幂等的（同样的行段
+            // 反复拷同样的字节）⇒ 两臂读到的时间之外没有任何东西会变。
+            let reps = std::env::var("SLOT_AB_REPS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if reps > 0 {
+                let mut each = Vec::with_capacity(reps);
+                let mut merged = Vec::with_capacity(reps);
+                for r in 0..reps {
+                    // 奇数轮换序：固定先跑同一臂会让它的读数系统性偏冷（纪律第 22 条）。
+                    let order: [&str; 2] = if r % 2 == 0 { ["0", "1"] } else { ["1", "0"] };
+                    for arm in order {
+                        unsafe { std::env::set_var("COPY_ONE_SUBMIT", arm) };
+                        let t = Instant::now();
+                        model.state_slot_broadcast(&bstate, 0, &targets)?;
+                        let ms = t.elapsed().as_secs_f64() * 1000.0;
+                        if arm == "0" {
+                            each.push(ms);
+                        } else {
+                            merged.push(ms);
+                        }
+                    }
+                }
+                unsafe { std::env::remove_var("COPY_ONE_SUBMIT") };
+                let mn = |v: &[f64]| v.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                let md = |v: &[f64]| {
+                    let s: f64 = v.iter().sum();
+                    s / v.len() as f64
+                };
+                let win = |arm: &str| -> usize {
+                    if arm == "1" {
+                        1
+                    } else {
+                        3 * model.layers_len() + 1
+                    }
+                };
+                log::info!(
+                    "[SLOT_AB] {} 个目标 × 每条 97 次拷贝：逐条提交 min={:.2} ms 均值={:.2} ms（{} 窗）\
+                     | 一次提交 min={:.2} ms 均值={:.2} ms（{} 窗）| 每轮配对（逐条 − 一次，+ = 合并更快）：{}",
+                    targets.len(),
+                    mn(&each),
+                    md(&each),
+                    win("0") * targets.len(),
+                    mn(&merged),
+                    md(&merged),
+                    win("1"),
+                    (0..reps)
+                        .map(|i| format!("{:+.1}", each[i] - merged[i]))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
         }
 
         // —— BUCKET_BENCH=1：长度桶预热到底把代价挪去哪了 ——
@@ -888,6 +947,14 @@ fn gating_json() -> serde_json::Value {
             "开（未设）—— 逐步路径每步 1 次宿主提交；=0 回到每步 4 次的旧序列，只给 A/B 当对照臂"
         ),
         "STEP_AB": knob("STEP_AB", "关 —— =1 时给逐步路径做进程内配对 A/B（配 STEP_AB_ROUNDS=<n>）"),
+        "COPY_ONE_SUBMIT": knob(
+            "COPY_ONE_SUBMIT",
+            "开（未设）—— 设备内区间拷贝一批一次提交；=0 回到逐条提交，只给 A/B 当对照臂"
+        ),
+        "SLOT_AB_REPS": knob(
+            "SLOT_AB_REPS",
+            "0 —— >0 时给槽位广播做「一次提交 vs 逐条提交」的进程内配对（配 SLOT_BENCH=1）"
+        ),
         "PENALTY": knob("PENALTY", "关 —— 无频率惩罚"),
         "SLOT_BENCH": knob("SLOT_BENCH", "关"),
         "ABLATE": knob("ABLATE", "空 —— 不消融任何 kernel"),

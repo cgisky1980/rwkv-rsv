@@ -5773,6 +5773,24 @@ impl State {
         backend.download_parts(&items)
     }
 
+    /// 把 `from` 槽的全部状态行段追加成一批 `copy_ranges` 项
+    /// （`slot_move` / `slot_broadcast` 共用 —— 行布局只在这里说一遍）。
+    fn push_slot_rows(
+        &self,
+        items: &mut Vec<(TensorId, usize, TensorId, usize, usize)>,
+        from: usize,
+        to: usize,
+        c: usize,
+        rnn: usize,
+    ) {
+        for s in &self.layers {
+            items.push((s.tmix_x, from * c, s.tmix_x, to * c, c));
+            items.push((s.tmix_rnn, from * rnn, s.tmix_rnn, to * rnn, rnn));
+            items.push((s.cmix_x, from * c, s.cmix_x, to * c, c));
+        }
+        items.push((self.v_first, from * c, self.v_first, to * c, c));
+    }
+
     /// 设备内单 slot 行迁移：把 slot `from` 的全部状态行拷到 slot `to`
     /// （连续批调度的槽位紧凑化用——全程设备内拷贝，不经过主机）。
     pub fn slot_move(
@@ -5790,14 +5808,9 @@ impl State {
         if from == to {
             return Ok(());
         }
-        let rnn = h * n * n;
-        for s in &self.layers {
-            backend.copy_range(s.tmix_x, from * c, s.tmix_x, to * c, c)?;
-            backend.copy_range(s.tmix_rnn, from * rnn, s.tmix_rnn, to * rnn, rnn)?;
-            backend.copy_range(s.cmix_x, from * c, s.cmix_x, to * c, c)?;
-        }
-        backend.copy_range(self.v_first, from * c, self.v_first, to * c, c)?;
-        Ok(())
+        let mut items = Vec::with_capacity(self.layers.len() * 3 + 1);
+        self.push_slot_rows(&mut items, from, to, c, h * n * n);
+        backend.copy_ranges(&items)
     }
 
     /// 设备内单 slot **广播**：把 `from` 行的状态拷进 `to` 的每一行（会话 fork、
@@ -5807,6 +5820,10 @@ impl State {
     /// **2× 单槽状态大小**的 PCIe 数据（单槽 ~15MB，见上面 `slot_back` 的注释），
     /// 且每层每段都是一次同步 download；全程设备内则一份都不过 PCIe 总线。
     /// 目标里出现 `from` 或重复项都无害（自拷直接跳过，重复只是多拷一次）。
+    ///
+    /// 所有目标合成**一批** `copy_ranges`（= 一次提交），而不是逐目标各开一窗：
+    /// `3·层数+1` × 目标数条拷贝在 Vulkan 上曾经是逐条独立提交（≈0.155 ms/条纯宿主空等，
+    /// fork 到 7 个槽 ≈105 ms）。
     pub fn slot_broadcast(
         &self,
         backend: &mut dyn ComputeBackend,
@@ -5819,10 +5836,21 @@ impl State {
         if from >= self.batch {
             return Err(format!("slot_broadcast: from {from} >= batch {}", self.batch).into());
         }
+        let rnn = h * n * n;
+        let mut items = Vec::with_capacity(to.len() * (self.layers.len() * 3 + 1));
         for &t in to {
-            self.slot_move(backend, from, t, c, h, n)?;
+            if t >= self.batch {
+                return Err(format!("slot_broadcast: to {t} >= batch {}", self.batch).into());
+            }
+            if t == from {
+                continue;
+            }
+            self.push_slot_rows(&mut items, from, t, c, rnn);
         }
-        Ok(())
+        if items.is_empty() {
+            return Ok(());
+        }
+        backend.copy_ranges(&items)
     }
 
     /// 设备内**跨 State** 行段迁移：把 `src` 的 `[src_slot, src_slot+rows)` 行灌进
