@@ -1640,6 +1640,47 @@ broadcast vs `slot_back`+`slot_load`) plus the whole `batch_parity` suite, `BACK
 `BACKEND=cuda` `cargo test --release` (77+10+1 each), `cargo fmt` + `cargo clippy --release --all-targets
 -- -D warnings`. Ledger §6.18, raw `/c/tmp/ac16/slot_ab_s{8,32}.log`.
 
+### 6.19 PROF_GPU truncated whole windows silently: the SUM was a *prefix* (2026-10-12, instrument fix)
+
+While checking §6.18's closing claim ("the remaining gap is GPU-side") against a fresh B=128 dump, that
+dump printed `SUM 54.868ms over 2048 kernels` for a decode window whose wall time is ≈364 ms — which read
+as "B=128 decode is only 15 % GPU-busy", i.e. it appeared to invalidate the entire per-kernel attribution
+behind this project's main remaining target (`gemm_imma` = 51.7 % of a step). It does not. **The instrument
+was lying.**
+
+- `QUERY_POOL_SIZE = 4096` timestamps, reset per window ⇒ **at most 2 048 dispatched kernels get a
+  timestamp per window**, and every kernel past that limit was silently *not* recorded
+  (`prof_gpu_count + 2 <= QUERY_POOL_SIZE` was the only test). So the table *and* the SUM cover only the
+  leading part of the window, with no indication of the cut. A B=128 self-loop step issues **1 477**
+  kernels (ledger §24's census), so any window of ≥ 2 steps is truncated; the probe that opened this
+  section ran 8 steps per window.
+- **Fix**: `Runtime` now counts the dropped dispatches (`prof_gpu_dropped`, incremented only when
+  profiling is on and the kernel was not `ABLATE`d) and prints
+  `⚠ 查询池已满 … 表和 SUM 都只是窗内前缀` after the SUM. No behaviour change when the pool does not fill.
+- **Rule this establishes**: for whole-window accounting at wide batches, keep the window to **one step**
+  (§24 used `SKIP_GRAPH=1 NTOK=1`; `SELFLOOP_CHUNK=1` does the same on the self-loop path while keeping
+  the §6.1 fingerprint). Ratio-of-prefix is still usable (the prefix is an integer number of layers'
+  worth of work in dispatch order), but never read a truncated SUM as GPU busyness.
+
+**Re-verified with 1 step per window** (`SELFLOOP_CHUNK=1 PROF_GPU=1 SLOTS=128 SEGS=4 NTOK=32`,
+160 single-step windows, fingerprint `decode tokens sum=0xd1fce1e xor=0x8ce` = §6.1's B=128 row exactly):
+
+| kernel | 条/步 (this run) | ms/步 (this run) | §24 记录的 条/步 | §24 ms/步 |
+|---|---:|---:|---:|---:|
+| `gemm_imma_bm64_nst8` | 193 | 20.12 | 193 | 23.90 |
+| `fuse_ka_dplr_norm_s16` | 32 | 5.87 | 32 | 8.73 |
+| `gemm_f16_f32` | 224 | 3.60 | 224 | 3.52 |
+| `gemm_imma_reduce` | 160 | 2.03 | 160 | 1.99 |
+| `sample` | 1 | 1.50 | 1 | 1.49 |
+| `quant_x_i8` | 193 | 1.34 | 193 | 1.35 |
+| **SUM** | **1 477** | **39.8** | **1 477** | **46.19 / 41.77** |
+
+⇒ **§24's attribution stands** (counts match to the unit; `gemm_imma` = 20.12/39.8 = **50.6 %** of a step
+vs the recorded 51.7 %). The two rows that read *lower* today (`gemm_imma` −16 %, the state kernel −33 %)
+are the clock/heat state of the session — §24's own two rounds differed by 10 % on the total — and the
+ms/step sum 39.8 now vs 46.9 measured on the wall in the same run is the usual timestamp-vs-wall residual,
+not a new finding. Ledger §6.19, raw `/c/tmp/ac16/imma_b128_step1.log`.
+
 ## 7. Layout
 
 ```

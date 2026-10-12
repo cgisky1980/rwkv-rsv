@@ -230,6 +230,10 @@ pub struct Runtime {
     prof_gpu: bool,
     prof_gpu_entries: Vec<(String, u32, u32, u64)>,
     prof_gpu_count: u32,
+    /// 本窗内**因查询池满而没拿到时间戳**的 dispatch 条数。
+    /// 池容量是硬上限（`QUERY_POOL_SIZE / 2` 条/窗），超出后静默丢弃 ⇒ 打印的 SUM 只是
+    /// 窗内前缀。不记这个数就会把「前缀」读成「整窗」（见 §6.18 附的仪器教训）。
+    prof_gpu_dropped: u32,
 }
 
 /// 唯一标识一个已创建的 kernel（pipeline）。
@@ -282,6 +286,7 @@ impl Runtime {
             prof_gpu: false,
             prof_gpu_entries: Vec::new(),
             prof_gpu_count: 0,
+            prof_gpu_dropped: 0,
         })
     }
 
@@ -941,6 +946,7 @@ impl Runtime {
         if self.prof_gpu {
             self.prof_gpu_entries.clear();
             self.prof_gpu_count = 0;
+            self.prof_gpu_dropped = 0;
             unsafe {
                 self.app
                     .cmd_reset_query_pool(self.cmd, 0, QUERY_POOL_SIZE as u32);
@@ -1055,6 +1061,13 @@ impl Runtime {
                 total / 1e6,
                 self.prof_gpu_entries.len()
             );
+            if self.prof_gpu_dropped > 0 {
+                log::warn!(
+                    "[PROF_GPU] ⚠ 查询池已满（{QUERY_POOL_SIZE} 个时间戳 = {} 条/窗），本窗另有 {} 条 dispatch 没有时间戳 ⇒ 上面这张表和 SUM 都只是**窗内前缀**，不能当作整窗的 GPU 忙碌时间。一窗多于这么多条时把 SELFLOOP_CHUNK 调小（每窗一步最准）。",
+                    QUERY_POOL_SIZE / 2,
+                    self.prof_gpu_dropped
+                );
+            }
             // `PROF_GAPS=1`：打印相邻 dispatch 之间的**空闲间隙** top-20（按间隙降序）。
             // 用途：定位「时间戳 SUM 远小于墙钟」的 inter-dispatch 停顿到底落在哪两个 kernel 之间。
             if std::env::var("PROF_GAPS").is_ok() {
@@ -1387,18 +1400,24 @@ impl Runtime {
         // GPU 时间戳：dispatch 前写 begin，dispatch 后写 end（仅 PROF_GPU=1 时开启）
         // `ABLATE=` 命中的 kernel：连时间戳一起跳（不占 ring 槽位），只跳 dispatch 本身。
         let ablated = ablate_hit(shader_name);
-        let gpu_q = if self.prof_gpu
-            && !ablated
-            && self.prof_gpu_count + 2 <= QUERY_POOL_SIZE as u32
-        {
-            let b = self.prof_gpu_count;
-            let e = self.prof_gpu_count + 1;
-            self.prof_gpu_count += 2;
-            unsafe {
-                self.app
-                    .cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, b);
+        let gpu_q = if self.prof_gpu && !ablated {
+            if self.prof_gpu_count + 2 <= QUERY_POOL_SIZE as u32 {
+                let b = self.prof_gpu_count;
+                let e = self.prof_gpu_count + 1;
+                self.prof_gpu_count += 2;
+                unsafe {
+                    self.app.cmd_write_timestamp(
+                        self.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        b,
+                    );
+                }
+                Some((b, e))
+            } else {
+                // 查询池满：这一条 dispatch 照常执行，但没有时间戳 ⇒ 计入截断数。
+                self.prof_gpu_dropped += 1;
+                None
             }
-            Some((b, e))
         } else {
             None
         };
