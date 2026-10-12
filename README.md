@@ -1681,6 +1681,56 @@ are the clock/heat state of the session — §24's own two rounds differed by 10
 ms/step sum 39.8 now vs 46.9 measured on the wall in the same run is the usual timestamp-vs-wall residual,
 not a new finding. Ledger §6.19, raw `/c/tmp/ac16/imma_b128_step1.log`.
 
+### 6.20 The sampling kernel was doing 11 full-vocab passes where 5 are enough (2026-10-12, bit-exact)
+
+`sample` is the one decode kernel whose cost is a *pass count*: every stage re-reads the whole 65 536-entry
+row, so its time is `passes × vocab × 4 B / bandwidth + passes × per-iteration latency`. Under the shipping
+decode 口径 (`TOPK=1` greedy, `TOPP=0.2`, temperature 1.0, penalties off) the shader walked the row **11 times**
+plus one pass per top-p candidate. Three folds take that to **5 + K**, each of them bit-exact:
+
+1. **temperature folded into the load** (−1). The penalty branch needs `logits → penalty → temperature` in that
+   order, so it can't merge; when penalties are off the load pass just writes `x * invT` — the same single
+   multiply, same rounding. (CUDA already did this: `sample_scaled1` ends in `return l * invT`.)
+2. **`top_k == 1` needs no radix select** (−4). The 4×8-bit bucketing exists to find the *K*-th largest bit
+   pattern; for K=1 that is just the maximum, and §5's max reduction computes the maximum anyway. `key_of` is an
+   order-preserving bijection, so `threshold = m` and `threshold = radix(1)` keep exactly the same elements
+   (`tv < threshold`), including ties. Gate becomes `top_k > 1u`.
+3. **normalize skipped when the sum is exactly 1.0** (−1) and **the top-p truncation no longer writes back**
+   (−1). `x / 1.0` is the identity for every float class, so the divide pass is dead when `total == 1.0` — which
+   is *always* under greedy, because after the top-k mask only `exp(m-m)=1.0` survives. The truncation test moved
+   into the §7 reads (`v < cutoff ? 0.0 : v`), which is legal because `temp` is the sampling scratch and nothing
+   reads it after the kernel (`gpu_model.rs` passes it only into `sample_*`); `cutoff = -1e30` when top-p is off
+   reproduces "no truncation".
+
+Measured on the instrument fixed in §6.19 (`SELFLOOP_CHUNK=1 PROF_GPU=1`, one dispatch per window, both arms
+through `VK_SPV_DIR` so they differ only in `sample.spv` bytes: old `3e9de68f`, new `bc192a3d`), median of 160
+windows per arm, 4 rounds with the arm order alternating:
+
+| batch | old ms/dispatch (4 rounds) | new ms/dispatch (4 rounds) | Δ |
+| --- | --- | --- | --- |
+| 8 | 0.5734 / 0.5733 / 0.5737 / 0.5782 | 0.2718 / 0.2744 / 0.2744 / 0.2743 | **−52.4 %** |
+| 128 | 1.4698 / 1.4734 / 1.4891 / 1.4882 | 0.6643 / 0.6742 / 0.6745 / 0.6809 | **−54.5 %** |
+
+8/8 rounds per width, the two arms never overlap (within-arm spread ≤1 %), and the fold also moved the small
+widths: B=1 0.279, B=32 0.421 (was 0.979), B=64 0.486 (was 1.076) ms per dispatch.
+
+**Why the CUDA note in `backend_cuda.rs:3627` ("pass merging alone = −2 %") did not predict this**: that
+experiment merged *traffic* (load/penalty/temperature into one pass) and the kernel stayed instruction-bound,
+4 warps/SM. What is removed here is 4 passes of `key_of` + shared-memory `atomicAdd` + 8 barriers per pass —
+the per-iteration cost, not the bytes. The two conclusions are compatible; cite the mechanism, not the number.
+
+**Gate = the token fingerprints**, since the claim is bit-exactness: B=1 `0x1acbfa/0x6d5c`, B=8
+`0xd07c18/0x647a`, B=32 `0x348dad8/0x757c`, B=64 `0x69352f6/0x6462`, B=128 `0xd1fce1e/0x8ce` — all five
+identical to §6.1's shipped values on **both** arms, plus the full test suite on both backends.
+
+**Honest end-to-end share**: 0.81 ms of a ~47-52 ms step at B=128 (≈1.7 %) and 0.30 ms of 13.6 ms at B=8
+(≈2.2 %) — both at or under this machine's ±2-3 % wall-clock floor, so it is **not** quotable as a paired-table
+movement; it is a kernel-level cut that removes a *fixed* cost, which is why it is worth more at B=1 (0.28 ms of
+a 11.6 ms step, where the whole gap to CUDA is 1.24 ms). What is left in the kernel: the top-p loop, which still
+consumes one candidate per full-row scan (`reduce_max` × K) — the only remaining pass-count lever there is to
+stop materializing the descending order one element at a time, and that is **not** bit-exact.
+Ledger §6.20, raw `/c/tmp/ac16/sampfold/`.
+
 ## 7. Layout
 
 ```

@@ -17,13 +17,16 @@
 //   × 8）。CUDA 版 `rwkv_sample_batch` 一直是 `grid=(1, batch, 1)`，一次覆盖所有槽。
 //   本版语义与原逐槽版**逐位等价**（同一 slot 的输入/参数/随机数与原来完全一致）。
 //
-// 流程：
-//   1. 载入 logits
+// 流程（**全词表趟数**是本网关的唯一成本口径，2026-10-12 §6.20 折掉了 6/11 趟）：
+//   1. 载入 logits（无惩罚时把 temperature 一并乘掉 = 同一趟）
 //   2. 惩罚：由历史 token 直方图统计计数，repetition(缩放) + frequency(次数偏移) + presence(存在偏移)
-//   3. temperature：temp[i] /= T（T<=0 时视为 1）
+//      —— 只有惩罚真的开启时才需要「载入 / 惩罚 / 温度」三趟里的后两趟
+//   3. temperature：temp[i] *= 1/T（T<=0 时视为 1）
 //   4. top-k：迭代 top_k 次找出第 k 大 logits 作阈值，低于阈值的 temp 置 -inf
-//   5. softmax：max 归约 → exp → 归一化为概率（写回 temp）
-//   6. top-p：从最大概率起累积，达到 top_p 后截断（低于累计阈值概率的 temp 置 0）
+//      —— top_k==1 时阈值 = §5 的 max（基数选择 4 趟全省）
+//   5. softmax：max 归约 → exp（top-k 掩码并入本趟）→ 归一化为概率（写回 temp）
+//      —— 和恰为 1.0 时归一化那趟是恒等，跳过
+//   6. top-p：从最大概率起累积，达到 top_p 后截断（**不回写**，判定折进 §7 的读取）
 //   7. 采样：splitmix 生成均匀随机数 u，multipass 区间归约定位累计概率分位点 → token
 //
 // 惩罚公式（与 OpenAI / vLLM / llama.cpp 主流一致，均作用于 softmax 前的 logits）：
@@ -203,14 +206,27 @@ void main() {
     Counter counter = params.counter;
     Hist hist = params.hist;
 
-    // ---------- 1. 载入 logits ----------
-    [[unroll]]
-    for (uint i = index; i < N; i += BLOCK_SIZE) {
-        temp.data[sbase + i] = in_logits.data[sbase + i];
+    // ---------- 1. 载入 logits（+ 3. temperature，见下） ----------
+    // ★ 惩罚那一支不走时，把 temperature 折进载入这一趟（2026-10-12，§6.20）：
+    //   每个元素仍是**同一次** `x * invT`，逐位等价，省掉一整趟全词表读写。
+    //   惩罚那一支要读计数，顺序必须是「原始 logits → 惩罚 → 温度」⇒ 只能分两趟。
+    const bool penalty_on = hist_len > 0u && (rep != 1.0 || freq != 0.0 || pres != 0.0);
+    float invT = 1.0 / temperature;
+    if (!(temperature > 0.0)) invT = 1.0;
+    if (!penalty_on) {
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            temp.data[sbase + i] = in_logits.data[sbase + i] * invT;
+        }
+    } else {
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            temp.data[sbase + i] = in_logits.data[sbase + i];
+        }
     }
 
     // ---------- 2. 惩罚（repetition / frequency / presence） ----------
-    if (hist_len > 0u && (rep != 1.0 || freq != 0.0 || pres != 0.0)) {
+    if (penalty_on) {
         // 清零直方图
         for (uint i = index; i < N; i += BLOCK_SIZE) counter.data[sbase + i] = 0u;
         barrier();
@@ -237,13 +253,15 @@ void main() {
         barrier();
     }
 
-    // ---------- 3. temperature ----------
-    float invT = 1.0 / temperature;
-    if (!(temperature > 0.0)) invT = 1.0;
-    [[unroll]]
-    for (uint i = index; i < N; i += BLOCK_SIZE) {
-        temp.data[sbase + i] *= invT;
+    // ---------- 3. temperature（只在惩罚那一支还需要单独一趟） ----------
+    // 非惩罚支已经在载入这一趟里乘过 `invT`（见上），这里必须跳过，否则乘两次。
+    if (penalty_on) {
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            temp.data[sbase + i] *= invT;
+        }
     }
+    barrier();
 
     // ---------- 4. top-k：基数选择（4 趟 × 8 位）----------
     // 旧版是「逐轮找最大 + 标记」的 O(top_k) 趟全词表扫描（top_k=50 ⇒ 100 趟），
@@ -253,7 +271,12 @@ void main() {
     // 掩码并入下面的 softmax 一趟（`v < threshold ⇒ 0`），语义与 CUDA `rwkv_sample_batch`
     // 的快速路径一致（保留全部 ≥ 第 K 大的元素）。
     float threshold = -1e30;
-    if (top_k > 0u && top_k < N) {
+    // ★ top_k == 1 不需要基数选择（2026-10-12，§6.20）：第 1 大的位模式就是最大值的位模式，
+    //   而 §5 的 max 归约本来就算出了它 ⇒ 4 趟全词表分桶是白跑的。`key_of` 是保序双射，
+    //   所以「threshold = m」与「threshold = val_of_key(radix(1))」**逐位相同**（含平局：
+    //   两者都只留下 ≥ 最大值的元素，exp 趟的 `tv < threshold` 判定完全一致）。
+    //   发货口径就是 TOPK=1（贪心），这一折省掉 4/11 趟。
+    if (top_k > 1u && top_k < N) {
         uint need = top_k;  // 当前桶内要找的「从大到小第 need 名」
         uint acc  = 0u;     // 已确定的 key 高位（逐趟左移 8 位拼接）
         // 第 0 趟：全部元素按最高 8 位分桶
@@ -325,6 +348,8 @@ void main() {
         }
         const float m = shared_val[0];
         barrier();
+        // top_k==1 的保留边界就是最大值本身（见 §4 的折叠说明）。
+        if (top_k == 1u) threshold = m;
         // exp + sum（★ top-k 掩码并入本趟：`v < threshold ⇒ 0`，与旧版
         // 「先写 -1e30 再 exp(-1e30-m)=0」逐位等价，省掉一整趟全词表读写）
         float s = 0.0;
@@ -344,7 +369,10 @@ void main() {
         }
         const float total = shared_val[0];
         barrier();
-        if (total > 0.0) {
+        // ★ `x / 1.0` 对任何浮点类都是恒等（含 ±0 / 次正规 / inf / NaN）⇒ 和恰为 1 时
+        //   这一趟全词表读写可以整个跳过（§6.20）。贪心口径（top_k=1）下 exp 趟只剩
+        //   `exp(m-m)=1.0` 一个非零项 ⇒ total 恒等于 1.0，所以这一支是**每步都走**的。
+        if (total > 0.0 && total != 1.0) {
             [[unroll]]
             for (uint i = index; i < N; i += BLOCK_SIZE) temp.data[sbase + i] /= total;
         }
@@ -352,7 +380,12 @@ void main() {
     }
 
     // ---------- 6. top-p ----------
-    if (top_p > 0.0 && top_p < 1.0) {
+    // ★ 截断**不回写**：旧的「`temp < g_cutoff ⇒ 0`」单独一趟读写全词表，而 temp 是
+    //   采样专用临时缓冲、本 kernel 之后再无人读（下一步的载入趟整体覆盖它，
+    //   gpu_model.rs 里 `temp` 只进 `sample_*` 系列）⇒ 把同一个判定折进 §7 的读取
+    //   （`prob_at`），读到 0 的位置与旧版逐位相同，省掉一整趟全词表读写（§6.20）。
+    const bool topp_on = top_p > 0.0 && top_p < 1.0;
+    if (topp_on) {
         const uint mwords = (MASK_WORD_STRIDE == 0u || MASK_WORD_STRIDE >= N) ? N : MASK_WORD_STRIDE;
         for (uint w = index; w < mwords; w += BLOCK_SIZE) mask.data[mbase + w] = 0u;
         barrier();
@@ -378,13 +411,14 @@ void main() {
             }
             barrier();
         }
-        barrier();
-        [[unroll]]
-        for (uint i = index; i < N; i += BLOCK_SIZE) {
-            if (temp.data[sbase + i] < g_cutoff) temp.data[sbase + i] = 0.0;
-        }
+        // g_cutoff 由 index 0 写、§7 全块读 ⇒ 这里必须留一道屏障（回写趟已折进读取）。
         barrier();
     }
+
+    // top-p 截断点：§6 不回写 temp，改由本段的读取施加。关掉 top-p 时取 -1e30
+    // ⇒ `v < cutoff` 恒假（概率恒 ≥ 0），与旧版「不截断」逐位一致。
+    float cutoff = -1e30;
+    if (topp_on) cutoff = g_cutoff;
 
     // ---------- 7. 采样 ----------
     // ★ 2026-10-03 重写（对齐 CUDA `rwkv_sample_batch` §9 的「并行定位」）：
@@ -403,7 +437,10 @@ void main() {
     const uint cb = index * CH;
     const uint ce = min(cb + CH, N);
     float ps = 0.0;
-    for (uint i = cb; i < ce; i++) ps += temp.data[sbase + i];
+    for (uint i = cb; i < ce; i++) {
+        const float v = temp.data[sbase + i];
+        ps += (v < cutoff) ? 0.0 : v;
+    }
     shared_val[index] = ps;
     barrier();
 
@@ -444,7 +481,10 @@ void main() {
     const uint q0 = z0 + index * CH2;
     const uint q1 = min(q0 + CH2, z1);
     float qs = 0.0;
-    for (uint i = q0; i < q1; i++) qs += temp.data[sbase + i];
+    for (uint i = q0; i < q1; i++) {
+        const float v = temp.data[sbase + i];
+        qs += (v < cutoff) ? 0.0 : v;
+    }
     shared_val[index] = qs;
     barrier();
     if (index == 0u) {
@@ -458,7 +498,8 @@ void main() {
                 chosen = a1 - 1u;
                 float a = acc;
                 for (uint i = a0; i < a1; i++) {
-                    a += temp.data[sbase + i];
+                    const float v = temp.data[sbase + i];
+                    a += (v < cutoff) ? 0.0 : v;
                     if (a > s_u) { chosen = i; break; }
                 }
                 break;
