@@ -1248,6 +1248,56 @@ prefill（四轮中位）仍在六档全面领先：Vulkan 872 / 2 257 / 5 325 /
 24 个格子的解码/预填充指纹四轮全部稳定，六枚 Vulkan 解码指纹等于 §6.1 的发货值。
 原始数据 `/c/tmp/ac16/pair12/`，汇总器 `agg12.mjs`。英文 README §6.1 的「11th re-measure」。
 
+### 6.18 rosalia/ember 算子勘察：唯一可学的一招，实测证伪（2026-10-12，`IM_PIPE` 保持默认 0）
+
+用户点名要看的仓库 = `cryscan/rosalia` 的 `ember` 分支（fp16/fp32 coopmat 的 RWKV-7 Vulkan 引擎）。
+它的 `assets/shaders/src/` 只有 **4 个** compute（`gemm` / `gemv` / `norm` / `token_shift`），
+**整树 grep `int8|s8|coopmate` 零命中** ⇒ 它**根本没有 int8 张量核路径**，也就是我们真正落后那个内核
+它没实现。逐项对照：
+
+| ember 的东西 | 我们的对应物 | 结论 |
+| --- | --- | --- |
+| `gemm.comp`：下一个 k 瓦片的 `local_a[]`/`local_b[]` 留在寄存器里，那几条 LDG 插在 smem 存回**之后**、本瓦片 mma **之前**（`if (!last)`） | `gemm_imma` 是「LDG → 立刻 STS → barrier → mma」，每个窗口白等一次延迟 | **唯一可学的一招**，见下面实测 |
+| smem 行步长补白（`STRIDE_SH_*_TILE_Y = 40`） | `WPU = 36` 已是同类补白 | 已经在做 |
+| `layout_iota` / `layout_index` 布局代数 | 手算位拆分寻址 | 只影响可读性，不引入 |
+| `norm.comp`：subgroup 归约 + 两级 `sketch_sum[]` 折叠 | `fuse_ka_dplr_norm_s16` 同构 | 已经在做 |
+| `token_shift.comp`：游标打包成一个 uint（state 8 / token 16 / len 8） | 逐字段读 `Cursors` 缓冲 | 省不了访存，不做 |
+| `gemv.comp`：小 M 走 SIMT 点积而非 coopmat | `VK_IMMA_BM` 小批量档 + `gemm_imma_f16` | 已有，且 #44 实测过 |
+
+**做法**。`IM_PIPE`（默认 **0**，只接非宽窗口档）把一个 k 窗口的全局载入（`NLD` 条权重字 +
+`NLDX` 条激活字 + 一条 `szs` + 一条 `xas`）取进寄存器组 `pr_*`，循环体改成
+① STS(`pr_*`)（数据已在寄存器 ⇒ 不等）→ ② `barrier(1)` → ③ **LDG(下一窗口) 进 `pr_*`**
+→ ④ 本窗口 mma/flush（③ 的延迟影子在 ④ 里跑）→ ⑤ `barrier(2)`。寄存器增量是**一组**窗口而非两组
+⇒ 与旧结构同量级。逐位等价是构造出来的：k 窗口序 / 量化组序 / 累加序一个没动，`szs`/`xas` 在
+`barrier(2)` 之后才覆写。
+
+| `kernel_bench` 四形状 × B=8/32/64/128/256 = 20 格，同 exe 跨进程 `VK_SPV_DIR` 双臂、4 轮反序、`KB_REPEATS=7` | 结果 |
+| --- | --- |
+| Δmin | **13/20 格为正（更慢）、2 格恰好 0.00、5 格为负** |
+| 同轮配对中位 | 全在 ±1~2 % 内、**符号不一致**（最稳定的负数只有 `imma_head b=32` −1.31 %、`imma_out b=64` −1.29 %） |
+| `sum(y)` | **两臂逐格相同**（key 97899659264、head 20024912、out 59992142、value 480213768）⇒ 逐位等价、无正确性代价 |
+
+**臂身份怎么证（这条比读数重要）**：这里「两臂数值相同」是改动的**预期**，不能当臂标记。标记走删文件
+硬报错——单独删掉 `spv_new/gemm_imma_bm64_nst8.spv` 会报 `VK_SPV_DIR shader not found:` 并点名这一枚
+（`asset.rs` **没有静默回落**到内嵌字节），放回该行照印。顺带一条仪器坑：**`kernel_bench` 哪怕所有臂全
+失败也 exit 0** ⇒ 脚本必须 `grep 失败`，只看返回码等于没验证。
+
+**判据：死的是假设，不是实现。** 被证伪的是「本 kernel 被每个 k 窗口的全局载入延迟卡住」。
+`2026-10-11-…gemm_imma 取数结构…` §三.2 那句「计算与载入不重叠」当时是**推断**；现在 CUDA
+（`IMMA_PIPE`/`IM_NBUF`，`backend_cuda.rs:1857-1876`）与 Vulkan 两侧都有反例了。解释：`BM=64/NST=8`
+一档 smem ≈23.8 KB ⇒ 每 SM 驻留 2 块 × 8 warp，自己那份延迟本就被**邻居块**盖住，把自己那部分挪进
+mma 窗口换不到东西。剩下的份额是**指令量本身**（每窗口 `(BM+SLOT)·BK` 字节的 STS + 每组 smem
+回读/落盘往返）⇒ 要「少做事」而不是「换个顺序做」。
+
+**记账口径**：`gemm_imma` 的封死子路清单仍是**五条**——① 跨瓦片流水、② split-K 当吞吐档、
+③ A 片段直读全局（−32~42 %）、④ `BN=16` 宽列档（+6.5~+39 %）、⑤ epilogue 落盘换序（最好 −1.1 %）。
+本轮**不是新增第 6 条**，而是把 **① 从「只有 CUDA 侧反例 + Vulkan 侧一句推断」补成两侧都有实测**
+⇒ 「GLSL 里的调度空间已尽」这句话第一次是证据而不是猜测。
+
+**门禁**：`IM_PIPE=0` 重编译出的 **14 枚 `gemm_imma_bm*_nst*.spv` 与 HEAD 逐字节 md5 全等**
+（`/c/tmp/ac16/immapipe/md5.txt`）⇒ 探针档没改变任何发货字节；工作树只动 `assets/shaders/src/gemm_imma.comp`。
+另加 fmt / clippy `-D warnings` / `cargo test --release`。原始数据 `/c/tmp/ac16/immapipe/`，台账 §6.23。
+
 ## 7. 目录结构
 
 ```

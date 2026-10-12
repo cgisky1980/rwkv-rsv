@@ -142,6 +142,65 @@ shared vec4   xas[SLOT * NGW];          // 本窗口的激活统计（每槽 × 
 #define PACKED_BYTE(arr, byte) \
     int(int8_t(((arr)[(byte) >> 2u] >> (8u * ((byte) & 3u))) & 0xFFu))
 
+/// ★ 跨 k 窗口**寄存器软流水**（`IM_PIPE=1`，2026-10-12 探针档；结构抄 rosalia/ember 的
+///   `gemm.comp`：它把下一个瓦片的 `uvec4` 载入插在本瓦片的 mma **之前**）。
+///
+/// 为什么要单独试（Vulkan 侧从没测过这条）：本 kernel 的默认结构是「LDG(本窗口) → 立刻 STS
+///   → barrier → mma → barrier」，那 16+16 条全局载入的 ~600 cycle 延迟**每个窗口白等一次**，
+///   块内没有任何东西填它（`BM=64/NST=8` 一档 smem ≈23.8 KB ⇒ 每 SM 只 2 块 = 16 warp，
+///   靠邻居块掩盖延迟的本钱比 CUDA 少）。CUDA 侧 `IMMA_PIPE`/`IM_NBUF` 那两条反例
+///   （`backend_cuda.rs:1857-1876`）**搬不过来**：那边本来就有 `cp.async`，延迟已经被 DMA 吃掉，
+///   再加软件流水只会多占寄存器。
+///
+/// 做法：寄存器组 `pr_*` 持有「下一个窗口」的数据；循环体改成
+///   ① STS(`pr_*`)（数据已在寄存器 ⇒ 不等）→ ② `barrier(1)` → ③ LDG(下一窗口) 进 `pr_*`
+///   → ④ 本窗口的 mma/flush（**在它跑的时候 ③ 的载入正在飞**）→ ⑤ `barrier(2)`。
+///   寄存器增量 = 一组窗口数据（`NLD + NLDX + 1 + 1`），不是两组 ⇒ 与旧结构同量级
+///   （旧结构本来也要 `wr`/`xr` 两组活到 STS 结束）。
+///
+/// **逐位等价是构造出来的**：mma 的 k 窗口序、量化组序、累加序一个都没动；`szs`/`xas` 在
+///   `barrier(2)` **之后**才被覆写 ⇒ 本窗口的 flush 读到的还是本窗口的统计。
+/// 只接非宽窗口档（`IM_BM=64/128`）；`IM_WIDE` 那档的 staging 是分块的，瓶颈另有其处（记录 §六）。
+///
+/// ⚠️ **2026-10-12 实测：这条路没有肉，`IM_PIPE` 保持默认 0（发货字节 = 0 档，逐字节对拍过）。**
+///   同 exe / 跨进程 `VK_SPV_DIR` 双臂、4 轮反序、`KB_REPEATS=7`、四形状 × B=8/32/64/128/256 = 20 格：
+///   **Δmin 有 13/20 格为正（更慢）、2 格恰好持平、5 格为负**，同轮配对中位在 ±1~2 % 内且符号不一致（最大的稳定负数只有
+///   `imma_head b=32` 的 −1.3 %、`imma_out b=64` 的 −1.3 %，都在本机噪声底之内）；
+///   **两臂 `sum(y)` 逐格相同** ⇒ 逐位等价成立（但两臂数值相同是这条改动的**预期**，不是臂标记——
+///   臂标记走「删掉探针文件必须硬报错」那条，已验）。原始数据 `/c/tmp/ac16/immapipe/`。
+///   ⇒ **证伪的是「本 kernel 被每个 k 窗口的全局载入延迟卡住」这个假设**：`2026-10-11-…取数结构…`
+///   §三.2 那句「计算与载入不重叠」当时是**推断不是证据**，现在 CUDA(`IMMA_PIPE`/`IM_NBUF`) 与
+///   Vulkan 两侧都有了反例。延迟已经被**同 SM 的另一个驻留块**盖住了（`BM=64/NST=8` 是 2 块/SM ×
+///   8 warp），所以把自己那一份延迟挪进 mma 窗口里换不到东西。剩下的份额是**指令量本身**
+///   （每窗口 `(BM+SLOT)·BK` 字节的 STS + 每组的 smem 回读/落盘往返），那要用「少做事」而不是
+///   「换个顺序做」来解。⇒ 封死子路清单里的**第 ① 条（跨瓦片流水）至此在 CUDA 与 Vulkan 两侧都有
+///   实测反例**（记录 §6.23）；其余四条 ② split-K 当吞吐档、③ A 片段直读全局、④ `BN=16` 宽列档、
+///   ⑤ epilogue 落盘换序 也全部实测过 ⇒ 别再往调度方向加档。
+#ifndef IM_PIPE
+#define IM_PIPE 0
+#endif
+
+/// 把一个 k 窗口取进寄存器（`IM_PIPE` 的预取与本体的序言共用）。守卫与旧结构逐条相同。
+#define IM_LD_WIN(KT, DW, DX, DSZ, DXA) \
+    [[unroll]] for (uint n = 0u; n < NLD; n++) { \
+        const uint i = index + n * BLOCK_SIZE; \
+        const uint src = min(row0 + (i >> 5u), M - 1u); \
+        DW[n] = params.in_idx.data[((KT) >> 7u) * (M * 32u) + src * 32u + (i & 31u)]; \
+    } \
+    [[unroll]] for (uint n = 0u; n < NLDX; n++) { \
+        const uint i = index + n * BLOCK_SIZE; \
+        if (i < XW && s0base + (i >> 5u) < BATCH) { \
+            DX[n] = params.in_xq.data[(s0base + (i >> 5u)) * K4 + ((KT) >> 2u) + (i & 31u)]; \
+        } \
+    } \
+    { \
+        const uint gnow = ((KT) >> 7u); \
+        if (index < BM) { DSZ = params.in_sz.data[min(row0 + index, M - 1u) * G + gnow]; } \
+        if (index < SLOT && s0base + index < BATCH) { \
+            DXA = params.in_aux.data[(s0base + index) * G + gnow]; \
+        } \
+    }
+
 void main() {
     const uint index = gl_LocalInvocationIndex;
     const uint wid   = gl_LocalInvocationIndex >> 5u;   // warp 号（行维 × 槽组维 的二维）
@@ -177,6 +236,16 @@ void main() {
     // split-K：本 block 负责的 k 区间（host 保证 `K/128 % KS == 0`，段按量化组对齐）
     const uint ksp = gl_WorkGroupID.y;
     const uint kb  = K / KS;
+
+#if IM_PIPE && !IM_WIDE
+    // 流水寄存器组 + 序言：进循环前先把**第一个**窗口取回来（此后每轮预取下一个）。
+    uint pr_w[NLD];
+    uint pr_x[NLDX];
+    uint pr_sz;
+    vec4 pr_xa;
+    const uint kt_end = (ksp + 1u) * kb;   // 本 block 的 k 上界（不含）
+    IM_LD_WIN(ksp * kb, pr_w, pr_x, pr_sz, pr_xa)
+#endif
 
     for (uint kt = ksp * kb; kt < (ksp + 1u) * kb; kt += BKW) {
         const uint gr = kt >> 7u;   // 组号（宽窗口档：本窗口的**首个**量化组）
@@ -235,6 +304,23 @@ void main() {
             }
         }
 #else
+  #if IM_PIPE
+        // 流水档：数据上一轮就已取进寄存器 ⇒ 这里只落盘，**不等全局延迟**。
+        [[unroll]]
+        for (uint n = 0u; n < NLD; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            ws[(i >> 5u) * WPU + (i & 31u)] = pr_w[n] ^ 0x80808080u;
+        }
+        [[unroll]]
+        for (uint n = 0u; n < NLDX; n++) {
+            const uint i = index + n * BLOCK_SIZE;
+            if (i < XW && s0base + (i >> 5u) < BATCH) {
+                xs[(i >> 5u) * WPU + (i & 31u)] = pr_x[n];
+            }
+        }
+        if (index < BM) { szs[index] = pr_sz; }
+        if (index < SLOT && s0base + index < BATCH) { xas[index] = pr_xa; }
+  #else
         uint wr[NLD];
         [[unroll]]
         for (uint n = 0u; n < NLD; n++) {
@@ -271,8 +357,18 @@ void main() {
         if (index < SLOT && s0base + index < BATCH) {
             xas[index] = params.in_aux.data[(s0base + index) * G + gr];
         }
+  #endif
 #endif
         barrier();  // (1) staging 完成
+
+#if IM_PIPE && !IM_WIDE
+        // ★ 流水的核心一行：下一个窗口的载入**插在本窗口 mma 之前**发出去，
+        //   于是那 ~600 cycle 由 mma/flush 的工作量盖住。最后一轮不再预取
+        //   （`kt + BKW < kt_end` 对本块所有线程一致 ⇒ 一致分支，不是发散分支）。
+        if (kt + BKW < kt_end) {
+            IM_LD_WIN(kt + BKW, pr_w, pr_x, pr_sz, pr_xa)
+        }
+#endif
 
         // —— 逐量化组推进窗口（`NGW==1` 时就是这个循环只转一圈 = 旧行为）——
         // 权重片段先载进寄存器、本组内被全部 NST 组复用；组序**升序** ⇒ 与旧结构逐位同序。

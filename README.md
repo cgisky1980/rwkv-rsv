@@ -1778,6 +1778,64 @@ evidence is the per-dispatch ruler above. What is left in the kernel is 4 passes
 normalize pass when `total ≠ 1`, the sampling scan) plus, for non-greedy 口径 only, the top-p loop.
 Ledger §6.21, raw `/c/tmp/ac16/fold2/`.
 
+### 6.22 rosalia/ember operator survey: the one structure worth copying, measured and falsified (2026-10-12, `IM_PIPE` stays 0)
+
+The user asked what our operators could learn from `cryscan/rosalia` branch `ember`
+(= `rosalia-ember`, an fp16/fp32 coopmat RWKV-7 Vulkan engine). Its `assets/shaders/src/` holds **four**
+compute shaders (`gemm` / `gemv` / `norm` / `token_shift`) and **no int8 path at all** — grepping the
+whole tree for `int8|s8|coopmate` returns nothing, so the kernel where we actually lag is one it never
+implemented. Point by point:
+
+| What ember has | Our counterpart | Verdict |
+| --- | --- | --- |
+| `gemm.comp`: the next k-tile's `local_a[]`/`local_b[]` stay in registers; those LDGs are issued **after** the smem store and **before** this tile's mma (`if (!last)`) | `gemm_imma` is LDG → STS → barrier → mma, i.e. it waits once per window | **The one transferable idea** - measured below |
+| Padded shared-memory row stride (`STRIDE_SH_*_TILE_Y = 40`) | `WPU = 36` is the same trick already | nothing new |
+| `layout_iota` / `layout_index` layout algebra | hand-written bit-split addressing | readability only, no perf - not adopted |
+| `norm.comp`: subgroup reduction + two-level `sketch_sum[]` fold | `fuse_ka_dplr_norm_s16` is the same shape | already doing it |
+| `token_shift.comp`: cursor packed into one uint (state 8 / token 16 / len 8) | we read cursor fields straight off the buffer | saves no memory traffic |
+| `gemv.comp`: small-M goes SIMT dot-product instead of coopmat | `VK_IMMA_BM` small-batch arm + `gemm_imma_f16` | already present, already measured (#44) |
+
+**Implementing the one idea.** `IM_PIPE` (default **0**, non-wide tiles only) hoists a whole k-window's
+global loads (`NLD` weight words + `NLDX` activation words + one `szs` + one `xas`) into register
+group `pr_*`, then reorders the loop to (1) STS from `pr_*` (data already in registers, no wait)
+(2) `barrier(1)` (3) issue the **next** window's loads into `pr_*` (4) run this window's mma/flush, so
+step 3's latency hides inside step 4 (5) `barrier(2)`. Register delta is one window, not two, so it is
+the same order as before. Bit-exactness is by construction: k-window order, quant-group order and
+accumulation order are untouched, and `szs`/`xas` are only overwritten after `barrier(2)`.
+
+| `kernel_bench`, 4 shapes x B=8/32/64/128/256 = 20 cells, same exe, two `VK_SPV_DIR` arms, 4 reversed rounds, `KB_REPEATS=7` | result |
+| --- | --- |
+| Δmin | **13/20 positive (slower), 2 exactly 0.00, 5 negative** |
+| Matched-round medians | all within +/-1-2 %, **inconsistent signs** (best stable negatives: `imma_head b=32` -1.31 %, `imma_out b=64` -1.29 %) |
+| `sum(y)` | **identical per cell** on both arms (key 97899659264, head 20024912, out 59992142, value 480213768) => bit-exact, no correctness cost |
+
+**How the arms were proven to be the arms** (this matters more than the numbers): identical values are
+*expected* here, so they cannot be the arm marker. The marker is a deletion test - removing only
+`spv_new/gemm_imma_bm64_nst8.spv` makes the run hard-fail with `VK_SPV_DIR shader not found:` naming
+exactly that file (`asset.rs` has **no silent fallback** to embedded bytes), and restoring it makes the
+row print again. Related trap: **`kernel_bench` exits 0 even when every arm failed**, so the driver must
+grep the output for the failure marker - checking the exit code proves nothing.
+
+**Verdict: the hypothesis is dead, not the implementation.** What is falsified is "this kernel is stuck
+on the global-load latency of each k-window". `2026-10-11-…gemm_imma 取数结构…` §3.2 asserted "compute
+and load never overlap" as an *inference*; now CUDA (`IMMA_PIPE` / `IM_NBUF`, `backend_cuda.rs:1857-1876`)
+and Vulkan both hold counter-examples. Explanation: at `BM=64/NST=8` smem is ~23.8 KB => 2 resident
+blocks per SM x 8 warps, so my own latency was already being hidden by the neighbouring block - moving
+it into my mma window buys nothing. What remains is **instruction volume itself** ((BM+SLOT)*BK bytes of
+STS per window plus the per-group smem read-back/store round trips), which needs *doing less work*, not
+*reordering the same work*.
+
+**Accounting**: `gemm_imma`'s sealed sub-path list stays at **five** - (1) cross-tile pipelining,
+(2) split-K as a throughput knob, (3) A-fragment direct global reads (-32-42 %), (4) `BN=16` wide-column
+tile (+6.5-+39 %), (5) epilogue store reordering (best -1.1 %). This round does not add a sixth; it
+upgrades **(1) from "CUDA-only counter-example + a Vulkan-side guess" to measured-on-both**, so
+"the scheduling space in GLSL is exhausted" is now evidence rather than speculation.
+
+**Gate**: recompiling with `IM_PIPE=0` reproduces all **14 `gemm_imma_bm*_nst*.spv` byte-for-byte**
+against HEAD (md5 in `/c/tmp/ac16/immapipe/md5.txt`) => no shipped byte changed; working tree touches
+only `assets/shaders/src/gemm_imma.comp`. Plus fmt / clippy `-D warnings` / `cargo test --release`.
+Raw data `/c/tmp/ac16/immapipe/`, ledger §6.23.
+
 ## 7. Layout
 
 ```
