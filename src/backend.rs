@@ -91,6 +91,17 @@ pub trait ComputeBackend {
     // —— 张量管理 ——
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId>;
     fn upload(&self, t: TensorId, data: &[f32]) -> R<()>;
+    /// 批内上传：语义与 `upload` 完全一致（同样的数据落到同样的张量），唯一差别是
+    /// 若当前正处于 `begin_batch`/`end_batch` 的录制窗口内，则把设备拷贝**记进本批的
+    /// command buffer**、随 `end_batch` 一次提交，而不是自己单开一条 command buffer
+    /// 再 submit + 等队列空。默认实现直接转发 `upload` ⇒ CUDA 逐字节不变（它的
+    /// `begin_batch`/`end_batch` 本来既不提交也不同步，kernel 直接落到 stream 上）。
+    ///
+    /// ⚠️ 只在「批内上传 + 批内（或批后）读」的模式下使用；批内上传后立刻 standalone
+    /// `download` 同一张量会读到陈旧内容（见 `Runtime::upload_record`）。
+    fn upload_in_batch(&mut self, t: TensorId, data: &[f32]) -> R<()> {
+        self.upload(t, data)
+    }
     /// 部分上传：把 data 写入张量 [offset, offset+len) 段（f32 元素偏移），
     /// 其余部分不动（batch State 的 slot 回灌用）。
     fn upload_part(&self, t: TensorId, offset: usize, data: &[f32]) -> R<()> {
@@ -1734,6 +1745,19 @@ impl ComputeBackend for VulkanBackend {
             VulkanTensor::F32(g) => self.rt.upload(g, data),
             VulkanTensor::F16(g) => self.rt.upload_f16(g, data),
             VulkanTensor::U32(_) => Err("upload: u32 tensor requires u32 data".into()),
+        }
+    }
+
+    /// 批内上传（任务 #72）：只有 F32 走记录档（`Runtime::upload_record`），其余类型
+    /// 退回 `upload` 的独立提交 ⇒ 语义与今天完全一致，只是少付一次 submit + wait。
+    fn upload_in_batch(&mut self, t: TensorId, data: &[f32]) -> R<()> {
+        match self
+            .tensors
+            .get(&t)
+            .ok_or("upload_in_batch: unknown tensor")?
+        {
+            VulkanTensor::F32(g) => self.rt.upload_record(g, data),
+            _ => self.upload(t, data),
         }
     }
 

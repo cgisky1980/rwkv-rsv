@@ -1656,7 +1656,7 @@ impl GpuModel {
             );
         }
         let (vocab, tmp) = (self.config.vocab, self.batch_step_tmp(batch)?);
-        let bb = self.batch_step_forward(state, tokens)?;
+        let one_submit = !std::env::var("STEP_ONE_SUBMIT").is_ok_and(|v| v == "0");
         // 采样参数行 [batch, 10]（hist_len 走 sampler[7]，seed 走 sampler[3]）。
         let mut sdata = Vec::with_capacity(batch * 10);
         for (b, &hl) in hist_len.iter().enumerate() {
@@ -1674,6 +1674,48 @@ impl GpuModel {
                 0.0,
             ]);
         }
+        if one_submit {
+            // ★ 默认档（任务 #72）：**整个解码步 = 一条 command buffer = 一次提交**。
+            // token 上传、全部层、norm/head、sampler 上传、采样 dispatch 全录进同一窗口，
+            // 上传走 `upload_in_batch`（Vulkan 侧把它记进本批，而不是自建一条
+            // command buffer 再 submit + wait）。旧序列每步 4 次「提交 + 队列空等」，
+            // 其中 2 次是纯宿主空等（#70 实测同类 ≈0.155 ms/次）。
+            // 顺序正确性：`record_copy_range` 把目的张量登记进 `written` ⇒ 后读的 dispatch
+            // 拿到 RAW 屏障；采样的 token 宿主写回目标同时被 `upload_record` 登记为
+            // `read` ⇒ WAR 屏障，二者都在同一批内。
+            let (batch, bb, decode_only) = self.batch_step_plan(state, tokens)?;
+            self.backend.begin_batch()?;
+            self.batch_step_record(state, tokens, batch, &bb, decode_only, true)?;
+            self.backend.upload_in_batch(tmp.sampler, &sdata)?;
+            self.backend.sample_into_host_seeded_batch(
+                bb.logits,
+                bb.current_token,
+                vocab,
+                tmp.temp,
+                tmp.mask,
+                tmp.counter,
+                tmp.sampler,
+                hist,
+                batch,
+                hist_stride,
+                0,
+            )?;
+            self.backend.end_batch()?;
+            // ★ 读回必须在 `end_batch()` **之后**，且走 `download_host` 而非 `download`：
+            // Vulkan 侧采样 dispatch 只是被记录进持久 command buffer（真正的 submit + 等待在
+            // end_batch），而 token 是写进该张量的 **host 可见镜像**（自循环的 gather 也从
+            // host 侧读 token）。`download` 会先做 device→host 拷贝，用本步上传时 device 侧
+            // 的「输入 token」覆盖掉 kernel 刚写回的采样结果 ⇒ 每步返回喂进去的 token。
+            // 客户端池每步都走这里，Vulkan 上因此全部会话卡在同一个 token 上循环。
+            let raw = self.backend.download_host(bb.current_token)?;
+            return Ok(raw.iter().map(|v| f32::to_bits(*v)).collect());
+        }
+        // `STEP_ONE_SUBMIT=0`：改动前的四提交序列（A/B 对照臂，逐次提交与发货前的字节序列一致：
+        // ① token 上传 ② 前向 ③ sampler 上传 ④ 采样）。
+        let (batch, bb, decode_only) = self.batch_step_plan(state, tokens)?;
+        self.backend.begin_batch()?;
+        self.batch_step_record(state, tokens, batch, &bb, decode_only, false)?;
+        self.backend.end_batch()?;
         self.backend.upload(tmp.sampler, &sdata)?;
         self.backend.begin_batch()?;
         self.backend.sample_into_host_seeded_batch(
@@ -1689,12 +1731,6 @@ impl GpuModel {
             hist_stride,
             0,
         )?;
-        // ★ 读回必须在 `end_batch()` **之后**，且走 `download_host` 而非 `download`：
-        // Vulkan 侧采样 dispatch 只是被记录进持久 command buffer（真正的 submit + 等待在
-        // end_batch），而 token 是写进该张量的 **host 可见镜像**（自循环的 gather 也从
-        // host 侧读 token）。`download` 会先做 device→host 拷贝，用本步上传时 device 侧
-        // 的「输入 token」覆盖掉 kernel 刚写回的采样结果 ⇒ 每步返回喂进去的 token。
-        // 客户端池每步都走这里，Vulkan 上因此全部会话卡在同一个 token 上循环。
         self.backend.end_batch()?;
         let raw = self
             .backend
@@ -1702,13 +1738,13 @@ impl GpuModel {
         Ok(raw.iter().map(|v| f32::to_bits(*v)).collect())
     }
 
-    /// 批量单步前向（`batch_step_sample` 的前半段）：喂入各 slot 的 token、
-    /// 批量贯穿全部层、写 ln_out+head，返回 batch 工作缓冲（logits 在 `bb.logits`
-    /// [batch, vocab]）。诊断 / 测试用（`batch_step_logits`）。
-    /// `batch ≤ state.batch()`：只用 batch State 的前 batch 行，多余行不动
-    ///（并发池活跃槽恒为前缀，槽位回收/新增只改前缀长度）。
-    fn batch_step_forward(&mut self, state: &mut State, tokens: &[Vec<u32>]) -> R<WorkBuffers> {
-        use crate::model::LN_EPS;
+    /// 批量单步的**校验 + 取工作缓冲**段。必须留在 `begin_batch` **外面**：
+    /// `batch_buffers` 在批宽变化时会释放/重建张量，落进录制窗口毫无意义。
+    fn batch_step_plan(
+        &mut self,
+        state: &State,
+        tokens: &[Vec<u32>],
+    ) -> R<(usize, WorkBuffers, bool)> {
         let batch = tokens.len();
         if batch == 0 {
             return Err("batch_step_forward: 空 batch".into());
@@ -1724,27 +1760,47 @@ impl GpuModel {
         if tokens.iter().any(|t| t.is_empty()) {
             return Err("batch_step_forward: 每 slot 至少 1 个 token".into());
         }
+        let bb = self.batch_buffers(batch)?;
+        // 全 slot 单 token = decode 快路径（逐 slot 单步 kernel，无 pad 浪费）；
+        // 否则走变长 seq 路径（prefill 分块 / 混批），从各 slot 末 token 取残差。
+        let decode_only = tokens.iter().all(|t| t.len() == 1);
+        Ok((batch, bb, decode_only))
+    }
+
+    /// 批量单步的**录制**段（不含 `begin_batch`/`end_batch`）：token 上传 → 全部层 →
+    /// norm → head。调用方决定窗口边界（`batch_step_forward` 两步一提交、
+    /// `batch_step_sample` 默认档一步一提交）。
+    /// `merge_upload` = token 上传是否记进本批（`false` = 改动前的「批内独立提交」，
+    /// 只给 A/B 对照臂用）。
+    fn batch_step_record(
+        &mut self,
+        state: &mut State,
+        tokens: &[Vec<u32>],
+        batch: usize,
+        bb: &WorkBuffers,
+        decode_only: bool,
+        merge_upload: bool,
+    ) -> R<()> {
+        use crate::model::LN_EPS;
         let (c, h, ns, vocab) = (
             self.config.n_embd,
             self.config.n_head,
             self.config.head_size,
             self.config.vocab,
         );
-        let bb = self.batch_buffers(batch)?;
-        // 全 slot 单 token = decode 快路径（逐 slot 单步 kernel，无 pad 浪费）；
-        // 否则走变长 seq 路径（prefill 分块 / 混批），从各 slot 末 token 取残差。
-        let decode_only = tokens.iter().all(|t| t.len() == 1);
-
-        self.backend.begin_batch()?;
         if decode_only {
             let flat: Vec<f32> = tokens.iter().map(|t| f32::from_bits(t[0])).collect();
-            self.backend
-                .upload(self.bufs_current_token_of(&bb), &flat)?;
+            let tok = self.bufs_current_token_of(bb);
+            if merge_upload {
+                self.backend.upload_in_batch(tok, &flat)?;
+            } else {
+                self.backend.upload(tok, &flat)?;
+            }
             state.v_first_set = false;
             self.backend
                 .gather_rows_device_f16(self.emb_ln, bb.x, bb.current_token, c, batch)?;
             for i in 0..self.config.n_layer {
-                self.forward_layer_batch(i, c, h, ns, batch, state, &bb)?;
+                self.forward_layer_batch(i, c, h, ns, batch, state, bb)?;
             }
         } else {
             // 变长 seq 路径：用专用 batch_seq_bufs（与单序列 prefill 的 T 抖动隔离）。
@@ -1767,7 +1823,18 @@ impl GpuModel {
             LN_EPS,
             batch,
         )?;
-        self.head_batch(&bb, c, vocab, batch)?;
+        self.head_batch(bb, c, vocab, batch)
+    }
+
+    /// 批量单步前向（`batch_step_sample` 的前半段）：喂入各 slot 的 token、
+    /// 批量贯穿全部层、写 ln_out+head，返回 batch 工作缓冲（logits 在 `bb.logits`
+    /// [batch, vocab]）。诊断 / 测试用（`batch_step_logits`）。
+    /// `batch ≤ state.batch()`：只用 batch State 的前 batch 行，多余行不动
+    ///（并发池活跃槽恒为前缀，槽位回收/新增只改前缀长度）。
+    fn batch_step_forward(&mut self, state: &mut State, tokens: &[Vec<u32>]) -> R<WorkBuffers> {
+        let (batch, bb, decode_only) = self.batch_step_plan(state, tokens)?;
+        self.backend.begin_batch()?;
+        self.batch_step_record(state, tokens, batch, &bb, decode_only, true)?;
         self.backend.end_batch()?;
         Ok(bb)
     }

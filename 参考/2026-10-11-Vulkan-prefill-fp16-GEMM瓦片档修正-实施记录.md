@@ -773,6 +773,68 @@ batch=8 `sum=0x159da230e933117 xor=0xe1d839d` —— **改前改后逐位相同*
 把它接成「一条 command buffer 记 97 段设备拷贝」是与 §6.15/§6.16 同形的第三根，且不需要主机内存。
 Raw：`/c/tmp/ac16/sio_{base,fill}.log`、门禁 `/c/tmp/ac16/sio_gates.log`。探针已按工作区纪律删除。
 
+---
+
+### 6.17 逐步解码每步 4 次宿主提交 → 1 次（2026-10-12，任务 #72；英文 README §6.17 / 中文 §6.12）
+
+§6.15/§6.16 之后，同一根「宿主同步次数」杠杆上最近的一格在**解码的逐步路径**：
+`batch_step_sample` 是客户端并发池的真实形态（每步一个 token、每步回主机做停词与流式判定），
+改前每一步 4 次提交 —— ① token `upload`、② 32 层前向窗口、③ 采样器参数 `upload`（每槽 10 f32）、
+④ 采样窗口。前向窗口与采样窗口之间还夹着一次 `download_host`（它不提交，但必须在 `end_batch` 之后）。
+
+**为什么不能改 `upload` 的全局语义**：`Runtime::upload` 有 ≈20 个调用点，多数在窗口**外**，
+把它们统统变成「录制」会在那些地方静默丢同步。所以做的是**逐调用点显式选择**：
+
+- `Runtime::upload_record(&mut self, tensor, data)`（`src/runtime.rs`，紧跟 `upload`）：
+  写 host 镜像 → 若 `self.recording` 则 `record_copy_range(host, 0, tensor.device, 0, data.len())`
+  （= `record_barriers` + `cmd_copy_from_range` + `mark_written`），否则回落 `copy_buffer`。
+  正确性来自 §6.15 那套 barrier 记账：RAW/WAW 看 `written` 表、WAR 看 `read` 表 ——
+  本例最关键的顺序是「采样内核在窗口内写 host 镜像 ⇒ 录进去的读必须在它之前完成」，
+  `mark_written` 保证后续段能看到写侧登记。⚠️ 语义差别：**整块镜像 vs `data.len()` 个元素**，
+  `upload`/`copy_buffer` 搬整块，`upload_record` 只搬传入的那段。
+- `ComputeBackend::upload_in_batch(id, data)`（`src/backend.rs`，trait 默认 = 普通 `upload`）⇒
+  **CUDA 逐字节不变是构造出来的**：那边 `begin_batch`/`end_batch` 既不提交也不等待，合并窗口是空操作。
+  只有 `VulkanBackend` 覆盖它（F32 张量走 `upload_record`，其余回落 `upload`）。
+  ⚠️ 写进注释的契约：**批内上传之后不许在同窗口内对该张量做独立 `download`**（读回会抢跑）。
+- `batch_step_sample` 拆成 `batch_step_plan`（校验 + `batch_buffers` 定容 —— **必须留在窗口外**，
+  因为批宽变化时它释放/重建张量）+ `batch_step_record`（token 上传 → 32 层 → norm → head，
+  `merge_upload` 参数只给对照臂传 false）。两条臂跑的 kernel 序列因此逐条相同。
+  门 = `STEP_ONE_SUBMIT`（默认开 = 合并；`=0` = 旧 4 次提交，只作对照臂）。
+
+**仪器是新建的**：`AB_VAR` 那台进程内双臂驱动的是 `submit_sample_selfloop_batch`，
+它根本不调 `batch_step_sample`，而且每 n 个 token 才提交一次 ⇒ 这根杠杆在它上面**天生读零成本**。
+新增 `STEP_AB=1` + `STEP_AB_ROUNDS=<n>`（`examples/batch_decode_bench.rs`）：一次加载模型，
+每臂各自 reset + prefill，奇数轮反序，统计量取每臂多轮最小 + 逐轮配对。
+
+**结构判据（先于秒表）**：`PROF_SUBMIT=1`、B=1、16 步 ⇒ 合并臂打 **20** 行窗口（每步 1 个，9.1~9.6 ms），
+对照臂 **36** 行（每步 2 个：8.6~9.2 ms 前向 + 0.62~0.96 ms 采样），另外那两次独立 `upload` 不打印但同样
+是 submit+wait。⇒「4 次→1 次」是被窗口计数钉住的，不是推算的。
+
+**读数（门控 = §6.1 发货口径，只 Vulkan）**：
+
+| B | 轮 | 对照 Δmin | 合并 Δmin | Δmin 差 | 逐轮配对均值 | 同号 | 指纹 |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 1 | 12 | 12.247 | 12.015 | −0.232（−1.89 %） | +0.241 ± 0.100 ms | 12/12 | 两臂 `0x1acbfa`/`0x6d5c` |
+| 8 | 8 | 14.279 | 13.951 | −0.328（−2.30 %） | +0.251 ± 0.048 | 8/8 | `0xd07c18`/`0x647a` |
+| 32 | 6 | 22.375 | 21.843 | −0.532（−2.38 %） | +0.228 ± 0.207 | 5/6 | `0x348dad8`/`0x757c` |
+| 128 | 4 | 55.164 | 57.293 | **+2.129（+3.86 %）** | −0.713 ± 1.382 | 2/4 | `0xd1fce1e`/`0x8ce` |
+
+三条判读：
+
+1. **配对方差比 Δmin 更该看**：效果 = **≈0.24 ms/步且与批宽无关**，正是宿主侧两次 `queue_wait_idle`
+   被消掉的签名（GPU 工作量逐字节相同）。B=32 的 Δmin 虚高到 0.53 ms 是那格轮间 19.7 % 散布造成的。
+2. **B=128 那格 +3.86 %「合并更慢」是仪器不是机制**：台账 §22 的轮内热台阶（同一轮 55→60 ms 单调爬，
+   排后面的臂吃亏）—— 四轮配对 −2.87/+0.53/+0.46/−0.97 ms，2/4 同号、|均值| < 标准差。
+   预测值 0.24/55 = 0.4 % 在仪器地板之下两个数位 ⇒ **这一档不许用端到端判**，
+   证据只有窗口计数 + 逐位指纹。⇒ 又一次验证纪律：**<2~3 % 的机制只能靠结构判据 + 指纹发货**。
+3. **每一臂的 decode 指纹与自循环对拍相同**（`[对拍 B=] ... => 一致`，B=1/8/32/128 全过），
+   且合并臂 = 对照臂 = §6.1 表里同档的值 ⇒ 这次改动**数值零影响**，它没有、也不该有指纹变化。
+
+📌 还剩的格（同形，按体量）：`slot_move`/`slot_broadcast`（97 次设备内 `copy_range` 各自一条
+command buffer + 提交/等待）、自循环里的批内采样器上传（`gpu_model.rs:3360`）、变长 seq 路径的
+`upload_u32(lens_t)` + `upload_u32(tok)`（`gpu_model.rs:1418`/`1422`）。
+Raw：`/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`、窗口计数 `/c/tmp/ac16/profsub_{1,0}.log`。
+
 
 
 

@@ -8,6 +8,9 @@
 //!   STEP=1：额外跑 `batch_step_sample` **逐步**路径（每步回主机），与上面的自循环路径
 //!   对拍同一套 sum/xor 指纹——这是「采样结果陈旧」类 bug 的回归探针（见 §STEP 块注释）。
 //!   DUMP_TOK_STEP=<路径>：STEP 路径逐 token 落盘，格式同 DUMP_TOK。
+//!   STEP_AB=1（+ STEP_AB_ROUNDS=<n>）：给**逐步路径**做进程内配对 A/B（每档自己 reset+prefill，
+//!   奇数轮反序，统计量取每档多轮最小）——上面那个 `AB_VAR` 块只覆盖自循环路径，量不到
+//!   「每步几次宿主提交」这类杠杆。见 §STEP 块注释。
 //!   SLOT_BENCH=1：量「把一份状态分发给多个槽」的两条做法（宿主往返 vs 设备内广播）。
 //!   BUCKET_BENCH=1：量长度桶预热把多少用户可见延迟挪到启动期（见该块注释）。
 //!   AB_VAR=<门名>：**进程内换档 A/B**（同一进程一次加载模型，按段交替两档测吞吐；
@@ -294,110 +297,199 @@ fn main() -> Result<(), Box<dyn Error>> {
                     log::info!("[PROBE] logits dumped -> {path}");
                 }
             }
-            let st_t0 = Instant::now();
-            // 复用同一 batch State（不另建，省显存）：重置 + 重新 prefill，保证与自循环
-            // 路径从完全相同的状态出发。
-            model.reset_state_of(&bstate)?;
-            let seeds2 = model.forward_seq_batch_padded(&mut bstate, &prompts, pad_to)?;
-            if seeds2 != seeds {
-                log::warn!("[STEP] 两次 prefill 的 seeds 不一致，对拍前提不成立");
-            }
-            let prefill_ms = st_t0.elapsed().as_millis();
-
-            // hist 行宽：默认只占 8（hist_len 恒 0，内核不会读到有效数据以外的位置）；
-            // PENALTY=1 时要按自循环的口径复刻「段内已生成 token」，行宽须 ≥ 段长 ntok。
+            // 每档自己 reset + prefill（保证两档从同一状态出发），见下面臂循环内。
             let hist_stride = if penalty { ntok.max(8) } else { 8 };
             let hist = model.alloc_u32(slots * hist_stride)?;
-            model.write_u32(hist, &vec![0u32; slots * hist_stride])?;
-            // PENALTY=1 的语义与自循环逐字对齐：每段开头 hist_len 归零，段内第 r 步
-            // hist_len = r（= 本段前 r 步采样出的 token，**不含**本步刚喂进去的那个），
-            // 采样后立刻把新 token 追加到该行第 r 列（`write_u32_part` = 增量上传）。
-            let mut hist_len = vec![0u32; slots];
+            // —— STEP_AB=1：给**逐步路径**做进程内配对 A/B ——
+            //
+            // 为什么上面那块 `AB_VAR` 帮不上忙：它跑的是自循环路径（一次提交 n 轮、全程不回
+            // 主机），而逐步路径每次提交只有一个 token ⇒ 「每步几次宿主提交」这类杠杆在自循环
+            // 上是**零成本**的，量不到。逐步路径又是客户端并发池的实际形态，所以配对必须做在
+            // 这里。口径与 `AB_VAR` 那块一致：每轮两档各跑一遍、奇数轮反序、统计量取**每档多轮
+            // 最小**（Δmin），每档绑定标记 = 该档自己的 STEP 指纹 + 与自循环的对拍。
+            let ab_mode = std::env::var("STEP_AB").is_ok_and(|v| v != "0");
+            let ab_rounds: usize = std::env::var("STEP_AB_ROUNDS")
+                .unwrap_or_else(|_| "6".into())
+                .parse()?;
+            let gate = "STEP_ONE_SUBMIT";
+            // (标签, 档位值)；空值 = 撤销变量走默认档。
+            let arms: Vec<(&str, &str)> = if ab_mode {
+                vec![("legacy", "0"), ("one-submit", "1")]
+            } else {
+                vec![("default", "")]
+            };
+            let mut arm_ms: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+            let mut arm_fp: Vec<(u64, u64)> = vec![(0, 0); arms.len()];
+            let rounds = if ab_mode { ab_rounds } else { 1 };
+            for r in 0..rounds {
+                let mut order: Vec<usize> = (0..arms.len()).collect();
+                if ab_mode && r % 2 == 1 {
+                    order.reverse();
+                }
+                for &ai in order.iter() {
+                    let (tag, val) = arms[ai];
+                    if ab_mode {
+                        // SAFETY: 本 example 全程单线程，且此刻没有 forward 在飞（上一档的
+                        // 循环已经把 `end_batch()` 收完）；被测门是每次 forward 读的 env。
+                        unsafe {
+                            if val.is_empty() {
+                                std::env::remove_var(gate);
+                            } else {
+                                std::env::set_var(gate, val);
+                            }
+                        }
+                        let got = std::env::var(gate).unwrap_or_default();
+                        if got != val {
+                            log::warn!("[STEP-AB] env 回读不一致 want={val:?} got={got:?}");
+                        }
+                    }
+                    let st_t0 = Instant::now();
+                    // 复用同一 batch State（不另建，省显存）：重置 + 重新 prefill，保证与自循环
+                    // 路径从完全相同的状态出发。
+                    model.reset_state_of(&bstate)?;
+                    let seeds2 = model.forward_seq_batch_padded(&mut bstate, &prompts, pad_to)?;
+                    if seeds2 != seeds {
+                        log::warn!("[STEP] 两次 prefill 的 seeds 不一致，对拍前提不成立");
+                    }
+                    let prefill_ms = st_t0.elapsed().as_millis();
 
-            // seed 口径必须复刻自循环：段初基 = 该槽上一段的末 token，段内第 r 步
-            // seed = 基 + r（见 `submit_sample_selfloop_batch` 的 `seeds_r`）。
-            let mut feed = seeds2.clone();
-            let mut st_sum = 0u64;
-            let mut st_xor = 0u64;
-            let mut st_total = 0usize;
-            let mut all_tokens: Vec<Vec<u32>> = vec![Vec::new(); slots];
-            let mut st_t1 = Instant::now();
-            for seg in 0..warmup + segs {
-                let base = feed.clone();
-                if penalty {
-                    // 段初清零，与 `submit_sample_selfloop_batch` 开头把 token_seq 整段
-                    // upload 成零、且 sampler[7]=round 从 0 起完全同构。
-                    hist_len.iter_mut().for_each(|l| *l = 0);
-                }
-                if seg == warmup {
-                    st_t1 = Instant::now();
-                }
-                for r in 0..ntok {
-                    let tokens: Vec<Vec<u32>> = feed.iter().map(|&t| vec![t]).collect();
-                    let sps: Vec<SamplerParams> = (0..slots)
-                        .map(|s| SamplerParams {
-                            seed: base[s].wrapping_add(r as u32),
-                            ..sp
-                        })
-                        .collect();
-                    let out = model.batch_step_sample(
-                        &mut bstate,
-                        &tokens,
-                        hist,
-                        hist_stride,
-                        &hist_len,
-                        &sps,
-                    )?;
-                    for (s, &t) in out.iter().enumerate() {
-                        feed[s] = t;
+                    // hist 行宽：默认只占 8（hist_len 恒 0，内核不会读到有效数据以外的位置）；
+                    // PENALTY=1 时要按自循环的口径复刻「段内已生成 token」，行宽须 ≥ 段长 ntok。
+                    model.write_u32(hist, &vec![0u32; slots * hist_stride])?;
+                    // PENALTY=1 的语义与自循环逐字对齐：每段开头 hist_len 归零，段内第 r 步
+                    // hist_len = r（= 本段前 r 步采样出的 token，**不含**本步刚喂进去的那个），
+                    // 采样后立刻把新 token 追加到该行第 r 列（`write_u32_part` = 增量上传）。
+                    let mut hist_len = vec![0u32; slots];
+
+                    // seed 口径必须复刻自循环：段初基 = 该槽上一段的末 token，段内第 r 步
+                    // seed = 基 + r（见 `submit_sample_selfloop_batch` 的 `seeds_r`）。
+                    let mut feed = seeds2.clone();
+                    let mut st_sum = 0u64;
+                    let mut st_xor = 0u64;
+                    let mut st_total = 0usize;
+                    let mut all_tokens: Vec<Vec<u32>> = vec![Vec::new(); slots];
+                    let mut st_t1 = Instant::now();
+                    for seg in 0..warmup + segs {
+                        let base = feed.clone();
                         if penalty {
-                            // 客户端池 `append_hist` 的形状：只写这一格，不重传整行。
-                            model.write_u32_part(hist, s * hist_stride + r, &[t])?;
-                            hist_len[s] = r as u32 + 1;
+                            // 段初清零，与 `submit_sample_selfloop_batch` 开头把 token_seq 整段
+                            // upload 成零、且 sampler[7]=round 从 0 起完全同构。
+                            hist_len.iter_mut().for_each(|l| *l = 0);
                         }
-                        if seg >= warmup {
-                            st_sum = st_sum.wrapping_add(t as u64);
-                            st_xor ^= t as u64;
-                            all_tokens[s].push(t);
-                            st_total += 1;
+                        if seg == warmup {
+                            st_t1 = Instant::now();
                         }
+                        for r in 0..ntok {
+                            let tokens: Vec<Vec<u32>> = feed.iter().map(|&t| vec![t]).collect();
+                            let sps: Vec<SamplerParams> = (0..slots)
+                                .map(|s| SamplerParams {
+                                    seed: base[s].wrapping_add(r as u32),
+                                    ..sp
+                                })
+                                .collect();
+                            let out = model.batch_step_sample(
+                                &mut bstate,
+                                &tokens,
+                                hist,
+                                hist_stride,
+                                &hist_len,
+                                &sps,
+                            )?;
+                            for (s, &t) in out.iter().enumerate() {
+                                feed[s] = t;
+                                if penalty {
+                                    // 客户端池 `append_hist` 的形状：只写这一格，不重传整行。
+                                    model.write_u32_part(hist, s * hist_stride + r, &[t])?;
+                                    hist_len[s] = r as u32 + 1;
+                                }
+                                if seg >= warmup {
+                                    st_sum = st_sum.wrapping_add(t as u64);
+                                    st_xor ^= t as u64;
+                                    all_tokens[s].push(t);
+                                    st_total += 1;
+                                }
+                            }
+                        }
+                    }
+                    let step_secs = st_t1.elapsed().as_secs_f64();
+                    let step_toks = st_total as f64 / step_secs;
+                    let ms_step = step_secs * 1000.0 / (st_total as f64 / slots as f64);
+                    step_readings = Some((step_toks, st_sum, st_xor));
+                    arm_ms[ai].push(ms_step);
+                    arm_fp[ai] = (st_sum, st_xor);
+                    log::info!(
+                        "[STEP B={}]{} prefill {} ms | decode {} tok {} ms = {:.1} tok/s（聚合，逐token回主机）\
+                 {:.2} ms/步",
+                        slots,
+                        if ab_mode {
+                            format!(" [{tag} r{r}]")
+                        } else {
+                            String::new()
+                        },
+                        prefill_ms,
+                        st_total,
+                        (step_secs * 1000.0) as u128,
+                        step_toks,
+                        ms_step
+                    );
+                    log::info!(
+                        "[STEP B={}]{} decode tokens sum={st_sum:#x} xor={st_xor:#x}",
+                        slots,
+                        if ab_mode {
+                            format!(" [{tag} r{r}]")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    log::info!(
+                        "[对拍 B={}] 自循环 sum={tok_sum:#x} xor={tok_xor:#x} | STEP sum={st_sum:#x} xor={st_xor:#x} => {}",
+                        slots,
+                        if (tok_sum, tok_xor) == (st_sum, st_xor) {
+                            "一致"
+                        } else {
+                            "**不一致**（逐步路径采样读数有问题）"
+                        }
+                    );
+                    if let Ok(path) = std::env::var("DUMP_TOK_STEP") {
+                        use std::io::Write as _;
+                        let f = std::fs::File::create(&path)?;
+                        let mut w = std::io::BufWriter::new(f);
+                        for (slot, out) in all_tokens.iter().enumerate() {
+                            for (step, &t) in out.iter().enumerate() {
+                                writeln!(w, "{slot} {step} {t}")?;
+                            }
+                        }
+                        log::info!("[STEP B={}] tokens dumped -> {path}", slots);
                     }
                 }
             }
-            let step_secs = st_t1.elapsed().as_secs_f64();
-            let step_toks = st_total as f64 / step_secs;
-            step_readings = Some((step_toks, st_sum, st_xor));
-            log::info!(
-                "[STEP B={}] prefill {} ms | decode {} tok {} ms = {:.1} tok/s（聚合，逐token回主机）",
-                slots,
-                prefill_ms,
-                st_total,
-                (step_secs * 1000.0) as u128,
-                step_toks
-            );
-            log::info!(
-                "[STEP B={}] decode tokens sum={st_sum:#x} xor={st_xor:#x}",
-                slots
-            );
-            log::info!(
-                "[对拍 B={}] 自循环 sum={tok_sum:#x} xor={tok_xor:#x} | STEP sum={st_sum:#x} xor={st_xor:#x} => {}",
-                slots,
-                if (tok_sum, tok_xor) == (st_sum, st_xor) {
-                    "一致"
-                } else {
-                    "**不一致**（逐步路径采样读数有问题）"
-                }
-            );
-            if let Ok(path) = std::env::var("DUMP_TOK_STEP") {
-                use std::io::Write as _;
-                let f = std::fs::File::create(&path)?;
-                let mut w = std::io::BufWriter::new(f);
-                for (slot, out) in all_tokens.iter().enumerate() {
-                    for (step, &t) in out.iter().enumerate() {
-                        writeln!(w, "{slot} {step} {t}")?;
-                    }
-                }
-                log::info!("[STEP B={}] tokens dumped -> {path}", slots);
+            if ab_mode {
+                let min_of = |v: &[f64]| v.iter().fold(f64::INFINITY, |a: f64, &b| a.min(b));
+                let (na, nb) = (min_of(&arm_ms[0]), min_of(&arm_ms[1]));
+                let pairs: Vec<String> = arm_ms[0]
+                    .iter()
+                    .zip(arm_ms[1].iter())
+                    .map(|(a, b)| format!("{a:.2}/{b:.2}"))
+                    .collect();
+                let same_fp = arm_fp[0] == arm_fp[1];
+                log::info!(
+                    "[STEP-AB B={}] {gate}: legacy {:.3} → one-submit {:.3} ms/步 = {:+.2} %\n  \
+                     逐轮配对 legacy/one {} | 指纹 {} legacy={:#x}/{:#x} one={:#x}/{:#x}",
+                    slots,
+                    na,
+                    nb,
+                    (nb - na) * 100.0 / na,
+                    pairs.join(" "),
+                    if same_fp {
+                        "相同 ✔"
+                    } else {
+                        "**不同 ✗**"
+                    },
+                    arm_fp[0].0,
+                    arm_fp[0].1,
+                    arm_fp[1].0,
+                    arm_fp[1].1
+                );
             }
         }
 
@@ -791,6 +883,11 @@ fn gating_json() -> serde_json::Value {
         "SELFLOOP_CHUNK": knob("SELFLOOP_CHUNK", "内核默认分段"),
         "PREFILL_SLOTS": knob("PREFILL_SLOTS", "8"),
         "STEP": knob("STEP", "关 —— 只跑自循环路径"),
+        "STEP_ONE_SUBMIT": knob(
+            "STEP_ONE_SUBMIT",
+            "开（未设）—— 逐步路径每步 1 次宿主提交；=0 回到每步 4 次的旧序列，只给 A/B 当对照臂"
+        ),
+        "STEP_AB": knob("STEP_AB", "关 —— =1 时给逐步路径做进程内配对 A/B（配 STEP_AB_ROUNDS=<n>）"),
         "PENALTY": knob("PENALTY", "关 —— 无频率惩罚"),
         "SLOT_BENCH": knob("SLOT_BENCH", "关"),
         "ABLATE": knob("ABLATE", "空 —— 不消融任何 kernel"),

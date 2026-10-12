@@ -411,6 +411,33 @@ impl Runtime {
         Ok(())
     }
 
+    /// **批内上传**：与 `upload` 同一条 memcpy + 同一段设备拷贝，唯一区别是
+    /// 当前正在 `begin_batch` 记录时，设备拷贝**记进本批的 command buffer**
+    /// （随 `end_batch` 一次提交），而不是自己建一条 command buffer 再 submit + wait。
+    ///
+    /// 存在的理由（任务 #72）：解码每步的「喂入 token」与「采样参数」两处上传原本各自
+    /// 付一次 submit + `queue_wait_idle`，而它们本来就发生在批内 ⇒ 每步 4 次提交里有 2 次
+    /// 是纯宿主空等（#70 实测同类空等 ≈0.155 ms/次）。批外调用退化成 `upload`，语义不变。
+    ///
+    /// ★ 顺序正确性由 `record_copy_range` 负责：它先 `record_barriers(reads=host,
+    /// writes=device)` 再 `mark_written(device)` ⇒ 本批后续读该张量的 dispatch 会拿到屏障。
+    /// ⚠️ 唯一的语义变化：批内「先 upload、后立刻 standalone `download` 同一张量」会读到
+    /// 陈旧的 device 内容（今天读得到是因为它当场就提交了）。两个调用点（token / sampler）
+    /// 都没有这种模式，故只在显式调用 `upload_record` 时才走记录档。
+    ///
+    /// 另一处与 `upload` 的可见差别：`upload` 走 `copy_buffer`，它拷的是**整段镜像**
+    /// （`data` 比张量短时也会把镜像尾部重灌一遍）；这里只拷 `data` 那么多元素。
+    /// 两个调用点都是满长度上传 ⇒ 实际字节完全相同。
+    pub fn upload_record(&mut self, tensor: &GpuTensor, data: &[f32]) -> R<()> {
+        let host = tensor.host.as_ref().ok_or("upload_record: host dropped")?;
+        host.copy_from(data, 0)?;
+        if self.recording {
+            self.record_copy_range(host, 0, &tensor.device, 0, data.len())
+        } else {
+            self.copy_buffer(host, &tensor.device)
+        }
+    }
+
     /// 从 GPU 下载数据（device → host）
     pub fn download(&self, tensor: &GpuTensor) -> R<Vec<f32>> {
         let host = tensor.host.as_ref().ok_or("download: host dropped")?;
