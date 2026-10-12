@@ -183,6 +183,31 @@ pub trait ComputeBackend {
     fn begin_batch(&mut self) -> R<()>;
     fn end_batch(&mut self) -> R<()>;
 
+    // —— 流水窗（把「录制」与「GPU 执行」重叠；只有 Vulkan 实现）——
+    //
+    // 语义：一段自循环不再「全录进一条 command buffer → submit → wait」，而是每 k 轮开
+    // 一窗、录完就 submit（**不等**），录下一窗时 GPU 正在吃上一窗；环满时只等最旧那窗的
+    // fence。存在的理由：B=128 用 `PROF_HOST` 在稳态段量到每步纯宿主录制 3.14 ms，而 GPU 在
+    // 那段时间完全空转——CUDA 靠 graph replay 本来就没有这段，这是 Vulkan 单方面要还的债。台账 §6.24。
+    //
+    // ★ 默认实现一律报错：不支持的后端调用到 = 编程错误，不做静默退化（退化成
+    //   begin/end_batch 会把重叠换回串行，测出来只会是假数字）。
+    fn supports_windows(&self) -> bool {
+        false
+    }
+    fn begin_segment(&mut self) -> R<()> {
+        Err("begin_segment: backend has no windowed pipeline".into())
+    }
+    fn begin_window(&mut self) -> R<()> {
+        Err("begin_window: backend has no windowed pipeline".into())
+    }
+    fn submit_window(&mut self) -> R<()> {
+        Err("submit_window: backend has no windowed pipeline".into())
+    }
+    fn end_segment(&mut self) -> R<()> {
+        Err("end_segment: backend has no windowed pipeline".into())
+    }
+
     /// 阻塞直到设备把**已提交/已入队**的活全部跑完。基准与剖析专用，推理路径不需要
     /// （Vulkan 靠 `end_batch` 的 submit+wait_idle 收口，CUDA 靠 graph replay / `download`）。
     ///
@@ -1974,6 +1999,26 @@ impl ComputeBackend for VulkanBackend {
 
     fn end_batch(&mut self) -> R<()> {
         self.rt.end_batch()
+    }
+
+    fn supports_windows(&self) -> bool {
+        true
+    }
+
+    fn begin_segment(&mut self) -> R<()> {
+        self.rt.begin_segment()
+    }
+
+    fn begin_window(&mut self) -> R<()> {
+        self.rt.begin_window()
+    }
+
+    fn submit_window(&mut self) -> R<()> {
+        self.rt.submit_window()
+    }
+
+    fn end_segment(&mut self) -> R<()> {
+        self.rt.end_segment()
     }
 
     fn synchronize(&mut self) -> R<()> {

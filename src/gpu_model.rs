@@ -3284,7 +3284,27 @@ impl GpuModel {
         }
         self.backend.upload(b.sampler, &sampler0)?;
 
-        self.backend.begin_batch()?;
+        // `SELFLOOP_PIPE=<k>`（**默认 2=开**，只对 Vulkan 生效；置 0 关）：把 n 轮切成「每 k 轮一个
+        // **流水窗**」——录完就 submit 但**不等**，录下一窗时 GPU 正在吃上一窗；回收槽位只等那一窗
+        // 的 fence。要消掉的是实测 3.14 ms/步（B=128，`PROF_HOST` 稳态段）的纯宿主录制空等：
+        // 一整段录成一条 command buffer 时 GPU 在这段时间里是完全空转的。CUDA 靠 graph replay
+        // 没有这段债，见 runtime.rs 的窗机制。
+        // 默认档的成对实测（进程内换档、8 轮 Δmin、每宽度 8/8 同号）：**固定 ms/步**而非百分比，
+        // 正是「消掉一项定长宿主开销」的签名 —— k=8 档 B=8 −1.71 / B=32 −2.17 / B=64 −1.92 /
+        // B=128 −1.76 ms/步。窗宽扫过 1/2/4/8：2 与 1 打平（+0.1/+0.3 %，在 ±2 % 空档底内）而
+        // 2 比 8 再快 0.68(B=128)/0.77(B=32) ms/步 ⇒ 取 **2**（首窗录制是消不掉的「lead-in」，
+        // k 越小那段越短；再小就只是多付 submit）。五个宽度的 decode 指纹与发货值逐位相同（台账 §6.24）。
+        // 与 `SELFLOOP_CHUNK`（切段但每段都等，结论「切段不赚」§22.6）互斥，本档优先。
+        let pipe: usize = std::env::var("SELFLOOP_PIPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let piped = pipe > 0 && self.backend.supports_windows();
+        if piped {
+            self.backend.begin_segment()?;
+        } else {
+            self.backend.begin_batch()?;
+        }
         let key = self.selfloop_key_for_state(&b, state);
         // graph 捕获只在支持的后端（CUDA）尝试；Vulkan 走下面的「逐轮直接记录」分支
         // （整段 n 轮同批、一次 submit）。SKIP_GRAPH 仍可强制降级（逐 kernel 剖析用）。
@@ -3320,7 +3340,13 @@ impl GpuModel {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         for round in 0..n {
-            if !graph_ok && chunk > 0 && round > 0 && round.is_multiple_of(chunk) {
+            if piped && round.is_multiple_of(pipe) {
+                // 窗边界：上一窗 submit（不等），本窗开录。round 0 只开窗。
+                if round > 0 {
+                    self.backend.submit_window()?;
+                }
+                self.backend.begin_window()?;
+            } else if !graph_ok && chunk > 0 && round > 0 && round.is_multiple_of(chunk) {
                 // 先提交并等待：uniform 池/查询池在下一批会被复用，必须等本批 GPU 读完。
                 self.backend.end_batch()?;
                 self.backend.begin_batch()?;
@@ -3379,7 +3405,13 @@ impl GpuModel {
                 )?;
             }
         }
-        self.backend.end_batch()?;
+        if piped {
+            // 收尾：最后一窗 submit（不等），再等齐所有在飞窗口的 fence。
+            self.backend.submit_window()?;
+            self.backend.end_segment()?;
+        } else {
+            self.backend.end_batch()?;
+        }
         Ok(SelfloopTicket {
             token_seq: b.token_seq,
             n,

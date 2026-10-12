@@ -6,7 +6,7 @@
 //! 两族共用同一 uniform 池 / 持久 command buffer / buffer 级 barrier 机制。
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 
 use half::f16;
@@ -234,6 +234,38 @@ pub struct Runtime {
     /// 池容量是硬上限（`QUERY_POOL_SIZE / 2` 条/窗），超出后静默丢弃 ⇒ 打印的 SUM 只是
     /// 窗内前缀。不记这个数就会把「前缀」读成「整窗」（见 §6.18 附的仪器教训）。
     prof_gpu_dropped: u32,
+    /// ★ **流水窗口**（`SELFLOOP_PIPE=<k>`，默认 2=开；只有 Vulkan 有）：环里的每个槽 =
+    /// 一个可复用的 compute command buffer + 它的 signal fence。为什么要它：
+    /// 非 graph 后端一整段自循环是「把 n 轮全录进**一条** command buffer → 一次 submit →
+    /// 一次 wait」，于是 GPU 在整个录制期间**完全空转**。B=128 用既有的 `PROF_HOST` 在
+    /// **稳态段**直接量到这段宿主录制 = 100.3 ms / 32 轮 = **3.14 ms/步**（47264 条 dispatch，
+    /// 其中 barrier 1.49 + dispatch 0.71 + cache 0.15 + key 0.12 ms/步）。
+    /// ⚠️ 别拿首段的读数：`record_kernel` 的 cache 未命中会走 `create_kernel`（VkPipeline 创建），
+    /// 首段因此读到 164-195 ms = 5.1-6.1 ms/步，虚高 ~1.7 ms/步（同一条仪器教训也解释了
+    /// §6.19 的「时间戳之和」缺口）。CUDA 靠 graph replay 把这段完全省掉，这是它每步领先的一截。
+    /// 做法：每 k 轮一个窗口，`submit` 后**不等**，录下一窗时 GPU 正在吃上一窗；
+    /// 回收槽位时只等「那一个窗的 fence」，不等 `queue_wait_idle`（后者会把整条队列排空，
+    /// 等于把重叠又换回串行）。见台账 §6.24。
+    windows: Vec<WindowSlot>,
+    /// 在飞窗口的提交顺序（队首 = 最旧，槽位全忙时等它）。
+    window_fifo: VecDeque<usize>,
+    /// 下一次找空闲槽的扫描起点（轮转，避免总用同一个槽）。
+    window_recycle: usize,
+    /// 当前正在录制的窗口下标；`usize::MAX` = 不在窗口里。
+    cur_window: usize,
+    /// 本段处于流水状态（决定 uniform 池耗尽时是「排空在飞窗口」还是直接报错）。
+    pipelined: bool,
+}
+
+/// 流水环里的一个槽：command buffer（连同它的分配持有者，drop 会 free）+ signal fence。
+#[derive(Debug)]
+struct WindowSlot {
+    cmd: vk::CommandBuffer,
+    /// 持有者：`CommandBuffer::drop` 会 `vkFreeCommandBuffers`，只存裸句柄会 use-after-free
+    /// （与 [`Runtime::_cmd_owner`] 同一条教训）。
+    _owner: CommandBuffer,
+    fence: vk::Fence,
+    in_flight: bool,
 }
 
 /// 唯一标识一个已创建的 kernel（pipeline）。
@@ -287,6 +319,11 @@ impl Runtime {
             prof_gpu_entries: Vec::new(),
             prof_gpu_count: 0,
             prof_gpu_dropped: 0,
+            windows: Vec::new(),
+            window_fifo: VecDeque::new(),
+            window_recycle: 0,
+            cur_window: usize::MAX,
+            pipelined: false,
         })
     }
 
@@ -924,6 +961,16 @@ impl Runtime {
 
     /// 开启一次批处理记录：reset 并 begin 持久 command buffer，清空待提交资源
     pub fn begin_batch(&mut self) -> R<()> {
+        // 流水段进行中**不能**开批：begin_batch 会把 uniform 池游标/slot 表清零，
+        // 而在飞窗口的 dispatch 正在读那些 slot ⇒ 覆写 = 读到下一窗的参数。
+        // 段内需要的「新窗」由 `begin_window` 提供（它刻意不清池）。
+        if self.pipelined {
+            return Err(
+                "begin_batch: 流水段内禁止开批（会清掉在飞窗口正在读的 uniform slot）；\
+                 请用 begin_window/submit_window"
+                    .into(),
+            );
+        }
         unsafe {
             self.app
                 .device
@@ -1110,6 +1157,178 @@ impl Runtime {
             self.prof_bar = std::time::Duration::ZERO;
             self.prof_disp = std::time::Duration::ZERO;
         }
+        Ok(())
+    }
+
+    /// 同时可提交的窗口数。4 绰绰有余：一窗的 GPU 时间 ≫ 录下一窗的宿主时间
+    /// （默认档 k=2、B=128：一窗 GPU ≈78 ms vs 录一窗 ≈6 ms），深度 >1 只是为了让
+    /// 「等最旧那窗」永远排不空，再深不会有别的收益（首窗 lead-in 只跟 k 有关）。
+    const WINDOW_DEPTH: usize = 4;
+
+    /// 懒分配流水环（command buffer + fence）。fence 随 Runtime 存活，不逐段建/毁。
+    fn ensure_windows(&mut self) -> R<()> {
+        if !self.windows.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..Self::WINDOW_DEPTH {
+            let owner = self.app.allocate_compute_command_buffers(1)?;
+            let cmd = owner[0];
+            let fence = unsafe {
+                self.app
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::builder(), None)?
+            };
+            self.windows.push(WindowSlot {
+                cmd,
+                _owner: owner,
+                fence,
+                in_flight: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// 只等**这一个**窗口跑完（不是 `queue_wait_idle`）——流水能重叠的关键就在这。
+    fn wait_window(&mut self, idx: usize) -> R<()> {
+        let fence = self.windows[idx].fence;
+        unsafe {
+            self.app.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            self.app.device.reset_fences(&[fence])?;
+        }
+        self.windows[idx].in_flight = false;
+        Ok(())
+    }
+
+    /// 排空全部在飞窗口（uniform 池耗尽时的兜底：那些 slot 还有 dispatch 在读）。
+    fn drain_windows(&mut self) -> R<()> {
+        while let Some(idx) = self.window_fifo.front().copied() {
+            self.wait_window(idx)?;
+            self.window_fifo.pop_front();
+        }
+        Ok(())
+    }
+
+    /// 取一个可用槽；全在飞时等最旧的那个（其余窗口仍在 GPU 上推进）。
+    fn acquire_window(&mut self) -> R<usize> {
+        self.ensure_windows()?;
+        let depth = self.windows.len();
+        for _ in 0..depth {
+            let idx = self.window_recycle;
+            self.window_recycle = (self.window_recycle + 1) % depth;
+            if !self.windows[idx].in_flight {
+                return Ok(idx);
+            }
+        }
+        let oldest = self
+            .window_fifo
+            .front()
+            .copied()
+            .ok_or("acquire_window: in_flight 与 window_fifo 不一致")?;
+        self.wait_window(oldest)?;
+        self.window_fifo.pop_front();
+        Ok(oldest)
+    }
+
+    /// 开启一段流水（对应非流水路径的 `begin_batch`，但**不动** command buffer 也不清池）：
+    /// 窗口本身由 `begin_window` 逐个开。
+    ///
+    /// ★ 与 `PROF_GPU` 互斥：查询池是单窗资源（`begin_batch` 里 `cmd_reset_query_pool`），
+    /// 多窗在飞时 SUM/间隙会读出假数据 ⇒ 直接报错，不做静默降级。
+    pub fn begin_segment(&mut self) -> R<()> {
+        if self.recording {
+            return Err("begin_segment: 已经在批次里".into());
+        }
+        // 上一段若在错误里中断过，`pipelined` 会挂着、窗口还在飞：先排空再开新段，
+        // 否则此后每一段都会永久报「流水段已开启」。
+        if self.pipelined {
+            self.drain_windows()?;
+        }
+        if std::env::var("PROF_GPU").is_ok() {
+            return Err(
+                "begin_segment: PROF_GPU 与流水窗互斥（查询池是单窗资源）；量流水请关 PROF_GPU"
+                    .into(),
+            );
+        }
+        self.ensure_windows()?;
+        self.window_fifo.clear();
+        for w in self.windows.iter_mut() {
+            w.in_flight = false;
+        }
+        self.pool_cursor = 0;
+        self.pool_slots.clear();
+        self.pipelined = true;
+        Ok(())
+    }
+
+    /// 开一窗：reset + begin 该窗自己的 command buffer，依赖记账从零开始。
+    /// **不清** uniform 池游标/slot 表：self-loop 每轮的 params 逐位一致（实测 32 轮
+    /// 47264 条 dispatch 只用 794 个 slot），跨窗复用同一批 slot ⇒ 既不用重写字节，
+    /// 也不会覆写「在飞窗口正在读」的内容。
+    pub fn begin_window(&mut self) -> R<()> {
+        if !self.pipelined {
+            return Err("begin_window: 不在流水段内（先 begin_segment）".into());
+        }
+        let idx = self.acquire_window()?;
+        let cmd = self.windows[idx].cmd;
+        unsafe {
+            self.app
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.app
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+        }
+        self.cmd = cmd;
+        self.cur_window = idx;
+        self.recording = true;
+        // 依赖记账按窗重新开始：跨窗的执行 + 可见顺序由「同一队列的提交顺序」保证。
+        self.written.clear();
+        self.read.clear();
+        Ok(())
+    }
+
+    /// 收一窗：end + submit（带 signal fence），**不等待**。
+    pub fn submit_window(&mut self) -> R<()> {
+        if !self.recording {
+            return Err("submit_window: 不在录制中".into());
+        }
+        let idx = self.cur_window;
+        unsafe {
+            self.app.device.end_command_buffer(self.cmd)?;
+            let buffers = [self.cmd];
+            let submit = vk::SubmitInfo::builder().command_buffers(&buffers);
+            let submits = [submit.build()];
+            self.app.device.queue_submit(
+                self.app.compute.queue,
+                &submits,
+                self.windows[idx].fence,
+            )?;
+        }
+        self.windows[idx].in_flight = true;
+        self.window_fifo.push_back(idx);
+        self.recording = false;
+        self.cur_window = usize::MAX;
+        Ok(())
+    }
+
+    /// 收尾一段流水：等完所有在飞窗口（此后的 host 读回才有意义），再复位记账。
+    /// 语义 = 非流水路径的 `end_batch`，只是它等的是一串 fence 而不是整条队列。
+    pub fn end_segment(&mut self) -> R<()> {
+        if !self.pipelined {
+            return Err("end_segment: 不在流水段内".into());
+        }
+        self.drain_windows()?;
+        self.pipelined = false;
+        // `self.cmd` 在段内被逐窗改写过；段尾必须换回持久 command buffer，否则下一次
+        // 非流水的 `begin_batch` 会往窗口的 buffer 上录（句柄能用，但和 `_cmd_owner` 脱钩）。
+        self.cmd = self._cmd_owner[0];
+        self.cur_window = usize::MAX;
+        self.pending.clear();
+        self.written.clear();
+        self.read.clear();
+        self.written_batch.clear();
+        self.pool_cursor = 0;
+        self.pool_slots.clear();
         Ok(())
     }
 
@@ -1325,6 +1544,9 @@ impl Runtime {
         // decode/selfloop 每 token 的 params 逐位一致，dedup 使池占用与 token 数
         // 无关；两个 kernel 即便 shader 不同，只要 params 逐位相同，各自的 shader
         // 按自身布局解读相同字节，结果与各自调用方传入的值一致，共享安全。
+        // ★ 流水段（`begin_segment`）内这张表跨窗保留、只在段尾清：占用上界与「一整段
+        // 录成一条 command buffer」的老路径完全一样（实测 32 轮 47264 条 dispatch = 794 个
+        // slot），所以切窗不会多要一个字节，也就不会新增耗尽风险。
         let slot_bytes = std::mem::size_of_val(params);
         let offset = if let Some(&off) = self.pool_slots.get(params) {
             off
