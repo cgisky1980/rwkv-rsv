@@ -1731,6 +1731,53 @@ consumes one candidate per full-row scan (`reduce_max` × K) — the only remain
 stop materializing the descending order one element at a time, and that is **not** bit-exact.
 Ledger §6.20, raw `/c/tmp/ac16/sampfold/`.
 
+### 6.21 …and under greedy the whole nucleus-sampling section is provably a no-op (2026-10-12, bit-exact: 5 passes → 4)
+
+§6.20 left one pass standing that should never have been taken at all: §6 (top-p) runs whenever
+`0 < top_p < 1`, but with `top_k == 1` there is nothing left to truncate. The proof is a chain of two
+statements already in the file:
+
+1. §4/§5 leave `threshold = max`, so the exp pass writes **exactly one non-zero class** — every token
+   whose logit equals the max gets `exp(m-m) = 1.0`, everything else gets `0.0`. After normalization
+   the surviving probabilities are `1.0` (no tie: `total` is exactly 1, and the divide is skipped) or
+   `1.0/ties` (ties are computed identically, so they are bit-identical values).
+2. §6 accumulates descending from the largest probability, so its **first** candidate already has
+   `p ≥ top_p` (because `top_p < 1` and `p` is the maximum of a distribution whose non-zero entries
+   are all equal). The loop therefore runs exactly one `reduce_max`, and `g_cutoff = p`.
+   §7 then filters `v < p` — which only ever hits the entries that were already `0.0`.
+
+⇒ skipping §6 entirely cannot change the sampled distribution, **and** it drops the pieces §6.20 could
+not: the mask clear, one full-row `reduce_max` (256 KiB of `temp` + 8 KiB of `mask`), and 4-6 barriers.
+`mask` is written nowhere else in the kernel and never leaves the device, so no state is lost — it is
+sampler-local scratch, exactly like `temp`. `topp_on` gains `&& top_k != 1u`; `top_k == 0` (no top-k)
+and `top_k > 1` keep the section, which is where it is load-bearing.
+
+**Why CUDA never paid this**: `backend_cuda.rs:3864` does nucleus sampling over the already-sorted
+top-K candidate list — with K=1 that is one thread doing one comparison, it never touches the table.
+This tax was Vulkan-only, which is the whole reason it was still in the profile.
+
+| shipping 口径, med of 160 one-step windows × 4 alternating rounds | B=8 | B=128 |
+| --- | --- | --- |
+| 5 passes (`bc192a3d`, = §6.20 shipped) | 0.2741 / 0.2743 / 0.2763 / 0.2763 | 0.6684 / 0.6732 / 0.6787 / 0.6801 |
+| **4 passes (`d1a5251a`, shipped)** | **0.2001 / 0.2021 / 0.2005 / 0.2021** | **0.5350 / 0.5418 / 0.5444 / 0.5473** |
+| Δmin | **−27.0 %** (−0.074 ms/step) | **−20.0 %** (−0.133 ms/step) |
+
+4/4 pairs negative, the two arms' round ranges do not overlap (new max 0.5473 < old min 0.6684), and
+the old arm reproduces §6.20's measurement to 0.8 % **across sessions** — which is also the check that
+the old arm really is the shipped bytes. Cumulative against the original kernel: B=8 0.573 → **0.200**
+(−65 %), B=128 1.470 → **0.542** (−63 %) full-vocab-pass-equivalent. Measured new arm at the other
+widths (single round): B=1 0.202, B=32 0.310, B=64 0.366 ms/step.
+
+**Gate**: the same five fingerprints as §6.20 — B=1 `0x1acbfa/0x6d5c`, B=8 `0xd07c18/0x647a`, B=32
+`0x348dad8/0x757c`, B=64 `0x69352f6/0x6462`, B=128 `0xd1fce1e/0x8ce` — identical on both arms and equal
+to §6.1's shipped values, plus fmt / clippy / both test suites.
+
+**Honest end-to-end share**: −0.13 ms of a 46.55 ms step (B=128) and −0.07 ms of 13.60 ms (B=8) =
+0.2-0.5 %, far under the ±2-3 % wall-clock floor ⇒ **not** quotable as a paired-table movement; the
+evidence is the per-dispatch ruler above. What is left in the kernel is 4 passes (load, exp+sum, the
+normalize pass when `total ≠ 1`, the sampling scan) plus, for non-greedy 口径 only, the top-p loop.
+Ledger §6.21, raw `/c/tmp/ac16/fold2/`.
+
 ## 7. Layout
 
 ```
