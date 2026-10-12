@@ -34,7 +34,7 @@ Validated against **RWKV-7 Goosed g1h-3B**; the model structure adapts to safete
 
 ## 2. Design Goals
 
-- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.941× (B=1) / 0.945× (B=8) / 0.806× (B=32) / 0.730× (B=64) / 0.690× (B=128) / 0.762× (B=256)** — ★ 8th same-session re-measure, 2026-10-12, 口径 = `power.limit` 300 W with SM clocks drifting 1680…1845; absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54, so the gap is 0.7–1.0 ms/step at low concurrency and 18.2 / 24.0 ms/step at B=128/256. ⚠️ Rows above this one in §6.1 are the 250 W 档 and **cannot be subtracted across 档** (the 5th round read 0.900 / 0.972 / 0.824 / 0.765 / 0.690 / 0.688; in that session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side — credit the group-major layout with its own same-session A/B, **+6.8…9.3 %**, see §6.1 "read the absolutes before the ratios"). Batched prefill is **not** monotonically behind (8th-round same-session six-width pair, §20.2): Vulkan **leads** at B=1/8/32 (2.47× / 1.44× / 1.085×) and trails 6.1 / 12.4 / 16.5 % at B=64/128/256 (0.94 / 0.89 / 0.86×) — the older "0.79…0.84×" was a large-width-only reading. ★ **Superseded in part by §6.11 (same day)**: a
+- **Portability first, with the cost stated**: Vulkan is the primary backend, giving cross-vendor / cross-platform reach. Measured here: **no gap to CUDA at the same SIMT 口径**, and at **default gates batched decode is 0.893× (B=1) / 0.943× (B=8) / 0.776× (B=32) / 0.718× (B=64) / 0.725× (B=128) / 0.746× (B=256)** — ★ 10th same-session re-measure, 2026-10-12, build `3099cfe`, **4 rounds of interleaved Δmin** (order reversed in rounds 3-4) at `power.limit` 300 W with SM clocks drifting (1 815-1 875 MHz at the session bounds); absolute ms/step Vulkan 11.62 / 13.60 / 21.69 / 30.40 / 46.55 / 86.78 vs CUDA 10.38 / 12.83 / 16.83 / 21.82 / 33.77 / 64.72, so the gap is **+1.24 / +0.77 ms/step at B=1/8** and **+4.86 → +22.06 ms/step from B=32 on**. ⚠️ The 8th round's 3-round-median 口径 (0.941 / 0.945 / 0.806 / 0.730 / 0.690 / 0.762 from 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48) stays in §6.1 as the historical median row — **a statistic change plus a session change, not a regression**, and the two never get subtracted from each other. ⚠️ Rows above this one in §6.1 are the 250 W 档 and **cannot be subtracted across 档** (the 5th round read 0.900 / 0.972 / 0.824 / 0.765 / 0.690 / 0.688; in that session CUDA's *own* absolutes drifted −6.4…−7.7 % versus the 4th, so the ratio jump there is mostly a session effect on the reference side — credit the group-major layout with its own same-session A/B, **+6.8…9.3 %**, see §6.1 "read the absolutes before the ratios"). Batched prefill is **ahead at every width** as of the 10th round (same 4-round Δmin pair, §6.1): Vulkan 862 / 2 368 / 5 511 / 9 558 / 17 865 / 35 573 ms vs CUDA 2 144 / 3 623 / 7 162 / 11 005 / 19 642 / 37 896 ms at B=1/8/32/64/128/256 = **2.49× / 1.53× / 1.30× / 1.15× / 1.10× / 1.065×**, prefill seeds byte-identical between the backends. That retires the 8th-round reading ("leads at B=1/8/32, trails 6.1 / 12.4 / 16.5 % at B=64/128/256") — it predates §6.13-§6.15 — and with it the older "0.79…0.84×" large-width-only framing. ★ **Superseded in part by §6.11 (same day)**: a
 block-order swizzle in the fp16 GEMM (A panel re-read once per N column under the old linear order) takes
 the clean chunk-loop wall at B=128 from **17.23 → 15.69 s (−8.9 %)** vs a same-session CUDA of 12.98 s,
 i.e. 0.753× → **0.828×**; the six-width ratio row above was taken before it shipped and has not been
@@ -350,6 +350,47 @@ measured in the same 档. Consequence for the ledger: the level-1 coopmat arm ke
 (§15: +8.8 % at B=128 from a same-session two-arm A/B at 1860 MHz/250 W) — do **not** recompute it from
 this table, where the same build reads 58.53 ms/step because the GPU is hot.
 
+★ **The 10th paired re-measure (2026-10-12, ledger §27) is the first taken entirely under that
+discipline — 4 rounds, arm order reversed for rounds 3-4, per-cell Δmin, and every reading bound to
+its own bitwise fingerprint** (all 12 decode + 6 prefill fingerprints single-valued across all four
+rounds, `err=0` in all 48 records; CUDA's decode fingerprints are byte-identical to rounds 5-9
+(`0x1acbfa`/`0xd02e16`/`0x345e198`/`0x68f1ce4`/`0xd21f638`/`0x1a49f841`) ⇒ the CUDA side is untouched
+code, and the Vulkan-side fingerprints moved vs round 9 as expected, because #67/#68 changed prefill
+numerics). Build = `3099cfe` (ffn-key half-accumulator + its `batch>=256` gate + device-side zero-fill
++ batched state I/O), 300 W, clocks floating (1 815-1 875 MHz at session boundaries). **Absolute
+ms/step first, as always:**
+
+| Batch | Vulkan ms/step | spread | CUDA ms/step | spread | Δ ms/step | Vulkan/CUDA (tok/s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 11.62 | 5.9% | 10.38 | 0.8% | **+1.24** | 0.893 (86.1 / 96.3) |
+| 8 | 13.60 | 1.2% | 12.83 | 0.5% | **+0.77** | 0.943 (588.2 / 623.5) |
+| 32 | 21.69 | 19.7% | 16.83 | 0.4% | **+4.86** | 0.776 (1 475 / 1 901) |
+| 64 | 30.40 | 30.7% | 21.82 | 1.6% | **+8.58** | 0.718 (2 105 / 2 933) |
+| 128 | 46.55 | 12.9% | 33.77 | 5.6% | **+12.78** | 0.725 (2 750 / 3 790) |
+| 256 | 86.78 | 7.6% | 64.72 | 4.5% | **+22.06** | 0.746 (2 950 / 3 955) |
+
+**Prefill at the same 口径, Δmin ms for the whole `PAD_TO=512` batched prefill** — ★ **Vulkan now leads
+CUDA at every width**, which reverses discipline item 4 below and the "CUDA takes over from B≥32"
+story recorded with round 8 (where B=64/128/256 trailed by 6.1 / 12.4 / 16.5 %):
+
+| Batch | Vulkan ms | spread | CUDA ms | spread | Vulkan faster by |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 862 | 13.8% | 2 144 | 6.9% | 1 282 ms (2.49×) |
+| 8 | 2 368 | 5.8% | 3 623 | 1.1% | 1 255 ms (1.53×) |
+| 32 | 5 511 | 8.1% | 7 162 | 3.0% | 1 651 ms (1.30×) |
+| 64 | 9 558 | 9.1% | 11 005 | 5.8% | 1 447 ms (1.15×) |
+| 128 | 17 865 | 3.6% | 19 642 | 2.7% | 1 777 ms (1.10×) |
+| 256 | 35 573 | 2.6% | 37 896 | 5.4% | 2 323 ms (1.065×) |
+
+Prefill seeds are byte-identical between the two backends at all six widths (`0x4021`/`0x1bd0d`/
+`0x6e599`/`0xdcb32`/`0x1b9664`/`0x372cc8`), so this is the same numerics priced two ways, not a
+quality trade. Where the decode gap lives is unchanged and now unambiguous: **B≤8 is within noise-plus
+(0.77-1.24 ms/step), and everything from B=32 on is a single kernel's problem** — §6.14's cross-backend
+kernel ruler puts Vulkan `gemm_imma` at 23.9 ms of a 46.6 ms B=128 step, i.e. **the whole B=128 gap
+(12.78 ms) is smaller than that one kernel's share**. ⚠️ Ruler caveat: the B=32/64 Vulkan cells read
+19.7 % / 30.7 % round spread (heat: 68-SM card with the display attached), so their Δmin gaps are
+order-of-magnitude statements, not 0.1 ms claims; B=1/8/128/256 are ≤8 %.
+
 **Gate snapshot (verbatim, identical for both backends in that session)**: `SEGS=4` `PAD_TO=512`
 `NTOK=32` `WARMUP=1` `SKIP_SINGLE=1` `prompt_repeat=6` `temp=1` `top_k=0`;
 `LOWRANK_GEMM` / `FFN_VALUE_GEMM` / `GEMV_IMMA` **all unset = ON** (CUDA low-rank 4-chain / FFN value
@@ -400,8 +441,12 @@ level-1 batch gate, default 64; raise/lower it to re-measure B=32/48 without a r
    made `gemm_imma` **7–14 % slower**, and the flat-throughput curve persists. Cost per wave is set by
    per-block *instruction issue*, not by weight re-read traffic — CUDA's own `IMMA_DB`/`IM_PIPE`
    dead-ends (`backend_cuda.rs` ≈1866) say the same thing from the other side.
-4. **prefill and decode rank in opposite directions**: at B=1 Vulkan prefill is *faster*
-   (1,169 vs 2,238 ms), then CUDA takes over from B≥32 and pulls away (86.5 s vs 46.7 s at B=256).
+4. **prefill and decode rank in opposite directions** — but the CUDA-side half of that sentence died
+   with the 10th re-measure. It used to read "at B=1 Vulkan prefill is faster (1,169 vs 2,238 ms), then
+   CUDA takes over from B≥32 and pulls away (86.5 s vs 46.7 s at B=256)"; **at the current build Vulkan
+   prefill is faster at all six widths** (2.49× at B=1 down to 1.065× at B=256, same-口径 table above,
+   byte-identical seeds). Decode is still where Vulkan is behind, and still monotonically so from B=32
+   on: the prefill/decode split is now the whole story of the gap.
 
 **A real cliff fixed in the same session (improvement 5)**: Vulkan fell off the tensor-core path for
 **batch>64** — the old `imma_ok` predicate carried a `batch <= 64` bound, and crossing it switched
@@ -1478,6 +1523,71 @@ another segment. Verified by `BACKEND=cuda cargo test --release`, not by a stopw
 each its own submit+wait - continuous-batching slot compaction pays it per migration. Ledger §6.16,
 raw `/c/tmp/ac16/sio_{base,fill}.log`, gates `/c/tmp/ac16/sio_gates.log`.
 
+### 6.17 Per-token decode: 4 host submissions → 1 (2026-10-12)
+
+§6.15 and §6.16 cut host round-trips in *prefill* and in *session hand-off*. This is the same lever in
+**decode**, and in the shape the client's concurrent pool actually runs: `batch_step_sample` = one token
+per step, read back to the host every step (stop-string tests and streaming deltas are decided host-side,
+so the self-loop path is not an option there). Per step it cost **four** Vulkan submissions — upload the
+token, the 32-layer forward window, upload the sampler parameters (10 f32 per slot), the sampling window —
+and every one of them is a `queue_submit` + `queue_wait_idle` (§6.15 measured ≈0.155 ms of pure host
+latency per small copy).
+
+- **`Runtime::upload_record(tensor, data)`**: write the host-visible mirror, then **record** an
+  element-exact host→device copy into the open batch window (`record_copy_range` = dependency-tracked
+  barriers + `cmd_copy_from_range` + `mark_written`) instead of standing up its own command buffer. With
+  no window open it falls back to `copy_buffer`, so it is legal wherever `upload` was. ⚠️ It copies
+  exactly `data.len()` elements, whereas `upload`/`copy_buffer` copy the whole mirror.
+- **`ComputeBackend::upload_in_batch(id, data)`**: trait default = plain `upload` ⇒ **CUDA is
+  byte-identical, deliberately** — CUDA's `begin_batch`/`end_batch` neither submit nor wait, so merging
+  windows is a no-op on that backend. Contract (documented at both sites): never follow an in-batch upload
+  with a *standalone* `download` of the same tensor inside the window — the readback would be submitted
+  before the recorded copy runs.
+- **`batch_step_sample` split so both arms execute the identical kernel sequence**: `batch_step_plan`
+  (sizing / `batch_buffers` — kept **outside** the window, because it frees and rebuilds tensors when the
+  batch width changes) + `batch_step_record` (token upload → 32 layers → norm → head, with a
+  `merge_upload` flag that only the control arm sets false). Gate: `STEP_ONE_SUBMIT=0` restores the old
+  4-submission sequence; **default = merged**.
+
+**Structural gate** (`PROF_SUBMIT=1`, B=1, 16 steps): legacy prints **2 windows per step**
+(8.6–9.2 ms forward + 0.62–0.96 ms sampling) *plus* the two uploads, which don't print; merged prints
+**1 window per step** (9.1–9.6 ms — same kernels, the sample work simply lands inside the window). 20
+printed windows for 16 steps merged vs 36 legacy.
+
+**Measured.** ⚠️ The existing in-process `AB_VAR` A/B could not see this lever at all: it drives
+`submit_sample_selfloop_batch`, which never calls `batch_step_sample`, and the self-loop submits once per
+*n* tokens — so "submissions per step" is free there by construction. A new block, `STEP_AB=1`
+(+ `STEP_AB_ROUNDS=<n>`), pairs the two arms around the per-token path in one process (model loaded once,
+each arm re-prefills its own state). Same gate set as §6.1's shipping table, Vulkan only:
+
+| Batch | rounds | legacy Δmin ms/step | one-submit Δmin | Δmin Δ | **paired per-round mean Δ** (legacy − merged; + = merged faster) | sign test | fingerprint |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 1 | 12 | 12.247 | 12.015 | −0.232 (−1.89 %) | **+0.241 ± 0.100** | 12/12 | `0x1acbfa`/`0x6d5c` both arms ✔ |
+| 8 | 8 | 14.279 | 13.951 | −0.328 (−2.30 %) | **+0.251 ± 0.048** | 8/8 | `0xd07c18`/`0x647a` ✔ |
+| 32 | 6 | 22.375 | 21.843 | −0.532 (−2.38 %) | **+0.228 ± 0.207** | 5/6 | `0x348dad8`/`0x757c` ✔ |
+| 128 | 4 | 55.164 | 57.293 | **+2.129 (+3.86 %) — not a regression** | −0.713 ± 1.382 | 2/4 (undecidable) | `0xd1fce1e`/`0x8ce` ✔ |
+
+Read the **paired per-round mean**, not the Δmin column: the effect is **≈0.24 ms/step and flat in batch
+width**, which is exactly the host-side signature (two removed `queue_wait_idle` round-trips; GPU work is
+byte-identical). Δmin exaggerates at B=32 because that cell drifts 19.7 % round-to-round on this card
+(§6.1's ruler caveat). At 0.24 ms this sits *under* the ≈2–3 % end-to-end floor at B≥32 and just inside it
+at B=1 — it is shipped on the structural gate (4 submissions → 1, verified window-for-window) plus the
+sign test, **not** on a throughput claim. ⚠️ At B=128 the Δmin even reads **+3.86 % *for* the merged arm**:
+that is the within-round heat ramp of ledger §22 (that cell drifts 55→60 ms across a round, and the arm
+running second pays for it — the four per-round pairs are −2.87 / +0.53 / +0.46 / −0.97 ms, i.e. sign 2/4
+with |mean| < sd, so the cell carries no information either way). The merged arm's predicted effect there
+is 0.24/55 = **0.4 %**, one decimal below this instrument's floor ⇒ **B≥128 cannot be judged end-to-end at
+all**; the binding evidence at that width is the window count and the identical fingerprint.
+
+⚠️ Also true, and the reason this is worth doing at all: the per-token path is **slower than the
+self-loop by construction** (B=1: 12.0 ms/step merged vs 11.62 ms/step on §6.1's self-loop 口径) — every
+step pays a host round-trip. What was fixed here is that it used to pay **four**.
+📌 Next rungs on the same lever, in size order: `State::slot_move` / `slot_broadcast` (97 device-side
+`copy_range` calls, each its own submit+wait — continuous-batching slot compaction pays it per migration),
+the self-loop's in-batch sampler upload (`gpu_model.rs:3360`), and the seq-path `upload_u32` pair
+(`lens_t` + `tok`, `gpu_model.rs:1418`/`1422`). Ledger §6.17, raw `/c/tmp/ac16/step_ab_{b1,b8,b32,b128}.log`,
+window counts `/c/tmp/ac16/profsub_{1,0}.log`.
+
 ## 7. Layout
 
 ```
@@ -1502,7 +1612,7 @@ This project initially referenced two existing RWKV inference implementations:
 | Philosophy | peak performance, hardware-specific | portability first, runtime-compiled shaders |
 | Weight precision | fp16 | fp16 / **int8** (auto-routed, 8 GB-VRAM floor) |
 | Relative gap (CUDA batched decode) | baseline | **ahead** — that same-session pair gave parity at B=1 and +11% to +26% at B=8–256; Albatross is gone from this machine, so **the column cannot be refreshed and must not be divided into §6.1's CUDA column** |
-| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1). ⚠️ **Updated 2026-10-11**: that row's "but rkv" is stale (§6.3 put r/k/v on W8A8 tensor cores by default), and after §6.3-§6.5 + §6.8 the same-session medians are **0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**; **re-measured a 4th time the same day, after §6.9 + the fp16-state arm: 0.874× / 0.740× / 0.627×** (CUDA columns byte-identical, B=8 is the control because §6.9's gate is `batch >= 32`). B=256 has not been re-measured since. ★ **Re-measured a 5th time the same day, after the group-major int8 weight layout — for the first time across all six batches: 0.900× (B=1) / 0.972× (B=8) / 0.824× (B=32) / 0.765× (B=64) / 0.690× (B=128) / 0.688× (B=256)**, CUDA fingerprints again byte-identical — ⚠️ **but not its throughput**: that session's CUDA absolutes sat 6.4…7.7 % below its own 4th-session values at all three shared cells while Vulkan's sat above, so most of the ratio move versus the 4th table is a reference-side session effect. The layout's own credit is its same-session two-arm A/B, **+6.8…9.3 %** (B=1/8/32, shrinking with batch — at large batch the weights are already amortized across slots). **The 0.27× at B=256 in this row is retired** — it measured a stale build; B=256 is now monotone with the rest of the curve (its 3-round spread is 25.8 %, one outlier round; excluding it the cell is 0.688–0.697). Shape of what is left: ≈2.8 pt at B=8, ≈17.6 pt at B=32, ≈31 pt at B=128/256. **★ 2026-10-12: 口径 changed and re-measured (session `20261012-004233-91772`, both backends interleaved in one session, six widths × 3 rounds, median; `power.limit` 300 W = the shipping 档 now)** — every row above belongs to the old 档 (250 W; the seventh also had `-lgc` pinned at 1860) and **cannot be compared across 档**. The new-档 baseline is **0.941 (B=1) / 0.945 (B=8) / 0.806 (B=32) / 0.730 (B=64) / 0.690 (B=128) / 0.762 (B=256)**, absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54 ⇒ the gap is 0.7–1.0 ms/step at low concurrency, 4.4 ms at B=32, 9.3 at B=64, 18.2 at B=128, 24.0 at B=256. Raising the power wall is "win at mid, lose at large": B=32 +160.5 tok/s but B=128 −141.9 and B=256 −225.0 (82 ℃, SM clocks drifting 1680–1845 ⇒ the big widths now hit **heat**, not the watt cap). One narrative correction: **the gap is decode-only** — on batched prefill Vulkan *leads* CUDA at B=1/8/32 (2.47× / 1.44× / 1.085×) and trails by 6.1 / 12.4 / 16.5 % only at B=64/128/256 (§20). |
+| Relative gap (Vulkan vs our own CUDA) | n/a | **Two 口径, and they disagree**: ① *SIMT vs SIMT* (CUDA's three tensor-core gates off) — parity, 0.98×–1.03× across decode B=1…256 and steady prefill; ② **defaults** (CUDA tensor cores on, Vulkan on for everything but rkv) — **behind at every batch**, 0.87× at B=1 down to **0.27× at B=256** (same-session interleaved medians, §6.1). ⚠️ **Updated 2026-10-11**: that row's "but rkv" is stale (§6.3 put r/k/v on W8A8 tensor cores by default), and after §6.3-§6.5 + §6.8 the same-session medians are **0.875× (B=8) / 0.716× (B=32) / 0.508× (B=128)**; **re-measured a 4th time the same day, after §6.9 + the fp16-state arm: 0.874× / 0.740× / 0.627×** (CUDA columns byte-identical, B=8 is the control because §6.9's gate is `batch >= 32`). B=256 has not been re-measured since. ★ **Re-measured a 5th time the same day, after the group-major int8 weight layout — for the first time across all six batches: 0.900× (B=1) / 0.972× (B=8) / 0.824× (B=32) / 0.765× (B=64) / 0.690× (B=128) / 0.688× (B=256)**, CUDA fingerprints again byte-identical — ⚠️ **but not its throughput**: that session's CUDA absolutes sat 6.4…7.7 % below its own 4th-session values at all three shared cells while Vulkan's sat above, so most of the ratio move versus the 4th table is a reference-side session effect. The layout's own credit is its same-session two-arm A/B, **+6.8…9.3 %** (B=1/8/32, shrinking with batch — at large batch the weights are already amortized across slots). **The 0.27× at B=256 in this row is retired** — it measured a stale build; B=256 is now monotone with the rest of the curve (its 3-round spread is 25.8 %, one outlier round; excluding it the cell is 0.688–0.697). Shape of what is left: ≈2.8 pt at B=8, ≈17.6 pt at B=32, ≈31 pt at B=128/256. **★ 2026-10-12: 口径 changed and re-measured (session `20261012-004233-91772`, both backends interleaved in one session, six widths × 3 rounds, median; `power.limit` 300 W = the shipping 档 now)** — every row above belongs to the old 档 (250 W; the seventh also had `-lgc` pinned at 1860) and **cannot be compared across 档**. The new-档 baseline is **0.941 (B=1) / 0.945 (B=8) / 0.806 (B=32) / 0.730 (B=64) / 0.690 (B=128) / 0.762 (B=256)**, absolute ms/step Vulkan 12.40 / 14.71 / 22.86 / 34.28 / 58.53 / 100.48 vs CUDA 11.67 / 13.89 / 18.43 / 25.01 / 40.37 / 76.54 ⇒ the gap is 0.7–1.0 ms/step at low concurrency, 4.4 ms at B=32, 9.3 at B=64, 18.2 at B=128, 24.0 at B=256. Raising the power wall is "win at mid, lose at large": B=32 +160.5 tok/s but B=128 −141.9 and B=256 −225.0 (82 ℃, SM clocks drifting 1680–1845 ⇒ the big widths now hit **heat**, not the watt cap). One narrative correction: **the gap is decode-only** — on batched prefill Vulkan *leads* CUDA at B=1/8/32 (2.47× / 1.44× / 1.085×) and trailed by 6.1 / 12.4 / 16.5 % only at B=64/128/256 (§20). ★ **10th re-measure (2026-10-12, build `3099cfe`, 4-round Δmin, 300 W) supersedes both halves of that row**: decode **0.893 / 0.943 / 0.776 / 0.718 / 0.725 / 0.746** (Vulkan 11.62 / 13.60 / 21.69 / 30.40 / 46.55 / 86.78 ms/step vs CUDA 10.38 / 12.83 / 16.83 / 21.82 / 33.77 / 64.72 ⇒ gap +1.24 / +0.77 / +4.86 / +8.58 / +12.78 / +22.06 ms/step), and **prefill now leads at all six widths** (2.49× → 1.065×, identical seeds), so the §20 "CUDA takes over at B≥64" half is closed. Shape of what is left: **≤1.3 ms/step at B≤8 (inside the heat floor), and from B=32 on it is one kernel's problem** — §6.14's cross-backend ruler puts `gemm_imma` at 23.9 ms of a 46.6 ms B=128 step, i.e. bigger than the entire 12.78 ms gap at that width. |
 
 The original gap came from ① Albatross's more aggressive kernel fusion; ② CUDA Graph capture cutting launch overhead; ③ CUDA's mature hardware-specific libraries. It has since been closed and reversed on the CUDA path by **int8 tensor cores on int8-resident weights** (half the bytes per token, 2× the tensor-core peak), split-K, merged multi-chain launches and shape-aware tiling. The **Vulkan** path was brought to the same level *at the same SIMT 口径*: halving activation traffic in the r/k/v fused kernel (fp16 activations), `vec4`+`dot` weight handling and shared-memory tiling of `x` closed the last ~40%, so Vulkan is throughput-neutral against CUDA **when CUDA is held to the same kernel sequence** while keeping cross-vendor reach. Against CUDA's *default* tensor-core path Vulkan is not neutral — the r/k/v batched kernel is the one op Vulkan keeps on SIMT by default (`VK_IMMA_OPS`), and that is where most of the B-scaling gap lives (see §6.1, 口径 paragraph). ⚠️ That last sentence is the 2026-10-10 pre-flip state: §6.3 (same day) moved r/k/v onto the W8A8 tensor-core path by default, and §6.4/§6.5/§6.8 then re-measured the remaining gap as sitting inside `gemm_imma` and the low-rank chain, not in r/k/v being SIMT.
 
