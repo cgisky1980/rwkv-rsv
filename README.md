@@ -71,7 +71,7 @@ Key env vars (see [src/main.rs](src/main.rs)):
 | `GEN_TOKENS` / `REPORT_EVERY` | Continuous autoregressive generation (`memtest` sub-flow) |
 | `DIAG` | Three-way check (seq / tok / CPU) + dequant validation |
 | `PROF_GPU` / `PROF_HOST` | GPU / host-side profiling |
-| `SELFLOOP_PIPE` | **Vulkan-only windowed submit** (`<rounds per window>`, default 0 = off). Without it a whole self-loop segment is recorded into **one** command buffer and submitted once, so the GPU idles through all the host recording that `PROF_HOST` measures. Windowing submits every k rounds **without waiting**, so recording round k+1 happens while the GPU eats window k. Mutually exclusive with `PROF_GPU` (the query pool is a single-window resource) — it hard-errors rather than reporting fake timestamps. |
+| `SELFLOOP_PIPE` | **Vulkan-only windowed submit** (`<rounds per window>`, **default 2 = on**; set 0 to disable). Without it a whole self-loop segment is recorded into **one** command buffer and submitted once, so the GPU idles through all the host recording that `PROF_HOST` measures. Windowing submits every k rounds **without waiting**, so recording round k+1 happens while the GPU eats window k. Applies to **both** self-loop paths — batched decode and the single-stream loop the desktop client uses (see §6.23). Two safety gates on the single-stream side: the segment must be longer than one window, and it must be on the per-round sampler-row path, otherwise an in-flight window would read a later round's sampling params. Mutually exclusive with `PROF_GPU` (the query pool is a single-window resource) — it hard-errors rather than reporting fake timestamps. |
 | `UNIFORM_POOL_MB` | Vulkan uniform pool capacity in MB (default 8; usage is O(distinct params per batch) — measured peak 69 KB, so this is a fallback knob, not something to tune) |
 | `VK_SPV_DIR` | **Shader A/B instrument.** Load every `*.spv` from this flat directory instead of the embedded copy. Required because release builds bake `assets/shaders/spv/*.spv` into the binary (`#[derive(RustEmbed)]` in [src/vulkan/asset.rs](src/vulkan/asset.rs)) — copying new bytes onto disk does **not** change what a running exe executes, so without this knob you silently benchmark the old kernels while believing you swapped them (this is what voided §6.10's numbers). Point it at a directory holding one variant's bytes and log the md5 of each spv actually bound. |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | Override cross-hardware adaptation |
@@ -1880,6 +1880,21 @@ while 2 beats 8 by another 0.68 (B=128) / 0.77 (B=32) ms/step ⇒ **k=2**. Chunk
 **Gate**: decode token streams **and** prefill seeds at B=1/8/32/64/128 are bit-identical to the shipped
 values with the new default on (ledger §6.24.6). Rust-only change — all `.spv` bytes md5-unchanged vs HEAD.
 Plus fmt / clippy `-D warnings` / `cargo test --release`. Raw data `/c/tmp/ac16/chophole/`, ledger §6.24.
+
+**Addendum — the same lever now also covers the single-stream loop** (the shape the desktop client runs).
+`PROF_HOST` there is only **0.69 ms/step** (261 dispatches, barrier-dominated) but a step is only ~9.9 ms,
+so the same fixed debt is ~7 % of the wall. Paired in-process A/B, 4 rounds: **-1.12 / -1.22 / -0.98 /
+-1.03 ms/step** (mean **-1.08**, 8/8 same sign) ⇒ Vulkan single-stream is **1.15×** CUDA in the same
+session. ⚠️ The measured gain is 1.7× the `PROF_HOST` prediction: on a low-dispatch path the host cost is
+not just the recorded `record()` time (sampler-row writes, submit, host-visible stores fall outside that
+timer) — an explicitly unclosed account, ledger §6.25. Two gates make it safe: the segment must be longer
+than one window (`n > pipe`, so a 1- or 2-round client call keeps the old code path), and windowing only
+runs on the per-round async sampler-row path — on the synchronous path every round overwrites row 0 and an
+in-flight window would sample with a later round's parameters. Fingerprint gate: `PIPE=0` / `PIPE=2` /
+shipped default all print the identical stream-ordered hash (`sum=0x278a9c xor=0x7354
+mix=0xcfeeb6baaf81b753`) and CUDA agrees on the same values; `mix` is a rolling FNV-1a specifically so a
+cross-window *reordering* (which `sum`/`xor` cannot see) would be caught. CUDA is untouched —
+`supports_windows()` is false there. Raw data `/c/tmp/ac16/s51/`, ledger §6.25.
 
 ## 7. Layout
 

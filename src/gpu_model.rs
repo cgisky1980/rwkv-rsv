@@ -1006,8 +1006,25 @@ impl GpuModel {
         self.backend.upload(b.token_seq, &vec![0.0; n])?;
         self.backend.upload(b.seq_cnt, &[0.0; 1])?;
 
-        // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交
-        self.backend.begin_batch()?;
+        // 流水窗与 `submit_sample_selfloop_batch` 共用 `SELFLOOP_PIPE`（默认 2，只对 Vulkan 生效）：
+        // 单流每步只发 ~261 个 kernel ⇒ 宿主录制 ≈0.69 ms/步（B=128 是 3.14），但它的一步只有
+        // ≈9.9 ms ⇒ 同一笔固定 ms 在这里约占 7 %。**必须**每轮写各自的 sampler 行（`use_async`）：
+        // 同步档每轮覆盖同一行，在飞的窗口会读到后面轮次的参数。
+        let pipe: usize = std::env::var("SELFLOOP_PIPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let piped = pipe > 0
+            && n > pipe
+            && self.backend.supports_windows()
+            && n <= self.backend.sampler_async_rows();
+
+        // 开启批处理：整段 self-loop 所有 kernel 一次性记录 + 提交（流水档 = 每 k 轮提交一窗）
+        if piped {
+            self.backend.begin_segment()?;
+        } else {
+            self.backend.begin_batch()?;
+        }
 
         // 首个 token 由 CPU 写入 host-visible 缓冲
         self.backend
@@ -1120,6 +1137,12 @@ impl GpuModel {
             // 每轮写入各自的采样行（第 round 行），sample kernel 执行时读取该行参数。
             // 整段一次 submit = CUDA graph 的等价物（且省掉逐轮 replay 与拷贝）。
             for round in 0..n {
+                if piped && round.is_multiple_of(pipe) {
+                    if round > 0 {
+                        self.backend.submit_window()?;
+                    }
+                    self.backend.begin_window()?;
+                }
                 if use_async {
                     self.backend.store_sampler_async(
                         b.sampler,
@@ -1163,7 +1186,12 @@ impl GpuModel {
         }
 
         // 一次性提交整段 self-loop（异步：不等 GPU 执行完）
-        self.backend.end_batch()?;
+        if piped {
+            self.backend.submit_window()?;
+            self.backend.end_segment()?;
+        } else {
+            self.backend.end_batch()?;
+        }
         Ok(SelfloopTicket {
             token_seq: b.token_seq,
             n,

@@ -67,7 +67,7 @@ cargo run --release
 | `GEN_TOKENS` / `REPORT_EVERY` | 连续自回归生成（`memtest` 子流程） |
 | `DIAG` | 三方核对（seq / tok / CPU）+ dequant 校验 |
 | `PROF_GPU` / `PROF_HOST` | GPU / 主机端性能剖析 |
-| `SELFLOOP_PIPE` | **仅 Vulkan 的分窗提交**（`<每窗轮数>`，默认 0=关）。不开时一整段自循环录进**一条** command buffer、末尾才提交一次，于是 GPU 在整段宿主录制期间空转（那段就是 `PROF_HOST` 量到的数）。开了每 k 轮提交一次且**不等待**，录下一窗时 GPU 正在吃上一窗。与 `PROF_GPU` 互斥（查询池是单窗资源）——同时开会硬报错，不产出假时间戳。 |
+| `SELFLOOP_PIPE` | **仅 Vulkan 的分窗提交**（`<每窗轮数>`，**默认 2=开**；设 0 关闭）。不开时一整段自循环录进**一条** command buffer、末尾才提交一次，于是 GPU 在整段宿主录制期间空转（那段就是 `PROF_HOST` 量到的数）。开了每 k 轮提交一次且**不等待**，录下一窗时 GPU 正在吃上一窗。**两条自循环路径都吃这根杠杆**——批量解码与桌面客户端走的单流（见 §6.19）。单流侧另有两道安全门：段长必须大于一窗，且必须走「每轮各写自己的采样参数行」那条路，否则在飞的窗口会读到后面轮次的采样参数。与 `PROF_GPU` 互斥（查询池是单窗资源）——同时开会硬报错，不产出假时间戳。 |
 | `UNIFORM_POOL_MB` | Vulkan uniform 池容量（MB，默认 8；占用是「批内不同 params 组合数」的 O(1)，实测高水位 69KB —— 这是极端形状兜底项，不是需要调的参数） |
 | `GEMM_TILE_*` / `GEMV_BLOCK_SIZE` / `GEMV_ROWS` | 覆盖跨硬件自适应参数 |
 
@@ -1351,7 +1351,19 @@ fence，绝不 `queue_wait_idle`。uniform 池的 slot 表故意铺满整段（7
 
 **门禁**：默认档开启后，B=1/8/32/64/128 的解码 token 流**与** prefill 种子与发货值**逐位相同**
 （台账 §6.24.6）。纯 Rust 改动——所有 `.spv` 字节对 HEAD md5 全等。
-另加 fmt / clippy `-D warnings` / `cargo test --release`。原始数据 `/c/tmp/ac16/chophole/`，台账 §6.24。
+另加 fmt / clippy `-D warnings` / `cargo test --release`。原始数据 `/c/tmp/ac16/chophole/`，台账 §6.24.
+
+**补记——同一根杠杆现在也覆盖单流自循环**（桌面客户端就是这个形状）。单流的 `PROF_HOST` 只有
+**0.69 ms/步**（每步 261 次 dispatch，barrier 占大头），但它一步只有 ≈9.9 ms ⇒ 同一笔固定债在这里
+约占 7 %。进程内成对 A/B、4 轮：**-1.12 / -1.22 / -0.98 / -1.03 ms/步**（均值 **-1.08**，8/8 同号）
+⇒ 同会话 Vulkan 单流是 CUDA 的 **1.15×**。⚠️ 实测收益是 `PROF_HOST` 预测值的 1.7 倍：低 dispatch
+数路径上「宿主成本」不等于 `record()` 计时器里的时间（采样参数行写入、提交、host-visible 写都在
+计时器之外）——这笔账**明确未闭合**，见台账 §6.25。两道门保证正确：段长必须大于一窗
+（`n > pipe`，1/2 轮的客户端调用走原代码路径），且只在「每轮各写自己的异步采样行」这条路上开窗——
+同步档每轮覆盖同一行，在飞的窗口会拿后面轮次的参数采样。指纹门禁：`PIPE=0` / `PIPE=2` / 发货默认
+三臂打印同一枚**顺序敏感**哈希（`sum=0x278a9c xor=0x7354 mix=0xcfeeb6baaf81b753`），CUDA 臂逐位一致；
+`mix` 是滚动的 FNV-1a，专门为「跨窗乱序」而设（`sum`/`xor` 看不见乱序）。CUDA 侧代码路径逐字不变
+（`supports_windows()` 为 false）。原始数据 `/c/tmp/ac16/s51/`，台账 §6.25。
 
 ## 7. 目录结构
 

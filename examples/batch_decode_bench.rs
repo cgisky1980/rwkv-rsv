@@ -138,10 +138,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let t1 = Instant::now();
         let mut toks_total = 0usize;
+        let (mut s_sum, mut s_xor, mut s_mix) = (0u64, 0u64, 0xcbf29ce484222325u64);
         for _ in 0..segs {
             let ticket = model.submit_sample_selfloop(&mut single, seg_seed, ntok, &sp)?;
             let toks = model.collect_sample_selfloop(ticket)?;
             seg_seed = toks[toks.len() - 1];
+            for &t in toks.iter() {
+                s_sum = s_sum.wrapping_add(t as u64);
+                s_xor ^= t as u64;
+                // 顺序敏感：单流是一条链，流水窗若把轮次序打乱，sum/xor 可能不变而 mix 必变。
+                s_mix = (s_mix ^ (t as u64)).wrapping_mul(0x100000001b3);
+            }
             toks_total += toks.len();
         }
         let secs = t1.elapsed().as_secs_f64();
@@ -154,6 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             (secs * 1000.0) as u128,
             tok_s
         );
+        log::info!("[单流] decode tokens sum={s_sum:#x} xor={s_xor:#x} mix={s_mix:#x}");
     }
 
     // —— 批量基准（每槽不同 prompt）——

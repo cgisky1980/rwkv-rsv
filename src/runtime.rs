@@ -253,7 +253,9 @@ pub struct Runtime {
     window_recycle: usize,
     /// 当前正在录制的窗口下标；`usize::MAX` = 不在窗口里。
     cur_window: usize,
-    /// 本段处于流水状态（决定 uniform 池耗尽时是「排空在飞窗口」还是直接报错）。
+    /// 本段处于流水状态：`begin_batch` 据此拒绝开批，`begin_segment` 据此判断上一段是否
+    /// 在中途报错时留下了在飞窗口（需要排空才能开新段）。uniform 池耗尽与它无关——那条
+    /// 永远直接报错，绝不复用可能还在被 GPU 读的 slot。
     pipelined: bool,
 }
 
