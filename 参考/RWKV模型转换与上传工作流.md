@@ -51,9 +51,9 @@ uv run rwkv-rsv/tools/verify_st.py .ai00-x-dev\models\rwkv\rwkv7-3B-int8.st
 
 | 档位 | 旧文件 | 新文件（统一名） | 状态 |
 |---|---|---|---|
-| 3B | `rwkv/rwkv7-g1i-2.9b.int8.st` | `rwkv/rwkv7-3B-int8.st` | ✅ 2026-08-31 完成（g1j 20260831, ctx16384；3,295,783,296 B；avg_cos=0.999881 / avg_rel=0.6139%，详见 [int8量化报告-g1j-3B-20260831.md](int8量化报告-g1j-3B-20260831.md)） |
-| 7B | `rwkv/rwkv7-g1i-7.2b/rwkv7-g1i-7.2b.int8.st` | `rwkv/rwkv7-7B-int8.st` | ✅ 2026-08-31 完成（g1j 20260831, ctx16384；7,898,815,456 B；avg_cos=0.999846 / avg_rel=0.6063%，详见 [int8量化报告-g1j-7B-20260831.md](int8量化报告-g1j-7B-20260831.md)；旧 7.2b 子目录两文件已从双端删除） |
-| 13B | （仓库尚无文件） | `rwkv/rwkv7-13B-int8.st` | ⏳ 等 g1j 13B 权重 |
+| 3B | `rwkv/rwkv7-g1i-2.9b.int8.st` | `rwkv/rwkv7-3B-int8.st` | ✅ 2026-10-31 换权重（**g1l 2.9b 20261031，ctx34304**；3,295,783,296 B；avg_cos=0.999881 / avg_rel=0.6143%，详见 [int8量化报告-g1l-2.9b-20261031.md](int8量化报告-g1l-2.9b-20261031.md)；上一版为 g1j 20260831 ctx16384，同架构同体积） |
+| 7B | `rwkv/rwkv7-g1i-7.2b/rwkv7-g1i-7.2b.int8.st` | `rwkv/rwkv7-7B-int8.st` | 🗑️ 2026-10-31 退役（文件从本地与 manifest 双端删除，router sidecar 的 `--tier-models 7b` 入口一并移除；远端仓库文件需同步删） |
+| 13B | （仓库尚无文件） | `rwkv/rwkv7-13B-int8.st` | ⏳ 等权重就绪 |
 
 配套代码：`client/src/apps/desktop/src/rwkv_llm.rs` 的 `BUILTIN_RWKV`（st_rel/vocab_rel）。
 vocab 三档共用顶层 `rwkv/vocab.json`（65536 World 词表；7B 独立 vocab 子目录待 7B 迁移时一并收敛）。
