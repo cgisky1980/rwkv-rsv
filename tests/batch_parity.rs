@@ -72,8 +72,8 @@ use rwkv_rsv::gpu_model::{GpuModel, SamplerParams, State};
 use rwkv_rsv::tokenizer::Tokenizer;
 
 const DEFAULT_MODEL: &str =
-    r"C:\work\ai00-x-dev\client\target\release\models\rwkv\rwkv7-3B-int8.st";
-const DEFAULT_VOCAB: &str = r"C:\work\ai00-x-dev\client\target\release\models\rwkv\vocab.json";
+    r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st";
+const DEFAULT_VOCAB: &str = r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json";
 
 /// 各槽互不相同的提示词（同 prompt 会把每层残差压成同一条数值路径，测不出并发行为）。
 const PROMPTS: [&str; 8] = [

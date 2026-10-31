@@ -178,10 +178,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     init_log();
 
     let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| {
-        r"C:\work\ai00-x-dev\client\target\release\models\rwkv\rwkv7-g1i-2.9b.int8.st".to_string()
+        r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st".to_string()
     });
     let vocab_path = std::env::var("VOCAB_JSON").unwrap_or_else(|_| {
-        r"C:\work\ai00-x-dev\client\target\release\models\rwkv\vocab.json".to_string()
+        r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json".to_string()
     });
 
     log::info!("loading model: {model_path}");

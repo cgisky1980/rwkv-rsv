@@ -43,10 +43,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     init_log();
 
     let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| {
-        r"C:\work\ai00-x-dev\client\target\release\models\rwkv\rwkv7-3B-int8.st".into()
+        r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st".into()
     });
     let vocab_path = std::env::var("VOCAB_JSON").unwrap_or_else(|_| {
-        r"C:\work\ai00-x-dev\client\target\release\models\rwkv\vocab.json".into()
+        r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json".into()
     });
     let slots: usize = std::env::var("SLOTS")
         .unwrap_or_else(|_| "8".into())

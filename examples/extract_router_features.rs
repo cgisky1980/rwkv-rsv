@@ -25,8 +25,8 @@ const DEFAULT_DATA: &str =
     r"C:\work\ai00-x-dev\client\scripts\router_head\data\golden_balanced.jsonl";
 const DEFAULT_OUT: &str = r"C:\work\ai00-x-dev\client\scripts\router_head\data\features.jsonl";
 const DEFAULT_MODEL: &str =
-    r"C:\work\ai00-x-dev\client\target\release\models\rwkv\rwkv7-g1i-2.9b.int8.st";
-const DEFAULT_VOCAB: &str = r"C:\work\ai00-x-dev\client\target\release\models\rwkv\vocab.json";
+    r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st";
+const DEFAULT_VOCAB: &str = r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json";
 
 /// 截断长度：与线上 `classify_with_engine` 保持一致（默认 256 = 会话摘要
 /// ~128 + 当前请求 ~128 的双段预算；可用环境变量 MAX_TOKENS 覆盖）。
