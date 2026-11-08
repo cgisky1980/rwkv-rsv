@@ -6776,6 +6776,26 @@ impl GpuLayer {
             backend.upload_u32(idx_gpu, idx_grouped.as_deref().unwrap_or(&idx_row))?;
             let sz_gpu = backend.create_tensor(sz8.len(), TensorDtype::U32)?;
             backend.upload_u32(sz_gpu, &sz8)?;
+            // 诊断：`I6_R8_VERIFY=1` 把刚上传的两张张量**下载回来逐元素验**（判断「显存里
+            // 到底是不是我上传的数据」）。若不一致，说明上传路径（pinned scratch / stream 序）
+            // 才是 `att.output` 崩的真正原因。
+            if idx == 0 && std::env::var("I6_R8_VERIFY").is_ok() {
+                let di = backend.download_u32(idx_gpu)?;
+                let ds = backend.download_u32(sz_gpu)?;
+                let bad_i = idx_row
+                    .iter()
+                    .zip(di.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let bad_s = sz8.iter().zip(ds.iter()).filter(|(a, b)| a != b).count();
+                log::info!(
+                    "[R8VER] {key}: len idx={}/{} sz={}/{} | 不一致 idx={bad_i} sz={bad_s}",
+                    di.len(),
+                    idx_row.len(),
+                    ds.len(),
+                    sz8.len()
+                );
+            }
             log::info!("layer {idx}: {key} 由 int6 重量化出 int8 副本（宽批 IMMA，{m}x{k}）");
             Ok(Some(Int8Handle {
                 idx: idx_gpu,
