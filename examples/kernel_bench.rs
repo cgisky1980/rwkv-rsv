@@ -54,7 +54,7 @@
 use std::time::Instant;
 
 use rwkv_rsv::backend::{
-    ComputeBackend, Int8Handle, TensorDtype, TensorId, create_backend, detect_backend,
+    ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId, create_backend, detect_backend,
 };
 
 /// 逗号分隔环境变量解析（空字符串 = 未设置；历史教训：空串会被 `is_ok()` 判真）。
@@ -116,6 +116,13 @@ impl Case {
     /// fp16 权重字节 = m*k*2。
     fn wbytes_f16(&self) -> f64 {
         (self.m * self.k * 2) as f64
+    }
+    /// int6（N-major 双平面）权重字节 = lo(m·k/2) + hi(m·k/4) + sz(m·k/128·4) = 0.781 B/权重。
+    fn wbytes_int6(&self) -> f64 {
+        (self.m * (self.k / 2) + self.m * (self.k / 4) + self.m * (self.k / 128) * 4) as f64
+    }
+    fn is_int6(&self) -> bool {
+        self.op.starts_with("i6")
     }
     /// 张量核的标量吞吐口径：`2·m·k·batch / ms`（含 split-K 归约，是「端到端有效 TOPS」）。
     fn tops(&self, batch: usize, ms: f64) -> f64 {
@@ -218,6 +225,44 @@ fn main() {
                 k: c,
                 imma: true,
                 icode: 2,
+                xgate: false,
+                pf16: false,
+            },
+            // ---- int6（N-major 双平面，`gemv_int6_*`）：与 SIMT int8 四形状一一对应，
+            //      用来量「0.75 B/权重」到底跑到多少 GB/s（2080 Ti 峰值 616）----
+            "i6_relu2" => Case {
+                op: op.clone(),
+                m: fh,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: false,
+            },
+            "i6_mul" => Case {
+                op: op.clone(),
+                m: c,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: false,
+            },
+            "i6_plain" => Case {
+                op: op.clone(),
+                m: vocab,
+                k: c,
+                imma: false,
+                icode: 0,
+                xgate: false,
+                pf16: false,
+            },
+            "i6_add" => Case {
+                op: op.clone(),
+                m: c,
+                k: fh,
+                imma: false,
+                icode: 0,
                 xgate: false,
                 pf16: false,
             },
@@ -425,7 +470,9 @@ fn main() {
                         continue;
                     }
                 };
-            let (wbytes, is_f16) = if case.op == "f16" || case.pf16 {
+            let (wbytes, is_f16) = if case.is_int6() {
+                (case.wbytes_int6(), false)
+            } else if case.op == "f16" || case.pf16 {
                 (case.wbytes_f16(), true)
             } else {
                 (case.wbytes_int8(), false)
@@ -443,7 +490,13 @@ fn main() {
                 case.tops(batch, ms),
                 jitter * 100.0,
                 fp,
-                if is_f16 { "  (fp16)" } else { "" }
+                if is_f16 {
+                    "  (fp16)"
+                } else if case.is_int6() {
+                    "  (int6 nm)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -474,11 +527,35 @@ fn run_case(
     let (m, k) = (case.m, case.k);
     let mut rng = Rng(0x5A5A_1234_ABCD_0001);
 
-    // 权重：int8（idx 打包 4×uint8 + sz 打包 scale/zero 两个 f16）或 fp16。
-    let (a8, w16) = if case.op == "f16" || case.pf16 {
+    // 权重：int8（idx 打包 4×uint8 + sz 打包 scale/zero 两个 f16）或 fp16 或 int6。
+    let (a8, w16, a6) = if case.is_int6() {
+        // int6 N-major：lo [k/2][m] / hi [k/4][m] / sz [k/128][m]（0.781 B/权重）。
+        // 内容只影响数值不影响计时：lo/hi 用固定花样的字节，scale 取 fp16 0.01。
+        let lo_n = (k / 2) * m / 4;
+        let hi_n = (k / 4) * m / 4;
+        let lo: Vec<u32> = (0..lo_n)
+            .map(|i| 0x0F0F_0F0Fu32.wrapping_mul(i as u32 | 1))
+            .collect();
+        let hi: Vec<u32> = (0..hi_n)
+            .map(|i| 0x3333_3333u32.wrapping_mul(i as u32 | 1))
+            .collect();
+        let sz: Vec<u32> = vec![0x211F_211Fu32; (k / 128) * m]; // scale≈0.01，zero 不用
+        let h = Int6Handle {
+            lo: b.create_tensor(lo_n, TensorDtype::U32)?,
+            hi: b.create_tensor(hi_n, TensorDtype::U32)?,
+            sz: b.create_tensor((k / 128) * m, TensorDtype::U32)?,
+            m,
+            k,
+            nmajor: true,
+        };
+        b.upload_u32(h.lo, &lo)?;
+        b.upload_u32(h.hi, &hi)?;
+        b.upload_u32(h.sz, &sz)?;
+        (None, None, Some(h))
+    } else if case.op == "f16" || case.pf16 {
         let t = b.create_tensor(m * k, TensorDtype::F16)?;
         b.upload(t, &vec![0.01f32; m * k])?;
-        (None, Some(t))
+        (None, Some(t), None)
     } else {
         let idx: Vec<u32> = (0..m * (k / 4)).map(|_| 0x7f7f_7f7fu32).collect();
         let sz: Vec<u32> = vec![0x3800_3c00u32; m * (k / 128)]; // 低 16=scale(1.0)，高 16=zero(0.5)
@@ -490,7 +567,7 @@ fn run_case(
         };
         b.upload_u32(h.idx, &idx)?;
         b.upload_u32(h.sz, &sz)?;
-        (Some(h), None)
+        (Some(h), None, None)
     };
 
     // 激活 [batch, k] f32 / 门控 [batch, k] f16 / 输出 [batch, m] f32。
@@ -557,6 +634,12 @@ fn run_case(
             "plain" => b.gemv_int8_plain(a8.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
             "add" => b.gemv_int8_add(a8.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
             "f16" => b.gemv_f16(w16.unwrap(), x.unwrap(), y, m, k, batch),
+            "i6_relu2" => b.gemv_int6_relu2(a6.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
+            "i6_mul" => {
+                b.gemv_int6_mul_add(a6.as_ref().unwrap(), x.unwrap(), g.unwrap(), y, m, k, batch)
+            }
+            "i6_plain" => b.gemv_int6_plain(a6.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
+            "i6_add" => b.gemv_int6_add(a6.as_ref().unwrap(), x.unwrap(), y, m, k, batch),
             "pf_out" | "pf_key" | "pf_value" => {
                 // `gemm(a, w, out, rows, n, k)`：`case.m` 在这里是**输出特征数 n**。
                 b.gemm(a16.unwrap(), w16.unwrap(), y, batch, m, k)
