@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let _ = bundle.infer_sample_selfloop(warm[2], 8, &sp)?;
     log::info!("预热完成\n");
+    gpu_telemetry("预热后");
 
     // 1) infer_seq：整段 prefill
     bundle.reset()?;
@@ -124,6 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 dt * 1e3 / reps as f64,
                 reps as f64 / dt
             );
+            gpu_telemetry(label);
         }
     }
 
@@ -248,12 +250,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    gpu_telemetry("结束");
     Ok(())
 }
 
 fn init_log() {
     let _ = log::set_logger(&STDOUT_LOGGER);
     log::set_max_level(log::LevelFilter::Info);
+}
+
+/// 打印当前 GPU 时钟/温度/功耗/降频原因（每条读数都要带上机器状态，见 参考 §1e）。
+///
+/// ★ 本机 **无法锁频**：`nvidia-smi --lock-gpu-clocks` 报 "current user does not have
+/// permission"（需管理员；GeForce 上 `--lock-memory-clocks` 直接不支持）。所以退而求其次：
+/// 每条读数前后打印 `clocks.sm` / 温度 / `clocks_throttle_reasons`，让「这一数是快机还是慢机
+/// 测的」可自证；配合交替 A/B 取最小，抵消 boost 爬升与热降频。
+fn gpu_telemetry(tag: &str) {
+    // 64 位进程走 System32（真目录），32 位进程只能走 Sysnative（重定向入口）⇒ 两个都试。
+    let candidates = [
+        r"C:\Windows\System32\nvidia-smi.exe",
+        r"C:\WINDOWS\Sysnative\nvidia-smi.exe",
+    ];
+    let Some(smi) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
+        return;
+    };
+    let out = std::process::Command::new(smi)
+        .args([
+            "--query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw,clocks_throttle_reasons.active",
+            "--format=csv,noheader",
+        ])
+        .output();
+    if let Ok(o) = out {
+        log::info!("[GPU {tag}] {}", String::from_utf8_lossy(&o.stdout).trim());
+    }
 }
 
 struct StdoutLogger;
