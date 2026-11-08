@@ -318,6 +318,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = bundle.infer_seq(&toks)?;
     }
     let ms_seq = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+    // ★ 带存档的验证 pass（投机环真正走的那条）与上面的 `infer_seq` 配对。
+    // 两者差 = 存档（32 层 × 8 张 `[T,C]` 拷贝）+ 逐位置 head/argmax 读回 + 图键差异。
+    // 必须**同进程紧邻**测量：本机无法锁频，跨进程比值会被热态漂移吃掉（见台账 §3.10）。
+    let t0 = std::time::Instant::now();
+    for i in 0..reps {
+        let toks = vec![(i % 1000) as u32 + 1; k + 1];
+        let _ = bundle
+            .model
+            .forward_seq_verify_with_state(&mut bundle.state, &toks)?;
+    }
+    let ms_verify = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
     // 回滚自检：同一基线下「T 全 pass + 回滚到 2」必须等于「直接 T=2 pass」
     if std::env::var("MTP_ROLLBACK_TEST").is_ok() {
         let mut c0 = seed_spec(&mut bundle)?;
@@ -367,6 +378,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         k + 1
     );
     log::info!("  drafter 链 {k} 深度      : {ms_draft:.3} ms");
+    log::info!(
+        "  T={} 验证 pass（带存档） : {ms_verify:.3} ms（比 infer_seq 多 {:.3} ms = 存档+逐位置读回）",
+        k + 1,
+        ms_verify - ms_seq
+    );
     let acc = acc_sum / steps.max(1) as f64;
     for (name, extra) in [("免费回滚（理想）", 0.0), ("第二遍 seq 重放", ms_seq)] {
         let per_step = ms_seq + ms_draft + extra;
