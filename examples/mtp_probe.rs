@@ -212,6 +212,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         tok = *out.last().unwrap();
     }
     let ms_spec = ts.elapsed().as_secs_f64() * 1000.0;
+
+    // 臂 C：与 spec 臂走**同一条 seq 路径**的逐 token 解码（T=1 的验证 pass）。
+    // 作用是把「投机机制本身有没有错」与「seq/decode 两条路径的数值差」分开：
+    // 若 B 与 C 长程一致而 B≠A，则机制正确，分歧只来自两条路径的数值档。
+    let mut c = seed_spec(&mut bundle)?;
+    let mut seqplain = Vec::with_capacity(n_gen);
+    seqplain.push(c);
+    while seqplain.len() < n_gen {
+        let p1 = bundle
+            .model
+            .forward_seq_verify_with_state(&mut bundle.state, &[c])?;
+        c = p1[0];
+        seqplain.push(c);
+    }
+    let mut same_ac = 0usize;
+    for (a, b) in spec.iter().zip(seqplain.iter()) {
+        if a == b {
+            same_ac += 1;
+        } else {
+            break;
+        }
+    }
+    log::info!("  spec vs seq-逐token：前 {same_ac}/{n_gen} 个一致（这条决定「机制」对不对）");
+    if std::env::var("MTP_PROF").is_ok() {
+        log::info!("  spec    [0..8] = {:?}", &spec[..spec.len().min(8)]);
+        log::info!(
+            "  seqplain[0..8] = {:?}",
+            &seqplain[..seqplain.len().min(8)]
+        );
+        log::info!("  plain   [0..8] = {:?}", &plain[..plain.len().min(8)]);
+    }
+
     let model = &mut bundle.model;
 
     // 流一致性：逐位置比对（near-tie 允许分歧，与上游同样声明）
@@ -286,6 +318,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = bundle.infer_seq(&toks)?;
     }
     let ms_seq = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+    // 回滚自检：同一基线下「T 全 pass + 回滚到 2」必须等于「直接 T=2 pass」
+    if std::env::var("MTP_ROLLBACK_TEST").is_ok() {
+        let mut c0 = seed_spec(&mut bundle)?;
+        let mut toks = vec![c0];
+        for _ in 0..k {
+            let p1 = bundle
+                .model
+                .forward_seq_verify_with_state(&mut bundle.state, &[c0])?;
+            c0 = p1[0];
+            toks.push(c0);
+        }
+        let (rolled, reference) =
+            bundle
+                .model
+                .mtp_rollback_selftest(&mut bundle.state, &toks, 2)?;
+        let mut md = 0.0f32;
+        let mut mi = 0usize;
+        for i in 0..rolled.len().min(reference.len()) {
+            let d = (rolled[i] - reference[i]).abs();
+            if d > md {
+                md = d;
+                mi = i;
+            }
+        }
+        log::info!(
+            "[回滚自检] tokens={toks:?} n=2：max|Δstate| = {md:.3e}（idx {mi} / {}）⇒ {}",
+            rolled.len(),
+            if md < 1e-5 {
+                "逐位一致 ✅"
+            } else {
+                "❌ 不一致（回滚有 bug）"
+            }
+        );
+    }
     let model = &mut bundle.model;
 
     let t0 = std::time::Instant::now();

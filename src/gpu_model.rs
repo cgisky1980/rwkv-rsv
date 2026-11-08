@@ -1153,6 +1153,36 @@ impl GpuModel {
         Ok(())
     }
 
+    /// 诊断：**回滚自检**。从同一基线状态出发，比较
+    /// ① 跑完整 T 个 token 的验证 pass 再回滚到 `n`；② 直接跑前 `n` 个 token 的 pass。
+    /// 两者必须逐位一致（因果 pass 的前 n 行只依赖前 n 个 token）。
+    /// 返回 `(回滚后的状态, 参考状态)`，调用方自行比较。
+    pub fn mtp_rollback_selftest(
+        &mut self,
+        state: &mut State,
+        tokens: &[u32],
+        n: usize,
+    ) -> R<(Vec<f32>, Vec<f32>)> {
+        let (c, h, nn) = (
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        );
+        let Some(mut snap) = self.mtp_snap.take() else {
+            return Err("mtp_rollback_selftest: MTP 未启用".into());
+        };
+        let base = self.state_back(state)?;
+        snap.copy_from(self.backend.as_mut(), state, c, h, nn)?;
+        let _ = self.forward_seq_verify_with_state(state, tokens)?;
+        self.spec_rollback(state, &snap, n)?;
+        let rolled = self.state_back(state)?;
+        state.load(&*self.backend, &base, c, h, nn)?;
+        let _ = self.forward_seq_verify_with_state(state, &tokens[..n])?;
+        let reference = self.state_back(state)?;
+        self.mtp_snap = Some(snap);
+        Ok((rolled, reference))
+    }
+
     /// 诊断：用 drafter 的 head 路径对当前末行 `ln_out(x)`（`bufs.x_norm`）求 argmax。
     ///
     /// 必须等于主模型这一步的 argmax——两者是同一份 head 权重、同一行 x_norm。
@@ -5191,10 +5221,19 @@ impl GpuModel {
         // TILE_M=256 的倍数，且每层要把 int8 权重 dequant 成 fp16 副本再 GEMM ⇒ T=4 也要 104 ms
         // （≈10 个 decode 步），而批量 GEMV 只读一遍量化权重（≈1 个 decode 步）。
         // 这条分支是 MTP 验证前向（T=K+1 的因果 pass）的成本前提；`SEQ_SMALL_T=0` 可关。
-        let small_t = t <= seq_small_t();
+        // ⚠️ 下界是 **2**：T=1 走这条分支时输出与 decode 路径不一致（实证见
+        // `examples/mtp_probe` 的「spec vs seq-逐token」臂会自循环），而 T=1 的 prefill
+        // 本来就没性能诉求 ⇒ 一律留在老路径上，先不碰。
+        let small_t = (2..=seq_small_t()).contains(&t);
         // 小 T 时把低秩 mid 的 GEMM 行数压到 64（tensor-core 的 M 下限；
         // 批量档的 `lr_rows` 用的就是 64）。mid ≤ 96 ⇒ 省掉的是 padding 的计算量。
-        let m_rows = if small_t { 64 } else { m_pad };
+        // `SEQ_ROWS` 只给诊断用：强制 mid GEMM 的行数（默认小 T 用 64），
+        // 用来判定「M=64 的窄 GEMM 是否算坏了 row≥1」。
+        let m_rows = match std::env::var("SEQ_ROWS").ok().and_then(|v| v.parse().ok()) {
+            Some(r) => r,
+            None if small_t => 64,
+            None => m_pad,
+        };
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv start");
         }
