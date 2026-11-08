@@ -1953,7 +1953,8 @@ impl Runtime {
         )
     }
 
-    /// int6（N-major）r/k/v + mid 融合氛围（decode 单流）。
+    /// int6（N-major）r/k/v + mid 融合核（decode 单流；`batch > 1` 时 `grid.y = batch`，
+    /// 每个槽各自算自己的 mid）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_int6_rkv_stage1(
         &mut self,
@@ -1982,11 +1983,19 @@ impl Runtime {
         wm: usize,
         am: usize,
         gm: usize,
+        batch: usize,
     ) -> R<()> {
         debug_assert_eq!((r.m, r.k), (c, c));
         debug_assert_eq!((k.m, k.k), (c, c));
         debug_assert_eq!((v.m, v.k), (c, c));
-        let spec = [c as u32, vm as u32, wm as u32, am as u32, gm as u32];
+        let spec = [
+            c as u32,
+            vm as u32,
+            wm as u32,
+            am as u32,
+            gm as u32,
+            batch as u32,
+        ];
         let params = [
             r.lo.device.address,
             r.hi.device.address,
@@ -2050,7 +2059,7 @@ impl Runtime {
             "shaders/spv/gemv_int6_rkv_stage1.spv",
             &spec,
             &params,
-            (threads.div_ceil(128), 1, 1),
+            (threads.div_ceil(128), batch as u32, 1),
             &reads,
             &writes,
         )?;

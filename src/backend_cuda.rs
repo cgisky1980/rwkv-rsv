@@ -5281,6 +5281,14 @@ extern "C" __global__ void gemv_int6nm_rkv(
     const int w    = threadIdx.x >> 5;
     const int nb   = (c + 31) >> 5;
     const int flat = blockIdx.x;
+    // 批量：grid.y = 槽号；x 与全部输出都按槽偏移（单流 batch=1 ⇒ slot 恒 0）。
+    const int slot = blockIdx.y;
+    const size_t xoff = (size_t)slot * c;
+    xr += xoff; xk += xoff; xv += xoff; xw += xoff; xa += xoff; xg += xoff;
+    const size_t o_rk = (size_t)slot * c;
+    out_r += o_rk; out_k += o_rk; out_v += o_rk;
+    out_vm += (size_t)slot * vm; out_wm += (size_t)slot * wm;
+    out_am += (size_t)slot * am; out_gm += (size_t)slot * gm;
 
     if (flat < nb) {
         const unsigned char* rl = reinterpret_cast<const unsigned char*>(R_lo);
@@ -8400,6 +8408,90 @@ impl CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+
+    /// N-major int6 的 r/k/v + mid 融合核发射器（单流 `batch=1` 与批量共用；
+    /// 批量时 `grid.y = batch`，内核按槽号偏移 x 与全部输出）。
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int6nm_rkv(
+        &mut self,
+        func: CuFunction,
+        warps: usize,
+        r_lo: u64,
+        r_hi: u64,
+        r_sz: u64,
+        k_lo: u64,
+        k_hi: u64,
+        k_sz: u64,
+        v_lo: u64,
+        v_hi: u64,
+        v_sz: u64,
+        v1d: u64,
+        w1d: u64,
+        a1d: u64,
+        g1d: u64,
+        xrd: u64,
+        xkd: u64,
+        xvd: u64,
+        xwd: u64,
+        xad: u64,
+        xgd: u64,
+        ord: u64,
+        okd: u64,
+        ovd: u64,
+        ovmd: u64,
+        owmd: u64,
+        oamd: u64,
+        ogmd: u64,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        let midtot = vm + wm + am + gm;
+        let grid = (
+            ((c as u32).div_ceil(32)) + (midtot as u32).div_ceil(warps as u32),
+            batch as u32,
+            1u32,
+        );
+        let block = (warps as u32 * 32, 1u32, 1u32);
+        let (c_i, vm_i, wm_i, am_i, gm_i) = (c as i32, vm as i32, wm as i32, am as i32, gm as i32);
+        let params = [
+            &r_lo as *const u64 as *mut c_void,
+            &r_hi as *const u64 as *mut c_void,
+            &r_sz as *const u64 as *mut c_void,
+            &k_lo as *const u64 as *mut c_void,
+            &k_hi as *const u64 as *mut c_void,
+            &k_sz as *const u64 as *mut c_void,
+            &v_lo as *const u64 as *mut c_void,
+            &v_hi as *const u64 as *mut c_void,
+            &v_sz as *const u64 as *mut c_void,
+            &v1d as *const u64 as *mut c_void,
+            &w1d as *const u64 as *mut c_void,
+            &a1d as *const u64 as *mut c_void,
+            &g1d as *const u64 as *mut c_void,
+            &xrd as *const u64 as *mut c_void,
+            &xkd as *const u64 as *mut c_void,
+            &xvd as *const u64 as *mut c_void,
+            &xwd as *const u64 as *mut c_void,
+            &xad as *const u64 as *mut c_void,
+            &xgd as *const u64 as *mut c_void,
+            &ord as *const u64 as *mut c_void,
+            &okd as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &ovmd as *const u64 as *mut c_void,
+            &owmd as *const u64 as *mut c_void,
+            &oamd as *const u64 as *mut c_void,
+            &ogmd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &vm_i as *const i32 as *mut c_void,
+            &wm_i as *const i32 as *mut c_void,
+            &am_i as *const i32 as *mut c_void,
+            &gm_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
 }
 
 impl ComputeBackend for CudaBackend {
@@ -10924,49 +11016,11 @@ impl ComputeBackend for CudaBackend {
                 &src,
                 "gemv_int6nm_rkv",
             )?;
-            let midtot = vm + wm + am + gm;
-            let grid = (
-                ((c as u32).div_ceil(32)) + (midtot as u32).div_ceil(warps as u32),
-                1u32,
-                1u32,
+            return self.launch_int6nm_rkv(
+                func, warps, r_lo, r_hi, r_sz, k_lo, k_hi, k_sz, v_lo, v_hi, v_sz, v1d, w1d, a1d,
+                g1d, xrd, xkd, xvd, xwd, xad, xgd, ord, okd, ovd, ovmd, owmd, oamd, ogmd, c, vm,
+                wm, am, gm, 1,
             );
-            let block = (warps as u32 * 32, 1u32, 1u32);
-            let (c_i, vm_i, wm_i, am_i, gm_i) =
-                (c as i32, vm as i32, wm as i32, am as i32, gm as i32);
-            let params = [
-                &r_lo as *const u64 as *mut c_void,
-                &r_hi as *const u64 as *mut c_void,
-                &r_sz as *const u64 as *mut c_void,
-                &k_lo as *const u64 as *mut c_void,
-                &k_hi as *const u64 as *mut c_void,
-                &k_sz as *const u64 as *mut c_void,
-                &v_lo as *const u64 as *mut c_void,
-                &v_hi as *const u64 as *mut c_void,
-                &v_sz as *const u64 as *mut c_void,
-                &v1d as *const u64 as *mut c_void,
-                &w1d as *const u64 as *mut c_void,
-                &a1d as *const u64 as *mut c_void,
-                &g1d as *const u64 as *mut c_void,
-                &xrd as *const u64 as *mut c_void,
-                &xkd as *const u64 as *mut c_void,
-                &xvd as *const u64 as *mut c_void,
-                &xwd as *const u64 as *mut c_void,
-                &xad as *const u64 as *mut c_void,
-                &xgd as *const u64 as *mut c_void,
-                &ord as *const u64 as *mut c_void,
-                &okd as *const u64 as *mut c_void,
-                &ovd as *const u64 as *mut c_void,
-                &ovmd as *const u64 as *mut c_void,
-                &owmd as *const u64 as *mut c_void,
-                &oamd as *const u64 as *mut c_void,
-                &ogmd as *const u64 as *mut c_void,
-                &c_i as *const i32 as *mut c_void,
-                &vm_i as *const i32 as *mut c_void,
-                &wm_i as *const i32 as *mut c_void,
-                &am_i as *const i32 as *mut c_void,
-                &gm_i as *const i32 as *mut c_void,
-            ];
-            return self.drv.launch(self.stream, func, grid, block, &params);
         }
 
         // int6 的行数档与 int8 **不同**：int6 的 K 单元数是 C/64（C=2560 → 40），
@@ -11309,6 +11363,101 @@ impl ComputeBackend for CudaBackend {
             return self.gemv_int6nm_launch(lo, hi, sz, xd, 0, yd, m, k, b, 3);
         }
         self.gemv_variant_dispatch(0, lo, hi, sz, xd, 0, yd, m, k, b, 3, 3)
+    }
+
+    /// batch 版 int6 r/k/v + mid：与单流同一个内核，`grid.y = batch`（内核按槽号偏移）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1_batch(
+        &mut self,
+        r: &Int6Handle,
+        k: &Int6Handle,
+        v: &Int6Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        if !r.nmajor {
+            return Err("gemv_int6_rkv_stage1_batch: CUDA 只支持 N-major int6 平面".into());
+        }
+        const OP: &str = "gemv_int6_rkv_stage1_batch";
+        let (r_lo, r_hi, r_sz) = (
+            self.u32_ptr(r.lo, OP)?,
+            self.u32_ptr(r.hi, OP)?,
+            self.u32_ptr(r.sz, OP)?,
+        );
+        let (k_lo, k_hi, k_sz) = (
+            self.u32_ptr(k.lo, OP)?,
+            self.u32_ptr(k.hi, OP)?,
+            self.u32_ptr(k.sz, OP)?,
+        );
+        let (v_lo, v_hi, v_sz) = (
+            self.u32_ptr(v.lo, OP)?,
+            self.u32_ptr(v.hi, OP)?,
+            self.u32_ptr(v.sz, OP)?,
+        );
+        let warps = i6nm_warps();
+        let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_RKV_SRC}");
+        let func = self.kernel(
+            &format!("gemv_int6nm_rkv_w{warps}"),
+            &src,
+            "gemv_int6nm_rkv",
+        )?;
+        self.launch_int6nm_rkv(
+            func,
+            warps,
+            r_lo,
+            r_hi,
+            r_sz,
+            k_lo,
+            k_hi,
+            k_sz,
+            v_lo,
+            v_hi,
+            v_sz,
+            self.f32_ptr(v1, OP)?,
+            self.f32_ptr(w1, OP)?,
+            self.f32_ptr(a1, OP)?,
+            self.f32_ptr(g1, OP)?,
+            self.f32_ptr(xr, OP)?,
+            self.f32_ptr(xk, OP)?,
+            self.f32_ptr(xv, OP)?,
+            self.f32_ptr(xw, OP)?,
+            self.f32_ptr(xa, OP)?,
+            self.f32_ptr(xg, OP)?,
+            self.f32_ptr(out_r, OP)?,
+            self.f32_ptr(out_k, OP)?,
+            self.f16_ptr(out_v, OP)?,
+            self.f32_ptr(out_vm, OP)?,
+            self.f32_ptr(out_wm, OP)?,
+            self.f32_ptr(out_am, OP)?,
+            self.f32_ptr(out_gm, OP)?,
+            c,
+            vm,
+            wm,
+            am,
+            gm,
+            batch,
+        )
     }
 
     fn dequant_int6_to_f16(&mut self, a: &Int6Handle, out: TensorId, m: usize, k: usize) -> R<()> {

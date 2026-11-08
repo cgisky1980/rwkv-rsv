@@ -1221,6 +1221,40 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("gemv_int8_rkv_stage1_batch not supported by this backend".into())
     }
+    /// batch 版 int6 r/k/v + mid（N-major）：x 输入与输出为 [batch, ...]，权重共享。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1_batch(
+        &mut self,
+        _r: &Int6Handle,
+        _k: &Int6Handle,
+        _v: &Int6Handle,
+        _v1: TensorId,
+        _w1: TensorId,
+        _a1: TensorId,
+        _g1: TensorId,
+        _xr: TensorId,
+        _xk: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_r: TensorId,
+        _out_k: TensorId,
+        _out_v: TensorId,
+        _out_vm: TensorId,
+        _out_wm: TensorId,
+        _out_am: TensorId,
+        _out_gm: TensorId,
+        _c: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_rkv_stage1_batch not supported by this backend".into())
+    }
+
     /// batch 版 gemv_lowrank_chain4：mid 输入与 v_first/输出为 [batch, ...]；权重共享。
     #[allow(clippy::too_many_arguments)]
     fn gemv_lowrank_chain4_batch(
@@ -3156,7 +3190,76 @@ impl ComputeBackend for VulkanBackend {
             self.rt.gemv_int6_rkv_stage1(
                 &r6, &k6, &v6, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
                 &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
-                &mut ogm_o, c, vm, wm, am, gm,
+                &mut ogm_o, c, vm, wm, am, gm, 1,
+            )
+        };
+        self.put_f32(out_r, or_o);
+        self.put_f32(out_k, ok_o);
+        self.put_f16(out_v, ov_o);
+        self.put_f32(out_vm, ovm_o);
+        self.put_f32(out_wm, owm_o);
+        self.put_f32(out_am, oam_o);
+        self.put_f32(out_gm, ogm_o);
+        res
+    }
+
+    /// batch 版 int6 r/k/v + mid（N-major）：`grid.y = batch`，每槽各自算 mid。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1_batch(
+        &mut self,
+        r: &Int6Handle,
+        k: &Int6Handle,
+        v: &Int6Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+    ) -> R<()> {
+        const OP: &str = "gemv_int6_rkv_stage1_batch";
+        let mut or_o = self.take_f32(out_r, OP)?;
+        let mut ok_o = self.take_f32(out_k, OP)?;
+        let mut ov_o = self.take_f16(out_v, OP)?;
+        let mut ovm_o = self.take_f32(out_vm, OP)?;
+        let mut owm_o = self.take_f32(out_wm, OP)?;
+        let mut oam_o = self.take_f32(out_am, OP)?;
+        let mut ogm_o = self.take_f32(out_gm, OP)?;
+        let res = {
+            let r6 = self.int6_ref(r, OP)?;
+            let k6 = self.int6_ref(k, OP)?;
+            let v6 = self.int6_ref(v, OP)?;
+            let v1_g = self.get_f32(v1, OP)?;
+            let w1_g = self.get_f32(w1, OP)?;
+            let a1_g = self.get_f32(a1, OP)?;
+            let g1_g = self.get_f32(g1, OP)?;
+            let xr_g = self.get_f32(xr, OP)?;
+            let xk_g = self.get_f32(xk, OP)?;
+            let xv_g = self.get_f32(xv, OP)?;
+            let xw_g = self.get_f32(xw, OP)?;
+            let xa_g = self.get_f32(xa, OP)?;
+            let xg_g = self.get_f32(xg, OP)?;
+            self.rt.gemv_int6_rkv_stage1(
+                &r6, &k6, &v6, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
+                &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
+                &mut ogm_o, c, vm, wm, am, gm, batch,
             )
         };
         self.put_f32(out_r, or_o);

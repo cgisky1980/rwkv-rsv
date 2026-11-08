@@ -2694,18 +2694,18 @@ impl GpuModel {
                 bb.lr_rows
             );
         }
+        // LOWRANK_GEMM / LOWRANK_GEMM1 时 mid 伪行数传 0 ⇒ 量化融合核只发 r/k/v
+        // （mid 交给下面的 fp16 GEMM 档）。
+        let (mvm, mwm, mam, mgm) = if lowrank_gemm || lowrank_stage1 {
+            (0, 0, 0, 0)
+        } else {
+            (vm, wm, am, gm)
+        };
         if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
             &self.layers[i].receptance_a8,
             &self.layers[i].key_a8,
             &self.layers[i].value_a8,
         ) {
-            // LOWRANK_GEMM / LOWRANK_GEMM1 时 mid 伪行数传 0 ⇒ `gemv_int8_rkv_stage1_batch`
-            // 只发 r/k/v。
-            let (mvm, mwm, mam, mgm) = if lowrank_gemm || lowrank_stage1 {
-                (0, 0, 0, 0)
-            } else {
-                (vm, wm, am, gm)
-            };
             // ★ 2026-10-04：r/k/v 三个 C×C int8 GEMM 改走 **W8A8 张量核**（同 att.output 的形状）。
             // 旧的 SIMT 融合核每个 workgroup 只算 `ROWS=4` 行、却要读全部 x（BGRP 个槽），
             // x 被重读 `C/ROWS = 640` 遍 ⇒ L2 带宽成为瓶颈（实测每层 ~307MB 的 x 流量 vs
@@ -2871,8 +2871,45 @@ impl GpuModel {
                     batch,
                 )?;
             }
+        } else if let (Some(r_i6), Some(k_i6), Some(v_i6)) = (
+            &self.layers[i].receptance_i6,
+            &self.layers[i].key_i6,
+            &self.layers[i].value_i6,
+        ) {
+            // int6（N-major）：同一个融合核按 `grid.y = batch` 展开，mid 亦**按槽**各算一份
+            // （低秩 GEMM 档对 int6 不适用：`gemm_imma` 只吃 W8A8，故 mid 一律交给融合核）。
+            self.backend.gemv_int6_rkv_stage1_batch(
+                r_i6,
+                k_i6,
+                v_i6,
+                self.layers[i].v1,
+                self.layers[i].w1,
+                self.layers[i].a1,
+                self.layers[i].g1,
+                bb.xr,
+                bb.xk,
+                bb.xv,
+                bb.xw,
+                bb.xa,
+                bb.xg,
+                bb.r,
+                bb.k,
+                bb.v,
+                bb.v_mid,
+                bb.w_mid,
+                bb.a_mid,
+                bb.g_mid,
+                c,
+                mvm,
+                mwm,
+                mam,
+                mgm,
+                batch,
+            )?;
         } else {
-            return Err("batch 并发路径要求 r/k/v 为 int8 量化权重（fp16 模型暂不支持）".into());
+            return Err(
+                "batch 并发路径要求 r/k/v 为 int8 或 int6 量化权重（fp16 模型暂不支持）".into(),
+            );
         }
 
         // v_first 跨层快照（[batch, C] 全量拷贝，len 自适应）。
@@ -3112,6 +3149,10 @@ impl GpuModel {
                 self.backend
                     .gemv_int8_mul_add(a8, bb.y_norm, bb.g, bb.x, c, c, batch)?;
             }
+        } else if let Some(wqo) = wq(self.layers[i].att_output_i6, self.layers[i].att_output_a8) {
+            // int6（N-major）：`gemv_int6nm` 的 mul 变体，批量走 `grid.y`
+            self.backend
+                .w_mul_add(&wqo, bb.y_norm, bb.g, bb.x, c, c, batch)?;
         } else {
             let w16 = *self.layers[i]
                 .output_w16
@@ -3162,6 +3203,9 @@ impl GpuModel {
         } else if let Some(a8) = &self.layers[i].ffn_key_a8 {
             self.backend
                 .gemv_int8_relu2(a8, bb.xb, bb.r2, fh, c, batch)?;
+        } else if let Some(wqk) = wq(self.layers[i].ffn_key_i6, self.layers[i].ffn_key_a8) {
+            // int6（N-major）
+            self.backend.w_relu2(&wqk, bb.xb, bb.r2, fh, c, batch)?;
         } else {
             let w16 = *self.layers[i]
                 .ffn_key_w16
@@ -3229,6 +3273,9 @@ impl GpuModel {
                     .ffn_value_sparse_add_batch(vt, bb.r2, bb.x, c, fh, batch)?;
             } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
                 self.backend.gemv_int8_add(a8, bb.r2, bb.x, c, fh, batch)?;
+            } else if let Some(wqv) = wq(self.layers[i].ffn_value_i6, self.layers[i].ffn_value_a8) {
+                // int6（N-major）
+                self.backend.w_add(&wqv, bb.r2, bb.x, c, fh, batch)?;
             } else {
                 let w16 = *self.layers[i]
                     .ffn_value_w16

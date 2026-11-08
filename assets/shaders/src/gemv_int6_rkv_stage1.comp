@@ -14,8 +14,9 @@
 // 相邻 invocation 覆盖相邻 row ⇒ 字节载入天然合并，且每个 invocation 自带完整点积
 //（无需跨线程归约，求和顺序固定 ⇒ 贪心 token 流可复现）。
 //
-// dispatch = (ceil((C + VM + WM + AM + GM) / BLOCK_SIZE), 1, 1)：
+// dispatch = (ceil((C + VM + WM + AM + GM) / BLOCK_SIZE), batch, 1)：
 //   前 C 个 invocation 各算一行 r/k/v；其后 VM+WM+AM+GM 个各算一行 mid 投影。
+//   `gl_WorkGroupID.y` = 槽号（单流 batch=1 ⇒ 恒 0），x 与全部输出按槽偏移。
 // 要求 C % 64 == 0（int6 打包块）。
 
 layout(constant_id = 0) const uint C  = 2560;
@@ -23,6 +24,7 @@ layout(constant_id = 1) const uint VM = 64;
 layout(constant_id = 2) const uint WM = 96;
 layout(constant_id = 3) const uint AM = 96;
 layout(constant_id = 4) const uint GM = 320;
+layout(constant_id = 5) const uint BATCH = 1;
 
 const uint BLOCK_SIZE = 128;
 const uint NCHUNK     = C / 64;
@@ -68,8 +70,8 @@ uint byte_at(InLo p, uint byte_index) {
     return (p.data[byte_index >> 2] >> ((byte_index & 3u) * 8u)) & 0xFFu;
 }
 
-// 单列 row 在 N-major 双平面上的完整点积（K = C）
-float dot_nm(InLo lo, InHi hi, InSZ sz, InF32 x, uint row) {
+// 单列 row 在 N-major 双平面上的完整点积（K = C）；xo 为槽在 x 上的偏移
+float dot_nm(InLo lo, InHi hi, InSZ sz, InF32 x, uint xo, uint row) {
     float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
     for (uint c = 0; c < NCHUNK; ++c) {
         const float sc = unpackHalf2x16(sz.data[(c >> 1) * C + row]).x;
@@ -85,43 +87,55 @@ float dot_nm(InLo lo, InHi hi, InSZ sz, InF32 x, uint row) {
             const int e1 = int(lb1 & 15u) | (int((hb >> 2) & 3u) << 4);
             const int e2 = int(lb0 >> 4) | (int((hb >> 4) & 3u) << 4);
             const int e3 = int(lb1 >> 4) | (int((hb >> 6) & 3u) << 4);
-            a0 += sc * float(e0 - 32) * x.data[kb + j];
-            a1 += sc * float(e1 - 32) * x.data[kb + 16u + j];
-            a2 += sc * float(e2 - 32) * x.data[kb + 32u + j];
-            a3 += sc * float(e3 - 32) * x.data[kb + 48u + j];
+            a0 += sc * float(e0 - 32) * x.data[xo + kb + j];
+            a1 += sc * float(e1 - 32) * x.data[xo + kb + 16u + j];
+            a2 += sc * float(e2 - 32) * x.data[xo + kb + 32u + j];
+            a3 += sc * float(e3 - 32) * x.data[xo + kb + 48u + j];
         }
     }
     return (a0 + a1) + (a2 + a3);
 }
 
-// mid 投影：fp32 权重 [rows, C] 行主序 × x[C]
-float dot_f32(InF32 w, InF32 x, uint row) {
+// mid 投影：fp32 权重 [rows, C] 行主序 × x[xo .. xo+C]
+float dot_f32(InF32 w, InF32 x, uint xo, uint row) {
     float d = 0.0;
     const uint base = row * C;
-    for (uint k = 0; k < C; ++k) d += w.data[base + k] * x.data[k];
+    for (uint k = 0; k < C; ++k) d += w.data[base + k] * x.data[xo + k];
     return d;
 }
 
 void main() {
     const uint gi   = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationIndex;
     const uint midt = VM + WM + AM + GM;
+    // 槽号：批量路径 grid.y = batch，x 与全部输出都按槽偏移
+    const uint slot = gl_WorkGroupID.y;
+    const uint xo   = slot * C;
+    const uint o_rkv = slot * C;
+    const uint o_vm  = slot * VM;
+    const uint o_wm  = slot * WM;
+    const uint o_am  = slot * AM;
+    const uint o_gm  = slot * GM;
 
     if (gi < C) {
-        params.out_r.data[gi] = dot_nm(params.r_lo, params.r_hi, params.r_sz, params.xr, gi);
-        params.out_k.data[gi] = dot_nm(params.k_lo, params.k_hi, params.k_sz, params.xk, gi);
-        params.out_v.data[gi] = float16_t(dot_nm(params.v_lo, params.v_hi, params.v_sz, params.xv, gi));
+        params.out_r.data[o_rkv + gi] =
+            dot_nm(params.r_lo, params.r_hi, params.r_sz, params.xr, xo, gi);
+        params.out_k.data[o_rkv + gi] =
+            dot_nm(params.k_lo, params.k_hi, params.k_sz, params.xk, xo, gi);
+        params.out_v.data[o_rkv + gi] =
+            float16_t(dot_nm(params.v_lo, params.v_hi, params.v_sz, params.xv, xo, gi));
         return;
     }
 
     const uint m = gi - C;
     if (m >= midt) return;
     if (m < VM) {
-        params.out_vm.data[m] = dot_f32(params.v1, params.xv, m);
+        params.out_vm.data[o_vm + m] = dot_f32(params.v1, params.xv, xo, m);
     } else if (m < VM + WM) {
-        params.out_wm.data[m - VM] = tanh(dot_f32(params.w1, params.xw, m - VM));
+        params.out_wm.data[o_wm + m - VM] = tanh(dot_f32(params.w1, params.xw, xo, m - VM));
     } else if (m < VM + WM + AM) {
-        params.out_am.data[m - VM - WM] = dot_f32(params.a1, params.xa, m - VM - WM);
+        params.out_am.data[o_am + m - VM - WM] = dot_f32(params.a1, params.xa, xo, m - VM - WM);
     } else {
-        params.out_gm.data[m - VM - WM - AM] = dot_f32(params.g1, params.xg, m - VM - WM - AM);
+        params.out_gm.data[o_gm + m - VM - WM - AM] =
+            dot_f32(params.g1, params.xg, xo, m - VM - WM - AM);
     }
 }
