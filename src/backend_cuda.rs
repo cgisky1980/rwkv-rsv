@@ -5243,6 +5243,31 @@ fn i6nm_ksplit() -> usize {
         .unwrap_or(3)
 }
 
+/// 按「已够不够填满 SM」缩放 split 段数：块数 = `ceil(m/32) × ksplit`。
+///
+/// **保留但默认不用**（`I6NM_SK_TARGET` 只在实验开启）：实测自适应是负优化 ——
+/// target=300/480 时 T=4 验证 pass 18.7/18.6 ms，而固定 3 是 16.5/16.7 ms。
+/// 失败原因是 `ffn.key`（m=10240 ⇒ 320 列块已经很多）被降到 split=1 后反而更慢，
+/// 与「按块数判并行度」的直觉相反：split 的好处不只是块数，还有**块内 K 跨度变短 ⇒
+/// 每块的权重段更连续、更容易凑成满带宽的流**。这条否定结论与台账 §3.10 补二的
+/// KSPLIT=1 vs 3 相位实验互相印证。
+#[allow(dead_code)]
+fn i6nm_ksplit_for(m: usize, k: usize) -> usize {
+    let cap = i6nm_ksplit();
+    if cap <= 1 {
+        return 1;
+    }
+    let target: usize = std::env::var("I6NM_SK_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    if target == 0 {
+        return cap.min(k / 64);
+    }
+    let blocks = m.div_ceil(32).max(1);
+    (target / blocks).clamp(1, cap).min(k / 64)
+}
+
 /// 融合 r/k/v+mid 核是否也走 split-K（`I6NM_RKV_SPLIT=1` 开；**默认关**，实测无收益，
 /// 理由见 `GEMV_INT6NM_RKV_SPLIT_SRC` 的注释）。
 fn i6nm_rkv_split_enabled() -> bool {
@@ -11790,10 +11815,6 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn supports_lowrank_mid1(&self) -> bool {
-        true
-    }
-
-    fn supports_int6_rkv_f32v(&self) -> bool {
         true
     }
 
