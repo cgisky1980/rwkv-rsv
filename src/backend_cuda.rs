@@ -9757,15 +9757,17 @@ impl CudaBackend {
         } else {
             1
         };
-        // ★ 张量核档（默认开，`I6NM_MMA=0` 关）：**只给 b ≥ 8**。
+        // ★ 张量核档（默认开，`I6NM_MMA=0` 关）：**b ≥ 5 走它**。
         //
-        // 为什么不是从 b=2 起（上游 `int6_gemm.py` 的 `RED_MAX_M = 1`）：那套是 B=32 的
-        // 服务端，M 能把 mma 的 16 行填满；我们单请求投机步 M=T=4，补到 16 行相当于
-        // **75% 的 mma 空转**，实测 T=4 验证 pass 反而 17.9 vs SIMT 的 15.9 ms。
-        // 而 b=8（批量解码）时 16 行填一半，实测聚合吞吐 244 → **276 tok/s（+13%）**，
-        // 两轮一致且 token 流（sum/xor）逐位相同。
-        // ⇒ 按 batch 分档：b ≥ 8 走张量核，b ≤ 7 留 SIMT。
-        if vec == 1 && op != 1 && (8..=16).contains(&b) && Self::i6nm_mma_on() {
+        // 分档点来自两条实测曲线（台账 §3.12/§3.13）：
+        // · SIMT 档的成本随 slot 数**线性上升**（累加器 `acc[BATCH][4]`：b=4 → 16 个 float、
+        //   b=6 → 24 个），实测 `gemv_int6nm_sk` 的 avg 0.0619(T=4) → 0.0843(T=6) = **+36%**，
+        //   而权重流量完全不变 ⇒ 边际成本递增。
+        // · mma 档把 M 补到 16 行，**成本几乎与 T 无关**（T≤16 都在同一个 tile 里）⇒ 边际成本≈0。
+        // 因此：T=4（b=4）用 SIMT（15.9 vs 17.9 ms），T≥5 用 mma（T=6 时 24.7 → ~18 ms）。
+        // 上游 `int6_gemm.py` 的 `RED_MAX_M = 1` 之所以能从 M=2 起就用 dot，是因为它的
+        // M 是 B=32 的真实批；我们要的是同一条**边际成本**曲线，不是同一个阈值。
+        if vec == 1 && op != 1 && (5..=16).contains(&b) && Self::i6nm_mma_on() {
             let ks = i6nm_ksplit().min(k / 64).max(1);
             return self.gemv_int6nm_mma_launch(lo, hi, sz, x, y, m, k, b, op, ks);
         }
