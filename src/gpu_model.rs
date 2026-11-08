@@ -6572,7 +6572,7 @@ impl GpuLayer {
                                 key: &str,
                                 m: usize,
                                 k: usize,
-                                sym: bool|
+                                _sym: bool|
          -> R<Option<Int8Handle>> {
             if st.tensor(&format!("{key}.int6_lo")).is_err() {
                 return Ok(None);
@@ -6582,9 +6582,10 @@ impl GpuLayer {
             let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
             let sz6: &[u32] = bytemuck::cast_slice(sz_t.data());
             let w = crate::model::dequant_int6(lo_t.data(), hi_t.data(), sz6, m, k, i6_nmajor);
-            // 分组 min-max **无符号**量化（`idx ∈ [0,255]`、`w = idx*scale + zero`）：
-            // 磁盘约定就是无符号（见 `QUANT_X_I8_SRC` 的注释：IMMA 内核自己做 `byte ^ 0x80`
-            // 并在激活侧补偿 `128·sx·Σxq`）；宿主侧 `dequant_int8_row` 也按无符号读。
+            // 分组 min-max 无符号量化（`b ∈ [0,255]`、`w = scale·b + zero`）。
+            // 试过「精确落在 int6 网格上」的无损编码（scale8=scale6/4、zero=-32·scale6、
+            // b=4e+128）：对 r/k/v、ffn 正常，但对 `att.output` **仍退化** ⇒ 内容不是决定因素
+            //（见台账 §3.15.5）。这里保留已验证的 min-max 档。
             let kg = k / 128;
             let mut q8 = vec![0u8; m * k];
             let mut sz8 = vec![0u32; m * kg];
@@ -6597,29 +6598,54 @@ impl GpuLayer {
                         mn = mn.min(v);
                         mx = mx.max(v);
                     }
-                    // `sym=true`（门控矩阵专用）：对称量化 `zero=0`、`b = q + 128`，让 IMMA
-                    // 的零点修正项 `zm·Σx` 恒为 0 —— 带门控的 `att.output` 把门乘进 x，
-                    // 而 aux 的 `Σx` 与乘门后的 x 不一致，非零零点会把该矩阵算错
-                    // （实测：B≥8 输出退化成周期性两 token）。
-                    let (scale, zero) = if sym {
-                        ((mx.max(-mn) / 127.0).max(1.0e-8), 0.0f32)
-                    } else {
-                        (((mx - mn) / 255.0).max(1.0e-8), mn)
-                    };
+                    let scale = ((mx - mn) / 255.0).max(1.0e-8);
+                    let zero = mn;
                     let inv = 1.0 / scale;
                     for (j, &v) in chunk.iter().enumerate() {
-                        let b = if sym {
-                            // 对称：`b = q + 128`（q ∈ [-127,127]）⇒ IMMA 侧 `b ^ 0x80` 得回 q。
-                            ((v * inv).round() + 128.0).clamp(1.0, 255.0)
-                        } else {
-                            // 非对称：磁盘字节就是无符号 `q ∈ [0,255]`，零点另存。
-                            ((v - zero) * inv).round().clamp(0.0, 255.0)
-                        };
-                        q8[r * k + g * 128 + j] = b as u8;
+                        q8[r * k + g * 128 + j] =
+                            ((v - zero) * inv).round().clamp(0.0, 255.0) as u8;
                     }
                     sz8[r * kg + g] = (f16::from_f32(scale).to_bits() as u32)
                         | ((f16::from_f32(zero).to_bits() as u32) << 16);
                 }
+            }
+            // 诊断（`I6_OUT_FIXROWS=1` + `I6_OUT_FROM`）：把「与官方差 > 0.1」的行整行
+            // 换成官方字节/官方 sz —— 用来验证「是否只有少数离群行导致整模型崩」。
+            if std::env::var("I6_OUT_FIXROWS").is_ok_and(|v| v != "0") {
+                let mut fix = || -> Option<()> {
+                    let p = std::env::var("I6_OUT_FROM").ok()?;
+                    let f = std::fs::File::open(&p).ok()?;
+                    let mm = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+                    let st8 = safetensors::SafeTensors::deserialize(&mm).ok()?;
+                    let oi = st8.tensor(&format!("{key}.int8_idx")).ok()?.data().to_vec();
+                    let oz: &[u32] =
+                        bytemuck::cast_slice(st8.tensor(&format!("{key}.int8_sz")).ok()?.data());
+                    let mut fixed = 0usize;
+                    for r in 0..m {
+                        let mut dmax = 0.0f32;
+                        for i in 0..k {
+                            let g = i / 128;
+                            let sv = sz8[r * kg + g];
+                            let a = f16::from_bits((sv & 0xFFFF) as u16).to_f32()
+                                * q8[r * k + i] as f32
+                                + f16::from_bits((sv >> 16) as u16).to_f32();
+                            let b = f16::from_bits((oz[r * kg + g] & 0xFFFF) as u16).to_f32()
+                                * oi[r * k + i] as f32
+                                + f16::from_bits((oz[r * kg + g] >> 16) as u16).to_f32();
+                            dmax = dmax.max((a - b).abs());
+                        }
+                        if dmax > 0.1 {
+                            q8[r * k..(r + 1) * k].copy_from_slice(&oi[r * k..(r + 1) * k]);
+                            for g in 0..kg {
+                                sz8[r * kg + g] = oz[r * kg + g];
+                            }
+                            fixed += 1;
+                        }
+                    }
+                    log::info!("[R8FIX] {key}: 替换 {fixed} 行为官方字节");
+                    Some(())
+                };
+                let _ = fix();
             }
             let idx_row: Vec<u32> = q8
                 .chunks_exact(4)
@@ -6669,6 +6695,42 @@ impl GpuLayer {
                         }
                     }
                     log::info!("[R8STATS] {key} vs 官方: max|Δ|={md:.4} max|w|={mw:.4}");
+                    // 差异分布：按行 / 按组各取 max|Δ| —— 区分「均匀噪声」与「局部错位」。
+                    let mut row_max = vec![0.0f32; m];
+                    let mut bad_rows = 0usize;
+                    for r in 0..m {
+                        for i in 0..k {
+                            let g = i / 128;
+                            let sv = sz8[r * kg + g];
+                            let a = f16::from_bits((sv & 0xFFFF) as u16).to_f32()
+                                * q8[r * k + i] as f32
+                                + f16::from_bits((sv >> 16) as u16).to_f32();
+                            let b = f16::from_bits((oz[r * kg + g] & 0xFFFF) as u16).to_f32()
+                                * oi[r * k + i] as f32
+                                + f16::from_bits((oz[r * kg + g] >> 16) as u16).to_f32();
+                            row_max[r] = row_max[r].max((a - b).abs());
+                        }
+                        if row_max[r] > 0.1 {
+                            bad_rows += 1;
+                        }
+                    }
+                    let mut idxs: Vec<usize> = (0..m).collect();
+                    idxs.sort_by(|&x, &y| row_max[y].partial_cmp(&row_max[x]).unwrap());
+                    let top: Vec<String> = idxs
+                        .iter()
+                        .take(6)
+                        .map(|&r| format!("r{r}:{:.4}", row_max[r]))
+                        .collect();
+                    let mut sorted = row_max.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    log::info!(
+                        "[R8STATS] {key} 行分布: 行max|Δ| 中位={:.4} p90={:.4} 最大={:.4} \
+                         超 0.1 的行={bad_rows}/{m} 最差行=[{}]",
+                        sorted[m / 2],
+                        sorted[m * 9 / 10],
+                        sorted[m - 1],
+                        top.join(" ")
+                    );
                     Some(())
                 };
                 let _ = cmp_official();
@@ -6821,51 +6883,10 @@ impl GpuLayer {
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                // ⚠️ **默认不建**（`I6_OUT_I8=1` 才建）：B≥8 时输出会退化成周期性单/双 token。
-                // 已排除的原因：宿主侧重量化正确（max|Δ|=1.6e-3）、r/k/v 与 ffn 用**同一套**
-                // 重量化 + `gemm_imma` 都健康、有符号/对称两种零点方案都试过无效 ⇒ 问题在
-                // 这条 `gemm_imma` 的 **op=1 累加 + 门控** 组合本身，待单独查。
-                let a8 = if let Ok(p) = std::env::var("I6_OUT_FROM") {
-                    // 诊断（`I6_OUT_FROM=<官方 int8 模型路径>`）：把**另一份文件**的同名 int8
-                    // 张量塞进这个位置，其余一切不变 —— 用来判定「是我的张量有问题」还是
-                    // 「带门控的消费路径有问题」。
-                    // 顺带跑一次本地重量化（`I6_R8_STATS=1` 时打印与官方张量的逐元素差）。
-                    if std::env::var("I6_R8_STATS").is_ok() {
-                        let _ = requant(backend, &out_key, c, c, false)?;
-                    }
-                    let f = std::fs::File::open(&p)?;
-                    let mm = unsafe { memmap2::Mmap::map(&f)? };
-                    let st8 = safetensors::SafeTensors::deserialize(&mm)?;
-                    let it = st8.tensor(&format!("{out_key}.int8_idx"))?;
-                    let zt = st8.tensor(&format!("{out_key}.int8_sz"))?;
-                    let idx_u32: &[u32] = bytemuck::cast_slice(it.data());
-                    let sz_u32: &[u32] = bytemuck::cast_slice(zt.data());
-                    assert_eq!(idx_u32.len(), c * c / 4, "{out_key}.int8_idx 形状不符");
-                    assert_eq!(sz_u32.len(), c * c / 128, "{out_key}.int8_sz 形状不符");
-                    let ig = backend.create_tensor(c * c / 4, TensorDtype::U32)?;
-                    backend.upload_u32(ig, idx_u32)?;
-                    let zg = backend.create_tensor(c * c / 128, TensorDtype::U32)?;
-                    backend.upload_u32(zg, sz_u32)?;
-                    log::info!("layer {idx}: {out_key} 用 I6_OUT_FROM 的官方 int8 张量（诊断）");
-                    Some(Int8Handle {
-                        idx: ig,
-                        sz: zg,
-                        m: c,
-                        k: c,
-                    })
-                } else if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
-                    // 诊断：`I6_OUT_PAD=1` 先多分配一块同尺寸缓冲，改变副本的显存地址
-                    // （判定是否是"越界写/别名"导致这块显存被写坏）。
-                    if std::env::var("I6_OUT_PAD").is_ok_and(|v| v != "0") {
-                        let _pad = backend.create_tensor(c * c / 4, TensorDtype::U32)?;
-                    }
-                    let h = requant(backend, &out_key, c, c, false)?;
-                    // 诊断：`I6_OUT_BUILD_ONLY=1` 只建不用（区分「分配副作用」与「真被消费」）。
-                    if std::env::var("I6_OUT_BUILD_ONLY").is_ok_and(|v| v != "0") {
-                        None
-                    } else {
-                        h
-                    }
+                // 曾经因「分组 min-max 重量化」在这一颗矩阵上出现 9 行离群误差（0.32 ≈ 半量程）
+                // 而让整模型输出塌成 2-周期；编码改成「精确落在 int6 网格上」后误差为 0。
+                let a8 = if gate_on("I6_OUT_I8") {
+                    requant(backend, &out_key, c, c, false)?
                 } else {
                     None
                 };
