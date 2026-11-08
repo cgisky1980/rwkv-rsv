@@ -1577,8 +1577,66 @@ pub trait ComputeBackend {
     /// int8 → fp16 反量化（prefill：解到 fp16 scratch 供 GEMM 消费）。
     #[allow(clippy::too_many_arguments)]
     fn dequant_int8_to_f16(&mut self, a: &Int8Handle, out: TensorId, m: usize, k: usize) -> R<()>;
-    /// y = sigmoid(a)（f32，token 并行）。
+    // —— MTP drafter 专用原语（规范见上游 docs/mtp.md §1.4）——
+    //
+    // drafter 只有这两个专用核，其余 Linear 全部复用既有 gemv/gemm：
+    // ① `mtp_rms_rope`：per-head RMSNorm(eps 1e-6) + rotate-half RoPE（每个 head 的前
+    //    `rope_dim` 维，θ=1e6，角度用 fp32 算）；
+    // ② `mtp_kv_write` + `mtp_attn`：KV ring 写入（先写后读，query 见自身）与 GQA 注意力
+    //    （head h 读 KV head h / (n_head/n_kv)，可见性 `0 ≤ sp ≤ qp && qp − sp < window`）。
+    // 拆成两个核是为了避开「网格内跨 head 的写后读」栅栏：同一 stream 上顺序执行即等价。
+
+    /// 原地对 `x`（`n_head × d`）做 per-head RMSNorm + RoPE。`w` 是共享的 `[d]` RMS 权重。
     #[allow(clippy::too_many_arguments)]
+    fn mtp_rms_rope(
+        &mut self,
+        _x: TensorId,
+        _w: TensorId,
+        _n_head: usize,
+        _d: usize,
+        _pos: u32,
+        _rope_dim: usize,
+        _theta: f32,
+    ) -> R<()> {
+        Err("mtp_rms_rope: backend not supported".into())
+    }
+
+    /// 把 `k_new/v_new`（`n_kv × d`）写进 ring 的第 `pos % s_ring` 槽，并记录该槽的绝对位置。
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_kv_write(
+        &mut self,
+        _kc: TensorId,
+        _vc: TensorId,
+        _ring_pos: TensorId,
+        _k_new: TensorId,
+        _v_new: TensorId,
+        _pos: u32,
+        _n_kv: usize,
+        _d: usize,
+        _s_ring: usize,
+    ) -> R<()> {
+        Err("mtp_kv_write: backend not supported".into())
+    }
+
+    /// GQA 注意力：`y[h*d + t] = Σ_j softmax(q·k_j/√d) · v_j[t]`（窗口内可见的 ring 槽）。
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_attn(
+        &mut self,
+        _q: TensorId,
+        _kc: TensorId,
+        _vc: TensorId,
+        _ring_pos: TensorId,
+        _y: TensorId,
+        _pos: u32,
+        _window: usize,
+        _n_head: usize,
+        _n_kv: usize,
+        _d: usize,
+        _s_ring: usize,
+    ) -> R<()> {
+        Err("mtp_attn: backend not supported".into())
+    }
+
     fn elementwise_sigmoid(&mut self, a: TensorId, y: TensorId, c: usize, batch: usize) -> R<()>;
     /// y = sigmoid(y)（原地，f32）。
     #[allow(clippy::too_many_arguments)]

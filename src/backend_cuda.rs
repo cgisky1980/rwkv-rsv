@@ -5474,6 +5474,153 @@ extern "C" __global__ void gemv_int6nm4_rkv(
 }
 "#;
 
+/// MTP drafter 专用三核（上游 `docs/mtp.md` §1.4）：
+///
+/// 1. `mtp_rms_rope`：per-head RMSNorm（eps 1e-6，共享 `[D]` 权重）+ rotate-half RoPE
+///    （每个 head 的**前 `rope` 维**，角度 `pos · θ^(-2i/rope)`，全程 fp32）。
+///    RMS 用 warp 洗牌 + shared 树归约（**不用 atomicAdd**：浮点 atomic 顺序不定，会让
+///    draft 不可复现；对 MTP 虽只影响速度，仍保持「固定归约顺序」的仓库纪律）。
+/// 2. `mtp_kv_write`：把新的 k/v 写进 ring 的第 `pos % S` 槽并记录该槽绝对位置。
+/// 3. `mtp_attn`：GQA 注意力。一个 block = 一个 query head；线程 t 负责输出第 t 维。
+///    分数阶段**每个线程自己算若干整槽的 dot**（D ≤ 128，无需跨线程归约），权重写 shared，
+///    再做「固定顺序」的 softmax 与加权和。
+const MTP_ATTN_SRC: &str = r#"
+extern "C" __global__ void mtp_rms_rope(
+    float* __restrict__ x,
+    const float* __restrict__ w,
+    const int n_head,
+    const int d,
+    const int pos,
+    const int rope,
+    const float theta)
+{
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    float* xh = x + (size_t)h * d;
+    float v = (t < d) ? xh[t] : 0.f;
+    float sq = v * v;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffffu, sq, off);
+    __shared__ float s_part[32];
+    const int warp = t >> 5, lane = t & 31;
+    if (lane == 0) s_part[warp] = sq;
+    __syncthreads();
+    if (t == 0) {
+        float total = 0.f;
+        const int nw = (blockDim.x + 31) >> 5;
+        for (int i = 0; i < nw; ++i) total += s_part[i];
+        s_part[0] = rsqrtf(total / (float)d + 1e-6f);
+    }
+    __syncthreads();
+    if (t < d) xh[t] = v * s_part[0] * w[t];
+    // rotate-half RoPE：只动前 rope 维（成对 (i, i + rope/2)）
+    if (t < rope / 2) {
+        const int i = t;
+        const int j = t + rope / 2;
+        const float a = xh[i], b = xh[j];
+        const float ang = (float)pos * powf(theta, -2.0f * (float)i / (float)rope);
+        const float c = cosf(ang), s = sinf(ang);
+        xh[i] = a * c - b * s;
+        xh[j] = a * s + b * c;
+    }
+}
+
+extern "C" __global__ void mtp_kv_write(
+    float* __restrict__ kc,
+    float* __restrict__ vc,
+    int* __restrict__ ring_pos,
+    const float* __restrict__ k_new,
+    const float* __restrict__ v_new,
+    const int pos,
+    const int nkv_d,
+    const int s_ring)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int slot = pos % s_ring;
+    if (i == 0) ring_pos[slot] = pos;
+    if (i < nkv_d) {
+        kc[(size_t)slot * nkv_d + i] = k_new[i];
+        vc[(size_t)slot * nkv_d + i] = v_new[i];
+    }
+}
+
+extern "C" __global__ void mtp_attn(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    const int* __restrict__ ring_pos,
+    float* __restrict__ y,
+    const int pos,
+    const int window,
+    const int n_head,
+    const int n_kv,
+    const int d,
+    const int s_ring)
+{
+    const int h = blockIdx.x;
+    const int t = threadIdx.x;
+    const int kvh = h / (n_head / n_kv);
+    const int kv_d = n_kv * d;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;              // [d]
+    float* s_w = smem + d;          // [s_ring] 权重
+    float* s_red = smem + d + s_ring;  // [32] 归约暂存
+    if (t < d) s_q[t] = q[(size_t)h * d + t];
+    __syncthreads();
+
+    const float scale = rsqrtf((float)d);
+    // 阶段 1：每个线程算 sizeof(stride) 个槽的分数（整槽 dot，无跨线程归约）
+    float lmax = -1e30f;
+    for (int j = t; j < s_ring; j += blockDim.x) {
+        const int sp = ring_pos[j];
+        float sc = -1e30f;
+        if (sp >= 0 && sp <= pos && pos - sp < window) {
+            const float* kj = kc + (size_t)j * kv_d + kvh * d;
+            float acc = 0.f;
+            for (int u = 0; u < d; ++u) acc += s_q[u] * kj[u];
+            sc = acc * scale;
+        }
+        s_w[j] = sc;
+        lmax = fmaxf(lmax, sc);
+    }
+    // 全 block 求 max（固定顺序：warp 洗牌 + shared 顺序加）
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lmax = fmaxf(lmax, __shfl_down_sync(0xffffffffu, lmax, off));
+    const int warp = t >> 5, lane = t & 31;
+    if (lane == 0) s_red[warp] = lmax;
+    __syncthreads();
+    float mx = -1e30f;
+    const int nw = (blockDim.x + 31) >> 5;
+    for (int i = 0; i < nw; ++i) mx = fmaxf(mx, s_red[i]);
+    __syncthreads();
+    // 阶段 2：exp + 求和（同样固定顺序）
+    float lsum = 0.f;
+    for (int j = t; j < s_ring; j += blockDim.x) {
+        const float e = expf(s_w[j] - mx);
+        s_w[j] = e;           // 可见性已由 -INFINITY 处理：exp(-inf - mx) = 0
+        lsum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffffu, lsum, off);
+    if (lane == 0) s_red[warp] = lsum;
+    __syncthreads();
+    float tot = 0.f;
+    for (int i = 0; i < nw; ++i) tot += s_red[i];
+    const float inv = (tot > 0.f) ? (1.f / tot) : 0.f;
+    __syncthreads();
+    // 阶段 3：加权和（线程 t 负责输出第 t 维）
+    if (t < d) {
+        float acc = 0.f;
+        for (int j = 0; j < s_ring; ++j) {
+            const float wj = s_w[j];
+            if (wj > 0.f) acc += wj * vc[(size_t)j * kv_d + kvh * d + t];
+        }
+        y[(size_t)h * d + t] = acc * inv;
+    }
+}
+"#;
+
 /// 通用（单矩阵）N-major int6 GEMV：`op` 复用 `gemv_variant` 的语义
 /// （0=relu²、1=mul_add（y+=，x 先乘 fp16 门控）、2=add（y+=）、3=覆盖写）。
 /// dispatch `(ceil(M/32), batch, 1)`、block = `I6NM_WARPS*32`。
@@ -11774,6 +11921,126 @@ impl ComputeBackend for CudaBackend {
         )
     }
 
+    // —— MTP drafter 专用三核 ——
+
+    fn mtp_rms_rope(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n_head: usize,
+        d: usize,
+        pos: u32,
+        rope_dim: usize,
+        theta: f32,
+    ) -> R<()> {
+        const OP: &str = "mtp_rms_rope";
+        let xd = self.f32_ptr(x, OP)?;
+        let wd = self.f32_ptr(w, OP)?;
+        let func = self.kernel("mtp_rms_rope", MTP_ATTN_SRC, "mtp_rms_rope")?;
+        let grid = (n_head as u32, 1u32, 1u32);
+        let block = (d as u32, 1u32, 1u32);
+        let (nh_i, d_i, pos_i, rope_i) = (n_head as i32, d as i32, pos as i32, rope_dim as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &wd as *const u64 as *mut c_void,
+            &nh_i as *const i32 as *mut c_void,
+            &d_i as *const i32 as *mut c_void,
+            &pos_i as *const i32 as *mut c_void,
+            &rope_i as *const i32 as *mut c_void,
+            &theta as *const f32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn mtp_kv_write(
+        &mut self,
+        kc: TensorId,
+        vc: TensorId,
+        ring_pos: TensorId,
+        k_new: TensorId,
+        v_new: TensorId,
+        pos: u32,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        const OP: &str = "mtp_kv_write";
+        let kcd = self.f32_ptr(kc, OP)?;
+        let vcd = self.f32_ptr(vc, OP)?;
+        let rpd = self.u32_ptr(ring_pos, OP)?;
+        let knd = self.f32_ptr(k_new, OP)?;
+        let vnd = self.f32_ptr(v_new, OP)?;
+        let func = self.kernel("mtp_kv_write", MTP_ATTN_SRC, "mtp_kv_write")?;
+        let nkv_d = n_kv * d;
+        let grid = ((nkv_d as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (pos_i, nkvd_i, s_i) = (pos as i32, nkv_d as i32, s_ring as i32);
+        let params = [
+            &kcd as *const u64 as *mut c_void,
+            &vcd as *const u64 as *mut c_void,
+            &rpd as *const u64 as *mut c_void,
+            &knd as *const u64 as *mut c_void,
+            &vnd as *const u64 as *mut c_void,
+            &pos_i as *const i32 as *mut c_void,
+            &nkvd_i as *const i32 as *mut c_void,
+            &s_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_attn(
+        &mut self,
+        q: TensorId,
+        kc: TensorId,
+        vc: TensorId,
+        ring_pos: TensorId,
+        y: TensorId,
+        pos: u32,
+        window: usize,
+        n_head: usize,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        const OP: &str = "mtp_attn";
+        let qd = self.f32_ptr(q, OP)?;
+        let kcd = self.f32_ptr(kc, OP)?;
+        let vcd = self.f32_ptr(vc, OP)?;
+        let rpd = self.u32_ptr(ring_pos, OP)?;
+        let yd = self.f32_ptr(y, OP)?;
+        if !n_head.is_multiple_of(n_kv) {
+            return Err(format!("{OP}: n_head({n_head}) 必须是 n_kv({n_kv}) 的倍数").into());
+        }
+        let func = self.kernel("mtp_attn", MTP_ATTN_SRC, "mtp_attn")?;
+        let grid = (n_head as u32, 1u32, 1u32);
+        let block = (d as u32, 1u32, 1u32);
+        let smem = (d + s_ring + 32) * std::mem::size_of::<f32>();
+        let (pos_i, win_i, nh_i, nk_i, d_i, s_i) = (
+            pos as i32,
+            window as i32,
+            n_head as i32,
+            n_kv as i32,
+            d as i32,
+            s_ring as i32,
+        );
+        let params = [
+            &qd as *const u64 as *mut c_void,
+            &kcd as *const u64 as *mut c_void,
+            &vcd as *const u64 as *mut c_void,
+            &rpd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &pos_i as *const i32 as *mut c_void,
+            &win_i as *const i32 as *mut c_void,
+            &nh_i as *const i32 as *mut c_void,
+            &nk_i as *const i32 as *mut c_void,
+            &d_i as *const i32 as *mut c_void,
+            &s_i as *const i32 as *mut c_void,
+        ];
+        self.drv
+            .launch_smem(self.stream, func, grid, block, &params, smem)
+    }
+
     fn dequant_int6_to_f16(&mut self, a: &Int6Handle, out: TensorId, m: usize, k: usize) -> R<()> {
         let (lo, hi, sz) = (
             self.u32_ptr(a.lo, "dequant_int6_to_f16")?,
@@ -15270,6 +15537,147 @@ mod tests {
         }
         assert!(worst < 2e-3, "mul_add nm 相对误差过大: {worst}");
         log::info!("int6 N-major（dequant / plain / mul_add）vs CPU OK");
+    }
+
+    /// MTP drafter 的三个专用核（`mtp_rms_rope` / `mtp_kv_write` / `mtp_attn`）对 CPU 参考。
+    ///
+    /// 钉住三件最容易写错的事：
+    /// ① RMSNorm 是 **per-head**（权重 `[d]` 共享）且 eps 在 sqrt 内；RoPE 只动每个 head 的
+    ///    前 `rope_dim` 维、用 rotate-half 配对 `(i, i + rope/2)`；
+    /// ② ring 的槽号是 `pos % S`，`ring_pos[j] = -1` 表示空；
+    /// ③ GQA 可见性 `0 ≤ sp ≤ qp && qp − sp < window`（**query 见自身**），且 head h 读
+    ///    KV head `h / (n_head/n_kv)`。
+    #[test]
+    fn mtp_drafter_kernels_match_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping mtp drafter test");
+            return;
+        }
+        let _gpu = crate::backend::gpu_test_guard();
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        // 小尺寸先把语义钉死：d=16、rope=8、4 个 query head / 2 个 KV head、ring S=6、窗口 4
+        let (d, rope, nh, nkv, s_ring, window) = (16usize, 8usize, 4usize, 2usize, 6usize, 4usize);
+        let theta = 1.0e6f32;
+
+        // 权重：[d] 的 RMS 权重
+        let wn: Vec<f32> = (0..d).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let wt = b.create_tensor(d, TensorDtype::F32).unwrap();
+        b.upload(wt, &wn).unwrap();
+        // 每个 head 一组确定值
+        let src: Vec<f32> = (0..nh * d)
+            .map(|i| ((i as f32) * 0.37).sin() + 0.1 * (i % 7) as f32)
+            .collect();
+        let xt = b.create_tensor(nh * d, TensorDtype::F32).unwrap();
+        b.upload(xt, &src).unwrap();
+        let pos = 5u32;
+        b.begin_batch().unwrap();
+        b.mtp_rms_rope(xt, wt, nh, d, pos, rope, theta).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(xt).unwrap();
+
+        // CPU 参考
+        let mut want = src.clone();
+        for h in 0..nh {
+            let base = h * d;
+            let ms: f32 = (0..d).map(|t| src[base + t] * src[base + t]).sum::<f32>() / d as f32;
+            let inv = 1.0 / (ms + 1e-6).sqrt();
+            for t in 0..d {
+                want[base + t] = src[base + t] * inv * wn[t];
+            }
+            for i in 0..rope / 2 {
+                let a = want[base + i];
+                let bb = want[base + i + rope / 2];
+                let ang = pos as f32 * theta.powf(-2.0 * i as f32 / rope as f32);
+                let (c, s) = (ang.cos(), ang.sin());
+                want[base + i] = a * c - bb * s;
+                want[base + i + rope / 2] = a * s + bb * c;
+            }
+        }
+        let md = got
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+        assert!(md < 1e-5, "mtp_rms_rope mismatch max_diff={md}");
+
+        // —— KV ring + GQA 注意力：跑 3 个位置，逐位置与 CPU 参考比 ——
+        let kc = b.create_tensor(s_ring * nkv * d, TensorDtype::F32).unwrap();
+        let vc = b.create_tensor(s_ring * nkv * d, TensorDtype::F32).unwrap();
+        b.upload(kc, &vec![0.0; s_ring * nkv * d]).unwrap();
+        b.upload(vc, &vec![0.0; s_ring * nkv * d]).unwrap();
+        let rp = b.create_tensor(s_ring, TensorDtype::U32).unwrap();
+        b.upload_u32(rp, &vec![u32::MAX; s_ring]).unwrap(); // -1 = 空槽
+
+        let qt = b.create_tensor(nh * d, TensorDtype::F32).unwrap();
+        let kn = b.create_tensor(nkv * d, TensorDtype::F32).unwrap();
+        let vn = b.create_tensor(nkv * d, TensorDtype::F32).unwrap();
+        let yt = b.create_tensor(nh * d, TensorDtype::F32).unwrap();
+
+        // CPU 侧镜像
+        let mut c_kc = vec![0.0f32; s_ring * nkv * d];
+        let mut c_vc = vec![0.0f32; s_ring * nkv * d];
+        let mut c_rp = vec![i64::MAX; s_ring];
+        for step in 0..3usize {
+            let p = 3 + step; // 位置 3,4,5（S=6，会绕圈）
+            let qv: Vec<f32> = (0..nh * d)
+                .map(|i| ((i as f32) * 0.11 + step as f32 * 0.5).cos())
+                .collect();
+            let kv: Vec<f32> = (0..nkv * d)
+                .map(|i| ((i as f32) * 0.07 + step as f32 * 0.3).sin())
+                .collect();
+            let vv: Vec<f32> = (0..nkv * d)
+                .map(|i| ((i as f32) * 0.13 + step as f32 * 0.9).cos())
+                .collect();
+            b.upload(qt, &qv).unwrap();
+            b.upload(kn, &kv).unwrap();
+            b.upload(vn, &vv).unwrap();
+            b.begin_batch().unwrap();
+            b.mtp_kv_write(kc, vc, rp, kn, vn, p as u32, nkv, d, s_ring)
+                .unwrap();
+            b.mtp_attn(qt, kc, vc, rp, yt, p as u32, window, nh, nkv, d, s_ring)
+                .unwrap();
+            b.end_batch().unwrap();
+            let got = b.download(yt).unwrap();
+
+            // CPU 镜像
+            let slot = p % s_ring;
+            c_kc[slot * nkv * d..(slot + 1) * nkv * d].copy_from_slice(&kv);
+            c_vc[slot * nkv * d..(slot + 1) * nkv * d].copy_from_slice(&vv);
+            c_rp[slot] = p as i64;
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut want = vec![0.0f32; nh * d];
+            for h in 0..nh {
+                let kvh = h / (nh / nkv);
+                let mut sc = vec![f32::NEG_INFINITY; s_ring];
+                for (j, &sp) in c_rp.iter().enumerate() {
+                    if sp < 0 || sp > p as i64 || (p as i64 - sp) >= window as i64 {
+                        continue;
+                    }
+                    let mut acc = 0.0f32;
+                    for u in 0..d {
+                        acc += qv[h * d + u] * c_kc[j * nkv * d + kvh * d + u];
+                    }
+                    sc[j] = acc * scale;
+                }
+                let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let ex: Vec<f32> = sc.iter().map(|&x| (x - mx).exp()).collect();
+                let tot: f32 = ex.iter().sum();
+                for t in 0..d {
+                    let mut acc = 0.0f32;
+                    for j in 0..s_ring {
+                        if ex[j] > 0.0 {
+                            acc += ex[j] * c_vc[j * nkv * d + kvh * d + t];
+                        }
+                    }
+                    want[h * d + t] = acc / tot;
+                }
+            }
+            let md = got
+                .iter()
+                .zip(&want)
+                .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+            assert!(md < 1e-5, "mtp_attn step={step} max_diff={md}");
+        }
+        log::info!("MTP drafter 三核（RMS+RoPE / KV ring / GQA attn）vs CPU OK");
     }
 
     /// copy_device（f32）与 copy_token 与 CPU 参考对比。
