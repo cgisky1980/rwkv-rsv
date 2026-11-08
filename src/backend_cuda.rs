@@ -5118,6 +5118,20 @@ fn i6nm_warps() -> usize {
         .unwrap_or(I6NM_WARPS)
 }
 
+/// 一条 lane 负责的输出列数（`I6NM_VEC`，1 或 4）。4 = 每线程 4 列（u32 载入，128 B/warp）。
+///
+/// ⚠️ **默认 1**：vec4 是为验证「32 B 事务太小」这个假设做的，实测**反而更慢**
+/// （2080 Ti，eager forward_token：vec1 13.9/14.0 ms vs vec4 16.3 ms @W=16；
+/// W=4/8 更差 32.9/19.5 ms）——事务大小不是瓶颈，而 vec4 把每块列数从 32 提到 128、
+/// 块数掉到 1/4 反而伤了并行度。代码保留（`I6NM_VEC=4`）供后续对照。
+fn i6nm_vec() -> usize {
+    std::env::var("I6NM_VEC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v == 1 || *v == 4)
+        .unwrap_or(1)
+}
+
 /// N-major int6 GEMV（decode）共用的设备函数 + 两个 kernel。
 ///
 /// 布局（量化器 `--int6-layout n`）：`lo [K/2][N]`、`hi [K/4][N]`、`sz [K/128][N]` 字节/词，
@@ -5189,6 +5203,274 @@ __device__ __forceinline__ float i6nm_dot(
         }
     }
     return (a0 + a1) + (a2 + a3);
+}
+"#;
+
+/// N-major int6 GEMV 的 **4 列/lane** 版本（`I6NM_VEC=4`）。
+///
+/// 动机（参考/2026-11-08-int6量化与MTP-阶段记录.md §1e）：1 列/lane 时一条 lane 只读 1 字节，
+/// 一个 warp 的载入指令只有 **32 B**；`ABLATE` 逐核消融测得 int6 权重只跑到 170 GB/s
+/// （2080 Ti 峰值 616）。改成一条 lane 负责 **4 个连续输出列**后：
+///   lo 一次 `uint4`（4 B）= 4 列 × 1 字节；warp 覆盖 128 列 ⇒ 一条载入指令 **128 B 连续**
+///   （正好一条 L2 line），GDDR6 的行局部性显著变好。
+///
+/// 几何：block 覆盖 128 列，块内 `I6NM_WARPS` 个 warp 按 k-chunk 轮转切分（同 1 列版），
+/// 归约在 `red[I6NM_WARPS][128]`（固定升序 ⇒ 可复现）。4 个子块各持一组 float4 累加器。
+const GEMV_INT6NM4_SRC: &str = r#"
+#ifndef I6NM_WARPS
+#define I6NM_WARPS 8
+#endif
+__device__ __forceinline__ float relu2f(float x) { return x > 0.f ? x * x : 0.f; }
+
+// 4 个连续输出列（col0..col0+3）在 k-chunk 轮转切分下的点积。
+// ra/rb/rc/rd 分别是 64-k 块内 4 个 16-k 子块的累加器（每个 float4 = 4 列）。
+template <bool GATED>
+__device__ __forceinline__ void i6nm_dot4(
+    const unsigned char* __restrict__ lo,
+    const unsigned char* __restrict__ hi,
+    const unsigned int*  __restrict__ sz,
+    const float* __restrict__ x,
+    const __half* __restrict__ g,
+    const int n, const int col0, const int nchunk, const int w,
+    float4& ra, float4& rb, float4& rc, float4& rd)
+{
+    ra = make_float4(0.f, 0.f, 0.f, 0.f);
+    rb = ra; rc = ra; rd = ra;
+    for (int c = w; c < nchunk; c += I6NM_WARPS) {
+        // 4 列的 scale 一次读（16 B，对齐）
+        const uint4 sz4 = *reinterpret_cast<const uint4*>(sz + (size_t)(c >> 1) * n + col0);
+        const float s0 = __half2float(__ushort_as_half((unsigned short)(sz4.x & 0xFFFFu)));
+        const float s1 = __half2float(__ushort_as_half((unsigned short)(sz4.y & 0xFFFFu)));
+        const float s2 = __half2float(__ushort_as_half((unsigned short)(sz4.z & 0xFFFFu)));
+        const float s3 = __half2float(__ushort_as_half((unsigned short)(sz4.w & 0xFFFFu)));
+        const size_t lo0 = (size_t)(c << 5) * n + col0;
+        const size_t hi0 = (size_t)(c << 4) * n + col0;
+        const int kb = c << 6;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            // ★ 4 个字节用 **u32 载入**（4 B 对齐即可）：`uint4` 要求 16 B 对齐，而列基址
+            // 只保证 4 B（col0 = lane*4）⇒ 用 uint4 会 716 misaligned。
+            const unsigned int l0 = *reinterpret_cast<const unsigned int*>(lo + lo0 + (size_t)j * n);
+            const unsigned int l1 =
+                *reinterpret_cast<const unsigned int*>(lo + lo0 + (size_t)(16 + j) * n);
+            const unsigned int hh1 = *reinterpret_cast<const unsigned int*>(hi + hi0 + (size_t)j * n);
+            float x0 = x[kb + j];
+            float x1 = x[kb + 16 + j];
+            float x2 = x[kb + 32 + j];
+            float x3 = x[kb + 48 + j];
+            if (GATED) {
+                x0 *= __half2float(g[kb + j]);
+                x1 *= __half2float(g[kb + 16 + j]);
+                x2 *= __half2float(g[kb + 32 + j]);
+                x3 *= __half2float(g[kb + 48 + j]);
+            }
+            const unsigned int b0[4] = {l0 & 0xFFu, (l0 >> 8) & 0xFFu, (l0 >> 16) & 0xFFu, l0 >> 24};
+            const unsigned int b1[4] = {l1 & 0xFFu, (l1 >> 8) & 0xFFu, (l1 >> 16) & 0xFFu, l1 >> 24};
+            const unsigned int hh[4] = {
+                hh1 & 0xFFu, (hh1 >> 8) & 0xFFu, (hh1 >> 16) & 0xFFu, hh1 >> 24};
+            const float sc[4] = {s0, s1, s2, s3};
+            float w0[4], w1[4], w2[4], w3[4];
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int e0 = int(b0[t] & 15u) | (int(hh[t] & 3u) << 4);
+                const int e1 = int(b1[t] & 15u) | (int((hh[t] >> 2) & 3u) << 4);
+                const int e2 = int(b0[t] >> 4)   | (int((hh[t] >> 4) & 3u) << 4);
+                const int e3 = int(b1[t] >> 4)   | (int((hh[t] >> 6) & 3u) << 4);
+                w0[t] = sc[t] * float(e0 - 32);
+                w1[t] = sc[t] * float(e1 - 32);
+                w2[t] = sc[t] * float(e2 - 32);
+                w3[t] = sc[t] * float(e3 - 32);
+            }
+            ra.x += w0[0] * x0; ra.y += w0[1] * x0; ra.z += w0[2] * x0; ra.w += w0[3] * x0;
+            rb.x += w1[0] * x1; rb.y += w1[1] * x1; rb.z += w1[2] * x1; rb.w += w1[3] * x1;
+            rc.x += w2[0] * x2; rc.y += w2[1] * x2; rc.z += w2[2] * x2; rc.w += w2[3] * x2;
+            rd.x += w3[0] * x3; rd.y += w3[1] * x3; rd.z += w3[2] * x3; rd.w += w3[3] * x3;
+        }
+    }
+}
+
+// 把 4 个子块累加器合成每列的 4 个值，写入 smem 的 [warp][128] 槽
+__device__ __forceinline__ void i6nm_spill4(
+    float4 a, float4 b, float4 c4, float4 d, float (*red)[128], int w, int lane)
+{
+    const float4 s = make_float4(a.x + b.x + c4.x + d.x,
+                                 a.y + b.y + c4.y + d.y,
+                                 a.z + b.z + c4.z + d.z,
+                                 a.w + b.w + c4.w + d.w);
+    const int base = lane << 2;
+    red[w][base + 0] = s.x;
+    red[w][base + 1] = s.y;
+    red[w][base + 2] = s.z;
+    red[w][base + 3] = s.w;
+}
+
+// 128 列 × 本块所有 warp 的确定性归约（升序加），前 128 线程各负责一列
+__device__ __forceinline__ float i6nm_reduce4(float (*red)[128], int col)
+{
+    if (threadIdx.x >= 128) return 0.f;
+    float s = 0.f;
+    #pragma unroll
+    for (int i = 0; i < I6NM_WARPS; ++i) s += red[i][col];
+    return s;
+}
+"#;
+
+/// 单矩阵 4 列/lane 变体（op 语义同 `gemv_int6nm`）。
+const GEMV_INT6NM4_ONE_SRC: &str = r#"
+extern "C" __global__ void gemv_int6nm4(
+    const unsigned int* __restrict__ lo,
+    const unsigned int* __restrict__ hi,
+    const unsigned int* __restrict__ sz,
+    const float* __restrict__ x,
+    const __half* __restrict__ g,
+    float* __restrict__ y,
+    const int m,
+    const int k,
+    const int op)
+{
+    const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
+    const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
+    const int lane = threadIdx.x & 31;
+    const int w = threadIdx.x >> 5;
+    const int b = blockIdx.y;
+    const int col0 = (blockIdx.x << 7) + (lane << 2);
+    const int nchunk = k >> 6;
+    const float* xb = x + (size_t)b * k;
+    float4 a, b2, c2, d2;
+    if (col0 < m) {
+        if (op == 1)
+            i6nm_dot4<true>(lo8, hi8, sz, xb, g + (size_t)b * k, m, col0, nchunk, w, a, b2, c2, d2);
+        else
+            i6nm_dot4<false>(lo8, hi8, sz, xb, (const __half*)0, m, col0, nchunk, w, a, b2, c2, d2);
+    } else {
+        a = make_float4(0.f, 0.f, 0.f, 0.f); b2 = a; c2 = a; d2 = a;
+    }
+    __shared__ float red[I6NM_WARPS][128];
+    i6nm_spill4(a, b2, c2, d2, red, w, lane);
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        const int nc = (blockIdx.x << 7) + threadIdx.x;
+        if (nc < m) {
+            float s = i6nm_reduce4(red, threadIdx.x);
+            const size_t o = (size_t)b * m + nc;
+            if (op == 0) y[o] = relu2f(s);
+            else if (op == 3) y[o] = s;
+            else y[o] += s;
+        }
+    }
+}
+"#;
+
+/// r/k/v + mid 融合的 4 列/lane 变体。
+const GEMV_INT6NM4_RKV_SRC: &str = r#"
+extern "C" __global__ void gemv_int6nm4_rkv(
+    const unsigned int* __restrict__ R_lo,
+    const unsigned int* __restrict__ R_hi,
+    const unsigned int* __restrict__ R_sz,
+    const unsigned int* __restrict__ K_lo,
+    const unsigned int* __restrict__ K_hi,
+    const unsigned int* __restrict__ K_sz,
+    const unsigned int* __restrict__ V_lo,
+    const unsigned int* __restrict__ V_hi,
+    const unsigned int* __restrict__ V_sz,
+    const float* __restrict__ V1,
+    const float* __restrict__ W1,
+    const float* __restrict__ A1,
+    const float* __restrict__ G1,
+    const float* __restrict__ xr,
+    const float* __restrict__ xk,
+    const float* __restrict__ xv,
+    const float* __restrict__ xw,
+    const float* __restrict__ xa,
+    const float* __restrict__ xg,
+    float* __restrict__ out_r,
+    float* __restrict__ out_k,
+    __half* __restrict__ out_v,
+    float* __restrict__ out_vm,
+    float* __restrict__ out_wm,
+    float* __restrict__ out_am,
+    float* __restrict__ out_gm,
+    const int c,
+    const int vm,
+    const int wm,
+    const int am,
+    const int gm)
+{
+    const int lane = threadIdx.x & 31;
+    const int w = threadIdx.x >> 5;
+    const int nb = (c + 127) >> 7;      // 每块 128 列
+    const int flat = blockIdx.x;
+    const int slot = blockIdx.y;
+    const size_t xoff = (size_t)slot * c;
+    xr += xoff; xk += xoff; xv += xoff; xw += xoff; xa += xoff; xg += xoff;
+    out_r += (size_t)slot * c; out_k += (size_t)slot * c; out_v += (size_t)slot * c;
+    out_vm += (size_t)slot * vm; out_wm += (size_t)slot * wm;
+    out_am += (size_t)slot * am; out_gm += (size_t)slot * gm;
+
+    if (flat < nb) {
+        const unsigned char* rl = reinterpret_cast<const unsigned char*>(R_lo);
+        const unsigned char* rh = reinterpret_cast<const unsigned char*>(R_hi);
+        const unsigned char* kl = reinterpret_cast<const unsigned char*>(K_lo);
+        const unsigned char* kh = reinterpret_cast<const unsigned char*>(K_hi);
+        const unsigned char* vl = reinterpret_cast<const unsigned char*>(V_lo);
+        const unsigned char* vh = reinterpret_cast<const unsigned char*>(V_hi);
+        const int col0 = (flat << 7) + (lane << 2);
+        const int nchunk = c >> 6;
+        __shared__ float red[I6NM_WARPS][128];
+        // 三个矩阵顺序做（各自的平面本来就分开），复用同一块 smem
+        #pragma unroll
+        for (int mat = 0; mat < 3; ++mat) {
+            const unsigned char* lop = (mat == 0) ? rl : ((mat == 1) ? kl : vl);
+            const unsigned char* hip = (mat == 0) ? rh : ((mat == 1) ? kh : vh);
+            const unsigned int*  szp = (mat == 0) ? R_sz : ((mat == 1) ? K_sz : V_sz);
+            const float* xp = (mat == 0) ? xr : ((mat == 1) ? xk : xv);
+            float4 a, b2, c2, d2;
+            if (col0 < c)
+                i6nm_dot4<false>(lop, hip, szp, xp, (const __half*)0, c, col0, nchunk, w,
+                                 a, b2, c2, d2);
+            else {
+                a = make_float4(0.f, 0.f, 0.f, 0.f); b2 = a; c2 = a; d2 = a;
+            }
+            __syncthreads();   // 上一轮读完 smem 再覆盖
+            i6nm_spill4(a, b2, c2, d2, red, w, lane);
+            __syncthreads();
+            if (threadIdx.x < 128) {
+                const int nc = (flat << 7) + threadIdx.x;
+                if (nc < c) {
+                    const float s = i6nm_reduce4(red, threadIdx.x);
+                    if (mat == 0) out_r[nc] = s;
+                    else if (mat == 1) out_k[nc] = s;
+                    else out_v[nc] = __float2half(s);
+                }
+            }
+            __syncthreads();   // 写出后才能进入下一个矩阵（防止覆盖 smem）
+        }
+        return;
+    }
+
+    // mid 投影：warp-per-row（与 1 列版一致）
+    const int midtot = vm + wm + am + gm;
+    const int mrow = (flat - nb) * I6NM_WARPS + w;
+    if (mrow >= midtot) return;
+    const float* wp;
+    const float* xp;
+    int chain = 3;
+    int row = 0;
+    if (mrow < vm) { chain = 0; row = mrow; wp = V1; xp = xv; }
+    else if (mrow < vm + wm) { chain = 1; row = mrow - vm; wp = W1; xp = xw; }
+    else if (mrow < vm + wm + am) { chain = 2; row = mrow - vm - wm; wp = A1; xp = xa; }
+    else { row = mrow - vm - wm - am; wp = G1; xp = xg; }
+    const float* wrow = wp + (long)row * c;
+    float d = 0.f;
+    for (int kk = lane; kk < c; kk += 32) d += wrow[kk] * xp[kk];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffffu, d, off);
+    if (lane == 0) {
+        if (chain == 0) out_vm[row] = d;
+        else if (chain == 1) out_wm[row] = tanhf(d);
+        else if (chain == 2) out_am[row] = d;
+        else out_gm[row] = d;
+    }
 }
 "#;
 
@@ -8390,9 +8672,26 @@ impl CudaBackend {
             return Err(format!("gemv_int6nm: K={k} 必须是 64 的倍数（int6 打包块）").into());
         }
         let warps = i6nm_warps();
-        let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_SRC}");
-        let func = self.kernel(&format!("gemv_int6nm_w{warps}"), &src, "gemv_int6nm")?;
-        let grid = ((m as u32).div_ceil(32), b as u32, 1u32);
+        // ⚠️ vec4 用 uint4 载入：要求平面行宽 M 是 4 的倍数（否则行首不对齐 16 B ⇒ 716）。
+        // 真模型 M ∈ {2560, 10240, 65536, vocab} 都满足；测试里的小 M 会走 vec1。
+        let vec = if m.is_multiple_of(4) { i6nm_vec() } else { 1 };
+        let (key, src, cols, name) = if vec == 4 {
+            (
+                format!("gemv_int6nm4_w{warps}"),
+                format!("#define I6NM_WARPS {warps}\n{GEMV_INT6NM4_SRC}{GEMV_INT6NM4_ONE_SRC}"),
+                128usize,
+                "gemv_int6nm4",
+            )
+        } else {
+            (
+                format!("gemv_int6nm_w{warps}"),
+                format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_SRC}"),
+                32usize,
+                "gemv_int6nm",
+            )
+        };
+        let func = self.kernel(&key, &src, name)?;
+        let grid = ((m as u32).div_ceil(cols as u32), b as u32, 1u32);
         let block = (warps as u32 * 32, 1u32, 1u32);
         let (m_i, k_i) = (m as i32, k as i32);
         let params = [
@@ -8409,6 +8708,31 @@ impl CudaBackend {
         self.drv.launch(self.stream, func, grid, block, &params)
     }
 
+    /// N-major int6 r/k/v 融合核的编译入口：按 `I6NM_VEC` 选 1 列/lane（32 列/块）或
+    /// 4 列/lane（128 列/块）。返回 (func, warps, 每块列数)。
+    /// `c` 为输出列数：vec4 需要 `c % 4 == 0`（uint4 载入的行对齐），否则退回 vec1。
+    fn int6nm_rkv_kernel(&mut self, c: usize) -> R<(CuFunction, usize, usize)> {
+        let warps = i6nm_warps();
+        if i6nm_vec() == 4 && c.is_multiple_of(4) {
+            let src =
+                format!("#define I6NM_WARPS {warps}\n{GEMV_INT6NM4_SRC}{GEMV_INT6NM4_RKV_SRC}");
+            let f = self.kernel(
+                &format!("gemv_int6nm4_rkv_w{warps}"),
+                &src,
+                "gemv_int6nm4_rkv",
+            )?;
+            Ok((f, warps, 128))
+        } else {
+            let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_RKV_SRC}");
+            let f = self.kernel(
+                &format!("gemv_int6nm_rkv_w{warps}"),
+                &src,
+                "gemv_int6nm_rkv",
+            )?;
+            Ok((f, warps, 32))
+        }
+    }
+
     /// N-major int6 的 r/k/v + mid 融合核发射器（单流 `batch=1` 与批量共用；
     /// 批量时 `grid.y = batch`，内核按槽号偏移 x 与全部输出）。
     #[allow(clippy::too_many_arguments)]
@@ -8416,6 +8740,7 @@ impl CudaBackend {
         &mut self,
         func: CuFunction,
         warps: usize,
+        cols: usize,
         r_lo: u64,
         r_hi: u64,
         r_sz: u64,
@@ -8451,7 +8776,7 @@ impl CudaBackend {
     ) -> R<()> {
         let midtot = vm + wm + am + gm;
         let grid = (
-            ((c as u32).div_ceil(32)) + (midtot as u32).div_ceil(warps as u32),
+            ((c as u32).div_ceil(cols as u32)) + (midtot as u32).div_ceil(warps as u32),
             batch as u32,
             1u32,
         );
@@ -11007,19 +11332,13 @@ impl ComputeBackend for CudaBackend {
         let oamd = f32p(oam, OP)?;
         let ogmd = f32p(ogm, OP)?;
 
-        // N-major：走 dot 形式内核（一个 lane 一个输出列，块内 8 warp 切 k-chunk）。
+        // N-major：走 dot 形式内核（按 I6NM_VEC 选 1 或 4 列/lane）。
         if r.nmajor {
-            let warps = i6nm_warps();
-            let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_RKV_SRC}");
-            let func = self.kernel(
-                &format!("gemv_int6nm_rkv_w{warps}"),
-                &src,
-                "gemv_int6nm_rkv",
-            )?;
+            let (func, warps, cols) = self.int6nm_rkv_kernel(c)?;
             return self.launch_int6nm_rkv(
-                func, warps, r_lo, r_hi, r_sz, k_lo, k_hi, k_sz, v_lo, v_hi, v_sz, v1d, w1d, a1d,
-                g1d, xrd, xkd, xvd, xwd, xad, xgd, ord, okd, ovd, ovmd, owmd, oamd, ogmd, c, vm,
-                wm, am, gm, 1,
+                func, warps, cols, r_lo, r_hi, r_sz, k_lo, k_hi, k_sz, v_lo, v_hi, v_sz, v1d, w1d,
+                a1d, g1d, xrd, xkd, xvd, xwd, xad, xgd, ord, okd, ovd, ovmd, owmd, oamd, ogmd, c,
+                vm, wm, am, gm, 1,
             );
         }
 
@@ -11415,16 +11734,11 @@ impl ComputeBackend for CudaBackend {
             self.u32_ptr(v.hi, OP)?,
             self.u32_ptr(v.sz, OP)?,
         );
-        let warps = i6nm_warps();
-        let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_RKV_SRC}");
-        let func = self.kernel(
-            &format!("gemv_int6nm_rkv_w{warps}"),
-            &src,
-            "gemv_int6nm_rkv",
-        )?;
+        let (func, warps, cols) = self.int6nm_rkv_kernel(c)?;
         self.launch_int6nm_rkv(
             func,
             warps,
+            cols,
             r_lo,
             r_hi,
             r_sz,
@@ -14835,8 +15149,8 @@ mod tests {
         let _gpu = crate::backend::gpu_test_guard();
         let mut b = CudaBackend::new().expect("create cuda backend");
 
-        // m 非 32 倍数；k = 4 个 64-k 打包块（2 个 scale 组）
-        let (m, k) = (70usize, 256usize);
+        // m=132：4 的倍数（走 4 列/lane 的 uint4 路径）、但不是 32/128 的倍数（尾列守卫）
+        let (m, k) = (132usize, 256usize);
         let (lo_row, hi_row, kg) = (k / 2, k / 4, k / 128);
         let mut e = vec![0u8; m * k];
         let mut lo_m = vec![0u8; m * lo_row];
