@@ -5474,6 +5474,36 @@ extern "C" __global__ void gemv_int6nm4_rkv(
 }
 "#;
 
+/// MTP drafter 的三个逐元素小原语（`y=a+b` / `y=a+(b−a)·k` / 带偏移拷贝）。
+const MTP_EW_SRC: &str = r#"
+extern "C" __global__ void mtp_ew_add(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ y, const int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void mtp_ew_lerp(
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ k, float* __restrict__ y, const int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float av = a[i];
+        y[i] = av + (b[i] - av) * k[i];
+    }
+}
+
+extern "C" __global__ void mtp_copy_part(
+    float* __restrict__ dst, const float* __restrict__ src,
+    const int off, const int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[off + i] = src[i];
+}
+"#;
+
 /// MTP drafter 专用三核（上游 `docs/mtp.md` §1.4）：
 ///
 /// 1. `mtp_rms_rope`：per-head RMSNorm（eps 1e-6，共享 `[D]` 权重）+ rotate-half RoPE
@@ -11921,6 +11951,71 @@ impl ComputeBackend for CudaBackend {
         )
     }
 
+    fn elementwise_add(&mut self, a: TensorId, b: TensorId, y: TensorId, n: usize) -> R<()> {
+        const OP: &str = "mtp_ew_add";
+        let (ad, bd, yd) = (
+            self.f32_ptr(a, OP)?,
+            self.f32_ptr(b, OP)?,
+            self.f32_ptr(y, OP)?,
+        );
+        let func = self.kernel("mtp_ew_add", MTP_EW_SRC, "mtp_ew_add")?;
+        let grid = ((n as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let n_i = n as i32;
+        let params = [
+            &ad as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn elementwise_lerp(
+        &mut self,
+        a: TensorId,
+        b: TensorId,
+        k: TensorId,
+        y: TensorId,
+        n: usize,
+    ) -> R<()> {
+        const OP: &str = "mtp_ew_lerp";
+        let (ad, bd, kd, yd) = (
+            self.f32_ptr(a, OP)?,
+            self.f32_ptr(b, OP)?,
+            self.f32_ptr(k, OP)?,
+            self.f32_ptr(y, OP)?,
+        );
+        let func = self.kernel("mtp_ew_lerp", MTP_EW_SRC, "mtp_ew_lerp")?;
+        let grid = ((n as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let n_i = n as i32;
+        let params = [
+            &ad as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &kd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn copy_part(&mut self, dst: TensorId, dst_off: usize, src: TensorId, n: usize) -> R<()> {
+        const OP: &str = "mtp_copy_part";
+        let (dd, sd) = (self.f32_ptr(dst, OP)?, self.f32_ptr(src, OP)?);
+        let func = self.kernel("mtp_copy_part", MTP_EW_SRC, "mtp_copy_part")?;
+        let grid = ((n as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (off_i, n_i) = (dst_off as i32, n as i32);
+        let params = [
+            &dd as *const u64 as *mut c_void,
+            &sd as *const u64 as *mut c_void,
+            &off_i as *const i32 as *mut c_void,
+            &n_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
     // —— MTP drafter 专用三核 ——
 
     fn mtp_rms_rope(
@@ -15678,6 +15773,48 @@ mod tests {
             assert!(md < 1e-5, "mtp_attn step={step} max_diff={md}");
         }
         log::info!("MTP drafter 三核（RMS+RoPE / KV ring / GQA attn）vs CPU OK");
+
+        // —— 三个逐元素小原语（add / lerp / copy_part）——
+        let n = 37usize;
+        let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let bb: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.3).sin()).collect();
+        let kk: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).cos()).collect();
+        let (ta, tb, tk) = (
+            b.create_tensor(n, TensorDtype::F32).unwrap(),
+            b.create_tensor(n, TensorDtype::F32).unwrap(),
+            b.create_tensor(n, TensorDtype::F32).unwrap(),
+        );
+        b.upload(ta, &a).unwrap();
+        b.upload(tb, &bb).unwrap();
+        b.upload(tk, &kk).unwrap();
+        let ty = b.create_tensor(n, TensorDtype::F32).unwrap();
+        b.begin_batch().unwrap();
+        b.elementwise_add(ta, tb, ty, n).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(ty).unwrap();
+        for i in 0..n {
+            assert!((got[i] - (a[i] + bb[i])).abs() < 1e-6, "ew_add i={i}");
+        }
+        b.begin_batch().unwrap();
+        b.elementwise_lerp(ta, tb, tk, ty, n).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(ty).unwrap();
+        for i in 0..n {
+            let want = a[i] + (bb[i] - a[i]) * kk[i];
+            assert!((got[i] - want).abs() < 1e-6, "ew_lerp i={i}");
+        }
+        // copy_part：拷到偏移 2n 处（dst 长度 3n）
+        let td = b.create_tensor(3 * n, TensorDtype::F32).unwrap();
+        b.upload(td, &vec![0.0f32; 3 * n]).unwrap();
+        b.begin_batch().unwrap();
+        b.copy_part(td, 2 * n, ta, n).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(td).unwrap();
+        for i in 0..n {
+            assert!((got[2 * n + i] - a[i]).abs() < 1e-6, "copy_part i={i}");
+            assert_eq!(got[i], 0.0, "copy_part 越界写了 dst[{i}]");
+        }
+        log::info!("MTP 逐元素原语（add / lerp / copy_part）vs CPU OK");
     }
 
     /// copy_device（f32）与 copy_token 与 CPU 参考对比。

@@ -12,6 +12,7 @@ use half::f16;
 use safetensors::tensor::TensorView;
 
 use crate::backend::{ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId, Wq};
+use crate::mtp::MtpDrafter;
 use crate::runtime::R;
 
 /// 把「int6 / int8 两个互斥可选句柄」收敛成一个分派用句柄：解码期 int6 优先。
@@ -200,6 +201,26 @@ pub struct GpuModel {
     state: Option<State>,
     // 标量缓冲区: -1/sqrt(e)，用于 w = exp(w_sig * scale)
     scale_w: TensorId,
+    /// MTP drafter 挂载点（`enable_mtp` 后才存在；未启用时整条路径零成本）。
+    mtp: Option<MtpCtx>,
+}
+
+/// MTP drafter 的挂载点：drafter 本体 + 两个 tap 层的输出残差缓冲。
+pub struct MtpCtx {
+    pub drafter: MtpDrafter,
+    /// 两个 tap 层（0-based，sidecar meta 的 `fuse_layers`）。
+    f1: usize,
+    f2: usize,
+    /// 上述两层的**输出残差**（即该层 `x`）的 `[C]` 快照。
+    tap0: TensorId,
+    tap1: TensorId,
+}
+
+impl MtpCtx {
+    /// 两个 tap 层号（诊断用）。
+    pub fn fuse_layers(&self) -> [usize; 2] {
+        [self.f1, self.f2]
+    }
 }
 
 /// 单层权重（全部已上传到 GPU）
@@ -839,7 +860,122 @@ impl GpuModel {
             selfloop_bufs: Vec::new(),
             state: Some(state),
             scale_w,
+            mtp: None,
         })
+    }
+
+    /// 挂载 MTP drafter（P4：单流）。sidecar 需先过 `check_against_model`。
+    ///
+    /// 只额外分配两个 `[C]` 的 tap 缓冲；drafter 的权重/状态/工作缓冲在
+    /// [`MtpDrafter::new`] 里一次分配。未调用本方法时 MTP 路径**零成本**（`mtp: None`）。
+    pub fn enable_mtp(&mut self, sc: &crate::mtp::MtpSidecar, max_k: usize) -> R<()> {
+        use crate::mtp::HeadSrc;
+        let c = self.config.n_embd;
+        let head = if let Some(h) = self.head_i6 {
+            HeadSrc::I6(h)
+        } else if let Some(h) = self.head_a8 {
+            HeadSrc::I8(h)
+        } else {
+            HeadSrc::F16(self.head_w16.ok_or("enable_mtp: head 无任何权重")?)
+        };
+        let tap0 = self.backend.create_tensor(c, TensorDtype::F32)?;
+        let tap1 = self.backend.create_tensor(c, TensorDtype::F32)?;
+        self.backend.fill_zeros(&[(tap0, c), (tap1, c)])?;
+        let drafter = MtpDrafter::new(
+            self.backend.as_mut(),
+            sc,
+            self.emb_ln,
+            head,
+            self.config.vocab,
+            max_k,
+        )?;
+        log::info!(
+            "MTP drafter 就绪：C={c} W={} depth={} max_k={max_k} taps={:?}",
+            drafter.window,
+            drafter.depth,
+            sc.meta.fuse_layers
+        );
+        self.mtp = Some(MtpCtx {
+            drafter,
+            f1: sc.meta.fuse_layers[0],
+            f2: sc.meta.fuse_layers[1],
+            tap0,
+            tap1,
+        });
+        Ok(())
+    }
+
+    /// MTP 是否已挂载。
+    pub fn mtp_enabled(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// drafter 已提交的位置数（= 主模型已处理的位置数）。
+    pub fn mtp_pos(&self) -> Option<u32> {
+        self.mtp.as_ref().map(|m| m.drafter.pos())
+    }
+
+    /// 清空 drafter 状态（与会话 reset 同步调用）。
+    pub fn mtp_reset(&mut self) -> R<()> {
+        if let Some(mut ctx) = self.mtp.take() {
+            let r = ctx.drafter.reset(self.backend.as_mut());
+            self.mtp = Some(ctx);
+            r
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 起草 `k` 个 token（P4 单流）：必须在**刚跑完一步** `forward_token` / `selfloop_step`
+    /// 之后调用——它用最后一行的 `ln_out(x)`（`bufs.x_norm`）与两个 tap 层残差当输入。
+    ///
+    /// `tok` 是**该位置之后**那个 token 的设备 `[1]` 索引缓冲（即要起草的起点）。
+    pub fn mtp_draft(&mut self, tok: TensorId, k: usize) -> R<Vec<u32>> {
+        let Some(mut ctx) = self.mtp.take() else {
+            return Err("mtp_draft: MTP 未启用（先 enable_mtp）".into());
+        };
+        let (h, m1, m2) = (self.bufs.x_norm, ctx.tap0, ctx.tap1);
+        let r = ctx
+            .drafter
+            .draft_chain(self.backend.as_mut(), h, m1, m2, tok, k);
+        self.mtp = Some(ctx);
+        r
+    }
+
+    /// 诊断：用 drafter 的 head 路径对当前末行 `ln_out(x)`（`bufs.x_norm`）求 argmax。
+    ///
+    /// 必须等于主模型这一步的 argmax——两者是同一份 head 权重、同一行 x_norm。
+    /// 若不等，问题在 taps/head 通路或 drapfter 的输入接线，而不在 drafter 的块内部。
+    pub fn mtp_head_check(&mut self) -> R<u32> {
+        let Some(mut ctx) = self.mtp.take() else {
+            return Err("mtp_head_check: MTP 未启用".into());
+        };
+        let h = self.bufs.x_norm;
+        let r = ctx.drafter.head_argmax(self.backend.as_mut(), h);
+        self.mtp = Some(ctx);
+        r
+    }
+
+    /// [`Self::mtp_draft`] 的 host token 版本（token id 直接给 u32）。
+    pub fn mtp_draft_host(&mut self, token: u32, k: usize) -> R<Vec<u32>> {
+        let t = self.bufs.current_token;
+        self.backend.store_token_host(t, token)?;
+        self.mtp_draft(t, k)
+    }
+
+    /// MTP tap（§1.1）：`fuse_layers` 两层的**输出残差**在设备内拷到 tap 缓冲。
+    /// 每层尾部调用；未启用 MTP 时立即返回（一个分支，无 kernel）。
+    fn mtp_tap(&mut self, i: usize) -> R<()> {
+        let Some((f1, f2, t0, t1)) = self.mtp.as_ref().map(|m| (m.f1, m.f2, m.tap0, m.tap1)) else {
+            return Ok(());
+        };
+        if i == f1 {
+            self.backend.copy_device(self.bufs.x, t0)?;
+        }
+        if i == f2 {
+            self.backend.copy_device(self.bufs.x, t1)?;
+        }
+        Ok(())
     }
 
     /// 重置 RNN 状态为零（回到首次推理前的初始状态）
@@ -927,6 +1063,8 @@ impl GpuModel {
             selfloop_bufs: Vec::new(),
             state: Some(state),
             scale_w: self.scale_w,
+            // 共享实例不带 MTP（drafter 的状态/权重属本体私有；需要时各自 enable_mtp）
+            mtp: None,
         })
     }
 
@@ -4168,6 +4306,8 @@ impl GpuModel {
             )?;
         }
         pf_phase!("ffnv_sparse");
+        // MTP tap：该层输出残差 → tap 缓冲（§1.1 的 m1/m2；未启用 MTP 时直接返回）
+        self.mtp_tap(i)?;
         let _ = t0; // 引用最后一次赋值，避免 unused_assignments 警告
 
         Ok(())

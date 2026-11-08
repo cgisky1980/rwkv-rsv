@@ -8,8 +8,10 @@
 //! - drafter **不决定输出**：它给的 draft 只影响速度，最终 token 一律由主模型采样得到；
 //! - drafter 权重可量化（上游 int6），量化只改接受率、不改输出。
 
+pub mod drafter;
 pub mod sidecar;
 
+pub use drafter::{HeadSrc, MtpDrafter, MtpState};
 pub use sidecar::{MtpMeta, MtpSidecar, find_sidecar, load_sidecar};
 
 /// drafter 固定超参（上游 §1.2：对任何 C 都一样）。

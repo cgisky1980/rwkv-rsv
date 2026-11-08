@@ -1637,6 +1637,29 @@ pub trait ComputeBackend {
         Err("mtp_attn: backend not supported".into())
     }
 
+    /// `y = a + b`（逐元素 f32，长度 n）——drafter 的 `+ dep[k-1]` 与残差用。
+    fn elementwise_add(&mut self, _a: TensorId, _b: TensorId, _y: TensorId, _n: usize) -> R<()> {
+        Err("elementwise_add: backend not supported".into())
+    }
+
+    /// `y = a + (b − a) · k`（逐元素 f32，长度 n）——drafter 的 token shift
+    /// （`kx = x2 + (prev − x2) ⊙ x_k`）。
+    fn elementwise_lerp(
+        &mut self,
+        _a: TensorId,
+        _b: TensorId,
+        _k: TensorId,
+        _y: TensorId,
+        _n: usize,
+    ) -> R<()> {
+        Err("elementwise_lerp: backend not supported".into())
+    }
+
+    /// 把 `src[0..n]` 拷到 `dst[dst_off .. dst_off+n]`（f32）——drafter 拼 `[u; LN_le(e)]` 用。
+    fn copy_part(&mut self, _dst: TensorId, _dst_off: usize, _src: TensorId, _n: usize) -> R<()> {
+        Err("copy_part: backend not supported".into())
+    }
+
     fn elementwise_sigmoid(&mut self, a: TensorId, y: TensorId, c: usize, batch: usize) -> R<()>;
     /// y = sigmoid(y)（原地，f32）。
     #[allow(clippy::too_many_arguments)]
