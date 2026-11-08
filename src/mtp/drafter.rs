@@ -39,6 +39,15 @@ pub enum HeadSrc {
 }
 
 impl HeadSrc {
+    /// 输出行数（全词表 = vocab；子表 = n_draft）。
+    fn rows(&self, vocab: usize) -> usize {
+        match self {
+            HeadSrc::I8(h) => h.m,
+            HeadSrc::I6(h) => h.m,
+            HeadSrc::F16(_) => vocab,
+        }
+    }
+
     fn gemv(
         &self,
         be: &mut dyn ComputeBackend,
@@ -207,6 +216,12 @@ pub struct MtpDrafter {
     rope_theta: f32,
     emb_ln: TensorId,
     head: HeadSrc,
+    /// head 的 **draft 词表子表**（`[n_draft, C]`）。`None` = 不支持/不需要，退回全词表+掩码。
+    head_c: Option<HeadSrc>,
+    /// 子表下标 → 真实 token id 的映射（u32，长度 = n_draft）。
+    draft_map: Option<TensorId>,
+    /// 本次起草的 logits 有效长度（有子表时 = n_draft，否则 = vocab）。
+    logits_len: usize,
     w: Weights,
     b: Bufs,
     /// `[vocab]` f32：draft 词表内 0，其余 −1e30（argmax 只在 draft 词表内选）。
@@ -343,6 +358,13 @@ impl MtpDrafter {
             s_ring,
         };
 
+        // ★ head 子表：draft 词表只有前 N 行会被用到（`draft_vocab[:N]`），而 head 是
+        // `[vocab, C]` int6 ⇒ 每深度白读 (1 − N/vocab) 的 head 带宽（16384/65536 ⇒ 省 3/4）。
+        // 有后端支持时把子表一次性摘出来，argmax 直接落在子表上，再用 `map` 把下标映射回
+        // 真实 token id（设备内 1 个线程）。不支持的模型/后端零成本（`None`）。
+        let (head_c, draft_map) = build_head_sub(be, &head, &sc.draft_vocab[..n_draft], c, vocab)?;
+        let logits_len = head_c.as_ref().map_or(vocab, |h| h.rows(vocab));
+
         let mut this = Self {
             c,
             vocab,
@@ -362,6 +384,9 @@ impl MtpDrafter {
             },
             emb_ln,
             head,
+            head_c,
+            draft_map,
+            logits_len,
             w,
             b,
             draft_mask,
@@ -577,13 +602,97 @@ impl MtpDrafter {
         // out → draft（`with_draft=false` 时整段跳过：`accept` 的补提交不需要草稿）
         be.norm(b.x, self.w.lo.w, self.w.lo.b, b.out, c, 1, self.ln_eps, 1)?;
         if with_draft {
-            self.head.gemv(be, b.out, b.logits, self.vocab, c)?;
-            be.elementwise_add(b.logits, self.draft_mask, b.logits, self.vocab)?;
-            be.argmax(b.logits, b.tok, self.vocab)?;
+            // 有 draft 词表子表时只跑子表（省 3/4 head 带宽），argmax 落在子表下标上，
+            // 再用 `map` 映射回真实 token id；没有子表时退回「全词表 + 掩码」。
+            let (src, len) = match self.head_c {
+                Some(h) => (h, self.logits_len),
+                None => (self.head, self.vocab),
+            };
+            src.gemv(be, b.out, b.logits, len, c)?;
+            if self.head_c.is_none() {
+                be.elementwise_add(b.logits, self.draft_mask, b.logits, self.vocab)?;
+            }
+            be.argmax(b.logits, b.tok, len)?;
+            if let Some(md) = self.draft_map {
+                be.map_index_u32(md, b.tok, b.tok)?;
+            }
         }
         // 下一深度 / 下一次提交的 token shift
         be.copy_device(b.x2, b.shift)
     }
+}
+
+/// 建 head 的 **draft 词表子表**：`n_draft` 行（`draft_vocab[:N]`）从全词表 head 里摘出来。
+///
+/// 为什么值得做：head 是 `[vocab, C]`（int6 = 126 MB / int8 = 168 MB），drafter 每步要在
+/// **每个深度**读一遍，而实际只用到 draft 词表的前 N 行（16384）⇒ 白读 3/4。
+///
+/// 返回 `(子表, 映射)`；不支持（Vulkan / fp16 head / N ≥ vocab）时返回 `(None, None)`，
+/// 调用方退回「全词表 + 掩码」，行为与之前逐位一致。
+fn build_head_sub(
+    be: &mut dyn ComputeBackend,
+    head: &HeadSrc,
+    ids: &[u32],
+    c: usize,
+    vocab: usize,
+) -> R<(Option<HeadSrc>, Option<TensorId>)> {
+    let (n, k) = (
+        ids.len(),
+        match head {
+            HeadSrc::I6(h) => h.k,
+            HeadSrc::I8(h) => h.k,
+            HeadSrc::F16(_) => return Ok((None, None)),
+        },
+    );
+    if n == 0 || n >= vocab || !n.is_multiple_of(4) || !k.is_multiple_of(128) {
+        return Ok((None, None));
+    }
+    let map = be.create_tensor(n, TensorDtype::U32)?;
+    be.upload_u32(map, ids)?;
+    let sub = match *head {
+        HeadSrc::I6(h) if h.nmajor => {
+            let s = Int6Handle {
+                lo: be.create_tensor(n * (k / 2) / 4, TensorDtype::U32)?,
+                hi: be.create_tensor(n * (k / 4) / 4, TensorDtype::U32)?,
+                sz: be.create_tensor(n * (k / 128), TensorDtype::U32)?,
+                m: n,
+                k,
+                nmajor: true,
+            };
+            match be.int6_gather_rows(&h, &s, map) {
+                Ok(()) => Some(HeadSrc::I6(s)),
+                Err(e) => {
+                    log::info!("MTP head 子表（int6）不可用：{e}");
+                    None
+                }
+            }
+        }
+        HeadSrc::I8(h) => {
+            let s = Int8Handle {
+                idx: be.create_tensor(n * (k / 4), TensorDtype::U32)?,
+                sz: be.create_tensor(n * (k / 128), TensorDtype::U32)?,
+                m: n,
+                k,
+            };
+            match be.int8_gather_rows(&h, &s, map) {
+                Ok(()) => Some(HeadSrc::I8(s)),
+                Err(e) => {
+                    log::info!("MTP head 子表（int8）不可用：{e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let Some(sub) = sub else {
+        return Ok((None, None));
+    };
+    log::info!(
+        "MTP head 子表就绪：{n} 行（全词表 {vocab}）⇒ 每深度 head 流量 ≈ {:.1} MB（原 {:.0} MB）",
+        (n as f64) * (c as f64) * 0.75 / 1.0e6,
+        (vocab as f64) * (c as f64) * 1.0 / 1.0e6
+    );
+    Ok((Some(sub), Some(map)))
 }
 
 fn up_f16(be: &mut dyn ComputeBackend, t: &MtpTensor) -> R<TensorId> {

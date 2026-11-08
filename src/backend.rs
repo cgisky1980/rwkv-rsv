@@ -989,6 +989,23 @@ pub trait ComputeBackend {
         }
     }
 
+    /// int6 平面**按行号表 gather**：`dst.o = src.map[o]`（三个平面按各自行宽搬运）。
+    /// 用途：MTP drafter 的 head 只需 draft 词表的前 N 行，一次性把子表摘出来，
+    /// 之后每个深度只读子表（vocab 65536 → 16384，省 3/4 的 head 带宽）。
+    fn int6_gather_rows(&mut self, _src: &Int6Handle, _dst: &Int6Handle, _map: TensorId) -> R<()> {
+        Err("int6_gather_rows: backend not supported".into())
+    }
+
+    /// 单元素索引映射 `out[0] = map[idx[0]]`（int6 子表的 argmax 结果 → 真实 token id）。
+    fn map_index_u32(&mut self, _map: TensorId, _idx: TensorId, _out: TensorId) -> R<()> {
+        Err("map_index_u32: backend not supported".into())
+    }
+
+    /// int8 平面按行号表 gather（同 [`Self::int6_gather_rows`]，int8 的 idx 是组主序）。
+    fn int8_gather_rows(&mut self, _src: &Int8Handle, _dst: &Int8Handle, _map: TensorId) -> R<()> {
+        Err("int8_gather_rows: backend not supported".into())
+    }
+
     /// r/k/v 三路融合。int6 只实现了单流档；批量档未实现时返回错误，
     /// 由调用方（`batch_decode_blocker`）提前拦住，不会运行期炸。
     #[allow(clippy::too_many_arguments)]

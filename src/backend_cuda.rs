@@ -8913,6 +8913,64 @@ extern "C" __global__ void rwkv_copy_range_f16(
 }
 "#;
 
+/// int6 平面**按行号表 gather**：把 `src` 的 `map[o]` 行搬到 `dst` 的 `o` 行（一次性建
+/// MTP draft 词表子表）。三个平面的**行宽不同**：`lo`/`hi` 是 `[*, m]` **字节**（= m/4 个 u32），
+/// `sz` 是 `[*, m]` **u32**（= m 个 u32）——与 `i6nm` 的寻址 `(row * n + col)` 一致。
+/// `grid.x` = 输出行号（每行一个 block，行内线程并行）。
+const I6_GATHER_ROWS_SRC: &str = r#"
+extern "C" __global__ void rwkv_i6_gather_rows(
+    const unsigned int* __restrict__ lo, const unsigned int* __restrict__ hi,
+    const unsigned int* __restrict__ sz,
+    unsigned int* __restrict__ dlo, unsigned int* __restrict__ dhi,
+    unsigned int* __restrict__ dsz,
+    const unsigned int* __restrict__ map,
+    const int nout, const int ms, const int md)
+{
+    const int o = blockIdx.x;
+    if (o >= nout) return;
+    const unsigned int s = map[o];
+    const int bws = ms >> 2, bwd = md >> 2;     // lo/hi 每行的 u32 数（源/目标）
+    for (int i = threadIdx.x; i < bwd; i += blockDim.x) {
+        dlo[(size_t)o * bwd + i] = lo[(size_t)s * bws + i];
+        dhi[(size_t)o * bwd + i] = hi[(size_t)s * bws + i];
+    }
+    for (int i = threadIdx.x; i < md; i += blockDim.x)
+        dsz[(size_t)o * md + i] = sz[(size_t)s * ms + i];
+}
+"#;
+
+/// int8 平面**按行号表 gather**（MTP head 子表用）。CUDA 的 `int8_idx` 是**行主序**
+/// `[m][k/4]`（组主序只给 Vulkan，见 `ComputeBackend::int8_idx_group_major`）⇒ 行 gather
+/// 就是「逐行搬 k/4 个 u32」；`sz` 是 `[m][k/128]`，同样按行连续搬。
+const I8_GATHER_ROWS_SRC: &str = r#"
+extern "C" __global__ void rwkv_i8_gather_rows(
+    const unsigned int* __restrict__ idx, const unsigned int* __restrict__ sz,
+    unsigned int* __restrict__ didx, unsigned int* __restrict__ dsz,
+    const unsigned int* __restrict__ map,
+    const int nout, const int kvi, const int kg)
+{
+    const int o = blockIdx.x;
+    if (o >= nout) return;
+    const unsigned int s = map[o];
+    for (int i = threadIdx.x; i < kvi; i += blockDim.x)
+        didx[(size_t)o * kvi + i] = idx[(size_t)s * kvi + i];
+    for (int i = threadIdx.x; i < kg; i += blockDim.x)
+        dsz[(size_t)o * kg + i] = sz[(size_t)s * kg + i];
+}
+"#;
+
+/// 单元素索引映射：`out[0] = map[idx[0]]`（draft 词表子表的 argmax 结果 → 真实 token id）。
+/// `idx`/`out` 是 **f32 缓冲**（argmax 把 token 索引按位模式写进 f32 张量）⇒ 这里按位重解释。
+/// 原地调用（`out == idx`）也安全：先读 idx[0] 再写。
+const MAP_INDEX_SRC: &str = r#"
+extern "C" __global__ void rwkv_map_index(
+    const unsigned int* __restrict__ map, const float* __restrict__ idx,
+    float* __restrict__ out)
+{
+    out[0] = __uint_as_float(map[__float_as_uint(idx[0])]);
+}
+"#;
+
 /// copy_token CUDA kernel：y[i] = x[token*stride + i]（sequence-parallel 状态更新用）。
 /// 语义对齐 Vulkan `copy_token.comp`。
 const COPY_TOKEN_SRC: &str = r#"
@@ -10383,6 +10441,106 @@ impl CudaBackend {
 }
 
 impl ComputeBackend for CudaBackend {
+    fn int6_gather_rows(&mut self, src: &Int6Handle, dst: &Int6Handle, map: TensorId) -> R<()> {
+        let (m, k) = (src.m, src.k);
+        if dst.k != k || dst.m > m {
+            return Err(
+                "int6_gather_rows: 形状不符（要求 dst.k == src.k 且 dst.m <= src.m）".into(),
+            );
+        }
+        if !dst.m.is_multiple_of(4) || !m.is_multiple_of(4) {
+            return Err("int6_gather_rows: 行宽必须是 4 的倍数（u32 载入）".into());
+        }
+        let func = self.kernel("i6_gather_rows", I6_GATHER_ROWS_SRC, "rwkv_i6_gather_rows")?;
+        let (slo, shi, ssz) = (
+            self.u32_ptr(src.lo, "i6_gather lo")?,
+            self.u32_ptr(src.hi, "i6_gather hi")?,
+            self.u32_ptr(src.sz, "i6_gather sz")?,
+        );
+        let (dlo, dhi, dsz) = (
+            self.u32_ptr(dst.lo, "i6_gather dlo")?,
+            self.u32_ptr(dst.hi, "i6_gather dhi")?,
+            self.u32_ptr(dst.sz, "i6_gather dsz")?,
+        );
+        let mp = self.u32_ptr(map, "i6_gather map")?;
+        let (nout_i, ms_i, md_i) = (dst.m as i32, m as i32, dst.m as i32);
+        let params = [
+            &slo as *const u64 as *mut c_void,
+            &shi as *const u64 as *mut c_void,
+            &ssz as *const u64 as *mut c_void,
+            &dlo as *const u64 as *mut c_void,
+            &dhi as *const u64 as *mut c_void,
+            &dsz as *const u64 as *mut c_void,
+            &mp as *const u64 as *mut c_void,
+            &nout_i as *const i32 as *mut c_void,
+            &ms_i as *const i32 as *mut c_void,
+            &md_i as *const i32 as *mut c_void,
+        ];
+        // 一行一个 block：lo/hi 每行 md/4 个 u32、sz 每行 md 个 u32
+        self.drv.launch(
+            self.stream,
+            func,
+            (dst.m as u32, 1, 1),
+            (256, 1, 1),
+            &params,
+        )
+    }
+
+    fn int8_gather_rows(&mut self, src: &Int8Handle, dst: &Int8Handle, map: TensorId) -> R<()> {
+        let (m, k) = (src.m, src.k);
+        if dst.k != k || dst.m > m || !k.is_multiple_of(128) {
+            return Err("int8_gather_rows: 形状不符".into());
+        }
+        if self.int8_idx_group_major() {
+            // 组主序（Vulkan）下不是连续行，需另一支实现；这里不静默给出错误结果。
+            return Err("int8_gather_rows: 组主序布局未实现".into());
+        }
+        let func = self.kernel("i8_gather_rows", I8_GATHER_ROWS_SRC, "rwkv_i8_gather_rows")?;
+        let (si, ss) = (
+            self.u32_ptr(src.idx, "i8_gather idx")?,
+            self.u32_ptr(src.sz, "i8_gather sz")?,
+        );
+        let (di, ds) = (
+            self.u32_ptr(dst.idx, "i8_gather didx")?,
+            self.u32_ptr(dst.sz, "i8_gather dsz")?,
+        );
+        let mp = self.u32_ptr(map, "i8_gather map")?;
+        let (nout_i, kvi_i, kg_i) = (dst.m as i32, (k / 4) as i32, (k / 128) as i32);
+        let params = [
+            &si as *const u64 as *mut c_void,
+            &ss as *const u64 as *mut c_void,
+            &di as *const u64 as *mut c_void,
+            &ds as *const u64 as *mut c_void,
+            &mp as *const u64 as *mut c_void,
+            &nout_i as *const i32 as *mut c_void,
+            &kvi_i as *const i32 as *mut c_void,
+            &kg_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(
+            self.stream,
+            func,
+            (dst.m as u32, 1, 1),
+            (256, 1, 1),
+            &params,
+        )
+    }
+
+    fn map_index_u32(&mut self, map: TensorId, idx: TensorId, out: TensorId) -> R<()> {
+        let func = self.kernel("map_index", MAP_INDEX_SRC, "rwkv_map_index")?;
+        let (mp, ip, op) = (
+            self.u32_ptr(map, "map_index map")?,
+            self.f32_ptr(idx, "map_index idx")?,
+            self.f32_ptr(out, "map_index out")?,
+        );
+        let params = [
+            &mp as *const u64 as *mut c_void,
+            &ip as *const u64 as *mut c_void,
+            &op as *const u64 as *mut c_void,
+        ];
+        self.drv
+            .launch(self.stream, func, (1, 1, 1), (1, 1, 1), &params)
+    }
+
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId> {
         self.next_id += 1;
         let id = TensorId(self.next_id);
