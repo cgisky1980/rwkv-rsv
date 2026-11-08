@@ -164,6 +164,40 @@ fn prefill_acc16(m_pad: usize) -> bool {
     true
 }
 
+/// 进程内换档 A/B 的「图代次」：混进 prefill/verify 图 key 的高 4 位。
+///
+/// 为什么需要：验证路径的图按 (T, State, …) 收键，图里烘焙的是**一整套 kernel 序列**。
+/// 进程内切换任何会改变 dispatch 序列的门（`SEQ_NORMSUM`、`SEQ_SHIFT6` 等）后若不换 key，
+/// 重放的仍是上一臂捕获的图 ⇒ 两臂量到的是同一份代码（历史坑：`MTP_AB_INT6` 当年被迫
+/// 配 `PREFILL_GRAPH=0` 才能测）。现在仪表侧每次切臂调用 [`set_graph_arm_epoch`]。
+static GRAPH_ARM_EPOCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 读取当前图代次（低 4 位有效）。
+pub fn graph_arm_epoch() -> usize {
+    GRAPH_ARM_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 切换图代次：调用后同 T 的图会**重新捕获**。仅供进程内 A/B 仪表使用（0 是默认档）。
+pub fn set_graph_arm_epoch(v: usize) {
+    GRAPH_ARM_EPOCH.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 低秩链**第二级**权重（`w2/a2/v2/g2`）是否走常驻 fp16 副本（`LR2F16`，**默认开**）。
+///
+/// 动机：这四张 `[C, mid]` 矩阵是 chain4 唯一的权重流量（本模型 ~2.9 MB/层 fp32），fp16 副本
+/// 已在显存里（prefill GEMM 用），换成它等于把这部分流量**砍半**，且不新增内存。
+/// 代价是权重过一次 fp16 舍入 ⇒ 数值档位与 prefill GEMM 档一致。解码与验证必须**同档**
+/// （否则两边的 logits 差会吃掉投机接受率），故两处共用一个门。
+///
+/// 实测（同进程轮转交替 8 轮 × 4 次，`mtp_probe` 的 `MTP_AB_VERIFY=LR2F16`）：
+/// 验证 pass 16.600 → 16.541 ms（−0.06 ms）、解码 8.652 → 8.621 ms/token（−0.03 ms）；
+/// 接受率不变（E2E 平均接受 1.83 草稿/步，与 fp32 档同）。收益小是因为 chain4 是
+/// warp-per-row 的**延迟受限**微内核，权重流量不是它的主项——但换档零成本，故默认开。
+#[inline]
+fn lr2_f16() -> bool {
+    std::env::var("LR2F16").map(|v| v != "0").unwrap_or(true)
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
@@ -2657,27 +2691,47 @@ impl GpuModel {
             batch,
         )?;
 
-        // y_norm = group_norm(y) + sum(r*k_mod*r_k)*v
-        self.backend.norm(
-            sb.y,
-            layer.ln_x_w,
-            layer.ln_x_b,
-            sb.y_norm,
-            n,
-            self.config.n_head,
-            GN_EPS,
-            bt,
-        )?;
-        self.backend.sum_rk_rk(
-            sb.r,
-            sb.k_mod,
-            layer.r_k,
-            sb.v,
-            sb.y_norm,
-            self.config.n_head,
-            n,
-            bt,
-        )?;
+        // y_norm = group_norm(y) + sum(r*k_mod*r_k)*v（与单序列路径同：融合核 + 回退档）
+        if std::env::var("SEQ_NORMSUM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            self.backend.norm_sum_rk_rk(
+                sb.y,
+                layer.ln_x_w,
+                layer.ln_x_b,
+                sb.r,
+                sb.k_mod,
+                layer.r_k,
+                sb.v,
+                sb.y_norm,
+                n,
+                self.config.n_head,
+                GN_EPS,
+                bt,
+            )?;
+        } else {
+            self.backend.norm(
+                sb.y,
+                layer.ln_x_w,
+                layer.ln_x_b,
+                sb.y_norm,
+                n,
+                self.config.n_head,
+                GN_EPS,
+                bt,
+            )?;
+            self.backend.sum_rk_rk(
+                sb.r,
+                sb.k_mod,
+                layer.r_k,
+                sb.v,
+                sb.y_norm,
+                self.config.n_head,
+                n,
+                bt,
+            )?;
+        }
 
         // g 链：sigmoid(xg@g1)@g2
         self.backend
@@ -4478,11 +4532,19 @@ impl GpuModel {
         //   b_i     = -kk_l2_i * a_i
         //   S 更新 + y = S @ r
         //   y_norm  = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k)*v
+        // 第二级权重档：`LR2F16` 走 fp16 副本（与 prefill GEMM 同档），否则 f32。
+        let l2 = &self.layers[i];
+        let l2f16 = lr2_f16() && self.backend.supports_lowrank_chain4_f16w();
+        let (q2w, q2a, q2v, q2g) = if l2f16 {
+            (l2.w2_16, l2.a2_16, l2.v2_16, l2.g2_16)
+        } else {
+            (l2.w2, l2.a2, l2.v2, l2.g2)
+        };
         self.backend.gemv_lowrank_chain4(
-            self.layers[i].w2,
-            self.layers[i].a2,
-            self.layers[i].v2,
-            self.layers[i].g2,
+            q2w,
+            q2a,
+            q2v,
+            q2g,
             self.bufs.w_mid,
             self.bufs.a_mid,
             self.bufs.v_mid,
@@ -4752,10 +4814,13 @@ impl GpuModel {
         // 保存），必须分开缓存，否则会重放到另一条序列上（静默算错）。
         // ★ 还要混进 `State` 的身份号：图里烘焙的是各状态张量的设备指针，同一实例上换一份
         // State 再重放就会「算别人的状态、写别人的状态」（同 self-loop 图那条 2026-10-10 的坑）。
+        // ★ 再混进「换档代次」（`set_graph_arm_epoch`）：进程内 A/B 切换任何**改变 kernel 序列**
+        // 的门（如 `SEQ_NORMSUM`）时必须换 key，否则重放的是上一臂捕获的图（数字全是假的）。
+        let arm = graph_arm_epoch() & 0xF;
         let gkey = if verify {
-            t | (1usize << 40) | ((state.uid() as usize & 0xFFFF) << 44)
+            t | (1usize << 40) | ((state.uid() as usize & 0xFFFF) << 44) | (arm << 60)
         } else {
-            t | ((state.uid() as usize & 0xFFFF) << 44)
+            t | ((state.uid() as usize & 0xFFFF) << 44) | (arm << 60)
         };
         if prefill_graph && self.backend.prefill_graph_valid(gkey)? {
             self.backend.prefill_graph_replay_keyed(gkey)?;
@@ -5363,8 +5428,15 @@ impl GpuModel {
         }
 
         // state[i].tmix_x = ln1[T-1]（须在 seq_shift 之后，避免覆盖 t=0 读取的旧 state）
-        self.backend
-            .copy_token(sb.ln1, state.layers[i].tmix_x, c, c, t - 1)?;
+        //
+        // ★ `SEQ_COPY2`（默认开）：这一发与 cmix 的同名回写合成一次 launch，放到本层
+        // cmix shift 之后（那里同样已过读取点，且中间没有任何节点读 `tmix_x`）。
+        // `SEQ_COPY2=0` 回退成原位置的两发 `copy_token`。
+        let copy2 = std::env::var("SEQ_COPY2").map(|v| v != "0").unwrap_or(true);
+        if !copy2 {
+            self.backend
+                .copy_token(sb.ln1, state.layers[i].tmix_x, c, c, t - 1)?;
+        }
 
         // r/k/v = token 并行 GEMM。
         // 方案A（默认）：int8 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
@@ -5618,11 +5690,17 @@ impl GpuModel {
             } else {
                 (sb.v_first, sb.v)
             };
+            // 第二级权重档与解码路径共用 `LR2F16`（必须同档，见 `lr2_f16` 的注释）。
+            let (l2w, l2a, l2v, l2g) = if lr2_f16() && self.backend.supports_lowrank_chain4_f16w() {
+                (layer.w2_16, layer.a2_16, layer.v2_16, layer.g2_16)
+            } else {
+                (layer.w2, layer.a2, layer.v2, layer.g2)
+            };
             self.backend.gemv_lowrank_chain4_f32(
-                layer.w2,
-                layer.a2,
-                layer.v2,
-                layer.g2,
+                l2w,
+                l2a,
+                l2v,
+                l2g,
                 sb.w_mid,
                 sb.a_mid,
                 sb.v_mid,
@@ -5741,29 +5819,48 @@ impl GpuModel {
             &[("y", sb.y), ("y_norm", sb.y_norm)],
         )?;
 
-        // y_norm = group_norm(y, ln_x_w, ln_x_b)
-        self.backend.norm(
-            sb.y,
-            layer.ln_x_w,
-            layer.ln_x_b,
-            sb.y_norm,
-            n,
-            self.config.n_head,
-            GN_EPS,
-            t,
-        )?;
-
-        // extra: y_norm += sum(r*k_mod*r_k, head) * v
-        self.backend.sum_rk_rk(
-            sb.r,
-            sb.k_mod,
-            layer.r_k,
-            sb.v,
-            sb.y_norm,
-            self.config.n_head,
-            n,
-            t,
-        )?;
+        // y_norm = group_norm(y, ln_x_w, ln_x_b) + sum(r*k_mod*r_k, head) * v
+        // 两节点同构（逐 (token, head) 分块）⇒ 默认走融合核；`SEQ_NORMSUM=0` 回退两次 launch。
+        if std::env::var("SEQ_NORMSUM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            self.backend.norm_sum_rk_rk(
+                sb.y,
+                layer.ln_x_w,
+                layer.ln_x_b,
+                sb.r,
+                sb.k_mod,
+                layer.r_k,
+                sb.v,
+                sb.y_norm,
+                n,
+                self.config.n_head,
+                GN_EPS,
+                t,
+            )?;
+        } else {
+            self.backend.norm(
+                sb.y,
+                layer.ln_x_w,
+                layer.ln_x_b,
+                sb.y_norm,
+                n,
+                self.config.n_head,
+                GN_EPS,
+                t,
+            )?;
+            self.backend.sum_rk_rk(
+                sb.r,
+                sb.k_mod,
+                layer.r_k,
+                sb.v,
+                sb.y_norm,
+                self.config.n_head,
+                n,
+                t,
+            )?;
+        }
 
         // g = sigmoid(xg@g1)@g2（tensor-core GEMM）
         // chain4 档已在融合核里算完（`g_mid` 进 kernel 内做 sigmoid），这里跳过。
@@ -5890,9 +5987,22 @@ impl GpuModel {
                 c,
             )?;
         }
-        // state[i].cmix_x = ln2[T-1]（须在 seq_shift 之后）
-        self.backend
-            .copy_token(sb.ln2, state.layers[i].cmix_x, c, c, t - 1)?;
+        // state[i].cmix_x = ln2[T-1]（须在 seq_shift 之后）；`SEQ_COPY2` 档顺带把本层的
+        // `tmix_x` 回写一起发出（两路同 token、同布局 ⇒ 单核双写）。
+        if copy2 {
+            self.backend.copy_token2(
+                sb.ln1,
+                state.layers[i].tmix_x,
+                sb.ln2,
+                state.layers[i].cmix_x,
+                c,
+                c,
+                t - 1,
+            )?;
+        } else {
+            self.backend
+                .copy_token(sb.ln2, state.layers[i].cmix_x, c, c, t - 1)?;
+        }
 
         // FFN = token 并行 GEMM；int8 默认走方案A（dequant→scratch→TC GEMM）
         if std::env::var("GEMM_DIAG").is_ok() {

@@ -445,6 +445,84 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // —— 同进程轮转交替：验证 pass 的「门开/关」A/B（`MTP_AB_VERIFY=<环境变量名>`）——
+    //
+    // 与 `MTP_AB_INT6` 同一纪律（同进程紧邻、轮转顺序、取最小值抗热节流），但这里切的门会
+    // **改变 dispatch 序列**，所以必须同时 bump 图代次（`set_graph_arm_epoch`）：否则重放的
+    // 是另一臂捕获的图，两臂量到同一份代码（历史坑，见 `MTP_AB_INT6` 的 PREFILL_GRAPH 说明）。
+    // 门值约定：`1` = 开、`0` = 关（默认档一般是开）。
+    if let Ok(gate) = std::env::var("MTP_AB_VERIFY") {
+        let rounds = env_usize("MTP_AB_ROUNDS", 6);
+        let reps = env_usize("MTP_AB_REPS", 4).max(1);
+        let toks: Vec<u32> = vec![2; k + 1];
+        let arms = [("开", "1", 1usize), ("关", "0", 2usize)];
+        let set = |val: &str, epoch: usize| {
+            unsafe { std::env::set_var(&gate, val) };
+            rwkv_rsv::gpu_model::set_graph_arm_epoch(epoch);
+        };
+        for &(_, val, ep) in &arms {
+            set(val, ep);
+            let _ = bundle
+                .model
+                .forward_seq_verify_with_state(&mut bundle.state, &toks)?;
+        }
+        let mut best = [f64::MAX; 2];
+        let mut all: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut dbest = [f64::MAX; 2];
+        for r in 0..rounds {
+            let mut line = String::new();
+            for s in 0..2 {
+                let ai = (s + r) % 2;
+                let (name, val, ep) = arms[ai];
+                set(val, ep);
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    let _ = bundle
+                        .model
+                        .forward_seq_verify_with_state(&mut bundle.state, &toks)?;
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+                // 同轮紧邻再量解码（第二级权重档同样影响解码，且必须与验证同档）
+                let t1 = std::time::Instant::now();
+                for i in 0..16 {
+                    let _ = bundle.model.forward_argmax(&[(i % 1000) as u32 + 1])?;
+                }
+                let dms = t1.elapsed().as_secs_f64() * 1000.0 / 16.0;
+                dbest[ai] = dbest[ai].min(dms);
+                if ms < best[ai] {
+                    best[ai] = ms;
+                }
+                all[ai].push(ms);
+                line.push_str(&format!(" {name} {ms:.3} /"));
+            }
+            log::info!("  [验证 A/B 第 {} 轮]{line}", r + 1);
+        }
+        // 同时报**最小值**与**中位数**：最小值抗热节流但会被单次幸运采样带偏，
+        // 中位数对顺序偏置稳健 ⇒ 两个统计量同号才算数。
+        for v in all.iter_mut() {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        let med = |v: &Vec<f64>| v[v.len() / 2];
+        log::info!(
+            "—— 验证 pass 门 A/B（{gate}，{rounds} 轮 × {reps} 次）：开 {:.3} ms / 关 {:.3} ms ⇒ Δ {:+.3} ms（{:+.1} %）｜中位 {:.3} / {:.3} ⇒ Δ {:+.3} ms",
+            best[0],
+            best[1],
+            best[0] - best[1],
+            (best[0] - best[1]) / best[1] * 100.0,
+            med(&all[0]),
+            med(&all[1]),
+            med(&all[0]) - med(&all[1])
+        );
+        log::info!(
+            "   解码（同轮紧邻，取最小）：开 {:.3} ms/token / 关 {:.3} ms/token ⇒ Δ {:+.3} ms",
+            dbest[0],
+            dbest[1],
+            dbest[0] - dbest[1]
+        );
+        unsafe { std::env::remove_var(&gate) };
+        rwkv_rsv::gpu_model::set_graph_arm_epoch(0);
+    }
+
     // —— 同进程逐轮交替的 int6 档位 A/B（`MTP_AB_INT6=1`，实验用）——
     //
     // 为什么必须同进程交替：本机无法锁频/锁显存时钟，跨进程的绝对 ms 与比值都会被热节流

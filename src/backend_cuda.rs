@@ -3165,6 +3165,93 @@ extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_f32(
         }
     }
 }
+
+// 同上的 **fp16 第二级权重**档（`SEQ_LR2F16`）：权重 [M, mid_pad] fp16（padding 为 0，
+// 但只累加到真实宽度 `k < kw`，stride 由 `round_up(kw,64)` 推出），其余逐字相同。
+extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_f32_f16w(
+    const __half* __restrict__ W2,
+    const __half* __restrict__ A2,
+    const __half* __restrict__ V2,
+    const __half* __restrict__ G2,
+    const float* __restrict__ xw, const float* __restrict__ xa,
+    const float* __restrict__ xv, const float* __restrict__ xg,
+    const float* __restrict__ w0, const float* __restrict__ a0,
+    const float* __restrict__ v0, const float* __restrict__ scale,
+    const float* __restrict__ v_first,
+    float* __restrict__ out_w, float* __restrict__ out_a,
+    float* __restrict__ out_v, float* __restrict__ out_g,
+    const int m, const int kw, const int ka, const int kv, const int kg,
+    const int sw, const int sa, const int sv, const int sg, const int batch)
+{
+    constexpr int BGRP = 4;
+    constexpr int WARPS = 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * WARPS + warp;
+    if (row >= m) return;
+    const int b0   = blockIdx.y * BGRP;
+    const int bcnt = min(BGRP, batch - b0);
+    const float sc = scale[0];
+    const int pw = (kw + 63) & ~63;
+    const int pa = (ka + 63) & ~63;
+    const int pv = (kv + 63) & ~63;
+    const int pg = (kg + 63) & ~63;
+
+    float lw[BGRP], la[BGRP], lv[BGRP], lg[BGRP];
+    #pragma unroll
+    for (int bi = 0; bi < BGRP; bi++) { lw[bi] = 0.f; la[bi] = 0.f; lv[bi] = 0.f; lg[bi] = 0.f; }
+    for (int k = lane; k < kw; k += 32) {
+        const float w = __half2float(W2[row * pw + k]);
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lw[bi] += xw[(b0 + bi) * sw + k] * w;
+        }
+    }
+    for (int k = lane; k < ka; k += 32) {
+        const float w = __half2float(A2[row * pa + k]);
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) la[bi] += xa[(b0 + bi) * sa + k] * w;
+        }
+    }
+    for (int k = lane; k < kv; k += 32) {
+        const float w = __half2float(V2[row * pv + k]);
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lv[bi] += xv[(b0 + bi) * sv + k] * w;
+        }
+    }
+    for (int k = lane; k < kg; k += 32) {
+        const float w = __half2float(G2[row * pg + k]);
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lg[bi] += sigmoidf_(xg[(b0 + bi) * sg + k]) * w;
+        }
+    }
+    #pragma unroll
+    for (int bi = 0; bi < BGRP; bi++) {
+        if (bi >= bcnt) break;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lw[bi] += __shfl_down_sync(0xffffffffu, lw[bi], off);
+            la[bi] += __shfl_down_sync(0xffffffffu, la[bi], off);
+            lv[bi] += __shfl_down_sync(0xffffffffu, lv[bi], off);
+            lg[bi] += __shfl_down_sync(0xffffffffu, lg[bi], off);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi >= bcnt) break;
+            const int mo = (b0 + bi) * m + row;
+            out_w[mo] = expf(sc * sigmoidf_(lw[bi] + w0[row]));
+            out_a[mo] = sigmoidf_(la[bi] + a0[row]);
+            const float vcur = out_v[mo];
+            out_v[mo] = vcur + sigmoidf_(lv[bi] + v0[row]) * (v_first[mo] - vcur);
+            out_g[mo] = lg[bi];
+        }
+    }
+}
 "#;
 
 /// 低秩链**两级 fp16 张量核 GEMM**（`LOWRANK_GEMM=1`，Turing `mma.m16n8k8`）。
@@ -6712,6 +6799,61 @@ extern "C" __global__ void gemv_lowrank_chain4(
         out_g[row] = __float2half(lg);
     }
 }
+
+// 同上的 **fp16 第二级权重**档（`LR2F16`）：权重 [M, mid_pad] fp16，stride = round_up(mid,64)，
+// 只累加到真实宽度。解码与验证必须同档（否则两边的数值差会吃掉接受率）。
+extern "C" __global__ void gemv_lowrank_chain4_f16w(
+    const __half* __restrict__ W2,
+    const __half* __restrict__ A2,
+    const __half* __restrict__ V2,
+    const __half* __restrict__ G2,
+    const float*  __restrict__ xw, const float*  __restrict__ xa,
+    const float*  __restrict__ xv, const float*  __restrict__ xg,
+    const float*  __restrict__ w0, const float*  __restrict__ a0,
+    const float*  __restrict__ v0, const float*  __restrict__ scale,
+    const __half* __restrict__ v_first,
+    __half* __restrict__ out_w, __half* __restrict__ out_a,
+    __half* __restrict__ out_v, __half* __restrict__ out_g,
+    const int m, const int kw, const int ka, const int kv, const int kg)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * 8 + warp;
+    if (row >= m) return;
+    const int pw = (kw + 63) & ~63;
+    const int pa = (ka + 63) & ~63;
+    const int pv = (kv + 63) & ~63;
+    const int pg = (kg + 63) & ~63;
+    const __half* wrow = W2 + row * pw;
+    const __half* arow = A2 + row * pa;
+    const __half* vrow = V2 + row * pv;
+    const __half* grow = G2 + row * pg;
+
+    float lw = 0.f, la = 0.f, lv = 0.f, lg = 0.f;
+    #pragma unroll 4
+    for (int k = lane; k < kw; k += 32) lw += xw[k] * __half2float(wrow[k]);
+    #pragma unroll 4
+    for (int k = lane; k < ka; k += 32) la += xa[k] * __half2float(arow[k]);
+    #pragma unroll 4
+    for (int k = lane; k < kv; k += 32) lv += xv[k] * __half2float(vrow[k]);
+    #pragma unroll 4
+    for (int k = lane; k < kg; k += 32) lg += sigmoidf(xg[k]) * __half2float(grow[k]);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        lw += __shfl_down_sync(0xffffffffu, lw, off);
+        la += __shfl_down_sync(0xffffffffu, la, off);
+        lv += __shfl_down_sync(0xffffffffu, lv, off);
+        lg += __shfl_down_sync(0xffffffffu, lg, off);
+    }
+    if (lane == 0) {
+        out_w[row] = __float2half(expf(scale[0] * sigmoidf(lw + w0[row])));
+        out_a[row] = __float2half(sigmoidf(la + a0[row]));
+        const float vcur = __half2float(out_v[row]);
+        out_v[row] = __float2half(
+            vcur + sigmoidf(lv + v0[row]) * (__half2float(v_first[row]) - vcur));
+        out_g[row] = __float2half(lg);
+    }
+}
 "#;
 
 /// gemv_variant CUDA kernel：统一处理 9 个 gemv 变体（权重类型 × 输出变换）。
@@ -8986,6 +9128,28 @@ extern "C" __global__ void rwkv_copy_token(
 }
 "#;
 
+/// copy_token2 CUDA kernel：一次 launch 回写两路 token-shift 状态（`tmix_x` / `cmix_x`）。
+///
+/// 两层状态回写分别是 10 KB 级、纯延迟受限的微内核，合成一发可省掉一次 dispatch。
+const COPY_TOKEN2_SRC: &str = r#"
+extern "C" __global__ void rwkv_copy_token2(
+    const float* __restrict__ x1,  // [T, C]
+    float* __restrict__ y1,        // [C]
+    const float* __restrict__ x2,  // [T, C]
+    float* __restrict__ y2,        // [C]
+    const int c,
+    const int stride,
+    const int token)
+{
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < c) {
+        const size_t off = (size_t)token * (size_t)stride + (size_t)i;
+        y1[i] = x1[off];
+        y2[i] = x2[off];
+    }
+}
+"#;
+
 /// elementwise_sigmoid CUDA kernel：y = sigmoid(a) = 1/(1+exp(-a))。
 /// 语义对齐 Vulkan `elementwise_f32_f32_sigmoid`（OP=1）；grid.y = batch。
 const ELEMENTWISE_SIGMOID_SRC: &str = r#"
@@ -9543,6 +9707,81 @@ extern "C" __global__ void rwkv_seq_shift6(
     }
     if (state_out != nullptr && token == t - 1) {
         for (int i = threadIdx.x; i < c; i += blockDim.x) state_out[i] = x[xbase + i];
+    }
+}
+"#;
+
+/// norm + sum_rk_rk 融合 kernel：
+///   y = group_norm(x, gamma, beta) + sum(r*k_mod*r_k, 按 head) * v
+///
+/// 语义与 `rwkv_norm` 后接 `rwkv_sum_rk_rk` 逐位一致（同一表达式、同一累加顺序不可保证，
+/// 但归约树形状与各自单独核相同：warp 蝶形 + 跨 warp 串行，故结果一致）。
+/// 布局与 `rwkv_norm` 相同：grid = rows*h，block 256，`row = blockIdx.x`。
+const NORM_SUM_RK_RK_SRC: &str = r#"
+extern "C" __global__ void rwkv_norm_sum_rk_rk(
+    const float* __restrict__ x,     // [rows, H*N] → y 的原文（group_norm 输入）
+    const float* __restrict__ gamma, // [H*N]
+    const float* __restrict__ beta,  // [H*N]
+    const float* __restrict__ r,     // [rows, H*N]
+    const float* __restrict__ km,    // k_mod [rows, H*N]
+    const float* __restrict__ rk,    // [H*N] 按 head 共享
+    const float* __restrict__ v,     // [rows, H*N]
+    float* __restrict__ y,           // [rows, H*N] 输出
+    const int c,
+    const int h,
+    const float eps)
+{
+    __shared__ float s_val[32];
+    __shared__ float s_sq[32];
+    __shared__ float s_pr[32];
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nw   = (blockDim.x + 31) >> 5;
+
+    const int row   = blockIdx.x;
+    const int b     = row / h;
+    const int hh    = row - b * h;
+    const int x_base = b * c * h + hh * c;
+    const int g_base = hh * c;
+
+    float sum = 0.f;
+    float sq  = 0.f;
+    float pr  = 0.f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float t = x[x_base + i];
+        sum += t;
+        sq = fmaf(t, t, sq);
+        pr += r[x_base + i] * km[x_base + i] * rk[g_base + i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+        sq  += __shfl_down_sync(0xffffffffu, sq, off);
+        pr  += __shfl_down_sync(0xffffffffu, pr, off);
+    }
+    if (lane == 0) { s_val[warp] = sum; s_sq[warp] = sq; s_pr[warp] = pr; }
+    __syncthreads();
+    if (tid == 0) {
+        float tsum = 0.f;
+        float tsq  = 0.f;
+        float tpr  = 0.f;
+        for (int w = 0; w < nw; ++w) { tsum += s_val[w]; tsq += s_sq[w]; tpr += s_pr[w]; }
+        const float mean = tsum / (float)c;
+        const float variance = tsq / (float)c - mean * mean;
+        s_val[0] = mean;
+        s_sq[0]  = rsqrtf(variance + eps);
+        s_pr[0]  = tpr;
+    }
+    __syncthreads();
+    const float mean    = s_val[0];
+    const float inv_std = s_sq[0];
+    const float s       = s_pr[0];
+
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float t = x[x_base + i];
+        y[x_base + i] = (t - mean) * inv_std * gamma[g_base + i] + beta[g_base + i]
+                        + s * v[x_base + i];
     }
 }
 "#;
@@ -12230,6 +12469,10 @@ impl ComputeBackend for CudaBackend {
         true
     }
 
+    fn supports_lowrank_chain4_f16w(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemv_lowrank_chain4_f32(
         &mut self,
@@ -12262,10 +12505,27 @@ impl ComputeBackend for CudaBackend {
         batch: usize,
     ) -> R<()> {
         const OP: &str = "gemv_lowrank_chain4_f32";
-        let w2d = self.f32_ptr(w2, OP)?;
-        let a2d = self.f32_ptr(a2, OP)?;
-        let v2d = self.f32_ptr(v2, OP)?;
-        let g2d = self.f32_ptr(g2, OP)?;
+        // 第二级权重是 fp16 还是 fp32 由**张量 dtype** 决定（调用方按 `SEQ_LR2F16` 选张量）：
+        // fp16 档权重流量减半（验证 pass 每层 ~5.9 MB → 2.9 MB），其余逐字不变。
+        let f16w = matches!(self.get(w2, OP)?, CudaTensor::F16 { .. })
+            && matches!(self.get(a2, OP)?, CudaTensor::F16 { .. })
+            && matches!(self.get(v2, OP)?, CudaTensor::F16 { .. })
+            && matches!(self.get(g2, OP)?, CudaTensor::F16 { .. });
+        let (w2d, a2d, v2d, g2d) = if f16w {
+            (
+                self.f16_ptr(w2, OP)?,
+                self.f16_ptr(a2, OP)?,
+                self.f16_ptr(v2, OP)?,
+                self.f16_ptr(g2, OP)?,
+            )
+        } else {
+            (
+                self.f32_ptr(w2, OP)?,
+                self.f32_ptr(a2, OP)?,
+                self.f32_ptr(v2, OP)?,
+                self.f32_ptr(g2, OP)?,
+            )
+        };
         let wmd = self.f32_ptr(w_mid, OP)?;
         let amd = self.f32_ptr(a_mid, OP)?;
         let vmd = self.f32_ptr(v_mid, OP)?;
@@ -12279,11 +12539,19 @@ impl ComputeBackend for CudaBackend {
         let oad = self.f32_ptr(out_a, OP)?;
         let ovd = self.f32_ptr(out_v, OP)?;
         let ogd = self.f32_ptr(out_g, OP)?;
-        let func = self.kernel(
-            "gemv_lowrank_chain4_f32",
-            GEMV_LOWRANK_CHAIN4_F32_SRC,
-            "gemv_lowrank_chain4_f32",
-        )?;
+        let func = if f16w {
+            self.kernel(
+                "gemv_lowrank_chain4_f32_f16w",
+                GEMV_LOWRANK_CHAIN4_F32_SRC,
+                "gemv_lowrank_chain4_f32_f16w",
+            )?
+        } else {
+            self.kernel(
+                "gemv_lowrank_chain4_f32",
+                GEMV_LOWRANK_CHAIN4_F32_SRC,
+                "gemv_lowrank_chain4_f32",
+            )?
+        };
         const WARPS: usize = 8;
         const BGRP: usize = 4;
         let grid = (m.div_ceil(WARPS) as u32, batch.div_ceil(BGRP) as u32, 1u32);
@@ -13352,10 +13620,26 @@ impl ComputeBackend for CudaBackend {
                 _ => Err(format!("{op}: tensor {t:?} must be f16").into()),
             }
         };
-        let w2d = f32(w2, "gemv_lowrank_chain4")?;
-        let a2d = f32(a2, "gemv_lowrank_chain4")?;
-        let v2d = f32(v2, "gemv_lowrank_chain4")?;
-        let g2d = f32(g2, "gemv_lowrank_chain4")?;
+        // 第二级权重 fp16 / fp32 由张量 dtype 决定（调用方按 `LR2F16` 选张量）。
+        let f16w = matches!(self.get(w2, "gemv_lowrank_chain4")?, CudaTensor::F16 { .. })
+            && matches!(self.get(a2, "gemv_lowrank_chain4")?, CudaTensor::F16 { .. })
+            && matches!(self.get(v2, "gemv_lowrank_chain4")?, CudaTensor::F16 { .. })
+            && matches!(self.get(g2, "gemv_lowrank_chain4")?, CudaTensor::F16 { .. });
+        let (w2d, a2d, v2d, g2d) = if f16w {
+            (
+                f16(w2, "gemv_lowrank_chain4")?,
+                f16(a2, "gemv_lowrank_chain4")?,
+                f16(v2, "gemv_lowrank_chain4")?,
+                f16(g2, "gemv_lowrank_chain4")?,
+            )
+        } else {
+            (
+                f32(w2, "gemv_lowrank_chain4")?,
+                f32(a2, "gemv_lowrank_chain4")?,
+                f32(v2, "gemv_lowrank_chain4")?,
+                f32(g2, "gemv_lowrank_chain4")?,
+            )
+        };
         let wmd = f32(wm, "gemv_lowrank_chain4")?;
         let amd = f32(am, "gemv_lowrank_chain4")?;
         let vmd = f32(vm, "gemv_lowrank_chain4")?;
@@ -13370,11 +13654,19 @@ impl ComputeBackend for CudaBackend {
         let ovd = f16(ov, "gemv_lowrank_chain4")?;
         let ogd = f16(og, "gemv_lowrank_chain4")?;
 
-        let func = self.kernel(
-            "gemv_lowrank_chain4",
-            GEMV_LOWRANK_CHAIN4_SRC,
-            "gemv_lowrank_chain4",
-        )?;
+        let func = if f16w {
+            self.kernel(
+                "gemv_lowrank_chain4_f16w",
+                GEMV_LOWRANK_CHAIN4_SRC,
+                "gemv_lowrank_chain4_f16w",
+            )?
+        } else {
+            self.kernel(
+                "gemv_lowrank_chain4",
+                GEMV_LOWRANK_CHAIN4_SRC,
+                "gemv_lowrank_chain4",
+            )?
+        };
         // ★ 2026-09-23：warp-per-row ⇒ grid = ceil(M/8)（每 block 8 个 warp、每 warp 一行）。
         let grid = (m.div_ceil(8) as u32, 1u32, 1u32);
         let block = (256u32, 1u32, 1u32);
@@ -14144,6 +14436,38 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    fn copy_token2(
+        &mut self,
+        x1: TensorId,
+        y1: TensorId,
+        x2: TensorId,
+        y2: TensorId,
+        c: usize,
+        stride: usize,
+        token: usize,
+    ) -> R<()> {
+        const OP: &str = "copy_token2";
+        let (x1d, y1d, x2d, y2d) = (
+            self.f32_ptr(x1, OP)?,
+            self.f32_ptr(y1, OP)?,
+            self.f32_ptr(x2, OP)?,
+            self.f32_ptr(y2, OP)?,
+        );
+        let func = self.kernel("copy_token2", COPY_TOKEN2_SRC, "rwkv_copy_token2")?;
+        let grid = ((c as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, stride_i, token_i) = (c as i32, stride as i32, token as i32);
+        let params = [
+            &x1d as *const u64 as *mut c_void,
+            &y1d as *const u64 as *mut c_void,
+            &x2d as *const u64 as *mut c_void,
+            &y2d as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &stride_i as *const i32 as *mut c_void,
+            &token_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
     fn gemm(
         &mut self,
         a: TensorId,
@@ -14478,6 +14802,58 @@ impl ComputeBackend for CudaBackend {
             &h_i as *const i32 as *mut c_void,
             &n_i as *const i32 as *mut c_void,
             &b_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+    fn norm_sum_rk_rk(
+        &mut self,
+        x: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        r: TensorId,
+        k_mod: TensorId,
+        r_k: TensorId,
+        v: TensorId,
+        y: TensorId,
+        c: usize,
+        h: usize,
+        eps: f32,
+        rows: usize,
+    ) -> R<()> {
+        const OP: &str = "norm_sum_rk_rk";
+        let f32 = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        let (xd, gd, bd, rd, kmd, rkd, vd, yd) = (
+            f32(x, OP)?,
+            f32(gamma, OP)?,
+            f32(beta, OP)?,
+            f32(r, OP)?,
+            f32(k_mod, OP)?,
+            f32(r_k, OP)?,
+            f32(v, OP)?,
+            f32(y, OP)?,
+        );
+        let func = self.kernel("norm_sum_rk_rk", NORM_SUM_RK_RK_SRC, "rwkv_norm_sum_rk_rk")?;
+        // 与 `norm` 同网格：每个 (token, head) 一个 block。
+        let grid = ((rows * h) as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, h_i) = (c as i32, h as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &gd as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &rd as *const u64 as *mut c_void,
+            &kmd as *const u64 as *mut c_void,
+            &rkd as *const u64 as *mut c_void,
+            &vd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &h_i as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }

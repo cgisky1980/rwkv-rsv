@@ -1395,6 +1395,14 @@ pub trait ComputeBackend {
         false
     }
 
+    /// 低秩链第二级的 `w2/a2/v2/g2` 是否接受 **fp16 权重**（默认不接受：调用方传 f32）。
+    ///
+    /// CUDA 按张量 dtype 分派到 `*_f16w` 内核；其它后端保持 f32 语义 ⇒ 这里返回 false 时
+    /// 上层（`gpu_model::lr2_f16`）必须传 f32 张量，否则会拿到 dtype 错误。
+    fn supports_lowrank_chain4_f16w(&self) -> bool {
+        false
+    }
+
     /// 低秩**一级** mid 的四链融合（小 T 验证路径）：一次 dispatch 算
     /// `mid_v = xv @ V1ᵀ`、`mid_w = tanh(xw @ W1ᵀ)`、`mid_a = xa @ A1ᵀ`、`mid_g = xg @ G1ᵀ`，
     /// 每条覆盖全部 slot、输出 f32，权重每行只读一次。
@@ -1659,6 +1667,23 @@ pub trait ComputeBackend {
         stride: usize,
         token: usize,
     ) -> R<()>;
+    /// 两路 `copy_token` 合成一次 launch（各层 tmix_x / cmix_x 的状态回写）。
+    ///
+    /// 默认实现退化成两次 [`Self::copy_token`]；CUDA 用单核双写（上层布局相同）。
+    #[allow(clippy::too_many_arguments)]
+    fn copy_token2(
+        &mut self,
+        x1: TensorId,
+        y1: TensorId,
+        x2: TensorId,
+        y2: TensorId,
+        c: usize,
+        stride: usize,
+        token: usize,
+    ) -> R<()> {
+        self.copy_token(x1, y1, c, stride, token)?;
+        self.copy_token(x2, y2, c, stride, token)
+    }
 
     // —— seq/prefill 路径算子（tensor-core GEMM / 融合 kernel）——
     /// C[M,N] = A[M,K] @ B[N,K]^T（fp16 输入，f32 累加/输出）。M/N 需为 TILE 倍数，K 为 32 倍数。
@@ -1895,6 +1920,30 @@ pub trait ComputeBackend {
         n: usize,
         batch: usize,
     ) -> R<()>;
+    /// `y = group_norm(x, gamma, beta) + sum(r * k_mod * r_k, 按 head 归约) * v`。
+    ///
+    /// 融合 `norm` + `sum_rk_rk`：两者按 (head, batch) 分块完全同构、且写同一张 `y`，
+    /// 合成一次 launch 可省掉 `y` 的一遍读+一遍写与一个串行节点。
+    /// `c` 为 head_size（= `norm` 的 `c`、`sum_rk_rk` 的 `n`），`rows` 为 token 行数。
+    #[allow(clippy::too_many_arguments)]
+    fn norm_sum_rk_rk(
+        &mut self,
+        x: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        r: TensorId,
+        k_mod: TensorId,
+        r_k: TensorId,
+        v: TensorId,
+        y: TensorId,
+        c: usize,
+        h: usize,
+        eps: f32,
+        rows: usize,
+    ) -> R<()> {
+        self.norm(x, gamma, beta, y, c, h, eps, rows)?;
+        self.sum_rk_rk(r, k_mod, r_k, v, y, h, c, rows)
+    }
     /// token shift + time-mix 插值（sequence-parallel，f32）。
     #[allow(clippy::too_many_arguments)]
     fn seq_shift(
