@@ -1064,9 +1064,27 @@ impl GpuModel {
                 }
             };
         }
-        // 1) 状态快照
+        // 1) 状态快照（34 次设备内拷贝 ⇒ 同样按固定形状上图，0.5 ms → ~0.15 ms）
+        // 形状与指针都固定（`state` / `mtp_snap` 都是常驻张量）⇒ 一张图永久重放。
         let mut snap = self.mtp_snap.take().unwrap();
-        snap.copy_from(self.backend.as_mut(), state, c, h, nn)?;
+        const SNAP_KEY: usize = 1usize << 42;
+        let snap_graph = self.backend.supports_graph_capture()
+            && std::env::var("MTP_SNAPSHOT_GRAPH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        if snap_graph && self.backend.prefill_graph_valid(SNAP_KEY)? {
+            self.backend.prefill_graph_replay_keyed(SNAP_KEY)?;
+        } else {
+            if snap_graph {
+                self.backend.begin_prefill_capture(SNAP_KEY)?;
+            }
+            snap.copy_from(self.backend.as_mut(), state, c, h, nn)?;
+            if snap_graph {
+                self.backend.end_prefill_capture()?;
+                // 捕获不执行 kernel ⇒ 立刻重放一次才产生本次快照
+                self.backend.prefill_graph_replay_keyed(SNAP_KEY)?;
+            }
+        }
         pp!("snapshot");
         // 2) 起草 k 个（深度 1 的提交副作用把 drafter 的位置推进 1）
         let tok_t = self.bufs.current_token;
