@@ -8338,6 +8338,114 @@ extern "C" __global__ void rwkv_to_f16_triple(
 }
 "#;
 
+/// seq_norm_shift CUDA kernel：`layernorm(x) [+ 整段存档] + ns 路 token shift` 一次做完。
+///
+/// 归因依据（台账 §3.8 的分阶段读数）：小 T 验证 pass 每层 22 个节点，其中 time-mix 的
+/// `norm(ln1)` 与 channel-mix 的 `norm(ln2)`+`存档`+`shift` 是**纯 overhead** 节点
+/// （权重流量为 0），每多一个节点就多一次串行化的 DRAM 扫（实测 ~7 µs/节点/层）。
+///
+/// ★ `prev` 的取法：shift 需要**上一行归一化后**的值，而那行由另一个 block 算 ⇒ 这里
+/// **重算**上一行的 mean/inv（同一算法、同一线程映射 ⇒ 结果与 `norm_out` 里逐位相同），
+/// 既避开跨块竞态，也不需要额外的中间缓冲。代价是多读一遍上一行（T×C×4 字节，可忽略）。
+const SEQ_NORM_SHIFT_SRC: &str = r#"
+// 单行 layernorm 的 mean/inv_std，逐位复刻 `rwkv_norm` 的归约顺序（warp shuffle + 跨 warp 树）。
+__device__ __forceinline__ void ns_row_stats(
+    const float* __restrict__ row,
+    const int c,
+    const float eps,
+    float* s_val,
+    float* s_sq,
+    float* out_mean,
+    float* out_inv)
+{
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nw   = (blockDim.x + 31) >> 5;
+    __syncthreads();   // 上一轮可能刚被读过，先隔离再覆写 shared
+    float sum = 0.f;
+    float sq  = 0.f;
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float v = row[i];
+        sum += v;
+        sq = fmaf(v, v, sq);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+        sq  += __shfl_down_sync(0xffffffffu, sq, off);
+    }
+    if (lane == 0) { s_val[warp] = sum; s_sq[warp] = sq; }
+    __syncthreads();
+    if (tid == 0) {
+        float tsum = 0.f;
+        float tsq  = 0.f;
+        for (int w = 0; w < nw; ++w) { tsum += s_val[w]; tsq += s_sq[w]; }
+        const float mean = tsum / (float)c;
+        s_val[0] = mean;
+        s_sq[0]  = rsqrtf(tsq / (float)c - mean * mean + eps);
+    }
+    __syncthreads();
+    *out_mean = s_val[0];
+    *out_inv  = s_sq[0];
+}
+
+extern "C" __global__ void rwkv_seq_norm_shift(
+    const float* __restrict__ x,        // [T, C] f32
+    const float* __restrict__ s,        // 旧 token-shift state [C]
+    const float* __restrict__ gamma,    // [C]
+    const float* __restrict__ beta,     // [C]
+    float* __restrict__ norm_out,       // [T, C]
+    float* __restrict__ norm_save,      // 可空：[T, C] 整段副本（回滚存档）
+    const float* __restrict__ tm0, const float* __restrict__ tm1,
+    const float* __restrict__ tm2, const float* __restrict__ tm3,
+    const float* __restrict__ tm4, const float* __restrict__ tm5,
+    float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3,
+    float* __restrict__ y4, float* __restrict__ y5,
+    const int c,
+    const int t,
+    const int stride,
+    const float eps,
+    const int ns)
+{
+    const int token = blockIdx.x;
+    if (token >= t) return;
+    const int tid = threadIdx.x;
+    __shared__ float s_val[32];
+    __shared__ float s_sq[32];
+
+    const size_t xb = (size_t)token * (size_t)stride;
+    const float* row = x + xb;
+    float mean = 0.f, inv = 0.f;
+    ns_row_stats(row, c, eps, s_val, s_sq, &mean, &inv);
+
+    float* nrow = norm_out + xb;
+    float* srow = (norm_save != nullptr) ? (norm_save + xb) : nullptr;
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float v = (row[i] - mean) * inv * gamma[i] + beta[i];
+        nrow[i] = v;
+        if (srow != nullptr) srow[i] = v;
+    }
+
+    // prev：t=0 用旧 state；t>0 重算上一行（逐位等于上一块写进 norm_out 的值）
+    float pmean = 0.f, pinv = 0.f;
+    const float* prow = nullptr;
+    if (token > 0) {
+        prow = x + (size_t)(token - 1) * (size_t)stride;
+        ns_row_stats(prow, c, eps, s_val, s_sq, &pmean, &pinv);
+    }
+    const float* tms[6] = {tm0, tm1, tm2, tm3, tm4, tm5};
+    float* ys[6] = {y0, y1, y2, y3, y4, y5};
+    for (int i = tid; i < c; i += blockDim.x) {
+        const float cur  = nrow[i];
+        const float prev = (token == 0) ? s[i] : ((prow[i] - pmean) * pinv * gamma[i] + beta[i]);
+        const float d = prev - cur;
+        for (int k = 0; k < ns; k++) ys[k][xb + i] = cur + tms[k][i] * d;
+    }
+}
+"#;
+
 /// to_f16_six CUDA kernel：六路 f32 → f16（`xr/xw/xk/xv/xa/xg`）。
 ///
 /// 小 T 序列路径里这 6 个激活在 `seq_shift6` 之后同时定稿，分两次 `to_f16_triple`
@@ -13145,6 +13253,75 @@ impl ComputeBackend for CudaBackend {
             &t_i as *const i32 as *mut c_void,
             &sx as *const i32 as *mut c_void,
             &sy as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn supports_seq_norm_shift(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seq_norm_shift(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        norm_out: TensorId,
+        norm_save: Option<TensorId>,
+        tm: [TensorId; 6],
+        y: [TensorId; 6],
+        ns: usize,
+        c: usize,
+        t: usize,
+        stride: usize,
+        eps: f32,
+    ) -> R<()> {
+        const OP: &str = "seq_norm_shift";
+        let xd = self.f32_ptr(x, OP)?;
+        let sd = self.f32_ptr(state, OP)?;
+        let gd = self.f32_ptr(gamma, OP)?;
+        let bd = self.f32_ptr(beta, OP)?;
+        let nd = self.f32_ptr(norm_out, OP)?;
+        let srd = match norm_save {
+            Some(sv) => self.f32_ptr(sv, OP)?,
+            None => 0u64,
+        };
+        let mut tmd = [0u64; 6];
+        let mut yd = [0u64; 6];
+        for k in 0..6 {
+            tmd[k] = if k < ns { self.f32_ptr(tm[k], OP)? } else { 0 };
+            yd[k] = if k < ns { self.f32_ptr(y[k], OP)? } else { 0 };
+        }
+        let func = self.kernel("seq_norm_shift", SEQ_NORM_SHIFT_SRC, "rwkv_seq_norm_shift")?;
+        let grid = (t as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i, st_i, ns_i) = (c as i32, t as i32, stride as i32, ns as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &sd as *const u64 as *mut c_void,
+            &gd as *const u64 as *mut c_void,
+            &bd as *const u64 as *mut c_void,
+            &nd as *const u64 as *mut c_void,
+            &srd as *const u64 as *mut c_void,
+            &tmd[0] as *const u64 as *mut c_void,
+            &tmd[1] as *const u64 as *mut c_void,
+            &tmd[2] as *const u64 as *mut c_void,
+            &tmd[3] as *const u64 as *mut c_void,
+            &tmd[4] as *const u64 as *mut c_void,
+            &tmd[5] as *const u64 as *mut c_void,
+            &yd[0] as *const u64 as *mut c_void,
+            &yd[1] as *const u64 as *mut c_void,
+            &yd[2] as *const u64 as *mut c_void,
+            &yd[3] as *const u64 as *mut c_void,
+            &yd[4] as *const u64 as *mut c_void,
+            &yd[5] as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &st_i as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
+            &ns_i as *const i32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }

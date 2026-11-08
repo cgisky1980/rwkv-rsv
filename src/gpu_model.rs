@@ -5244,50 +5244,84 @@ impl GpuModel {
         macro_rules! pf_phase {
             ($name:expr) => {
                 if pf {
-                    self.backend.end_batch()?;
+                    // ★ 这里必须 `synchronize()` 而不是 `end_batch()`：CUDA 的 end_batch 不提交也不等待，
+                    // 量到的只是 host 入队时间（历史上这里读出的 0.0001s 就是这么来的）。同步会把墙钟
+                    // 抬高（每次多一个 round-trip），但**阶段之间的相对占比**仍然可用于归因。
+                    self.backend.synchronize()?;
                     log::info!(
-                        "[P] t={t} layer {i} {}: {:.4}s",
+                        "[P] t={t} layer {i} {}: {:.4}ms",
                         $name,
-                        t0.elapsed().as_secs_f64()
+                        t0.elapsed().as_secs_f64() * 1000.0
                     );
-                    self.backend.begin_batch()?;
                     t0 = std::time::Instant::now();
                 }
             };
         }
 
         // ===== Time Mixing =====
-        // ln1 = layer_norm(x, ln1_w, ln1_b) over T 个 token
-        self.backend
-            .norm(sb.x, layer.ln1_w, layer.ln1_b, sb.ln1, c, 1, LN_EPS, t)?;
-
-        // token shift + time-mix：xr/xw/xk/xv/xa/xg（t=0 用旧 state，t>0 用前一 token）
-        // 六路一次融合（共享 `x`/旧状态，只差 `tm` 与输出；默认实现退化成 6 次 seq_shift）。
-        // `SEQ_SHIFT6=0` 回退 6 次单路（对拍/诊断；大 T prefill 的形状也走这里）。
+        // ln1 = layer_norm(x) + token shift × 6（t=0 用旧 state，t>0 用前一 token）
+        //
+        // ⚠️ `SEQ_NORMSHIFT=1` 可把 `norm+shift` 融成一个核（`seq_norm_shift`），**实测更慢**
+        // （T=4 验证 pass 14.1 → 16.4 ms）：融合核要**重算**上一行的 mean/inv（跨块竞态的唯一
+        // 免锁解法），而这两步本来就是零权重流量的微内核 ⇒ 多出来的一遍归约（带两个 barrier、
+        // 只有 T 个 block 在跑）远贵于被省掉的那次 launch。**结论：零权重流量的节点不值得融**
+        // （§3.8 里"每节点 7 µs"的推断被这条实验推翻，chain4/阶段式的收益来自去掉**重复计算**，
+        // 不是来自少 launch）。默认走两次独立 launch，保留融合核供对比/后续大融合试验复用。
         // ★ `tmix_x` 的回写**不能**并进来：t=0 的块要读旧 state，而写方是 t-1 的块，
         // 块之间没有顺序保证（t≥2 时是实打实的竞态）⇒ 单独一次 copy_token。
         let sh6: [TensorId; 6] = [
             layer.x_r, layer.x_w, layer.x_k, layer.x_v, layer.x_a, layer.x_g,
         ];
         let out6: [TensorId; 6] = [sb.xr, sb.xw, sb.xk, sb.xv, sb.xa, sb.xg];
-        if std::env::var("SEQ_SHIFT6")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-        {
-            self.backend
-                .seq_shift6(sb.ln1, state.layers[i].tmix_x, sh6, out6, None, c, t, c, c)?;
+        let normshift = self.backend.supports_seq_norm_shift()
+            && std::env::var("SEQ_NORMSHIFT").is_ok_and(|v| v == "1");
+        if normshift {
+            self.backend.seq_norm_shift(
+                sb.x,
+                state.layers[i].tmix_x,
+                layer.ln1_w,
+                layer.ln1_b,
+                sb.ln1,
+                None,
+                sh6,
+                out6,
+                6,
+                c,
+                t,
+                c,
+                LN_EPS,
+            )?;
         } else {
-            for k in 0..6 {
-                self.backend.seq_shift(
+            self.backend
+                .norm(sb.x, layer.ln1_w, layer.ln1_b, sb.ln1, c, 1, LN_EPS, t)?;
+            if std::env::var("SEQ_SHIFT6")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            {
+                self.backend.seq_shift6(
                     sb.ln1,
                     state.layers[i].tmix_x,
-                    sh6[k],
-                    out6[k],
+                    sh6,
+                    out6,
+                    None,
                     c,
                     t,
                     c,
                     c,
                 )?;
+            } else {
+                for k in 0..6 {
+                    self.backend.seq_shift(
+                        sb.ln1,
+                        state.layers[i].tmix_x,
+                        sh6[k],
+                        out6[k],
+                        c,
+                        t,
+                        c,
+                        c,
+                    )?;
+                }
             }
         }
 
@@ -5714,22 +5748,50 @@ impl GpuModel {
         )?;
 
         // ===== Channel Mixing =====
-        // ln2 = layer_norm(x, ln2_w, ln2_b)
-        self.backend
-            .norm(sb.x, layer.ln2_w, layer.ln2_b, sb.ln2, c, 1, LN_EPS, t)?;
-        Self::seq_save_ln2(self.backend.as_mut(), i, c, t, sb)?;
-
-        // xb = token shift（t=0 用旧 cmix_x state，t>0 用前一轮 ln2）
-        self.backend.seq_shift(
-            sb.ln2,
-            state.layers[i].cmix_x,
-            layer.ffn_x_k,
-            sb.xb,
-            c,
-            t,
-            c,
-            c,
-        )?;
+        // ln2 = layer_norm(x) + token shift（`SEQ_NORMSHIFT=1` 时连回滚存档一起并进一个核；
+        // 默认关，理由见 Time Mixing 那段：微内核融合实测更慢）
+        if normshift {
+            let save = sb
+                .vsaves
+                .as_ref()
+                .and_then(|v| v.per_layer.get(i).map(|d| d[7]));
+            self.backend.seq_norm_shift(
+                sb.x,
+                state.layers[i].cmix_x,
+                layer.ln2_w,
+                layer.ln2_b,
+                sb.ln2,
+                save,
+                [
+                    layer.ffn_x_k,
+                    layer.ffn_x_k,
+                    layer.ffn_x_k,
+                    layer.ffn_x_k,
+                    layer.ffn_x_k,
+                    layer.ffn_x_k,
+                ],
+                [sb.xb, sb.xb, sb.xb, sb.xb, sb.xb, sb.xb],
+                1,
+                c,
+                t,
+                c,
+                LN_EPS,
+            )?;
+        } else {
+            self.backend
+                .norm(sb.x, layer.ln2_w, layer.ln2_b, sb.ln2, c, 1, LN_EPS, t)?;
+            Self::seq_save_ln2(self.backend.as_mut(), i, c, t, sb)?;
+            self.backend.seq_shift(
+                sb.ln2,
+                state.layers[i].cmix_x,
+                layer.ffn_x_k,
+                sb.xb,
+                c,
+                t,
+                c,
+                c,
+            )?;
+        }
         // state[i].cmix_x = ln2[T-1]（须在 seq_shift 之后）
         self.backend
             .copy_token(sb.ln2, state.layers[i].cmix_x, c, c, t - 1)?;

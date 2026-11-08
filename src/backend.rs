@@ -1844,6 +1844,44 @@ pub trait ComputeBackend {
     fn supports_seq_shift6(&self) -> bool {
         false
     }
+    /// `norm` + `ns` 路 token shift 融合（小 T 序列路径的 time-mix / channel-mix 前段）。
+    ///
+    /// `norm_out` 是归一化后的 `[T, C]`；`norm_save` 非空时同时写一份（回滚存档）；
+    /// `tm`/`y` 只用前 `ns` 项（1 = channel-mix，6 = time-mix）。
+    ///
+    /// ★ 语义细节：shift 的 `prev` 要用**上一行归一化后的值**，而上一行由另一个块算
+    /// ⇒ 融合核必须**重算**上一行的 mean/inv（同一算法、同一线程映射，结果逐位相同），
+    /// 不能读 `norm_out`（跨块无顺序保证）。默认实现退化成「norm + 存档 + ns 次 shift」。
+    #[allow(clippy::too_many_arguments)]
+    fn seq_norm_shift(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        norm_out: TensorId,
+        norm_save: Option<TensorId>,
+        tm: [TensorId; 6],
+        y: [TensorId; 6],
+        ns: usize,
+        c: usize,
+        t: usize,
+        stride: usize,
+        eps: f32,
+    ) -> R<()> {
+        self.norm(x, gamma, beta, norm_out, c, 1, eps, t)?;
+        if let Some(sv) = norm_save {
+            self.copy_range(norm_out, 0, sv, 0, t * c)?;
+        }
+        for k in 0..ns {
+            self.seq_shift(norm_out, state, tm[k], y[k], c, t, stride, stride)?;
+        }
+        Ok(())
+    }
+    /// 后端是否有 [`Self::seq_norm_shift`] 的融合核。
+    fn supports_seq_norm_shift(&self) -> bool {
+        false
+    }
     #[allow(clippy::too_many_arguments)]
     fn dplr_seq(
         &mut self,
