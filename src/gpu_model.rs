@@ -25,6 +25,20 @@ fn wq(i6: Option<Int6Handle>, a8: Option<Int8Handle>) -> Option<Wq> {
     i6.map(Wq::I6).or_else(|| a8.map(Wq::I8))
 }
 
+/// `att.output` 的分派：默认 int6 优先；`I6_OUT_PREFER_I8=1` 时强制 int8 副本优先。
+///
+/// 存在的理由：批量档的崩溃要分离「副本的数值/内核」与「批量机制本身」。单流
+/// （`forward_token` / `forward_seq`）没有图捕获、没有 batch 维、没有 split-K，
+/// 把副本塞进单流跑一遍文本质量，就能判断问题在哪一侧。
+#[inline]
+fn wq_out(i6: Option<Int6Handle>, a8: Option<Int8Handle>) -> Option<Wq> {
+    let prefer = std::env::var("I6_OUT_PREFER_I8").is_ok_and(|v| v != "0");
+    if let Some(a) = a8.filter(|_| prefer) {
+        return Some(Wq::I8(a));
+    }
+    wq(i6, a8)
+}
+
 /// LayerNorm eps（与 CPU model.rs 一致）
 pub const LN_EPS: f32 = 1.0e-5;
 /// L2 范数防除零（与 fuse_ka_dplr 的 1e-12 一致）
@@ -181,6 +195,16 @@ pub fn graph_arm_epoch() -> usize {
 pub fn set_graph_arm_epoch(v: usize) {
     GRAPH_ARM_EPOCH.store(v, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// 复验条目：(层号, idx 张量, sz 张量, 期望 idx, 期望 sz)。
+type R8Item = (usize, TensorId, TensorId, Vec<u32>, Vec<u32>);
+
+/// 诊断（`I6_R8_REVERIFY=1`）：加载期记下每层 `att.output` int8 副本的张量与**上传的字节**，
+/// 等**全部层加载完**之后再下载回来比一次。
+///
+/// 为什么要这样：`I6_R8_VERIFY` 是「刚上传完就验」，只能证明那一刻显存里是我传的数据，
+/// 证不了后面几十次分配/上传没把它改掉——而「创建时机」正是当时唯一没排除的嫌疑。
+static R8_REVERIFY: std::sync::Mutex<Vec<R8Item>> = std::sync::Mutex::new(Vec::new());
 
 /// 低秩链**第二级**权重（`w2/a2/v2/g2`）是否走常驻 fp16 副本（`LR2F16`，**默认开**）。
 /// 动机：这四张 `[C, mid]` 矩阵是 chain4 唯一的权重流量（本模型 ~2.9 MB/层 fp32），fp16 副本
@@ -773,6 +797,37 @@ impl SeqBuffers {
 }
 
 impl GpuModel {
+    /// 逐层比对「加载期记下的期望字节」与显存现值，返回 (idx 不一致数, sz 不一致数)。
+    fn check_r8_items(backend: &mut dyn ComputeBackend, items: &[R8Item]) -> R<(usize, usize)> {
+        let (mut bi, mut bs) = (0usize, 0usize);
+        for (l, ti, ts, ei, es) in items {
+            let di = backend.download_u32(*ti)?;
+            let ds = backend.download_u32(*ts)?;
+            if di.len() != ei.len() || ds.len() != es.len() {
+                log::warn!("[R8REV] layer {l} 长度不符");
+                continue;
+            }
+            let (bi_l, bs_l) = (
+                ei.iter().zip(di.iter()).filter(|(a, b)| a != b).count(),
+                es.iter().zip(ds.iter()).filter(|(a, b)| a != b).count(),
+            );
+            if bi_l + bs_l > 0 {
+                log::warn!("[R8REV] layer {l}: 不一致 idx={bi_l} sz={bs_l}");
+            }
+            bi += bi_l;
+            bs += bs_l;
+        }
+        Ok((bi, bs))
+    }
+
+    /// 诊断（`I6_R8_REVERIFY` 配套）：**运行期**再验一次 `att.output` 副本是否还是我上传的
+    /// 字节。加载期验过只说明「那一刻对」，不能排除后续分配（batch 缓冲/图捕获）把它挪走/覆盖。
+    /// 返回 (idx 不一致数, sz 不一致数)；没登记过就返回 (0, 0)。
+    pub fn reverify_out_copy(&mut self) -> R<(usize, usize)> {
+        let items = R8_REVERIFY.lock().unwrap().clone();
+        Self::check_r8_items(self.backend.as_mut(), &items)
+    }
+
     /// 从 safetensors 文件加载模型并上传到 GPU
     pub fn from_safetensors(mut backend: Box<dyn ComputeBackend>, path: &str) -> R<Self> {
         let file = std::fs::File::open(path)?;
@@ -940,6 +995,15 @@ impl GpuModel {
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
             layers.push(GpuLayer::load(backend.as_mut(), &st, i, n_embd, &config)?);
+        }
+
+        // `I6_R8_REVERIFY=1`：全部层加载完再验一次 out 副本（区分「上传错」与「后被写坏」）。
+        {
+            let items = R8_REVERIFY.lock().unwrap().clone();
+            if !items.is_empty() {
+                let (bi, bs) = Self::check_r8_items(backend.as_mut(), &items)?;
+                log::info!("[R8REV] 全部层加载完复验 att.output 副本：不一致 idx={bi} sz={bs}");
+            }
         }
 
         // 工作缓冲区
@@ -2758,7 +2822,7 @@ impl GpuModel {
         // y_g = y_norm * g；y_out = GEMM(output_w, y_g) + x
         self.backend
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, bt)?;
-        if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
+        if let Some(wqo) = wq_out(layer.att_output_i6, layer.att_output_a8) {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
             self.backend
@@ -3670,6 +3734,30 @@ impl GpuModel {
         )?;
 
         // x += (y_norm .* g) @ output_w（gemv_variant 已支持 batch 维）。
+        // 诊断（`I6_DUMP_LAYER=<i>`）：把该层的 x（进/出）与 out 的两个输入落盘，
+        // 供宿主侧按 `w = scale·b + zero` 复算这一层的贡献、与 GPU 实际增量对拍。
+        let dump_ok = match std::env::var("I6_DUMP_LAYER").ok().as_deref() {
+            Some("all") => true,
+            Some(v) => v.parse::<usize>().is_ok_and(|x| x == i),
+            None => false,
+        };
+        if dump_ok {
+            for (tag, t, n) in [("x_in", bb.x, batch * c), ("y_norm", bb.y_norm, batch * c)] {
+                let d = self.backend.download(t)?;
+                let bytes: Vec<u8> = d[..n.min(d.len())]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                std::fs::write(format!("target/i6l{i}_{tag}.bin"), bytes).ok();
+            }
+            let g = self.backend.download(bb.g)?;
+            let bytes: Vec<u8> = g[..(batch * c).min(g.len())]
+                .iter()
+                .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+                .collect();
+            std::fs::write(format!("target/i6l{i}_gate.bin"), bytes).ok();
+            log::info!("[I6DUMP] layer {i}: x_in/y_norm/gate 落盘");
+        }
         if let Some(a8) = &self.layers[i].att_output_a8 {
             // ★ W8A8 张量核：门控 `·g` 由 `quant_x_i8`（HAS_G）顺手乘掉，GEMM 走累加 op。
             if Self::imma_op_on("out") && self.imma_ok(c, c, batch) {
@@ -3701,6 +3789,15 @@ impl GpuModel {
                 .ok_or("output_w16 missing when not int8")?;
             self.backend
                 .gemv_f16_mul_add(w16, bb.y_norm, bb.g, bb.x, c, c, batch)?;
+        }
+        if dump_ok {
+            let d = self.backend.download(bb.x)?;
+            let bytes: Vec<u8> = d[..(batch * c).min(d.len())]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            std::fs::write(format!("target/i6l{i}_x_out.bin"), bytes).ok();
+            log::info!("[I6DUMP] layer {i}: x_out 落盘");
         }
 
         // ===== Channel Mixing =====
@@ -3889,7 +3986,24 @@ impl GpuModel {
             sampler_row,
         )?;
         self.backend
-            .record_tokens(bb.current_token, token_seq, seq_cnt, seq_stride, batch)
+            .record_tokens(bb.current_token, token_seq, seq_cnt, seq_stride, batch)?;
+        self.probe_norm(bb, c, batch)
+    }
+    fn probe_norm(&mut self, bb: &WorkBuffers, c: usize, batch: usize) -> R<()> {
+        if std::env::var("I6_PROBE_NORM").is_err() {
+            return Ok(());
+        }
+        let d = self.backend.download(bb.x)?;
+        let mut s = String::new();
+        for b in 0..batch {
+            let v = &d[b * c..(b + 1) * c];
+            s.push_str(&format!(
+                " {:.3}",
+                (v.iter().map(|q| (*q as f64) * (*q as f64)).sum::<f64>()).sqrt()
+            ));
+        }
+        log::info!("[I6NORM] |x| per slot:{s}");
+        Ok(())
     }
 
     /// batch 采样 self-loop：B 个 slot 在**同一 GpuModel/同一 batch State** 上并发
@@ -4622,7 +4736,7 @@ impl GpuModel {
 
         // x += (y_norm .* g) @ output_w（mul + 残差累加都折叠进 gemv，省 2 次 dispatch）；
         // 量化权重自动路由：int8 → fp16
-        if let Some(wqo) = wq(self.layers[i].att_output_i6, self.layers[i].att_output_a8) {
+        if let Some(wqo) = wq_out(self.layers[i].att_output_i6, self.layers[i].att_output_a8) {
             self.backend
                 .w_mul_add(&wqo, self.bufs.y_norm, self.bufs.g, self.bufs.x, c, c, 1)?;
         } else {
@@ -5905,7 +6019,7 @@ impl GpuModel {
         // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8 默认走方案A（dequant→scratch→TC GEMM）
         if small_t {
             // 小 T：原地累加（x += y_g @ W），因此不交换 x/y_out
-            if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
+            if let Some(wqo) = wq_out(layer.att_output_i6, layer.att_output_a8) {
                 self.backend.w_add(&wqo, sb.y_g, sb.x, c, c, t)?;
             } else {
                 self.backend.gemv_f16_add(
@@ -5917,7 +6031,7 @@ impl GpuModel {
                     t,
                 )?;
             }
-        } else if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
+        } else if let Some(wqo) = wq_out(layer.att_output_i6, layer.att_output_a8) {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
             self.backend
@@ -6583,16 +6697,37 @@ impl GpuLayer {
             let sz6: &[u32] = bytemuck::cast_slice(sz_t.data());
             let w = crate::model::dequant_int6(lo_t.data(), hi_t.data(), sz6, m, k, i6_nmajor);
             // 分组 min-max 无符号量化（`b ∈ [0,255]`、`w = scale·b + zero`）。
-            // 试过「精确落在 int6 网格上」的无损编码（scale8=scale6/4、zero=-32·scale6、
-            // b=4e+128）：对 r/k/v、ffn 正常，但对 `att.output` **仍退化** ⇒ 内容不是决定因素
-            //（见台账 §3.15.5）。这里保留已验证的 min-max 档。
+            // `I6_R8_SYM=2` 是「精确落在 int6 网格上」的**无损**编码（下面有说明）。
             let kg = k / 128;
             let mut q8 = vec![0u8; m * k];
             let mut sz8 = vec![0u32; m * kg];
+            // `I6_R8_SYM=2`：**无损**编码 —— 直接用 int6 的码位重打包（零误差，数学上等于 int6
+            // 权重本身）：`b = 4·(e+32)`、`scale8 = scale6/4`、`zero = -32·scale6`。
+            // 用途：把「数值」与「通路」彻底分开。2026-11-09 实测（`I6_R8_TRUTH=1` 逐元素确认
+            // max|Δ| = 0.00000）：**数值与 int6 完全相同的副本在批量贪心解码里仍然落进 2-周期**，
+            // ⇒ 本函数写出的权重内容不是决定因素（见台账 §3.15.7）。
+            let mode = std::env::var("I6_R8_SYM")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
             for r in 0..m {
                 let row = &w[r * k..(r + 1) * k];
                 for g in 0..kg {
                     let chunk = &row[g * 128..(g + 1) * 128];
+                    if mode == 2 {
+                        // int6 的 sz 布局随平面一起转置：N-major 是 `[K/128][M]`，M-major 才是
+                        // `[M][K/128]`（同一个「按形状猜会撞车」的坑，见台账 §1b）。
+                        let si = if i6_nmajor { g * m + r } else { r * kg + g };
+                        let s6 = f16::from_bits((sz6[si] & 0xFFFF) as u16).to_f32();
+                        let s8 = s6 / 4.0;
+                        for (j, &v) in chunk.iter().enumerate() {
+                            let e = (v / s6).round().clamp(-32.0, 31.0);
+                            q8[r * k + g * 128 + j] = (4.0 * (e + 32.0)) as u8;
+                        }
+                        sz8[r * kg + g] = (f16::from_f32(s8).to_bits() as u32)
+                            | ((f16::from_f32(-32.0 * s6).to_bits() as u32) << 16);
+                        continue;
+                    }
                     let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
                     for &v in chunk {
                         mn = mn.min(v);
@@ -6647,10 +6782,125 @@ impl GpuLayer {
                 };
                 let _ = fix();
             }
+            // ★ 判别实验（`I6_COPY_SRC=<int8 模型路径>`）：把**官方同名张量**的字节换进
+            // `q8`/`sz8`，然后走**完全同一条**创建/上传路径。职责是回答「退化到底是数值
+            // 造成的，还是这条创建路径（时序/对象）造成的」——此前所有数据侧假设（含
+            // 无损编码）都排除过，但官方字节是通过 `load_int8` 走的另一条路径，两者从未在
+            // 同一路径上比过。官方文件与 int6 模型同形状 ⇒ 直接等长覆写。
+            // `I6_COPY_SRC_ONLY=<a>[-<b>]` 把覆写限制在层区间内（其余层仍用我自己的字节），
+            // 用来区分「某一层的数据坏了」与「每层都不一样的累积噪声」。
+            let copy_src_on = std::env::var("I6_COPY_SRC").is_ok()
+                && match std::env::var("I6_COPY_SRC_ONLY") {
+                    Ok(r) => {
+                        let (a, b) = match r.split_once('-') {
+                            Some((a, b)) => {
+                                (a.parse().unwrap_or(0), b.parse().unwrap_or(usize::MAX))
+                            }
+                            None => (r.parse().unwrap_or(0), r.parse().unwrap_or(usize::MAX)),
+                        };
+                        (a..=b).contains(&idx)
+                    }
+                    Err(_) => true,
+                };
+            if copy_src_on {
+                let p = std::env::var("I6_COPY_SRC")?;
+                let f = std::fs::File::open(&p)?;
+                let mm = unsafe { memmap2::Mmap::map(&f) }?;
+                let st8 = safetensors::SafeTensors::deserialize(&mm)?;
+                let oi = st8.tensor(&format!("{key}.int8_idx"))?;
+                let oz = st8.tensor(&format!("{key}.int8_sz"))?;
+                assert_eq!(oi.data().len(), q8.len(), "{key}: I6_COPY_SRC idx 长度不符");
+                q8.copy_from_slice(oi.data());
+                let ozs: &[u32] = bytemuck::cast_slice(oz.data());
+                assert_eq!(ozs.len(), sz8.len(), "{key}: I6_COPY_SRC sz 长度不符");
+                sz8.copy_from_slice(ozs);
+                log::info!("[COPYSRC] {key}: 内容换成官方 int8 字节（上传路径不变）");
+            }
             let idx_row: Vec<u32> = q8
                 .chunks_exact(4)
                 .map(|c4| u32::from_le_bytes([c4[0], c4[1], c4[2], c4[3]]))
                 .collect();
+            // `I6_R8_DUMP=<前缀>`：把**这一层**的 idx/sz 原样落盘（只第一层），
+            // 供 `examples/imma_probe.rs` 用 `IDX_BIN=<前缀>` 直接做 GPU-vs-CPU 对拍。
+            if key.contains("output") && std::env::var("I6_R8_DUMP").is_ok() {
+                let p = std::env::var("I6_R8_DUMP").unwrap_or_default();
+                std::fs::write(format!("{p}_l{idx}_idx.bin"), &q8).ok();
+                let szb: Vec<u8> = sz8.iter().flat_map(|w| w.to_le_bytes()).collect();
+                std::fs::write(format!("{p}_l{idx}_sz.bin"), &szb).ok();
+                log::info!("[R8DUMP] {key}: idx/sz 落盘 {p}_{{idx,sz}}.bin");
+            }
+            // 诊断（`I6_R8_TRUTH=1`）：拿**重量化前的 `w`（int6 真值）**当基准，逐元素算重建
+            // 误差，并统计「组内跨度」与「scale 落成 f16 次正规/零」的组数。
+            // 此前所有数值自检比的都是**官方 int8 文件**（那是另一次独立量化，不是真值），
+            // 于是「我的编码是否真的表达得了这颗矩阵」从来没被单独验证过。
+            if std::env::var("I6_R8_TRUTH").is_ok() {
+                let (mut md, mut mw, mut sq) = (0.0f32, 0.0f32, 0.0f32);
+                let (mut min_range, mut tiny, mut zero_scale) = (f32::MAX, 0usize, 0usize);
+                for r in 0..m {
+                    for g in 0..kg {
+                        let sv = sz8[r * kg + g];
+                        let sc = f16::from_bits((sv & 0xFFFF) as u16).to_f32();
+                        let zr = f16::from_bits((sv >> 16) as u16).to_f32();
+                        if sc == 0.0 {
+                            zero_scale += 1;
+                        }
+                        let chunk = &w[r * k + g * 128..r * k + (g + 1) * 128];
+                        let (mn, mx) = chunk
+                            .iter()
+                            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                        min_range = min_range.min(mx - mn);
+                        if mx - mn < 1.0e-3 {
+                            tiny += 1;
+                        }
+                        for (j, &wt) in chunk.iter().enumerate() {
+                            let rec = sc * q8[r * k + g * 128 + j] as f32 + zr;
+                            md = md.max((rec - wt).abs());
+                            mw = mw.max(wt.abs());
+                            sq += (rec - wt) * (rec - wt);
+                        }
+                    }
+                }
+                log::info!(
+                    "[R8TRUTH] {key}: max|Δ|={md:.5} max|w|={mw:.5} rel={:.3}% rms={:.5} \
+                     组跨度min={min_range:.6} <1e-3 的组={tiny} scale=0 的组={zero_scale}",
+                    md * 100.0 / mw.max(1.0e-9),
+                    (sq / (m * k) as f32).sqrt()
+                );
+                // 同一把尺量**官方**那对 (idx,sz)：如果官方的重建误差远大于我这份，说明
+                // 「w = scale·b + zero」不是官方/内核的约定，我的编码整个方向就错了。
+                let cmp_truth = || -> Option<()> {
+                    let p = std::env::var("I6_OUT_FROM").ok()?;
+                    let f = std::fs::File::open(&p).ok()?;
+                    let mm = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+                    let st8 = safetensors::SafeTensors::deserialize(&mm).ok()?;
+                    let oi = st8.tensor(&format!("{key}.int8_idx")).ok()?;
+                    let oz = st8.tensor(&format!("{key}.int8_sz")).ok()?;
+                    let oib = oi.data();
+                    let ozs: &[u32] = bytemuck::cast_slice(oz.data());
+                    let (mut d2, mut s2) = (0.0f32, 0.0f32);
+                    for r in 0..m {
+                        for g in 0..kg {
+                            let sv = ozs[r * kg + g];
+                            let sc = f16::from_bits((sv & 0xFFFF) as u16).to_f32();
+                            let zr = f16::from_bits((sv >> 16) as u16).to_f32();
+                            for (j, &wt) in
+                                w[r * k + g * 128..r * k + (g + 1) * 128].iter().enumerate()
+                            {
+                                let rec = sc * oib[r * k + g * 128 + j] as f32 + zr;
+                                d2 = d2.max((rec - wt).abs());
+                                s2 += (rec - wt) * (rec - wt);
+                            }
+                        }
+                    }
+                    log::info!(
+                        "[R8TRUTH] {key} 官方: max|Δ|={d2:.5} rel={:.3}% rms={:.5}",
+                        d2 * 100.0 / mw.max(1.0e-9),
+                        (s2 / (m * k) as f32).sqrt()
+                    );
+                    Some(())
+                };
+                let _ = cmp_truth();
+            }
             if idx == 0 && std::env::var("I6_R8_STATS").is_ok() {
                 let (mut smin, mut smax) = (f32::MAX, f32::MIN);
                 let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
@@ -6776,6 +7026,13 @@ impl GpuLayer {
             backend.upload_u32(idx_gpu, idx_grouped.as_deref().unwrap_or(&idx_row))?;
             let sz_gpu = backend.create_tensor(sz8.len(), TensorDtype::U32)?;
             backend.upload_u32(sz_gpu, &sz8)?;
+            if std::env::var("I6_R8_REVERIFY").is_ok() && key.contains("output") {
+                let exp_idx = idx_grouped.as_deref().unwrap_or(&idx_row).to_vec();
+                R8_REVERIFY
+                    .lock()
+                    .unwrap()
+                    .push((idx, idx_gpu, sz_gpu, exp_idx, sz8.clone()));
+            }
             // 诊断：`I6_R8_VERIFY=1` 把刚上传的两张张量**下载回来逐元素验**（判断「显存里
             // 到底是不是我上传的数据」）。若不一致，说明上传路径（pinned scratch / stream 序）
             // 才是 `att.output` 崩的真正原因。
@@ -6789,11 +7046,17 @@ impl GpuLayer {
                     .count();
                 let bad_s = sz8.iter().zip(ds.iter()).filter(|(a, b)| a != b).count();
                 log::info!(
-                    "[R8VER] {key}: len idx={}/{} sz={}/{} | 不一致 idx={bad_i} sz={bad_s}",
+                    "[R8VER] {key}: len idx={}/{} sz={}/{} | 不一致 idx={bad_i} sz={bad_s} | \
+                     group_major={} 与上传缓冲比不一致={}",
                     di.len(),
                     idx_row.len(),
                     ds.len(),
-                    sz8.len()
+                    sz8.len(),
+                    backend.int8_idx_group_major(),
+                    di.iter()
+                        .zip(idx_grouped.as_deref().unwrap_or(&idx_row).iter())
+                        .filter(|(a, b)| a != b)
+                        .count()
                 );
             }
             log::info!("layer {idx}: {key} 由 int6 重量化出 int8 副本（宽批 IMMA，{m}x{k}）");
@@ -6903,9 +7166,13 @@ impl GpuLayer {
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                // 曾经因「分组 min-max 重量化」在这一颗矩阵上出现 9 行离群误差（0.32 ≈ 半量程）
-                // 而让整模型输出塌成 2-周期；编码改成「精确落在 int6 网格上」后误差为 0。
-                let a8 = if gate_on("I6_OUT_I8") {
+                // **默认关**（`I6_OUT_I8=1` 才建）。2026-11-09 复查（见台账 §3.15.7）：
+                // 副本本身**没有 bug** —— 逐层 GPU 增量与宿主 `w = scale·b + zero` 复算
+                // 对得上（fit_k = 1.000±0.001，比 int6 内核更准），单流生成也通顺；但**批量**
+                // 贪心解码会从第 8~11 个 token 起落进 2-周期（B=4 时 4 槽里 2 槽不受影响）。
+                // 这是「残差流换了一种（更好的）舍入 ⇒ 贪心轨迹换道 ⇒ 周期性吸引子」的质量
+                // 余量问题，与数据/上传/内核都无关；要开它得先有 teacher-forced 的质量判据。
+                let a8 = if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
                     requant(backend, &out_key, c, c, false)?
                 } else {
                     None

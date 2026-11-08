@@ -57,7 +57,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DIAG：权重做成「对角」——第 r 行只有 k = r % 128 处 byte=1（= q_u 1），其余 0，
     // 且 scale=1 / zero=0 ⇒ `y(slot, r) = sx * q[slot][r % 128]`，
     // 于是可以把 GPU 的输出直接反解成「它认为的 q 值」，从而定位 A/B 的行列映射。
-    let idx: Vec<u32> = if ones {
+    let mut sz_override: Option<Vec<u32>> = None;
+    let idx: Vec<u32> = if let Ok(p) = std::env::var("IDX_BIN") {
+        // 用**真实**数据（`I6_R8_DUMP` 落盘的 int6→int8 重量化副本）做对拍：字节来自
+        // `gpu_model::requant_i6_to_i8`，尺寸必须与 M/K 一致。
+        let ib = std::fs::read(format!("{p}_idx.bin"))?;
+        let sb = std::fs::read(format!("{p}_sz.bin"))?;
+        assert_eq!(ib.len(), m * k, "IDX_BIN idx 长度不符");
+        assert_eq!(sb.len(), m * (k / K_GROUP) * 4, "IDX_BIN sz 长度不符");
+        sz_override = Some(
+            sb.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        );
+        ib.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else if ones {
         let mut v = vec![0u32; idx_words];
         for r in 0..m {
             let byte = ((r % 5) + 1) as u32;
@@ -88,17 +104,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect()
     };
-    let sz: Vec<u32> = (0..m * g)
-        .map(|_| {
-            // 尺度取 0.5..1.5 的正数，零点取 0（探针只验证算术路径，不追求真实分布）
-            let s = if diag {
-                1.0
-            } else {
-                0.5 + (lcg(&mut rng) % 1000) as f32 / 1000.0
-            };
-            (f16::from_f32(0.0).to_bits() as u32) << 16 | f16::from_f32(s).to_bits() as u32
-        })
-        .collect();
+    let sz: Vec<u32> = match sz_override.take() {
+        Some(v) => v,
+        None => (0..m * g)
+            .map(|_| {
+                // 尺度取 0.5..1.5 的正数，零点取 0（探针只验证算术路径，不追求真实分布）
+                let s = if diag {
+                    1.0
+                } else {
+                    0.5 + (lcg(&mut rng) % 1000) as f32 / 1000.0
+                };
+                (f16::from_f32(0.0).to_bits() as u32) << 16 | f16::from_f32(s).to_bits() as u32
+            })
+            .collect(),
+    };
     let x: Vec<f32> = if ones {
         vec![1.0f32; batch * k]
     } else {
@@ -153,14 +172,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let q = quantize(&x, k, batch);
 
     let mut runs: Vec<Vec<f32>> = Vec::new();
+    // `SIMT=1`：CUDA 上批量档的 int8 乘加实际走 `gemv_int8_mul_add`（`gemm_imma` 只有
+    // Vulkan 实现）⇒ 直接量这条，CPU 参照是朴素的 `y0 + Σ (x·g)·w`（fp64）。
+    let simt = std::env::var("SIMT").is_ok_and(|v| v != "0");
+    let gate_t = if simt {
+        let t = b.create_tensor(batch * k, TensorDtype::F16)?;
+        // 门控全 1：kernel 里 `x * gate` 后仍等于 x，参照不用改。
+        b.upload(t, &vec![1.0f32; batch * k])?;
+        Some(t)
+    } else {
+        None
+    };
     for _ in 0..reps {
         let y = mk_f32(&mut *b, batch * m)?;
         b.upload(y, &y0)?;
         b.begin_batch()?;
-        b.quant_x_i8(xt, None, xq, xaux, k, batch)?;
-        b.gemm_imma(&a, xq, xaux, y, partial, m, k, batch, op)?;
+        if let Some(gt) = gate_t {
+            b.gemv_int8_mul_add(&a, xt, gt, y, m, k, batch)?;
+        } else {
+            b.quant_x_i8(xt, None, xq, xaux, k, batch)?;
+            b.gemm_imma(&a, xq, xaux, y, partial, m, k, batch, op)?;
+        }
         b.end_batch()?;
         runs.push(b.download(y)?);
+    }
+    if simt {
+        let got = &runs[0];
+        let (mut worst_abs, mut worst_rel) = (0.0f64, 0.0f64);
+        let mut worst = String::new();
+        let mut bad = 0usize;
+        for s in 0..batch {
+            for r in 0..m {
+                let mut acc = 0.0f64;
+                for gi in 0..g {
+                    let sv = sz[r * g + gi];
+                    let sc = f16::from_bits((sv & 0xFFFF) as u16).to_f32() as f64;
+                    let z = f16::from_bits((sv >> 16) as u16).to_f32() as f64;
+                    for kk in 0..K_GROUP {
+                        let kx = gi * K_GROUP + kk;
+                        let byte = (idx[r * (k / 4) + kx / 4] >> (8 * (kx % 4))) & 0xFF;
+                        let w = (sc * byte as f64 + z) as f32 as f64; // kernel 落 fp16
+                        acc += w * x[s * k + kx] as f64;
+                    }
+                }
+                let expect = y0[s * m + r] as f64 + acc;
+                let gv = got[s * m + r] as f64;
+                let a = (gv - expect).abs();
+                let rel = a / expect.abs().max(1e-3);
+                if rel > worst_rel {
+                    worst_rel = rel;
+                    worst = format!("slot {s} row {r}: gpu={gv:.5} cpu={expect:.5}");
+                }
+                worst_abs = worst_abs.max(a);
+                if a > 1e-2 * expect.abs().max(1.0) {
+                    bad += 1;
+                }
+            }
+        }
+        println!(
+            "[probe] SIMT 乘加：超 1% 的元素 {bad}/{} | 最大绝对误差 {worst_abs:.3e} | \
+             最大相对误差 {worst_rel:.3e} | 最差点 {worst}",
+            batch * m
+        );
+        return Ok(());
     }
 
     // ⓪ 逐项核对 `quant_x_i8` 的产物（xq / xaux）——gemm 出错时先确认 A 侧输入本身对。

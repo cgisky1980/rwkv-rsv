@@ -227,6 +227,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         let mut seg_seed_next = seeds.clone();
+        // `I6_R8_REVERIFY=2`：prefill **之后**再验一次 att.output 的 int8 副本 —— 判断
+        // 「批量缓冲/图捕获的分配」有没有把权重张量挪走或覆盖（数据在加载期已验证过）。
+        if std::env::var("I6_R8_REVERIFY").is_ok_and(|v| v == "2") {
+            let (bi, bs) = model.reverify_out_copy()?;
+            log::info!("[R8REV-after-prefill] att.output 副本：不一致 idx={bi} sz={bs}");
+        }
         for _ in 0..warmup {
             let ticket =
                 model.submit_sample_selfloop_batch(&mut bstate, &seg_seed_next, ntok, &sp)?;
