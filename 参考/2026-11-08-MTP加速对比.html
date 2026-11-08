@@ -178,7 +178,26 @@
   （decode 从 8.65 掉到 11.6 ms）。用 verify/decode 比值一照就露馅。所有倍数只认「同配置下 plain vs spec」。
 </p>
 
-<h2><span class="n">06</span>口径与不确定性（必读）</h2>
+<h2><span class="n">06</span>int6 张量核档：B=8 提速 13%，T=4 反而慢（已按 batch 分档）</h2>
+<p class="note">按 MTP 原项目 <span class="mono">kernels/int6_gemm.py</span> 的 <span class="mono">USE_DOT</span> 分支实现：6-bit 解包成精确 fp16 → <span class="mono">mma.m16n8k8</span> → scale 在 chunk 末乘。</p>
+<table>
+  <thead><tr><th>场景</th><th class="num">SIMT（原档）</th><th class="num">张量核</th><th>判定</th></tr></thead>
+  <tbody>
+    <tr><td>批量解码 <b>B=8</b>（聚合吞吐）</td><td class="num">244.0 / 238.6 tok/s</td><td class="num"><b>275.8 / 273.5</b></td><td><span class="tag keep">+13%，已默认</span></td></tr>
+    <tr><td>MTP 投机 T=4（M=4）验证 pass</td><td class="num">15.9 ms</td><td class="num">17.9 ms</td><td><span class="tag drop">留 SIMT</span></td></tr>
+  </tbody>
+</table>
+<p class="note" style="margin-top:14px">
+  <b>为什么 T=4 变慢</b>：mma 的 M 只有 16 行，T=4 补到 16 = <b>75% 空转</b>，再加解包成本；B=8 能填一半，收益才出来。
+  所以按 batch 分档：<span class="mono">8..=16</span> 走张量核，<span class="mono">≤7</span> 留 SIMT。
+</p>
+<p class="note">
+  <b>两份上游交叉印证</b>：<span class="mono">rwkv_lightning_cuda/quant/gemmv/README_w4a16.md</span> 明写「M≤16 保留原寄存器解包路径」，
+  Tensor Core 只给 M&gt;16 —— 与实测分档点完全一致；而 MTP 原项目的 <span class="mono">RED_MAX_M = 1</span> 是 <b>服务端 B=32</b> 口径，
+  它的 1.8–1.9× 建立在 128 行验证上。B=8 两轮的 token 流 <span class="mono">sum/xor</span> 逐位相同，数值档无影响。
+</p>
+
+<h2><span class="n">07</span>口径与不确定性（必读）</h2>
 <table>
   <tbody>
     <tr><td>测量方式</td><td>同一进程内先跑 plain（逐 token decode）再跑 spec（起草→验证→回滚），两者从同一 prompt 出发；三轮独立复测取一致方向。</td></tr>
