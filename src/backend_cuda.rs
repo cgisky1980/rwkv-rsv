@@ -5243,6 +5243,99 @@ fn i6nm_ksplit() -> usize {
         .unwrap_or(3)
 }
 
+/// int6 张量核档的**最小 batch**（`I6NM_MMA_MINB`，默认 4；实验可降到 2）。
+///
+/// 分档点来自**同进程轮转交替**的对拍（`mtp_probe` 的 `MTP_AB_INT6=1`）：T=4（M=4 补到 16）
+/// 时 mma 的 verify/decode = **1.49–1.58**，SIMT 档同轮是 **1.80–1.92** ⇒ T=4 起换 mma。
+/// 此前「mma 在 T=4 更慢（17.9 vs 15.9）」的结论来自**跨进程**读数，被热节流污染（同一份
+/// 代码两次进程曾差 1.6×），本轮用轮转交替 + 逐轮比值复核后翻案。
+fn i6nm_mma_min_b() -> usize {
+    let o = I6NM_MMA_MIN_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o != 0 {
+        return o;
+    }
+    std::env::var("I6NM_MMA_MINB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|b| (2..=16).contains(b))
+        .unwrap_or(4)
+}
+
+/// 运行期覆盖 [`i6nm_mma_min_b`]（`None` = 撤销覆盖）。
+///
+/// 存在的理由：本机无法锁频/锁显存时钟，跨进程比值会被热节流吃掉（同一份代码两次进程
+/// 曾测出 1.6× 的差异）。要判断「张量核档在 T=4 到底快不快」，必须在**同一个进程内
+/// 逐轮交替两臂**、再各自对同一轮的 decode 取比值。`min_b=99` 即强制全走 SIMT。
+pub fn set_i6nm_mma_min_b(v: Option<usize>) {
+    I6NM_MMA_MIN_B_OVERRIDE.store(v.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+static I6NM_MMA_MIN_B_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// int6 张量核档每个 block 的 warp 数（`I6NM_MMA_WARPS`，默认 2）。
+///
+/// 一个 warp 覆盖 32 个输出列 ⇒ block 覆盖 `MMA_WARPS × 32` 列。默认 2 的 block 只有
+/// 64 线程，**占用率极低**（m=2560 时只有 `80/2 × ksplit` 个块）；这是张量核档在 T=4/5
+/// 上跑不过 SIMT 的嫌疑之一，故留成可扫的旋钮。
+fn i6nm_mma_warps() -> usize {
+    let o = I6NM_MMA_WARPS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o != 0 {
+        return o;
+    }
+    std::env::var("I6NM_MMA_WARPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|w| (1..=8).contains(w))
+        .unwrap_or(2)
+}
+
+/// 运行期覆盖 [`i6nm_mma_warps`]（`None` = 撤销覆盖）。
+pub fn set_i6nm_mma_warps(v: Option<usize>) {
+    I6NM_MMA_WARPS_OVERRIDE.store(v.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+static I6NM_MMA_WARPS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// int6 张量核档的 split-K（`I6NM_MMA_KS=0` 或未设 = 自适应补块数到 ~512）。
+///
+/// 与 SIMT 档相反（那里固定 3 最优），张量核档一个块干的活少得多（每 warp 只有 32 列），
+/// 块数不足是主要瓶颈 ⇒ 用「列块数 × split ≥ 目标」反推 split。部分和流量
+/// `ksplit×b×m×4 B` 相对权重流量可忽略（ksplit=12 时约 +10 %）。
+fn i6nm_mma_ks(m: usize, k: usize, warps: usize) -> usize {
+    let cap = (k / 64).max(1);
+    if let Some(ks) = std::env::var("I6NM_MMA_KS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|s| *s >= 1)
+    {
+        return ks.min(cap);
+    }
+    let target: usize = I6NM_MMA_BLOCKS_OVERRIDE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(
+            std::env::var("I6NM_MMA_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512),
+        );
+    if target == 0 {
+        return 1;
+    }
+    let colblocks = m.div_ceil(32).div_ceil(warps);
+    let ks = target.div_ceil(colblocks.max(1));
+    ks.clamp(1, cap)
+}
+
+/// 运行期覆盖 [`i6nm_mma_ks`] 的目标块数（`None` = 撤销覆盖）。
+pub fn set_i6nm_mma_blocks(v: Option<usize>) {
+    I6NM_MMA_BLOCKS_OVERRIDE.store(v.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+static I6NM_MMA_BLOCKS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 按「已够不够填满 SM」缩放 split 段数：块数 = `ceil(m/32) × ksplit`。
 ///
 /// **保留但默认不用**（`I6NM_SK_TARGET` 只在实验开启）：实测自适应是负优化 ——
@@ -6388,8 +6481,9 @@ extern "C" __global__ void gemv_int6nm_mma(
     const unsigned int* __restrict__ hi,
     const unsigned int* __restrict__ sz,
     const float* __restrict__ x,
+    const __half* __restrict__ g,     // [b*k]（gated=1 时 x 先乘它；可为 0）
     float* __restrict__ partial,
-    const int n, const int k, const int b, const int ksplit)
+    const int n, const int k, const int b, const int ksplit, const int gated)
 {
     const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
     const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
@@ -6453,10 +6547,23 @@ extern "C" __global__ void gemv_int6nm_mma(
                 // mma 的 A 只有 16 行（batch pad），与列无关 ⇒ 4 个 tile 复用同一对 a
                 const int m0 = gid, m1 = gid + 8;
                 const int ka = ksub + j;
-                const unsigned a0 = (m0 < b)
-                    ? i6nm_pack2h(x[(size_t)m0 * k + ka], x[(size_t)m0 * k + ka + 1]) : 0u;
-                const unsigned a1 = (m1 < b)
-                    ? i6nm_pack2h(x[(size_t)m1 * k + ka], x[(size_t)m1 * k + ka + 1]) : 0u;
+                unsigned a0 = 0u, a1 = 0u;
+                if (m0 < b) {
+                    float v0 = x[(size_t)m0 * k + ka], v1 = x[(size_t)m0 * k + ka + 1];
+                    if (gated) {
+                        v0 *= __half2float(g[(size_t)m0 * k + ka]);
+                        v1 *= __half2float(g[(size_t)m0 * k + ka + 1]);
+                    }
+                    a0 = i6nm_pack2h(v0, v1);
+                }
+                if (m1 < b) {
+                    float v0 = x[(size_t)m1 * k + ka], v1 = x[(size_t)m1 * k + ka + 1];
+                    if (gated) {
+                        v0 *= __half2float(g[(size_t)m1 * k + ka]);
+                        v1 *= __half2float(g[(size_t)m1 * k + ka + 1]);
+                    }
+                    a1 = i6nm_pack2h(v0, v1);
+                }
                 const unsigned aa[2] = {a0, a1};
                 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
@@ -9767,9 +9874,9 @@ impl CudaBackend {
         // 因此：T=4（b=4）用 SIMT（15.9 vs 17.9 ms），T≥5 用 mma（T=6 时 24.7 → ~18 ms）。
         // 上游 `int6_gemm.py` 的 `RED_MAX_M = 1` 之所以能从 M=2 起就用 dot，是因为它的
         // M 是 B=32 的真实批；我们要的是同一条**边际成本**曲线，不是同一个阈值。
-        if vec == 1 && op != 1 && (5..=16).contains(&b) && Self::i6nm_mma_on() {
-            let ks = i6nm_ksplit().min(k / 64).max(1);
-            return self.gemv_int6nm_mma_launch(lo, hi, sz, x, y, m, k, b, op, ks);
+        if vec == 1 && (i6nm_mma_min_b()..=16).contains(&b) && Self::i6nm_mma_on() {
+            let ks = i6nm_mma_ks(m, k, i6nm_mma_warps());
+            return self.gemv_int6nm_mma_launch(lo, hi, sz, x, g, y, m, k, b, op, ks);
         }
         if ksplit > 1 {
             return self.gemv_int6nm_split_launch(lo, hi, sz, x, g, y, m, k, b, op, ksplit);
@@ -9857,8 +9964,11 @@ impl CudaBackend {
         self.imma_gemm_reduce(partial, y, ksplit, b, m, op)
     }
 
-    /// int6 张量核档的发射器（`I6NM_MMA=0` 可关，A/B 用）。只覆盖 `op ∈ {0,2,3}`：
-    /// `op==1`（mul_add）需要 fp16 门控，暂留 SIMT 路径。
+    /// int6 张量核档的发射器（`I6NM_MMA=0` 可关，A/B 用）。
+    ///
+    /// `op==1`（mul_add：`y += (x ⊙ gate) @ W`）也走这里——门控在 A fragment 构造时乘进
+    /// 激活（每 2 个权重一次，摊在 16 行上，成本可忽略），所以验证路径的 6 个主矩阵
+    /// （r/k/v/mid 之外的 output/ffn key/ffn value）全部落在同一档上，不必留一条 SIMT 尾巴。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int6nm_mma_launch(
         &mut self,
@@ -9866,6 +9976,7 @@ impl CudaBackend {
         hi: u64,
         sz: u64,
         x: u64,
+        g: u64,
         y: u64,
         m: usize,
         k: usize,
@@ -9873,27 +9984,30 @@ impl CudaBackend {
         op: i32,
         ksplit: usize,
     ) -> R<()> {
-        const MMA_WARPS: usize = 2;
+        let warps = i6nm_mma_warps();
         let part = self.ipart_scratch(ksplit * b * m)?;
         let partial = self.f32_ptr(part, "gemv_int6nm_mma")?;
-        let src = format!("#define MMA_WARPS {MMA_WARPS}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_MMA_SRC}");
-        let key = format!("gemv_int6nm_mma_w{MMA_WARPS}_s{ksplit}");
+        let gated = i32::from(op == 1);
+        let src = format!("#define MMA_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_MMA_SRC}");
+        let key = format!("gemv_int6nm_mma_w{warps}_s{ksplit}_g{gated}");
         let func = self.kernel(&key, &src, "gemv_int6nm_mma")?;
-        // 每 warp 32 列 ⇒ 一个 block 覆盖 MMA_WARPS × 32 列
+        // 每 warp 32 列 ⇒ 一个 block 覆盖 warps × 32 列
         let ntiles = m.div_ceil(32);
-        let grid = (ntiles.div_ceil(MMA_WARPS) as u32, ksplit as u32, 1u32);
-        let block = ((MMA_WARPS * 32) as u32, 1u32, 1u32);
+        let grid = (ntiles.div_ceil(warps) as u32, ksplit as u32, 1u32);
+        let block = ((warps * 32) as u32, 1u32, 1u32);
         let (n_i, k_i, b_i, ks_i) = (m as i32, k as i32, b as i32, ksplit as i32);
         let params = [
             &lo as *const u64 as *mut c_void,
             &hi as *const u64 as *mut c_void,
             &sz as *const u64 as *mut c_void,
             &x as *const u64 as *mut c_void,
+            &g as *const u64 as *mut c_void,
             &partial as *const u64 as *mut c_void,
             &n_i as *const i32 as *mut c_void,
             &k_i as *const i32 as *mut c_void,
             &b_i as *const i32 as *mut c_void,
             &ks_i as *const i32 as *mut c_void,
+            &gated as *const i32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)?;
         self.imma_gemm_reduce(partial, y, ksplit, b, m, op)
@@ -17313,7 +17427,9 @@ mod tests {
         b.gemv_int6_mul_add(&h, xt, gt, yt, m, k, batch)
             .expect("gemv_int6_mul_add nm batch");
         let worst = check(&b.download(yt).unwrap(), 1);
-        assert!(worst < 2e-3, "mul_add nm batch 相对误差过大: {worst}");
+        // 门控档现在也走张量核（门控在 A fragment 里乘进激活），故与上面三档同一容差；
+        // 实测 1.7e-2，量级与其余三档一致（同为「激活 f32→f16」那笔舍入）。
+        assert!(worst < tol, "mul_add nm batch 相对误差过大: {worst}");
 
         // ③ split=3：K=256 只有 4 个 chunk，分段为 1/1/2，覆盖非均分尾段；
         // batch=5 与 m=132 同时钉住部分和的 slot 步长和尾列。四 op 共用既有归约核。

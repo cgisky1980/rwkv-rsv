@@ -1187,7 +1187,7 @@ impl GpuModel {
             && std::env::var("MTP_ROLLBACK_GRAPH")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        let gkey = (1usize << 41) | n;
+        let gkey = (1usize << 41) | n | ((state.uid() as usize & 0xFFFF) << 44);
         if graph_on && self.backend.prefill_graph_valid(gkey)? {
             self.seq_bufs = Some(sb);
             self.backend.prefill_graph_replay_keyed(gkey)?;
@@ -4735,12 +4735,28 @@ impl GpuModel {
         // CUDA prefill graph：整段各层 + head 一次捕获为 graph，之后同 T 直接重放，
         // 消除跨层 launch 开销。Vulkan 为 no-op（逐一提交）。诊断路径（GEMM_DIAG/PROFILE）
         // 含下载/逐段 submit，与 graph 捕获互斥，故仅在普通路径启用。
-        let prefill_graph = std::env::var("PREFILL_GRAPH").as_deref() == Ok("1")
-            && std::env::var("GEMM_DIAG").is_err()
+        //
+        // ★ **MTP 验证路径默认开**（`PREFILL_GRAPH=0` 可关）：T=4 的验证 pass 有 ~700 个
+        // launch，逐个入队的宿主开销实测占 10 % 左右（同进程交替 E2E：0.80–0.85× → 0.92×）。
+        // 普通 prefill 仍默认关——它的 `t` 是 prompt 长度，图数量会随时长漫游；验证路径只有
+        // T ≤ 8 的几种形状，缓存稳定。
+        let pg_env = std::env::var("PREFILL_GRAPH").ok();
+        let graph_default = verify && self.mtp.is_some();
+        let prefill_graph = match pg_env.as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => graph_default,
+        } && std::env::var("GEMM_DIAG").is_err()
             && std::env::var("PROFILE").is_err();
         // 图 key：验证路径的 kernel 序列与同 T 的普通 prefill **不同**（head 全 T 行 + 逐位置
         // 保存），必须分开缓存，否则会重放到另一条序列上（静默算错）。
-        let gkey = if verify { t | (1usize << 40) } else { t };
+        // ★ 还要混进 `State` 的身份号：图里烘焙的是各状态张量的设备指针，同一实例上换一份
+        // State 再重放就会「算别人的状态、写别人的状态」（同 self-loop 图那条 2026-10-10 的坑）。
+        let gkey = if verify {
+            t | (1usize << 40) | ((state.uid() as usize & 0xFFFF) << 44)
+        } else {
+            t | ((state.uid() as usize & 0xFFFF) << 44)
+        };
         if prefill_graph && self.backend.prefill_graph_valid(gkey)? {
             self.backend.prefill_graph_replay_keyed(gkey)?;
         } else {

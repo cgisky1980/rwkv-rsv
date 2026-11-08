@@ -392,6 +392,130 @@ fn main() -> Result<(), Box<dyn Error>> {
             ms_dec / (per_step / acc)
         );
     }
+    // —— 端到端 plain vs spec 的**逐轮交替** A/B（`MTP_AB_E2E=1`）——
+    //
+    // 上面那段 A/B 是「先量完 plain 再量 spec」，中间隔了几秒——本机热节流在这个尺度上
+    // 就能把比值改掉 30 %（实测同一份代码两次进程 1.11× / 0.89×）。这里每轮从同一 prompt
+    // 重新播种，plain 与 spec 各自跑 n 个 token 紧邻着量，再取逐轮比值的**中位数**。
+    if std::env::var("MTP_AB_E2E").is_ok() {
+        let n = env_usize("MTP_E2E_N", 32);
+        let rounds = env_usize("MTP_E2E_ROUNDS", 4);
+        let mut rs: Vec<f64> = Vec::new();
+        let mut accs: Vec<f64> = Vec::new();
+        for _ in 0..rounds {
+            let mut t = seed_spec(&mut bundle)?;
+            let t0 = std::time::Instant::now();
+            let mut cnt = 1usize;
+            while cnt < n {
+                t = bundle.model.forward_argmax(&[t])?;
+                cnt += 1;
+            }
+            let ms_plain = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut w = seed_spec(&mut bundle)?;
+            let t0 = std::time::Instant::now();
+            let mut cnt = 1usize;
+            let mut steps = 0usize;
+            let mut accepted = 0usize;
+            while cnt < n {
+                let out = bundle.model.spec_step(&mut bundle.state, w, k)?;
+                accepted += out.len() - 2;
+                steps += 1;
+                cnt += out.len() - 1;
+                w = *out.last().unwrap();
+            }
+            let ms_spec = t0.elapsed().as_secs_f64() * 1000.0;
+            accs.push(accepted as f64 / steps.max(1) as f64);
+            rs.push(ms_plain / ms_spec);
+            log::info!(
+                "  [E2E 第 {} 轮] plain {ms_plain:.0} ms / spec {ms_spec:.0} ms ⇒ {:.2}×（接受 {:.2}）",
+                rs.len(),
+                ms_plain / ms_spec,
+                accs.last().unwrap()
+            );
+        }
+        let mut sorted = rs.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = sorted[sorted.len() / 2];
+        let min = sorted[0];
+        let acc = accs.iter().sum::<f64>() / accs.len() as f64;
+        log::info!(
+            "—— 端到端交替 A/B（{rounds} 轮 × {n} token，K={k}）：{min:.2}×（最好）/ {med:.2}×（中位），平均接受 {acc:.2} 草稿/步"
+        );
+    }
+
+    // —— 同进程逐轮交替的 int6 档位 A/B（`MTP_AB_INT6=1`，实验用）——
+    //
+    // 为什么必须同进程交替：本机无法锁频/锁显存时钟，跨进程的绝对 ms 与比值都会被热节流
+    // 吃掉（同一份代码两次进程实测差 1.6×）。这里每轮把各臂的 decode / verify 紧邻着量，
+    // 再用各自**同一轮**的 decode 做分母 ⇒ 节流漂移对两臂同向，比值可信。
+    if std::env::var("MTP_AB_INT6").is_ok() {
+        use rwkv_rsv::backend_cuda::{set_i6nm_mma_blocks, set_i6nm_mma_min_b, set_i6nm_mma_warps};
+        let apply = |minb: usize, w: usize, blocks: usize| {
+            set_i6nm_mma_min_b(Some(minb));
+            set_i6nm_mma_warps((w != 0).then_some(w));
+            set_i6nm_mma_blocks((blocks != 0).then_some(blocks));
+        };
+        // ⚠️ 这套 A/B 必须配 `PREFILL_GRAPH=0` 跑：验证路径的图按 T 收键，切臂时不会重捕获，
+        // 于是所有臂都会重放第一个臂捕获的图（实测把 v1/v2 的差别整段抹掉、数字全是假的）。
+        let arms: Vec<(&str, usize, usize, usize)> = vec![
+            ("simt        ", 99, 0, 0),
+            ("mma w2/256  ", 4, 2, 256),
+            ("mma w2/512  ", 4, 2, 512),
+            ("mma w4/512  ", 4, 4, 512),
+            ("mma w4/1024 ", 4, 4, 1024),
+        ];
+        let toks: Vec<u32> = vec![2; k + 1];
+        // 预热：把内核编译/图捕获排除在计时之外
+        for &(_, minb, w, blocks) in &arms {
+            apply(minb, w, blocks);
+            let _ = bundle.model.forward_argmax(&[7])?;
+            let _ = bundle
+                .model
+                .forward_seq_verify_with_state(&mut bundle.state, &toks)?;
+        }
+        let rounds = 8usize;
+        // 每臂每轮的「verify/decode」比值（同一轮紧邻测量）。取**最小值**作为报告值：
+        // 热节流只会让读数变慢，最小值最接近「没有被节流污染」的那一轮。
+        let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+        let mut decs: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+        let mut vers: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+        for r in 0..rounds {
+            // 轮转顺序：让每个臂在不同轮次里出现在不同位置，抵消「轮内顺序」偏置
+            for step in 0..arms.len() {
+                let ai = (step + r) % arms.len();
+                let (_, minb, w, blocks) = arms[ai];
+                apply(minb, w, blocks);
+                let t0 = std::time::Instant::now();
+                for i in 0..3 {
+                    let _ = bundle.model.forward_argmax(&[(i % 1000) as u32 + 1])?;
+                }
+                let d = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
+                let t0 = std::time::Instant::now();
+                for _ in 0..2 {
+                    let _ = bundle
+                        .model
+                        .forward_seq_verify_with_state(&mut bundle.state, &toks)?;
+                }
+                let v = t0.elapsed().as_secs_f64() * 1000.0 / 2.0;
+                decs[ai].push(d);
+                vers[ai].push(v);
+                ratios[ai].push(v / d);
+            }
+        }
+        log::info!("—— int6 档位同进程交替 A/B（{rounds} 轮，T={}）——", k + 1);
+        for (ai, (name, ..)) in arms.iter().enumerate() {
+            let minr = ratios[ai].iter().cloned().fold(f64::MAX, f64::min);
+            let mind = decs[ai].iter().cloned().fold(f64::MAX, f64::min);
+            let minv = vers[ai].iter().cloned().fold(f64::MAX, f64::min);
+            log::info!(
+                "  {name}: 最小 decode {mind:.2} ms，最小 verify {minv:.2} ms ⇒ **{minr:.2}×**（各轮比值 min）"
+            );
+        }
+        set_i6nm_mma_min_b(None);
+        set_i6nm_mma_warps(None);
+        set_i6nm_mma_blocks(None);
+    }
+
     Ok(())
 }
 
