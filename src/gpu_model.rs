@@ -6672,6 +6672,38 @@ impl GpuLayer {
                     Some(())
                 };
                 let _ = cmp_official();
+                // 字节级 dump：我的 idx/sz 与官方同名张量的**前 4 KB**，落到 `target/`
+                // （`I6_R8_STATS=1` + `I6_OUT_FROM=<int8 模型>`；只对 att.output）。
+                if key.contains("output") {
+                    let mine_idx: Vec<u8> = idx_row
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .take(4096)
+                        .collect();
+                    let mine_sz: Vec<u8> = sz8
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .take(4096)
+                        .collect();
+                    std::fs::write("target/r8_mine_idx.bin", &mine_idx).ok();
+                    std::fs::write("target/r8_mine_sz.bin", &mine_sz).ok();
+                    let dump_off = || -> Option<()> {
+                        let p = std::env::var("I6_OUT_FROM").ok()?;
+                        let f = std::fs::File::open(&p).ok()?;
+                        let mm = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+                        let st8 = safetensors::SafeTensors::deserialize(&mm).ok()?;
+                        let it = st8.tensor(&format!("{key}.int8_idx")).ok()?;
+                        let zt = st8.tensor(&format!("{key}.int8_sz")).ok()?;
+                        let oi = &it.data()[..4096.min(it.data().len())];
+                        let oz: &[u32] = bytemuck::cast_slice(zt.data());
+                        let ozb: Vec<u8> =
+                            oz.iter().flat_map(|w| w.to_le_bytes()).take(4096).collect();
+                        std::fs::write("target/r8_off_idx.bin", oi).ok();
+                        std::fs::write("target/r8_off_sz.bin", &ozb).ok();
+                        Some(())
+                    };
+                    let _ = dump_off();
+                }
             }
             let idx_grouped = if backend.int8_idx_group_major() {
                 Some(crate::backend::int8_idx_to_group_major(&idx_row, m, k))
@@ -6822,6 +6854,11 @@ impl GpuLayer {
                         k: c,
                     })
                 } else if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
+                    // 诊断：`I6_OUT_PAD=1` 先多分配一块同尺寸缓冲，改变副本的显存地址
+                    // （判定是否是"越界写/别名"导致这块显存被写坏）。
+                    if std::env::var("I6_OUT_PAD").is_ok_and(|v| v != "0") {
+                        let _pad = backend.create_tensor(c * c / 4, TensorDtype::U32)?;
+                    }
                     let h = requant(backend, &out_key, c, c, false)?;
                     // 诊断：`I6_OUT_BUILD_ONLY=1` 只建不用（区分「分配副作用」与「真被消费」）。
                     if std::env::var("I6_OUT_BUILD_ONLY").is_ok_and(|v| v != "0") {
