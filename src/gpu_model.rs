@@ -183,7 +183,6 @@ pub fn set_graph_arm_epoch(v: usize) {
 }
 
 /// 低秩链**第二级**权重（`w2/a2/v2/g2`）是否走常驻 fp16 副本（`LR2F16`，**默认开**）。
-///
 /// 动机：这四张 `[C, mid]` 矩阵是 chain4 唯一的权重流量（本模型 ~2.9 MB/层 fp32），fp16 副本
 /// 已在显存里（prefill GEMM 用），换成它等于把这部分流量**砍半**，且不新增内存。
 /// 代价是权重过一次 fp16 舍入 ⇒ 数值档位与 prefill GEMM 档一致。解码与验证必须**同档**
@@ -196,6 +195,19 @@ pub fn set_graph_arm_epoch(v: usize) {
 #[inline]
 fn lr2_f16() -> bool {
     std::env::var("LR2F16").map(|v| v != "0").unwrap_or(true)
+}
+
+/// int6 模型用「加载期补出的 int8 副本」跑 r/k/v W8A8 张量核的**最小批宽**
+/// （`RKV_I8_MINB`，默认 8）。
+///
+/// 单流（batch < 8，含 MTP 的投机步）仍走 int6 GEMV —— 那条档的 16.6 ms verify / 1.83 接受
+/// 是在 int6 上量的，换 int8 会同时改数值与速度；批量档才切过去（B≥8 起收益很大）。
+#[inline]
+fn i6_rkv_i8_min_batch() -> usize {
+    std::env::var("RKV_I8_MINB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
 }
 
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
@@ -3240,7 +3252,10 @@ impl GpuModel {
             let rkv_imma = c.is_multiple_of(64)
                 && c.is_multiple_of(128)
                 && Self::imma_op_on("rkv")
-                && self.imma_ok(c, c, batch);
+                && self.imma_ok(c, c, batch)
+                // int6 模型的 int8 副本是加载期补出来的（`I6_RKV_I8`）：只给**批量档**用，
+                // 单流仍走 int6 GEMV（MTP 的 16.6 ms / 接受率 1.83 就是在那条档上量的）。
+                && (self.layers[i].receptance_i6.is_none() || batch >= i6_rkv_i8_min_batch());
             // `VK_RKV_GEMM`：r/k/v 中**哪些走张量核**（字符集取自 `rkv`，默认全走）。
             // 未选中的矩阵由 SIMT 融合核补算（`RKV_MATMASK`）。二分定位用（§5K）。
             let rkv_sel: u32 = match std::env::var("VK_RKV_GEMM") {
@@ -6546,6 +6561,76 @@ impl GpuLayer {
                 }
                 Ok((None, None, Some(load_linear_f16(backend, key.to_string())?)))
             };
+        // ★ int6 模型在**宽批**上缺 W8A8 张量核：`gemm_imma` 只吃 int8，故这些 C×C / ffn
+        // 矩阵只能落回 SIMT。实测（B=16 自循环）int6 311 tok/s vs int8 同形状 **1027 tok/s**，
+        // 消融显示 r/k/v 一条占该步 48%、ffn value 再占 21%。这里在加载期由 int6 反量化后
+        // 按 128 分组**重量化出 int8 副本**（255 级 > 63 级，重量化误差小于原量化误差），
+        // 只给批量档的 `gemm_imma` 用；单流仍走 int6 GEMV（`wq()` 优先 int6，MTP 调参不变）。
+        // 门：`I6_RKV_I8=0` 关 r/k/v 副本，`I6_FFN_I8=0` 关 ffn/out 副本。
+        // 显存代价：r/k/v 3×C×C B/层（≈630 MB）+ ffn/out ≈59 MB/层（≈1.9 GB）。
+        let requant_i6_to_i8 = |backend: &mut dyn ComputeBackend,
+                                key: &str,
+                                m: usize,
+                                k: usize|
+         -> R<Option<Int8Handle>> {
+            if st.tensor(&format!("{key}.int6_lo")).is_err() {
+                return Ok(None);
+            }
+            let lo_t = st.tensor(&format!("{key}.int6_lo"))?;
+            let hi_t = st.tensor(&format!("{key}.int6_hi"))?;
+            let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
+            let sz6: &[u32] = bytemuck::cast_slice(sz_t.data());
+            let w = crate::model::dequant_int6(lo_t.data(), hi_t.data(), sz6, m, k, i6_nmajor);
+            // 分组 min-max 非对称量化：反量化式 `idx * scale + zero`（与 `unpack_int8_sz` 一致）。
+            let kg = k / 128;
+            let mut q8 = vec![0u8; m * k];
+            let mut sz8 = vec![0u32; m * kg];
+            for r in 0..m {
+                let row = &w[r * k..(r + 1) * k];
+                for g in 0..kg {
+                    let chunk = &row[g * 128..(g + 1) * 128];
+                    let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for &v in chunk {
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                    }
+                    let scale = ((mx - mn) / 255.0).max(1.0e-8);
+                    let zero = mn;
+                    let inv = 1.0 / scale;
+                    for (j, &v) in chunk.iter().enumerate() {
+                        q8[r * k + g * 128 + j] =
+                            ((v - zero) * inv).round().clamp(0.0, 255.0) as u8;
+                    }
+                    sz8[r * kg + g] = (f16::from_f32(scale).to_bits() as u32)
+                        | ((f16::from_f32(zero).to_bits() as u32) << 16);
+                }
+            }
+            let idx_row: Vec<u32> = q8
+                .chunks_exact(4)
+                .map(|c4| u32::from_le_bytes([c4[0], c4[1], c4[2], c4[3]]))
+                .collect();
+            let idx_grouped = if backend.int8_idx_group_major() {
+                Some(crate::backend::int8_idx_to_group_major(&idx_row, m, k))
+            } else {
+                None
+            };
+            let idx_gpu = backend.create_tensor(m * k / 4, TensorDtype::U32)?;
+            backend.upload_u32(idx_gpu, idx_grouped.as_deref().unwrap_or(&idx_row))?;
+            let sz_gpu = backend.create_tensor(sz8.len(), TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, &sz8)?;
+            log::info!("layer {idx}: {key} 由 int6 重量化出 int8 副本（宽批 IMMA，{m}x{k}）");
+            Ok(Some(Int8Handle {
+                idx: idx_gpu,
+                sz: sz_gpu,
+                m,
+                k,
+            }))
+        };
+        let gate_on = |name: &str| !std::env::var(name).is_ok_and(|v| v == "0");
+        // 只有「有 int6、没有原生 int8」的矩阵才补副本（真 int8 模型不受影响）。
+        let requant = |backend: &mut dyn ComputeBackend, key: &str, m: usize, k: usize| {
+            requant_i6_to_i8(backend, key, m, k)
+        };
         let (ffn_key_i6, ffn_key_a8, ffn_key_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.key.weight"),
@@ -6558,6 +6643,27 @@ impl GpuLayer {
             c,
             cfg.ffn_hidden,
         )?;
+        // ffn key/value 的 int8 副本（批量档 W8A8 用）：见 `requant_i6_to_i8` 的说明。
+        let ffn_key_a8 = match ffn_key_a8 {
+            Some(a) => Some(a),
+            None if ffn_key_i6.is_some() && gate_on("I6_FFN_I8") => requant(
+                backend,
+                &format!("blocks.{idx}.ffn.key.weight"),
+                cfg.ffn_hidden,
+                c,
+            )?,
+            None => None,
+        };
+        let ffn_value_a8 = match ffn_value_a8 {
+            Some(a) => Some(a),
+            None if ffn_value_i6.is_some() && gate_on("I6_FFN_I8") => requant(
+                backend,
+                &format!("blocks.{idx}.ffn.value.weight"),
+                c,
+                cfg.ffn_hidden,
+            )?,
+            None => None,
+        };
         // 稀疏 FFN 平铺权重（fp16，CUDA 稀疏内核用）：两种量化均构建，解码按 r2 非零列只读。
         // `FFN_VALUE_GEMM`（默认开）时返回 (None, dense16)——改用稠密张量核 GEMM。
         let (ffn_value_tiled, ffn_value_dense16) = load_ffn_value_tiled(
@@ -6576,13 +6682,44 @@ impl GpuLayer {
             load_linear(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?;
         let (value_i6, value_a8, value_w16) =
             load_linear(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?;
+        // r/k/v 的 int8 副本（批量档 W8A8 用）：r/k/v 一条占批量解步步长的 48%。
+        let receptance_a8 = match receptance_a8 {
+            Some(a) => Some(a),
+            None if receptance_i6.is_some() && gate_on("I6_RKV_I8") => requant(
+                backend,
+                &format!("blocks.{idx}.att.receptance.weight"),
+                c,
+                c,
+            )?,
+            None => None,
+        };
+        let key_a8 = match key_a8 {
+            Some(a) => Some(a),
+            None if key_i6.is_some() && gate_on("I6_RKV_I8") => {
+                requant(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?
+            }
+            None => None,
+        };
+        let value_a8 = match value_a8 {
+            Some(a) => Some(a),
+            None if value_i6.is_some() && gate_on("I6_RKV_I8") => {
+                requant(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?
+            }
+            None => None,
+        };
         // att.output：量化时走对应 GEMM（零 fp16 副本）；
         // fp32 诊断副本仅 GEMM_DIAG 时用反量化权重创建（正式推理不创建，省 ~26MB/层）
         let want_diag = std::env::var("GEMM_DIAG").is_ok();
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                (Some(i6), None, None, None)
+                // att.output 的 int8 副本（批量档 W8A8 用，见 `requant_i6_to_i8`）。
+                let a8 = if gate_on("I6_FFN_I8") {
+                    requant(backend, &out_key, c, c)?
+                } else {
+                    None
+                };
+                (Some(i6), a8, None, None)
             } else if let Some(a8) = load_int8(backend, &out_key, c, c)? {
                 let ow = if want_diag {
                     let idx_t = st.tensor(&format!("{out_key}.int8_idx"))?;

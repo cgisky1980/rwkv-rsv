@@ -190,6 +190,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         let seed_xor: u64 = seeds.iter().fold(0u64, |a, &v| a ^ (v as u64));
         log::info!("prefill seeds sum={seed_sum:#x} xor={seed_xor:#x}");
         model.log_vram("prefill 后");
+        // —— `MTP_VERIFY_SHAPE=1`：量「合批投机验证」的**形状成本** ——
+        //
+        // 投机 verify 的一步 = 每个槽 T=K+1 行的一次因果 pass。这里直接用批量 seq pass
+        // （每槽 T 个固定 token、不重置状态——与真实投机环一致：状态逐步前进）量它的墙钟。
+        // 判读：`per_pass / 单流 verify` = 合批把一次验证摊薄了几倍；B 个槽的投机步
+        // 收益 ≈ `B × 接受数 / (per_pass + B × drafter)`，只有摊薄倍数 ≳ 2 才值得做。
+        if std::env::var("MTP_VERIFY_SHAPE").is_ok_and(|v| v != "0") {
+            let envn = |k: &str, d: usize| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
+            let t = envn("MTP_SHAPE_T", 4);
+            let reps = envn("MTP_SHAPE_REPS", 6);
+            let vprompts: Vec<Vec<u32>> = (0..slots)
+                .map(|s| {
+                    let base = seeds[s % seeds.len()] as usize;
+                    (0..t)
+                        .map(|i| (((base + i * 7919 + s * 31) % 30000) + 1) as u32)
+                        .collect()
+                })
+                .collect();
+            for _ in 0..2 {
+                let _ = model.forward_seq_batch_padded(&mut bstate, &vprompts, t)?;
+            }
+            let tv = Instant::now();
+            for _ in 0..reps {
+                let _ = model.forward_seq_batch_padded(&mut bstate, &vprompts, t)?;
+            }
+            let per = tv.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            log::info!(
+                "[MTP 形状] B={slots} T={t} 合批 seq pass = {per:.2} ms/步（{:.2} ms/槽）",
+                per / slots as f64
+            );
+        }
         let mut seg_seed_next = seeds.clone();
         for _ in 0..warmup {
             let ticket =
