@@ -149,6 +149,46 @@ fn main() -> Result<(), Box<dyn Error>> {
         "  平均接受长度 = {:.3} token/主前向（门限 ≥1.8）",
         acc_sum / steps.max(1) as f64
     );
+
+    // —— 成本三件套：验证券化之前的先决读数（决定 K 与回滚策略）——
+    // ① 单 token decode（plain 基线）② T=K+1 的因果 seq pass（验证明细）③ drafter 链
+    let reps = env_usize("MTP_REPS", 16).max(1);
+    let t0 = std::time::Instant::now();
+    for i in 0..reps {
+        let _ = model.forward_argmax(&[(i % 1000) as u32 + 1])?;
+    }
+    let ms_dec = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+
+    let t0 = std::time::Instant::now();
+    for i in 0..reps {
+        let toks = vec![(i % 1000) as u32 + 1; k + 1];
+        let _ = bundle.infer_seq(&toks)?;
+    }
+    let ms_seq = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+    let model = &mut bundle.model;
+
+    let t0 = std::time::Instant::now();
+    for i in 0..reps {
+        let _ = model.mtp_draft_host((i % 1000) as u32 + 1, k)?;
+    }
+    let ms_draft = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+
+    log::info!("—— 成本（{reps} 次取均值，K={k}）——");
+    log::info!("  单 token decode        : {ms_dec:.3} ms");
+    log::info!(
+        "  T={} 因果 seq pass     : {ms_seq:.3} ms（验证券化用）",
+        k + 1
+    );
+    log::info!("  drafter 链 {k} 深度      : {ms_draft:.3} ms");
+    let acc = acc_sum / steps.max(1) as f64;
+    for (name, extra) in [("免费回滚（理想）", 0.0), ("第二遍 seq 重放", ms_seq)] {
+        let per_step = ms_seq + ms_draft + extra;
+        log::info!(
+            "  投影：{name} ⇒ {:.2} ms/token、{:.2}×",
+            per_step / acc,
+            ms_dec / (per_step / acc)
+        );
+    }
     Ok(())
 }
 
