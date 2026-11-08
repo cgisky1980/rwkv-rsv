@@ -5385,37 +5385,51 @@ impl GpuModel {
         }
 
         if !stage1 {
-            // ★ `xr16/xk16/xv16` 在后面的低秩一级 v 链里还要用（`gemm(sb.xv16, v1_16, ...)`），
-            // 所以这一遍转换在小 T 分支里也**不能**省。
-            self.backend.to_f16_triple(
-                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
-            )?;
-            if small_t {
+            if small_t && self.backend.supports_to_f16_six() {
+                // 小 T：r/k/v 走批量 GEMV（吃的是 **f32** 激活），6 路 f16 副本只为一级 mid
+                // 的 GEMM 服务 ⇒ 一次 `to_f16_six` 顶掉原来的两次 triple（少一个串行节点）。
                 Self::rkv_small(self.backend.as_mut(), layer, c, t, sb)?;
-            } else if let (Some(qr), Some(qk), Some(qv)) = (
-                wq(layer.receptance_i6, layer.receptance_a8),
-                wq(layer.key_i6, layer.key_a8),
-                wq(layer.value_i6, layer.value_a8),
-            ) {
-                self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-                self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-                self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
-                self.backend
-                    .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+                self.backend.to_f16_six(
+                    sb.xr, sb.xw, sb.xk, sb.xv, sb.xa, sb.xg, sb.xr16, sb.xw16, sb.xk16, sb.xv16,
+                    sb.xa16, sb.xg16, c, t, m_pad, c, c,
+                )?;
             } else {
-                let r16 = layer
-                    .receptance_w16
-                    .as_ref()
-                    .ok_or("receptance_w16 missing")?;
-                let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
-                let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
-                self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
-                self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
-                self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
+                // ★ `xr16/xk16/xv16` 在后面的低秩一级 v 链里还要用（`gemm(sb.xv16, v1_16, ...)`），
+                // 所以这一遍转换在小 T 分支里也**不能**省。
+                self.backend.to_f16_triple(
+                    sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
+                )?;
+                if small_t {
+                    Self::rkv_small(self.backend.as_mut(), layer, c, t, sb)?;
+                } else if let (Some(qr), Some(qk), Some(qv)) = (
+                    wq(layer.receptance_i6, layer.receptance_a8),
+                    wq(layer.key_i6, layer.key_a8),
+                    wq(layer.value_i6, layer.value_a8),
+                ) {
+                    self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
+                    self.backend
+                        .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+                    self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
+                    self.backend
+                        .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+                    self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
+                    self.backend
+                        .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+                } else {
+                    let r16 = layer
+                        .receptance_w16
+                        .as_ref()
+                        .ok_or("receptance_w16 missing")?;
+                    let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
+                    let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
+                    self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
+                    self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
+                    self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
+                }
+                // 低秩 w/a/g 第一级投影输入转 fp16（xw/xa/xg → [M_PAD, C]）
+                self.backend.to_f16_triple(
+                    sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, t, m_pad, c, c,
+                )?;
             }
             if std::env::var("GEMM_DIAG").is_ok() {
                 log::info!("[FS] layer {i} gemm rkv done");
@@ -5435,11 +5449,6 @@ impl GpuModel {
                 ],
             )?;
             Self::verify_gemm_rkv(self.backend.as_mut(), layer, i, sb, c)?;
-
-            // 低秩 w/a/g 第一级投影输入转 fp16（xw/xa/xg → [M_PAD, C]）
-            self.backend.to_f16_triple(
-                sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, t, m_pad, c, c,
-            )?;
         }
 
         // v_first 逻辑：layer 0 存 v_first = v；layer>0 交叉混合 v

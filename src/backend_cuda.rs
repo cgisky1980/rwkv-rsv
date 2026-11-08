@@ -8338,6 +8338,48 @@ extern "C" __global__ void rwkv_to_f16_triple(
 }
 "#;
 
+/// to_f16_six CUDA kernel：六路 f32 → f16（`xr/xw/xk/xv/xa/xg`）。
+///
+/// 小 T 序列路径里这 6 个激活在 `seq_shift6` 之后同时定稿，分两次 `to_f16_triple`
+/// 只是历史原因留下的多余串行节点；语义与逐路 `to_f16` 逐位一致（同一 `__float2half`）。
+const TO_F16_SIX_SRC: &str = r#"
+extern "C" __global__ void rwkv_to_f16_six(
+    const float* __restrict__ xr, const float* __restrict__ xw,
+    const float* __restrict__ xk, const float* __restrict__ xv,
+    const float* __restrict__ xa, const float* __restrict__ xg,
+    __half* __restrict__ yr, __half* __restrict__ yw,
+    __half* __restrict__ yk, __half* __restrict__ yv,
+    __half* __restrict__ ya, __half* __restrict__ yg,
+    const int c,
+    const int t,
+    const int x_stride,
+    const int y_stride)
+{
+    const int token = blockIdx.x;
+    const size_t yb = (size_t)token * (size_t)y_stride;
+    if (token >= t) {
+        for (int i = threadIdx.x; i < c; i += blockDim.x) {
+            yr[yb + i] = __float2half(0.0f);
+            yw[yb + i] = __float2half(0.0f);
+            yk[yb + i] = __float2half(0.0f);
+            yv[yb + i] = __float2half(0.0f);
+            ya[yb + i] = __float2half(0.0f);
+            yg[yb + i] = __float2half(0.0f);
+        }
+        return;
+    }
+    const size_t xb = (size_t)token * (size_t)x_stride;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        yr[yb + i] = __float2half(xr[xb + i]);
+        yw[yb + i] = __float2half(xw[xb + i]);
+        yk[yb + i] = __float2half(xk[xb + i]);
+        yv[yb + i] = __float2half(xv[xb + i]);
+        ya[yb + i] = __float2half(xa[xb + i]);
+        yg[yb + i] = __float2half(xg[xb + i]);
+    }
+}
+"#;
+
 /// dequant_int6_to_f16 CUDA kernel：int6（lo4+hi2 双平面）反量化为 fp16 [M,K]。
 /// 布局与 `tools/quantize_any4.py --bits 6` / `model.rs::dequant_int6` 一致：
 /// lo uint32[M,K/8]（= K/2 字节）、hi uint32[M,K/16]（= K/4 字节）、sz uint32[M,K/128]。
@@ -12818,6 +12860,73 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    fn supports_to_f16_six(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn to_f16_six(
+        &mut self,
+        xr: TensorId,
+        xw: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        yr: TensorId,
+        yw: TensorId,
+        yk: TensorId,
+        yv: TensorId,
+        ya: TensorId,
+        yg: TensorId,
+        c: usize,
+        t: usize,
+        m_pad: usize,
+        x_stride: usize,
+        y_stride: usize,
+    ) -> R<()> {
+        const OP: &str = "to_f16_six";
+        let xd = [
+            self.f32_ptr(xr, OP)?,
+            self.f32_ptr(xw, OP)?,
+            self.f32_ptr(xk, OP)?,
+            self.f32_ptr(xv, OP)?,
+            self.f32_ptr(xa, OP)?,
+            self.f32_ptr(xg, OP)?,
+        ];
+        let yd = [
+            self.f16_ptr(yr, OP)?,
+            self.f16_ptr(yw, OP)?,
+            self.f16_ptr(yk, OP)?,
+            self.f16_ptr(yv, OP)?,
+            self.f16_ptr(ya, OP)?,
+            self.f16_ptr(yg, OP)?,
+        ];
+        let func = self.kernel("to_f16_six", TO_F16_SIX_SRC, "rwkv_to_f16_six")?;
+        let grid = (m_pad as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i, xs, ys) = (c as i32, t as i32, x_stride as i32, y_stride as i32);
+        let params = [
+            &xd[0] as *const u64 as *mut c_void,
+            &xd[1] as *const u64 as *mut c_void,
+            &xd[2] as *const u64 as *mut c_void,
+            &xd[3] as *const u64 as *mut c_void,
+            &xd[4] as *const u64 as *mut c_void,
+            &xd[5] as *const u64 as *mut c_void,
+            &yd[0] as *const u64 as *mut c_void,
+            &yd[1] as *const u64 as *mut c_void,
+            &yd[2] as *const u64 as *mut c_void,
+            &yd[3] as *const u64 as *mut c_void,
+            &yd[4] as *const u64 as *mut c_void,
+            &yd[5] as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &xs as *const i32 as *mut c_void,
+            &ys as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
     fn dequant_int8_to_f16(&mut self, a: &Int8Handle, out: TensorId, m: usize, k: usize) -> R<()> {
         let (idx, sz) = (
             self.u32_ptr(a.idx, "dequant_int8_to_f16")?,

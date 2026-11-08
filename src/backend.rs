@@ -1650,6 +1650,39 @@ pub trait ComputeBackend {
         x_stride: usize,
         y_stride: usize,
     ) -> R<()>;
+    /// 六输入融合转换（`xr/xw/xk/xv/xa/xg` 一次转完）。
+    ///
+    /// 存在的理由：小 T 序列路径里这 6 个激活全部在 `seq_shift6` 之后就已定稿，
+    /// 分两次 `to_f16_triple` 只是历史原因留下的**一个多余的串行节点**（每个节点约 0.1 ms：
+    /// 见台账 §3.8 的「每节点一次独立 DRAM 扫」）。默认实现退化成两次三输入版。
+    #[allow(clippy::too_many_arguments)]
+    fn to_f16_six(
+        &mut self,
+        xr: TensorId,
+        xw: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        yr: TensorId,
+        yw: TensorId,
+        yk: TensorId,
+        yv: TensorId,
+        ya: TensorId,
+        yg: TensorId,
+        c: usize,
+        t: usize,
+        m_pad: usize,
+        x_stride: usize,
+        y_stride: usize,
+    ) -> R<()> {
+        self.to_f16_triple(xr, xk, xv, yr, yk, yv, c, t, m_pad, x_stride, y_stride)?;
+        self.to_f16_triple(xw, xa, xg, yw, ya, yg, c, t, m_pad, x_stride, y_stride)
+    }
+    /// 后端是否有 [`Self::to_f16_six`] 的融合核（默认实现等价，不需要开关）。
+    fn supports_to_f16_six(&self) -> bool {
+        false
+    }
     /// int8 → fp16 反量化（prefill：解到 fp16 scratch 供 GEMM 消费）。
     #[allow(clippy::too_many_arguments)]
     fn dequant_int8_to_f16(&mut self, a: &Int8Handle, out: TensorId, m: usize, k: usize) -> R<()>;
