@@ -203,6 +203,8 @@ pub struct GpuModel {
     scale_w: TensorId,
     /// MTP drafter 挂载点（`enable_mtp` 后才存在；未启用时整条路径零成本）。
     mtp: Option<MtpCtx>,
+    /// 投机步的主模型状态快照（`enable_mtp` 时按模型维度分配）。
+    mtp_snap: Option<State>,
 }
 
 /// MTP drafter 的挂载点：drafter 本体 + 两个 tap 层的输出残差缓冲。
@@ -214,6 +216,10 @@ pub struct MtpCtx {
     /// 上述两层的**输出残差**（即该层 `x`）的 `[C]` 快照。
     tap0: TensorId,
     tap1: TensorId,
+    /// 待用的 drafter 输入 `(h, m1, m2)`：投机步之后指向 `VerifySaves` 里那一位置的 tap；
+    /// `None` = 用刚跑完一次 decode 的 `bufs.x_norm` + `tap0/tap1`（每次 `forward_token`
+    /// 结束都会清成 `None`，所以两者不会混用）。
+    pending_h: Option<[TensorId; 3]>,
 }
 
 impl MtpCtx {
@@ -581,6 +587,25 @@ pub struct SeqBuffers {
     /// [ffn_hidden, C] = 26.2M 元素（52.4MB）。每矩阵 GEMM 前由 dequant 全量覆写，
     /// 顺序复用（barrier 由 record_kernel 读写序保证），替代旧逐层 3.4GB fp16 副本。
     w_scratch: TensorId,
+    /// 验证前向（MTP 投机步）用的**逐位置 logits** `[T, vocab]`。按需分配：
+    /// T=8 时 2 MB，而 prefill 的 T=2048 会是 537 MB ⇒ 只有验证路径（T ≤ 8）才建。
+    logits_t: Option<TensorId>,
+    /// 验证前向的**逐位置回滚输入 + drafter tap**（见 [`VerifySaves`]）。按需分配。
+    vsaves: Option<Box<VerifySaves>>,
+}
+
+/// 验证前向（投机解码）要留下的两样东西。
+///
+/// **为什么存「输入」而不是「状态快照」**：状态快照要 `3·n_layer·T` 张量（T=8 时 768 张、
+/// 336 MB 的写流量），而回滚只用到每层 `dplr_seq` 的 6 个输入 + 两次 token shift ⇒
+/// 8 张/层、共 21 MB；回滚时每层重跑一次 `dplr_seq(T=n)` 即可，**不需要改任何内核**。
+struct VerifySaves {
+    /// 每层 `[r, w, k_mod, v, kk_l2, b_vec, ln1, ln2]`，各 `[T, C]`。
+    /// 每层单独一张（而不是一张 `[L·T, C]`）是因为 `dplr_seq` 只吃 `TensorId`，没有偏移参数。
+    per_layer: Vec<[TensorId; 8]>,
+    /// 逐位置的 drafter tap：`[position] = [h(=ln_out(x) 行), m1, m2]`，各 `[C]`。
+    /// drafter 提交「被接受的草稿」时要按位置取主模型那一行的三个残差。
+    taps: Vec<[TensorId; 3]>,
 }
 
 impl SeqBuffers {
@@ -646,6 +671,54 @@ impl SeqBuffers {
         for t in tensors {
             backend.free_tensor(t);
         }
+        if let Some(t) = self.logits_t {
+            backend.free_tensor(t);
+        }
+        if let Some(v) = self.vsaves.take() {
+            for a in &v.per_layer {
+                for t in a {
+                    backend.free_tensor(*t);
+                }
+            }
+            for a in &v.taps {
+                for t in a {
+                    backend.free_tensor(*t);
+                }
+            }
+        }
+    }
+
+    /// 按需分配验证前向的缓冲（`logits_t` 是 `T×vocab×4` 字节 ⇒ 只允许小 T）。
+    fn ensure_verify(
+        &mut self,
+        backend: &mut dyn ComputeBackend,
+        c: usize,
+        vocab: usize,
+        n_layer: usize,
+    ) -> R<()> {
+        if self.logits_t.is_none() {
+            self.logits_t = Some(backend.create_tensor(self.t * vocab, TensorDtype::F32)?);
+        }
+        if self.vsaves.is_none() {
+            let mut per_layer = Vec::with_capacity(n_layer);
+            for _ in 0..n_layer {
+                let mut a = [TensorId(0); 8];
+                for x in a.iter_mut() {
+                    *x = backend.create_tensor(self.t * c, TensorDtype::F32)?;
+                }
+                per_layer.push(a);
+            }
+            let mut taps = Vec::with_capacity(self.t);
+            for _ in 0..self.t {
+                let mut a = [TensorId(0); 3];
+                for x in a.iter_mut() {
+                    *x = backend.create_tensor(c, TensorDtype::F32)?;
+                }
+                taps.push(a);
+            }
+            self.vsaves = Some(Box::new(VerifySaves { per_layer, taps }));
+        }
+        Ok(())
     }
 }
 
@@ -861,6 +934,7 @@ impl GpuModel {
             state: Some(state),
             scale_w,
             mtp: None,
+            mtp_snap: None,
         })
     }
 
@@ -895,12 +969,21 @@ impl GpuModel {
             drafter.depth,
             sc.meta.fuse_layers
         );
+        // 投机步的主模型状态快照（与当前内部态同形）
+        self.mtp_snap = Some(State::new(
+            self.backend.as_mut(),
+            c,
+            self.config.n_head,
+            self.config.head_size,
+            self.config.n_layer,
+        )?);
         self.mtp = Some(MtpCtx {
             drafter,
             f1: sc.meta.fuse_layers[0],
             f2: sc.meta.fuse_layers[1],
             tap0,
             tap1,
+            pending_h: None,
         });
         Ok(())
     }
@@ -934,12 +1017,140 @@ impl GpuModel {
         let Some(mut ctx) = self.mtp.take() else {
             return Err("mtp_draft: MTP 未启用（先 enable_mtp）".into());
         };
-        let (h, m1, m2) = (self.bufs.x_norm, ctx.tap0, ctx.tap1);
+        let [h, m1, m2] = ctx
+            .pending_h
+            .unwrap_or([self.bufs.x_norm, ctx.tap0, ctx.tap1]);
         let r = ctx
             .drafter
             .draft_chain(self.backend.as_mut(), h, m1, m2, tok, k);
         self.mtp = Some(ctx);
         r
+    }
+
+    /// 一次投机步（单流、**贪心**验证）。
+    ///
+    /// 返回本次**提交**的 token（长度 ≥ 2）：`[tok, 被接受的草稿..., 首个未命中位上的采样]`。
+    /// 语义与普通解码等价——每个提交的 token 都是主模型在该位置分布上的一次采样（贪心 = argmax），
+    /// 草稿只决定「一个主前向能吐几个 token」。
+    ///
+    /// 前置：`state` 是主模型状态（已处理到位置 p），`tok` 是位置 p+1 的 token（刚采样出来）；
+    /// 待用的 drafter 输入 `H`：刚跑过 decode 就用 `bufs`，刚跑过投机步就用上一步记下的 tap。
+    ///
+    /// 返回后：`state` 推进到位置 p+j+1，返回的最后一个 token **尚未**进状态（它就是下一步的 `tok`）。
+    pub fn spec_step(&mut self, state: &mut State, tok: u32, k: usize) -> R<Vec<u32>> {
+        let (c, h, nn) = (
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        );
+        if self.mtp.is_none() || self.mtp_snap.is_none() {
+            return Err("spec_step: MTP 未启用（先 enable_mtp）".into());
+        }
+        let prof = std::env::var("MTP_PROF").is_ok();
+        let mut t0 = std::time::Instant::now();
+        macro_rules! pp {
+            ($name:expr) => {
+                if prof {
+                    log::info!(
+                        "[SP] {}: {:.3} ms",
+                        $name,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    t0 = std::time::Instant::now();
+                }
+            };
+        }
+        // 1) 状态快照
+        let mut snap = self.mtp_snap.take().unwrap();
+        snap.copy_from(self.backend.as_mut(), state, c, h, nn)?;
+        pp!("snapshot");
+        // 2) 起草 k 个（深度 1 的提交副作用把 drafter 的位置推进 1）
+        let tok_t = self.bufs.current_token;
+        self.backend.store_token_host(tok_t, tok)?;
+        let drafts = self.mtp_draft(tok_t, k)?;
+        pp!("draft");
+        // 3) 验证：T = k+1 的因果 pass，拿逐位置 argmax
+        let mut toks = Vec::with_capacity(k + 1);
+        toks.push(tok);
+        toks.extend_from_slice(&drafts[..k]);
+        let picks = self.forward_seq_verify_with_state(state, &toks)?;
+        pp!("verify");
+        // 4) 接受前缀：j = 连续命中的草稿数
+        let mut j = 0usize;
+        while j < k && picks[j] == drafts[j] {
+            j += 1;
+        }
+        if prof {
+            log::info!(
+                "[SPD] pos={} tok={} drafts={:?} picks={:?} j={}",
+                self.mtp.as_ref().map(|m| m.drafter.pos()).unwrap_or(0),
+                tok,
+                drafts,
+                picks,
+                j
+            );
+        }
+        // 5) 回滚到「已处理 j+1 个 token」的状态（按验证时存下的逐位置输入重放）
+        self.spec_rollback(state, &snap, j + 1)?;
+        pp!("rollback");
+        // 6) drafter 补提交被接受的 j 个草稿，并把下一步的 H 指向 taps[j]
+        let taps: Vec<[TensorId; 3]> = self
+            .seq_bufs
+            .as_ref()
+            .and_then(|sb| sb.vsaves.as_ref())
+            .map(|v| v.taps.clone())
+            .unwrap_or_default();
+        if let Some(mut ctx) = self.mtp.take() {
+            for (i, &d) in drafts.iter().take(j).enumerate() {
+                let Some(t) = taps.get(i) else { break };
+                self.backend.store_token_host(tok_t, d)?;
+                ctx.drafter
+                    .commit_only(self.backend.as_mut(), t[0], t[1], t[2], tok_t)?;
+            }
+            ctx.pending_h = taps.get(j).copied();
+            self.mtp = Some(ctx);
+        }
+        pp!("commit");
+        let _ = t0; // 最后一次赋值不被读，避免 unused_assignments
+        self.mtp_snap = Some(snap);
+
+        let mut out = Vec::with_capacity(j + 2);
+        out.push(tok);
+        out.extend_from_slice(&drafts[..j]);
+        out.push(picks[j]);
+        Ok(out)
+    }
+
+    /// 回滚：`state` ← 快照，然后按验证时存下的逐位置输入重放前 `n` 个 token 的状态更新。
+    ///
+    /// 只重算「状态」，不重算前向（不需要权重）⇒ 每层一次 `dplr_seq(T=n)` + 两次
+    /// `copy_token`（token shift 取第 n−1 行），量级 ~0.2 ms，而不是第二遍 16 ms 的 seq pass。
+    fn spec_rollback(&mut self, state: &mut State, snap: &State, n: usize) -> R<()> {
+        let (c, h, nn) = (
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        );
+        let Some(sb) = self.seq_bufs.take() else {
+            return Err("spec_rollback: 没有 seq 缓冲（须先跑过验证前向）".into());
+        };
+        let Some(pl) = sb.vsaves.as_ref().map(|v| v.per_layer.clone()) else {
+            self.seq_bufs = Some(sb);
+            return Err("spec_rollback: 验证存档缺失".into());
+        };
+        state.copy_from(self.backend.as_mut(), snap, c, h, nn)?;
+        self.backend.begin_batch()?;
+        for (i, d) in pl.iter().enumerate().take(self.config.n_layer) {
+            let s = &state.layers[i];
+            self.backend.dplr_seq(
+                s.tmix_rnn, d[0], d[1], d[2], d[3], d[4], d[5], sb.y, h, nn, n, c,
+            )?;
+            self.backend.copy_token(d[6], s.tmix_x, c, c, n - 1)?;
+            self.backend.copy_token(d[7], s.cmix_x, c, c, n - 1)?;
+        }
+        self.backend.end_batch()?;
+        self.seq_bufs = Some(sb);
+        Ok(())
     }
 
     /// 诊断：用 drafter 的 head 路径对当前末行 `ln_out(x)`（`bufs.x_norm`）求 argmax。
@@ -974,6 +1185,10 @@ impl GpuModel {
         }
         if i == f2 {
             self.backend.copy_device(self.bufs.x, t1)?;
+        }
+        // 解码路径的 tap 是「本 token」的：一旦跑过 decode，投机步留下的 pending H 就作废
+        if let Some(m) = self.mtp.as_mut() {
+            m.pending_h = None;
         }
         Ok(())
     }
@@ -1065,6 +1280,7 @@ impl GpuModel {
             scale_w: self.scale_w,
             // 共享实例不带 MTP（drafter 的状态/权重属本体私有；需要时各自 enable_mtp）
             mtp: None,
+            mtp_snap: None,
         })
     }
 
@@ -4326,6 +4542,34 @@ impl GpuModel {
     /// 前向推理（sequence-parallel，web-rwkv 风格）：接受外部 `State`。
     /// 把整段 T 个 token 一次贯穿各层，返回最后 token 的 logits [vocab]。
     pub fn forward_seq_with_state(&mut self, state: &mut State, tokens: &[u32]) -> R<Vec<f32>> {
+        let (logits, _) = self.forward_seq_impl(state, tokens, false)?;
+        Ok(logits)
+    }
+
+    /// **验证前向**（MTP 投机步）：一次因果 pass 处理 `tokens`，返回**每个位置**的采样结果
+    /// （贪心 = argmax），即 `picks[i]` = 「位置 p+i 的下一 token」。
+    ///
+    /// 与 `forward_seq_with_state` 的唯一差别是 head 算**全 T 行**并把逐行 argmax 读回；
+    /// 同时把每层的 `dplr_seq` 输入、`ln1/ln2`、以及两个 tap 层的逐位置残差存进
+    /// [`VerifySaves`]，供 [`Self::spec_rollback`] 用。要求 `T ≤ 8`（`logits_t` 是 T×vocab）。
+    ///
+    /// 副作用：`state` 被推进到 `p + tokens.len()`（与普通 prefill 一致）。
+    pub fn forward_seq_verify_with_state(
+        &mut self,
+        state: &mut State,
+        tokens: &[u32],
+    ) -> R<Vec<u32>> {
+        let (_, picks) = self.forward_seq_impl(state, tokens, true)?;
+        Ok(picks)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_seq_impl(
+        &mut self,
+        state: &mut State,
+        tokens: &[u32],
+        verify: bool,
+    ) -> R<(Vec<f32>, Vec<u32>)> {
         let t = tokens.len();
         assert!(t >= 1, "forward_seq requires at least 1 token");
         let (c, n, vocab) = (self.config.n_embd, self.config.head_size, self.config.vocab);
@@ -4348,6 +4592,15 @@ impl GpuModel {
         }
         // 临时取出 seq_bufs，避免 forward_seq_layer 的 &mut self 与 &mut self.seq_bufs 冲突
         let mut seq_bufs = self.seq_bufs.take().unwrap();
+        if verify {
+            if t > 8 {
+                self.seq_bufs = Some(seq_bufs);
+                return Err(
+                    format!("验证前向只支持 T ≤ 8（得 {t}）：逐位置 logits 是 T×vocab").into(),
+                );
+            }
+            seq_bufs.ensure_verify(self.backend.as_mut(), c, vocab, self.config.n_layer)?;
+        }
         let sb = &mut seq_bufs;
 
         // 收集整段嵌入行 [t, c]（用 CPU 缓存，避免每次下载 671MB 的 emb_ln 表）
@@ -4367,11 +4620,14 @@ impl GpuModel {
         let prefill_graph = std::env::var("PREFILL_GRAPH").as_deref() == Ok("1")
             && std::env::var("GEMM_DIAG").is_err()
             && std::env::var("PROFILE").is_err();
-        if prefill_graph && self.backend.prefill_graph_valid(t)? {
+        // 图 key：验证路径的 kernel 序列与同 T 的普通 prefill **不同**（head 全 T 行 + 逐位置
+        // 保存），必须分开缓存，否则会重放到另一条序列上（静默算错）。
+        let gkey = if verify { t | (1usize << 40) } else { t };
+        if prefill_graph && self.backend.prefill_graph_valid(gkey)? {
             self.backend.prefill_graph_replay()?;
         } else {
             if prefill_graph {
-                self.backend.begin_prefill_capture(t)?;
+                self.backend.begin_prefill_capture(gkey)?;
             }
             // 单批处理全部层：任何层都走 int8 GEMM（零 fp16 副本），无需逐层 begin/end_batch 隔离。
             self.backend.begin_batch()?;
@@ -4406,19 +4662,40 @@ impl GpuModel {
                 LN_EPS,
                 t,
             )?;
-            if std::env::var("HEAD_DIAG").is_ok() {
-                log::info!("[HEAD] copy_token start");
-            }
-            // head_in = x_norm[T-1]（末 token 行）
-            self.backend
-                .copy_token(sb.x_norm, sb.head_in, c, c, t - 1)?;
-            if std::env::var("HEAD_DIAG").is_ok() {
-                log::info!("[HEAD] head_gemv start");
-            }
-            // logits = head_in @ head.T，输出 [vocab]（int8 量化 head 省 4× 带宽）
-            self.head_gemv(sb.head_in, sb.logits, vocab, c)?;
-            if std::env::var("HEAD_DIAG").is_ok() {
-                log::info!("[HEAD] head_gemv done");
+            if verify {
+                // 验证：head 一次算全 T 行 → logits_t [T, vocab]（随后逐行 argmax）
+                let logits_t = sb.logits_t.ok_or("verify: logits_t 未分配")?;
+                if let Some(wqh) = wq(self.head_i6, self.head_a8) {
+                    self.backend
+                        .w_plain(&wqh, sb.x_norm, logits_t, vocab, c, t)?;
+                } else {
+                    let w16 = self.head_w16.ok_or("head 既无 int8 也无 fp16 权重")?;
+                    self.backend
+                        .gemv_f16(w16, sb.x_norm, logits_t, vocab, c, t)?;
+                }
+                // drafter 的 `h` 就是每行的 `ln_out(x)`：存进 taps[p][0]
+                if let Some(vs) = sb.vsaves.as_ref() {
+                    let mut items = Vec::with_capacity(t);
+                    for p in 0..t.min(vs.taps.len()) {
+                        items.push((sb.x_norm, p * c, vs.taps[p][0], 0, c));
+                    }
+                    self.backend.copy_ranges(&items)?;
+                }
+            } else {
+                if std::env::var("HEAD_DIAG").is_ok() {
+                    log::info!("[HEAD] copy_token start");
+                }
+                // head_in = x_norm[T-1]（末 token 行）
+                self.backend
+                    .copy_token(sb.x_norm, sb.head_in, c, c, t - 1)?;
+                if std::env::var("HEAD_DIAG").is_ok() {
+                    log::info!("[HEAD] head_gemv start");
+                }
+                // logits = head_in @ head.T，输出 [vocab]（int8 量化 head 省 4× 带宽）
+                self.head_gemv(sb.head_in, sb.logits, vocab, c)?;
+                if std::env::var("HEAD_DIAG").is_ok() {
+                    log::info!("[HEAD] head_gemv done");
+                }
             }
 
             self.backend.end_batch()?;
@@ -4455,13 +4732,30 @@ impl GpuModel {
             log::info!("[FS] y_g16[0..4] = {:?}", &yg16[..4]);
         }
 
-        // 返回最后 token 的 logits（先下载，再归还 seq_bufs）
-        let last_logits = self.backend.download(sb.logits)?;
+        // 返回最后 token 的 logits / 逐位置 picks（先下载，再归还 seq_bufs）
+        let (last_logits, picks) = if verify {
+            let logits_t = sb.logits_t.ok_or("verify: logits_t 未分配")?;
+            let all = self.backend.download(logits_t)?;
+            let mut picks = Vec::with_capacity(t);
+            for row in 0..t {
+                let lg = &all[row * vocab..(row + 1) * vocab];
+                let mut best = 0usize;
+                for i in 1..lg.len() {
+                    if lg[i] > lg[best] {
+                        best = i;
+                    }
+                }
+                picks.push(best as u32);
+            }
+            (Vec::new(), picks)
+        } else {
+            (self.backend.download(sb.logits)?, Vec::new())
+        };
 
         // 归还 seq_bufs
         self.seq_bufs = Some(seq_bufs);
 
-        Ok(last_logits)
+        Ok((last_logits, picks))
     }
 
     /// 序列 prefill 后返回最后一层 FFN 输出（残差流 sb.x）在 T 维的 mean pooling。
@@ -5021,6 +5315,10 @@ impl GpuModel {
             n,
             t,
         )?;
+        // 投机解码回滚用：保存本层 `dplr_seq` 的 6 个输入 + ln1
+        //（未分配验证缓冲时零成本；必须在 dplr_seq 之前——虽然本核不写这些输入，
+        //  但放在这里与「输入已全部定稿」的时刻一致）
+        Self::seq_save_inputs(self.backend.as_mut(), i, c, t, sb)?;
         pf_phase!("lowrank+fuse_ka");
 
         // DPLR：单次 launch 处理整段 T（内部循环），S 跨 token 传递
@@ -5151,6 +5449,7 @@ impl GpuModel {
         // ln2 = layer_norm(x, ln2_w, ln2_b)
         self.backend
             .norm(sb.x, layer.ln2_w, layer.ln2_b, sb.ln2, c, 1, LN_EPS, t)?;
+        Self::seq_save_ln2(self.backend.as_mut(), i, c, t, sb)?;
 
         // xb = token shift（t=0 用旧 cmix_x state，t>0 用前一轮 ln2）
         self.backend.seq_shift(
@@ -5251,6 +5550,10 @@ impl GpuModel {
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn done");
         }
+        // drafter tap：`fuse_layers` 两层的输出残差逐位置保存（未启用 MTP 时零成本）
+        if let Some((f1, f2)) = self.mtp.as_ref().map(|m| (m.f1, m.f2)) {
+            Self::seq_save_tap(self.backend.as_mut(), f1, f2, i, c, t, sb)?;
+        }
         pf_phase!("channel_mix+ffn");
 
         Ok(())
@@ -5294,6 +5597,80 @@ impl GpuModel {
         // 低秩一级 mid 仍由调用方用张量核 GEMM 算（mid ≤ 96，m_pad=256 的 padding 代价
         // 只有 ~0.2 ms/整 pass；而 w 链的 `gemm_tanh` 把 tanh 融在里面，拆开要新算子）
         Ok(())
+    }
+
+    /// 验证前向（MTP 投机步）的逐位置保存：每层 `dplr_seq` 的 6 个输入 + `ln1`。
+    /// 未分配验证缓冲时立即返回（普通 prefill **零成本**：只有一次 `Option` 判断）。
+    fn seq_save_inputs(
+        be: &mut dyn ComputeBackend,
+        i: usize,
+        c: usize,
+        t: usize,
+        sb: &SeqBuffers,
+    ) -> R<()> {
+        let Some(vs) = sb.vsaves.as_ref() else {
+            return Ok(());
+        };
+        if i >= vs.per_layer.len() {
+            return Ok(());
+        }
+        let d = vs.per_layer[i];
+        let len = t * c;
+        let items = [
+            (sb.r, 0, d[0], 0, len),
+            (sb.w, 0, d[1], 0, len),
+            (sb.k_mod, 0, d[2], 0, len),
+            (sb.v, 0, d[3], 0, len),
+            (sb.kk_l2, 0, d[4], 0, len),
+            (sb.b_vec, 0, d[5], 0, len),
+            (sb.ln1, 0, d[6], 0, len),
+        ];
+        be.copy_ranges(&items)
+    }
+
+    /// 验证前向：`ln2` 逐位置保存（channel-mix 的 token shift 回滚用）。
+    fn seq_save_ln2(
+        be: &mut dyn ComputeBackend,
+        i: usize,
+        c: usize,
+        t: usize,
+        sb: &SeqBuffers,
+    ) -> R<()> {
+        let Some(vs) = sb.vsaves.as_ref() else {
+            return Ok(());
+        };
+        if i >= vs.per_layer.len() {
+            return Ok(());
+        }
+        let d = vs.per_layer[i][7];
+        be.copy_range(sb.ln2, 0, d, 0, t * c)
+    }
+
+    /// 验证前向的 drafter tap：`fuse_layers` 两层的**输出残差**逐位置存进 `taps[pos][1/2]`。
+    fn seq_save_tap(
+        be: &mut dyn ComputeBackend,
+        f1: usize,
+        f2: usize,
+        i: usize,
+        c: usize,
+        t: usize,
+        sb: &SeqBuffers,
+    ) -> R<()> {
+        let slot = if i == f1 {
+            1
+        } else if i == f2 {
+            2
+        } else {
+            return Ok(());
+        };
+        let Some(vs) = sb.vsaves.as_ref() else {
+            return Ok(());
+        };
+        let mut items = Vec::with_capacity(t);
+        for p in 0..t.min(vs.taps.len()) {
+            items.push((sb.x, p * c, vs.taps[p][slot], 0, c));
+        }
+        be.copy_ranges(&items)
     }
 }
 
@@ -6422,6 +6799,30 @@ impl State {
         Ok(())
     }
 
+    /// 设备内**整态拷贝**（`src → self`）：投机解码的状态快照 / 回滚用。
+    ///
+    /// 走 [`Self::copy_rows_from`] 的同一条路（`3·n_layer+1` 条设备内拷贝、一次提交），
+    /// 全程不过主机。要求两个 State 由同一模型创建（层数与逐张量布局一致、batch 相同）。
+    pub fn copy_from(
+        &mut self,
+        backend: &mut dyn ComputeBackend,
+        src: &State,
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if src.batch != self.batch {
+            return Err(format!(
+                "State::copy_from: batch 不符 {} vs {}",
+                self.batch, src.batch
+            )
+            .into());
+        }
+        self.copy_rows_from(backend, src, 0, 0, self.batch, c, h, n)?;
+        self.v_first_set = src.v_first_set;
+        Ok(())
+    }
+
     /// 单 slot 状态回灌（batch 布局）：把单序列布局数据写入指定 slot 段。
     pub fn slot_load(
         &self,
@@ -6783,6 +7184,9 @@ impl SeqBuffers {
             g_mid16: mk_f16(&mut *backend, cfg.g_mid_pad)?,
             // dequant 每次 GEMM 前全量覆写，无需零初始化上传
             w_scratch: backend.create_tensor(cfg.ffn_hidden * c, TensorDtype::F16)?,
+            // 验证前向（MTP）按需分配
+            logits_t: None,
+            vsaves: None,
         })
     }
 }

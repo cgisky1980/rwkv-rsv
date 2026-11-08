@@ -352,7 +352,25 @@ impl MtpDrafter {
         tok: TensorId,
     ) -> R<()> {
         let p = self.st.pos;
-        self.depth1(be, h, m1, m2, tok, p)?;
+        self.depth1(be, h, m1, m2, tok, p, true)?;
+        be.copy_device(self.b.x2, self.st.ffn_x)?;
+        self.st.pos += 1;
+        Ok(())
+    }
+
+    /// 只提交、不产草稿（§3.3 的 `accept` 用）：跳过 head + 掩码 + argmax（那一步要读 168 MB
+    /// int8 head，是整块最贵的一段）。纯提交 ≈ 0.1 ms，带 head ≈ 1.1 ms ⇒ 接受后补提交
+    /// `j` 步的代价可以忽略。
+    pub fn commit_only(
+        &mut self,
+        be: &mut dyn ComputeBackend,
+        h: TensorId,
+        m1: TensorId,
+        m2: TensorId,
+        tok: TensorId,
+    ) -> R<()> {
+        let p = self.st.pos;
+        self.depth1(be, h, m1, m2, tok, p, false)?;
         be.copy_device(self.b.x2, self.st.ffn_x)?;
         self.st.pos += 1;
         Ok(())
@@ -390,7 +408,7 @@ impl MtpDrafter {
             )?;
             let u = b.u;
             // 深度 i+1 ⇒ `dep[i]`（`dep[k-1]` 在深度 k 加）
-            self.block(be, u, b.tok, p + i as u32, i)?;
+            self.block(be, u, b.tok, p + i as u32, i, true)?;
             be.copy_part(b.drafts, i, b.tok, 1)?;
         }
         let d = be.download(b.drafts)?;
@@ -398,6 +416,7 @@ impl MtpDrafter {
     }
 
     /// 深度 1：`u = fproj·[LN_lh(h); LN_lf0(m1); LN_lf1(m2)]`，然后跑一个块。
+    #[allow(clippy::too_many_arguments)]
     fn depth1(
         &mut self,
         be: &mut dyn ComputeBackend,
@@ -406,6 +425,7 @@ impl MtpDrafter {
         m2: TensorId,
         tok: TensorId,
         p: u32,
+        with_draft: bool,
     ) -> R<()> {
         let (b, c) = (self.b, self.c);
         be.norm(h, self.w.lh.w, self.w.lh.b, b.h_n, c, 1, self.ln_eps, 1)?;
@@ -424,7 +444,7 @@ impl MtpDrafter {
         )?;
         // 深度 1 的 token shift = 最后一个已提交位置的 x2
         be.copy_device(self.st.ffn_x, b.shift)?;
-        self.block(be, b.u, tok, p, 0)
+        self.block(be, b.u, tok, p, 0, with_draft)
     }
 
     /// 一个 drafter 块（§1.4 的 `proj` 之后全部），结果 `out`/`x2`/`tok`(argmax) 留缓冲。
@@ -436,6 +456,7 @@ impl MtpDrafter {
         tok: TensorId,
         p: u32,
         dep_row: usize,
+        with_draft: bool,
     ) -> R<()> {
         let (b, c) = (self.b, self.c);
         let (d, nh, nkv) = (MTP_HEAD_DIM, MTP_N_HEAD, MTP_N_KV_HEAD);
@@ -515,11 +536,13 @@ impl MtpDrafter {
             1,
         )?;
 
-        // out → draft
+        // out → draft（`with_draft=false` 时整段跳过：`accept` 的补提交不需要草稿）
         be.norm(b.x, self.w.lo.w, self.w.lo.b, b.out, c, 1, self.ln_eps, 1)?;
-        self.head.gemv(be, b.out, b.logits, self.vocab, c)?;
-        be.elementwise_add(b.logits, self.draft_mask, b.logits, self.vocab)?;
-        be.argmax(b.logits, b.tok, self.vocab)?;
+        if with_draft {
+            self.head.gemv(be, b.out, b.logits, self.vocab, c)?;
+            be.elementwise_add(b.logits, self.draft_mask, b.logits, self.vocab)?;
+            be.argmax(b.logits, b.tok, self.vocab)?;
+        }
         // 下一深度 / 下一次提交的 token shift
         be.copy_device(b.x2, b.shift)
     }

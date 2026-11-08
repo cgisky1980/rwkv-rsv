@@ -150,6 +150,94 @@ fn main() -> Result<(), Box<dyn Error>> {
         acc_sum / steps.max(1) as f64
     );
 
+    // —— 投机步 A/B：同一贪心流，plain 逐 token vs spec（起草→验证→回滚）——
+    let n_gen = env_usize("MTP_GEN", 32);
+    let am = |v: &[f32]| -> u32 {
+        let mut b = 0;
+        for i in 1..v.len() {
+            if v[i] > v[b] {
+                b = i;
+            }
+        }
+        b as u32
+    };
+    // ★ 两臂都必须从**同一个真实 prompt** 出发：`seed=1` 会让模型掉进「token 1 自循环」，
+    // 而 token 1 不在 draft 词表内 ⇒ 接受率必然 0（见台账 §3.3 的坑 2）。
+    model.mtp_reset()?;
+    model.reset_state()?;
+    let mut tok = model.forward_argmax(&prompt)?;
+    let mut plain = Vec::with_capacity(n_gen);
+    plain.push(tok); // prompt 之后的第一个 token（两臂对齐到同一位置）
+    let tp = std::time::Instant::now();
+    while plain.len() < n_gen {
+        tok = model.forward_argmax(&[tok])?;
+        plain.push(tok);
+    }
+    let ms_plain = tp.elapsed().as_secs_f64() * 1000.0;
+
+    // spec 臂：prompt 逐 token 走，并同步提交 drafter（§3.4 的 prefill 提交规则）
+    let seed_spec = |bundle: &mut rwkv_rsv::gpu_model::Bundle| -> Result<u32, Box<dyn Error>> {
+        bundle.reset()?;
+        bundle.model.mtp_reset()?;
+        let mut tok = 0u32;
+        for (i, &t) in prompt.iter().enumerate() {
+            let lg = bundle.infer_tokens(&[t])?;
+            let nt = am(&lg);
+            if i + 1 < prompt.len() {
+                let _ = bundle.model.mtp_draft_host(prompt[i + 1], 1)?;
+            } else {
+                tok = nt;
+            }
+        }
+        Ok(tok)
+    };
+    // 预热：图捕获 + 各 n 的 `dplr_seq` 变体编译都在前几步，不计时
+    let mut w = seed_spec(&mut bundle)?;
+    for _ in 0..k + 2 {
+        let out = bundle.model.spec_step(&mut bundle.state, w, k)?;
+        w = *out.last().unwrap();
+    }
+    let mut tok = seed_spec(&mut bundle)?;
+    let mut spec = Vec::with_capacity(n_gen);
+    let mut steps = 0usize;
+    let mut accepted = 0usize;
+    let ts = std::time::Instant::now();
+    while spec.len() < n_gen {
+        let out = bundle.model.spec_step(&mut bundle.state, tok, k)?;
+        accepted += out.len() - 2; // 被接受的草稿数（末尾那个是新采样、未进状态）
+        steps += 1;
+        for &t in &out[..out.len() - 1] {
+            spec.push(t);
+        }
+        tok = *out.last().unwrap();
+    }
+    let ms_spec = ts.elapsed().as_secs_f64() * 1000.0;
+    let model = &mut bundle.model;
+
+    // 流一致性：逐位置比对（near-tie 允许分歧，与上游同样声明）
+    let mut same = 0usize;
+    for (a, b) in plain.iter().zip(spec.iter()) {
+        if a == b {
+            same += 1;
+        } else {
+            break;
+        }
+    }
+    log::info!(
+        "—— 投机步 A/B（贪心 {n_gen} token，K={k}）——\n  plain: {:.2} ms（{:.1} tok/s）\n  spec : {:.2} ms（{:.1} tok/s）⇒ **{:.2}×**，{steps} 步、平均接受 {:.2} 草稿/步\n  流一致性：前 {same}/{n_gen} 个一致{}",
+        ms_plain,
+        n_gen as f64 * 1000.0 / ms_plain,
+        ms_spec,
+        n_gen as f64 * 1000.0 / ms_spec,
+        ms_plain / ms_spec,
+        accepted as f64 / steps.max(1) as f64,
+        if same == n_gen {
+            "（完全一致）"
+        } else {
+            "（near-tie 分歧，见文档）"
+        }
+    );
+
     // —— 成本三件套：验证券化之前的先决读数（决定 K 与回滚策略）——
     // ① 单 token decode（plain 基线）② T=K+1 的因果 seq pass（验证明细）③ drafter 链
     let reps = env_usize("MTP_REPS", 16).max(1);
