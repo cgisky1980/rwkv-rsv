@@ -26,5 +26,9 @@ __pycache__/
 
 # Embedded reference repo (Albatross; tracked separately upstream)
 /参考/Albatross
+# MTP 上游实现（OpenMOSE/RWKV-Infer-Next）：
+#   git clone --depth 1 https://github.com/OpenMOSE/RWKV-Infer-Next.git 参考/RWKV-Infer-Next
+# 上游 `docs/mtp.md` + `rwkv_next/{spec,drafter,mtp}.py` + `kernels/int6_gemm.py` 是 MTP 的权威规范与参照实现。
+/参考/RWKV-Infer-Next
 # 基准原始读数（JSONL 派生产物，可由 examples/bench_ab / batch_decode_bench 重新生成）
 /bench
