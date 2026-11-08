@@ -1005,7 +1005,12 @@ impl GpuModel {
     /// 清空 drafter 状态（与会话 reset 同步调用）。
     pub fn mtp_reset(&mut self) -> R<()> {
         if let Some(mut ctx) = self.mtp.take() {
+            // ★ Vulkan 的 `record_kernel` 要求「命令缓冲处于 recording 状态」——
+            // 所有非 `forward_*` 路径的 kernel 序列都必须自己圈一次 begin/end_batch
+            // （CUDA 上这两个调用是 no-op，不影响语义）。
+            self.backend.begin_batch()?;
             let r = ctx.drafter.reset(self.backend.as_mut());
+            self.backend.end_batch()?;
             self.mtp = Some(ctx);
             r
         } else {
@@ -1024,9 +1029,12 @@ impl GpuModel {
         let [h, m1, m2] = ctx
             .pending_h
             .unwrap_or([self.bufs.x_norm, ctx.tap0, ctx.tap1]);
+        // 同 `mtp_reset`：drafter 的 kernel 序列必须自己圈一次 begin/end_batch（Vulkan 要求）
+        self.backend.begin_batch()?;
         let r = ctx
             .drafter
             .draft_chain(self.backend.as_mut(), h, m1, m2, tok, k);
+        self.backend.end_batch()?;
         self.mtp = Some(ctx);
         r
     }
@@ -1123,12 +1131,20 @@ impl GpuModel {
             .map(|v| v.taps.clone())
             .unwrap_or_default();
         if let Some(mut ctx) = self.mtp.take() {
+            self.backend.begin_batch()?;
+            let mut r = Ok(());
             for (i, &d) in drafts.iter().take(j).enumerate() {
                 let Some(t) = taps.get(i) else { break };
-                self.backend.store_token_host(tok_t, d)?;
-                ctx.drafter
-                    .commit_only(self.backend.as_mut(), t[0], t[1], t[2], tok_t)?;
+                r = self.backend.store_token_host(tok_t, d).and_then(|()| {
+                    ctx.drafter
+                        .commit_only(self.backend.as_mut(), t[0], t[1], t[2], tok_t)
+                });
+                if r.is_err() {
+                    break;
+                }
             }
+            self.backend.end_batch()?;
+            r?;
             ctx.pending_h = taps.get(j).copied();
             self.mtp = Some(ctx);
         }
@@ -1259,7 +1275,9 @@ impl GpuModel {
             return Err("mtp_head_check: MTP 未启用".into());
         };
         let h = self.bufs.x_norm;
+        self.backend.begin_batch()?;
         let r = ctx.drafter.head_argmax(self.backend.as_mut(), h);
+        self.backend.end_batch()?;
         self.mtp = Some(ctx);
         r
     }

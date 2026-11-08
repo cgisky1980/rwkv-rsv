@@ -4015,9 +4015,11 @@ impl ComputeBackend for VulkanBackend {
 
     fn elementwise_add(&mut self, a: TensorId, b: TensorId, y: TensorId, n: usize) -> R<()> {
         const OP: &str = "elementwise_add";
-        let mut y_o = self.take_f32(y, OP)?;
+        // ★ 先取输入再取输出：drafter 的 `elementwise_add(x0, dep, x0)` 是**原地**的，
+        // 而 `take_f32` 会把它从表里摘掉 ⇒ 先 take 再 get 会报 "unknown tensor"。
         let a_g = self.get_f32(a, OP)?;
         let b_g = self.get_f32(b, OP)?;
+        let mut y_o = self.take_f32(y, OP)?;
         let res = self.rt.elementwise_add(&a_g, &b_g, &mut y_o, n);
         self.put_f32(y, y_o);
         res
@@ -4032,10 +4034,10 @@ impl ComputeBackend for VulkanBackend {
         n: usize,
     ) -> R<()> {
         const OP: &str = "elementwise_lerp";
-        let mut y_o = self.take_f32(y, OP)?;
         let a_g = self.get_f32(a, OP)?;
         let b_g = self.get_f32(b, OP)?;
         let k_g = self.get_f32(k, OP)?;
+        let mut y_o = self.take_f32(y, OP)?;
         let res = self.rt.elementwise_lerp(&a_g, &b_g, &k_g, &mut y_o, n);
         self.put_f32(y, y_o);
         res
@@ -4043,8 +4045,8 @@ impl ComputeBackend for VulkanBackend {
 
     fn copy_part(&mut self, dst: TensorId, dst_off: usize, src: TensorId, n: usize) -> R<()> {
         const OP: &str = "copy_part";
-        let mut y_o = self.take_f32(dst, OP)?;
         let s_g = self.get_f32(src, OP)?;
+        let mut y_o = self.take_f32(dst, OP)?;
         let res = self.rt.copy_range(&s_g, 0, &mut y_o, dst_off, n);
         self.put_f32(dst, y_o);
         res

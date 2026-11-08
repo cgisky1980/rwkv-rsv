@@ -856,13 +856,28 @@ impl App {
                     .build()
             });
 
-        let mut info = vk::DeviceCreateInfo::builder()
-            .enabled_extension_names(&extensions)
-            .queue_create_infos(infos)
+        // ★ 核心 features 之前一个都没请求（DeviceCreateInfo 只挂了 Features2 链）⇒ `shaderInt64`
+        // 关闭。而 `gemv_f32io*` / `gemv_rkv_stage1` 这 10 个已提交的 shader **声明了 Int64
+        // capability**（glslang 为 buffer_reference 的 64 位寻址生成），于是它们的 shader module
+        // 在验证层眼里非法、管线无效 ⇒ dispatch 直接 **ERROR_DEVICE_LOST**。
+        // 之前没人踩到，是因为主解码/预填路径在 Vulkan 上不走这些 fp16 GEMV；MTP drafter 全程用它。
+        // 设备支持才请求（不支持时请求 true 会让 create_device 失败）。
+        let core_supported = unsafe { instance.get_physical_device_features(device) };
+        let mut core_features = vk::PhysicalDeviceFeatures::builder()
+            .shader_int64(core_supported.shader_int64 == vk::TRUE)
+            .build();
+        // `core_features` 被 `features_core` 按值拷入，后续不再读 ⇒ 显式忽略以免 unused_assignments
+        let _ = &mut core_features;
+        let mut features_core = vk::PhysicalDeviceFeatures2::builder()
+            .features(core_features)
             .push_next(&mut features_11)
             .push_next(&mut features_12)
             .push_next(&mut features_13)
             .push_next(&mut features_cooperative_matrix);
+        let mut info = vk::DeviceCreateInfo::builder()
+            .enabled_extension_names(&extensions)
+            .queue_create_infos(infos)
+            .push_next(&mut features_core);
         if let Some(f) = features_atomic_float.as_mut() {
             info = info.push_next(f);
         }
