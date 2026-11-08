@@ -15,7 +15,7 @@
 //! $env:MODEL_PATH="...\rwkv7-g1l-2.9b-int8.st"; $env:MTP_K=3; $env:MTP_TOKENS=64
 //! cargo run --release --example mtp_probe
 //! ```
-//! 环境变量：`MODEL_PATH`（必填）、`MTP_K`（默认 3）、`MTP_TOKENS`（默认 64）、
+//! 环境变量：`MODEL_PATH`（必填）、`MTP_K`（默认 5）、`MTP_TOKENS`（默认 64）、
 //! `MTP_SEED`（初始 token，默认 1）、`MTP_FORCE=1`（放行 `n_layer` 不符的 sidecar）。
 
 use std::error::Error;
@@ -26,7 +26,9 @@ use rwkv_rsv::mtp::{find_sidecar, load_sidecar};
 fn main() -> Result<(), Box<dyn Error>> {
     init_log();
     let model_path = std::env::var("MODEL_PATH")?;
-    let k = env_usize("MTP_K", 3);
+    // ★ 默认 K=5：验证 pass 的成本对 T 几乎不敏感（mma 补到 16 行），而每多一个深度还
+    // 能多收约 0.4 个草稿 ⇒ K=3 是**最差**的档（台账 §3.14.5 的 K 扫描）。
+    let k = env_usize("MTP_K", 5);
     let n = env_usize("MTP_TOKENS", 64);
     let seed = env_usize("MTP_SEED", 1) as u32;
     let force = std::env::var("MTP_FORCE").is_ok_and(|v| v == "1");
