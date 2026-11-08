@@ -5398,10 +5398,28 @@ impl GpuModel {
         // 保留这条通路是因为它把 `to_f32` 与 stage1 的接线都跑通了（`f16` 档模型或
         // 将来 `out_v` 改 f32 时直接可用），并且是「launch 数 vs 数值档」的对照实验。
         let mut stage1 = false;
+        // ★ 序列验证路径的 r/k/v + 四个一级 mid：整段交给 `gemv_int6_rkv_stage1_batch_f32v`
+        // （1 次 dispatch 替掉 3 次 r/k/v GEMV + 1 次 mid1 融合核）。
+        //
+        // 与 §3.8 被否决的 `SEQ_STAGE1` **只差一处**：这里 `out_v` 落 f32，不再是 f16。
+        // 当年接受率下降（K=2：1.31→1.04）的根因就是 f16 舍入把 `v` 拉低了数值档，
+        // 而下游 `dplr_seq`/`sum_rk_rk` 只吃 f32 ⇒ 现在没有那次舍入，`v` 与 decode 同档。
+        //
+        // 开关：`SEQ_STAGE1=2` 走新档（f32 v）；`=1` 旧 f16 档；**未设 = 关闭（默认）**。
+        // ★ 实测否掉（台账 §3.10 补二）：即使 f32 v + split-K + 分链 z 轴，T=4 验证 pass
+        // 仍是 19.7~21.4 ms，比默认「3 次 r/k/v GEMV + mid1 融合核」的 16.5 ms 慢 3~5 ms。
+        // 病因不是数值（f32 v 消掉了那次 f16 舍入），而是这个融合核把 r/k/v 与 mid 两条
+        // 路径的寄存器需求并到一个函数里 ⇒ 占用率下降，抵消了「少 3 次 launch」的收益。
+        let seq_stage1 = std::env::var("SEQ_STAGE1").ok();
+        let stage1_mode = match seq_stage1.as_deref() {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        };
         if small_t
             && chain4
-            && self.backend.supports_to_f32()
-            && std::env::var("SEQ_STAGE1").is_ok_and(|v| v == "1")
+            && stage1_mode > 0
+            && (stage1_mode != 1 || self.backend.supports_to_f32())
         {
             let (qr, qk, qv) = (
                 wq(layer.receptance_i6, layer.receptance_a8),
@@ -5414,8 +5432,9 @@ impl GpuModel {
                 self.config.a_mid,
                 self.config.g_mid,
             );
+            let want_f32v = stage1_mode == 2;
             match (qr, qk, qv) {
-                (Some(Wq::I8(a)), Some(Wq::I8(b)), Some(Wq::I8(d))) => {
+                (Some(Wq::I8(a)), Some(Wq::I8(b)), Some(Wq::I8(d))) if !want_f32v => {
                     self.backend.gemv_int8_rkv_stage1_batch(
                         &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk, sb.xv,
                         sb.xr16, sb.xk16, sb.xv16, sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v16_t,
@@ -5427,12 +5446,20 @@ impl GpuModel {
                 (Some(Wq::I6(a)), Some(Wq::I6(b)), Some(Wq::I6(d)))
                     if a.nmajor && b.nmajor && d.nmajor =>
                 {
-                    self.backend.gemv_int6_rkv_stage1_batch(
-                        &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk, sb.xv,
-                        sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v16_t, sb.v_mid, sb.w_mid, sb.a_mid,
-                        sb.g_mid, c, vm, wm, am, gm, t,
-                    )?;
-                    self.backend.to_f32(sb.v16_t, sb.v, c, t, c)?;
+                    if want_f32v {
+                        self.backend.gemv_int6_rkv_stage1_batch_f32v(
+                            &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk,
+                            sb.xv, sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v, sb.v_mid, sb.w_mid,
+                            sb.a_mid, sb.g_mid, c, vm, wm, am, gm, t,
+                        )?;
+                    } else {
+                        self.backend.gemv_int6_rkv_stage1_batch(
+                            &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk,
+                            sb.xv, sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v16_t, sb.v_mid, sb.w_mid,
+                            sb.a_mid, sb.g_mid, c, vm, wm, am, gm, t,
+                        )?;
+                        self.backend.to_f32(sb.v16_t, sb.v, c, t, c)?;
+                    }
                     stage1 = true;
                 }
                 _ => {}
@@ -5523,16 +5550,50 @@ impl GpuModel {
                 (wwp, aap, vvp, ggp)
             };
             if !stage1 {
-                if i > 0 {
+                // 一级 mid 四条链：一次融合 dispatch（`lowrank_mid1`）换掉 4 次 cuBLAS 小 GEMM。
+                // 依据（台账 §3.10 补）：4 次 GEMM 的 M 按 64 补齐而真实只有 T≤8 行、
+                // N∈{64,96,96,320}、K=2560 ⇒ 整段 0.150 ms/层只搬 8.85 MB = 60 GB/s。
+                // `SEQ_MID1=0` 回退旧 GEMM 档（A/B 与对拍用）。
+                let mid1_fused = self.backend.supports_lowrank_mid1()
+                    && std::env::var("SEQ_MID1").map(|v| v != "0").unwrap_or(true);
+                if mid1_fused {
+                    self.backend.lowrank_mid1(
+                        layer.v1_16,
+                        layer.w1_16,
+                        layer.a1_16,
+                        layer.g1_16,
+                        sb.xv16,
+                        sb.xw16,
+                        sb.xa16,
+                        sb.xg16,
+                        sb.v_mid,
+                        sb.w_mid,
+                        sb.a_mid,
+                        sb.g_mid,
+                        c,
+                        t,
+                        // layer 0 不跑 v 低秩链（`v_first` 就是 `v`）⇒ 连权重都不读。
+                        if i == 0 { 0 } else { self.config.v_mid },
+                        self.config.w_mid,
+                        self.config.a_mid,
+                        self.config.g_mid,
+                        vvp,
+                        wwp,
+                        aap,
+                        ggp,
+                    )?;
+                } else {
+                    if i > 0 {
+                        self.backend
+                            .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
+                    }
                     self.backend
-                        .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
+                        .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
+                    self.backend
+                        .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
+                    self.backend
+                        .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
                 }
-                self.backend
-                    .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
-                self.backend
-                    .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
-                self.backend
-                    .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
             }
             // ★ layer 0：`v_first` 与 `out_v` 传同一张（lam = 0 ⇒ v 原样保留，与该层不跑
             // v 低秩链的语义等价），所以 `v_mid` 不必算（上面已跳过）。

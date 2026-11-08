@@ -1263,6 +1263,43 @@ pub trait ComputeBackend {
         Err("gemv_int6_rkv_stage1_batch not supported by this backend".into())
     }
 
+    /// 与 [`Self::gemv_int6_rkv_stage1_batch`] 同语义，但 `out_v` 落 **f32**。
+    ///
+    /// 用途：小 T 序列验证路径。f16 的 `out_v` 会让 `v` 比 decode 路径低一个数值档，
+    /// 进而改掉接受率（台账 §3.8 的 `SEQ_STAGE1` 就是因此被否决）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1_batch_f32v(
+        &mut self,
+        _r: &Int6Handle,
+        _k: &Int6Handle,
+        _v: &Int6Handle,
+        _v1: TensorId,
+        _w1: TensorId,
+        _a1: TensorId,
+        _g1: TensorId,
+        _xr: TensorId,
+        _xk: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_r: TensorId,
+        _out_k: TensorId,
+        _out_v: TensorId,
+        _out_vm: TensorId,
+        _out_wm: TensorId,
+        _out_am: TensorId,
+        _out_gm: TensorId,
+        _c: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_rkv_stage1_batch_f32v not supported by this backend".into())
+    }
+
     /// batch 版 gemv_lowrank_chain4：mid 输入与 v_first/输出为 [batch, ...]；权重共享。
     #[allow(clippy::too_many_arguments)]
     fn gemv_lowrank_chain4_batch(
@@ -1338,6 +1375,46 @@ pub trait ComputeBackend {
     /// 后端是否实现 [`Self::gemv_lowrank_chain4_f32`]（能力查询，避免每个调用点靠
     /// 返回值嗅探；错误路径不该出现在热循环里）。
     fn supports_lowrank_chain4_f32(&self) -> bool {
+        false
+    }
+
+    /// 低秩**一级** mid 的四链融合（小 T 验证路径）：一次 dispatch 算
+    /// `mid_v = xv @ V1ᵀ`、`mid_w = tanh(xw @ W1ᵀ)`、`mid_a = xa @ A1ᵀ`、`mid_g = xg @ G1ᵀ`，
+    /// 每条覆盖全部 slot、输出 f32，权重每行只读一次。
+    ///
+    /// 存在理由：小 T 路径原来是 4 次 cuBLAS 小 GEMM（M 按 64 补齐、真实只有 T≤8 行），
+    /// 整段只有 60 GB/s（见 `backend_cuda.rs` 的 `LOWRANK_MID1_SRC` 与台账 §3.10）。
+    #[allow(clippy::too_many_arguments)]
+    fn lowrank_mid1(
+        &mut self,
+        _v1_16: TensorId,
+        _w1_16: TensorId,
+        _a1_16: TensorId,
+        _g1_16: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_v: TensorId,
+        _out_w: TensorId,
+        _out_a: TensorId,
+        _out_g: TensorId,
+        _c: usize,
+        _batch: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+        _sv: usize,
+        _sw: usize,
+        _sa: usize,
+        _sg: usize,
+    ) -> R<()> {
+        Err("lowrank_mid1 not supported by this backend".into())
+    }
+
+    /// 后端是否实现 [`Self::lowrank_mid1`]。
+    fn supports_lowrank_mid1(&self) -> bool {
         false
     }
 

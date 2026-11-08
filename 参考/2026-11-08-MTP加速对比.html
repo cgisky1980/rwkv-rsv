@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>RWKV-7 · MTP 投机解码加速对比（CUDA int6）</title>
+<style>
+  :root{
+    --ink-0:#111417; --ink-1:#2a3037; --ink-2:#5b646d; --ink-3:#8b949c;
+    --paper:#f7f5f1; --line:#ded9d1; --accent:#1f5f6b; --accent-soft:#cfe0e3;
+    --seal:#a8322a; --grid:#e9e4dc;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:48px 32px 64px; background:var(--paper); color:var(--ink-1);
+    font-family:"Inter","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{border-bottom:2px solid var(--ink-0);padding-bottom:20px;margin-bottom:36px}
+  h1{
+    font-family:Georgia,"Songti SC",serif; font-weight:600; font-size:30px;
+    color:var(--ink-0); margin:0 0 10px; letter-spacing:-.01em;
+  }
+  .sub{color:var(--ink-2);font-size:13px}
+  .sub b{color:var(--seal);font-weight:600}
+  h2{
+    font-family:Georgia,"Songti SC",serif; font-size:19px; color:var(--ink-0);
+    margin:40px 0 6px; font-weight:600;
+  }
+  h2 .n{color:var(--accent);font-family:ui-monospace,Consolas,monospace;font-size:13px;margin-right:8px}
+  .note{color:var(--ink-3);font-size:12.5px;margin:0 0 18px}
+  .mono{font-family:ui-monospace,"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums}
+  .card{background:#fff;border:1px solid var(--line);padding:24px 24px 12px}
+  svg{display:block;width:100%;height:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0 4px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--grid)}
+  th{font-weight:600;color:var(--ink-0);font-size:12px;letter-spacing:.02em;text-transform:uppercase}
+  td.num{text-align:right;font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:none}
+  .tag{display:inline-block;padding:1px 7px;border-radius:3px;font-size:11.5px;margin-right:6px}
+  .keep{background:var(--accent-soft);color:#14454e}
+  .drop{background:#f3e0de;color:var(--seal)}
+  .kv{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:18px 0 0}
+  .kv>div{background:#fff;padding:16px 18px}
+  .kv .lab{font-size:11.5px;color:var(--ink-3);letter-spacing:.04em;text-transform:uppercase}
+  .kv .val{font-family:ui-monospace,Consolas,monospace;font-size:22px;color:var(--ink-0);font-variant-numeric:tabular-nums;margin-top:4px}
+  .kv .val small{font-size:12px;color:var(--ink-2);margin-left:4px}
+  footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);color:var(--ink-3);font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>MTP 投机解码加速对比</h1>
+  <div class="sub">
+    RWKV-7 g1l-2.9b · int6（N-major）· CUDA · RTX 2080 Ti ·
+    投机 K=3（T=4 验证）· 贪心解码 · 200 步同进程 A/B 口径<br>
+    结论：<b>1.12×（122.2 → 136.2 tok/s）</b>，三轮复测 1.11 / 1.11 / 1.13，方向一致。
+  </div>
+  <div class="kv">
+    <div><div class="lab">基线 decode</div><div class="val">122.2<small>tok/s</small></div></div>
+    <div><div class="lab">MTP 投机</div><div class="val">136.2<small>tok/s</small></div></div>
+    <div><div class="lab">平均接受</div><div class="val">1.91<small>草稿/步</small></div></div>
+    <div><div class="lab">加速比</div><div class="val" style="color:var(--accent)">1.12<small>×</small></div></div>
+  </div>
+</header>
+
+<h2><span class="n">01</span>吞吐：本轮三次改动如何把 0.85× 推到 1.12×</h2>
+<p class="note">三条柱都是同一台机器、同一模型、同一 A/B 口径；每次改动都在同进程交替读数下确认过方向。</p>
+<div class="card">
+<svg viewBox="0 0 980 300" role="img" aria-label="吞吐对比柱状图">
+  <!-- baseline reference -->
+  <line x1="150" y1="30" x2="150" y2="250" stroke="#ded9d1"/>
+  <!-- y grid: 0..160 tok/s over 200px -->
+  <g stroke="#e9e4dc" stroke-dasharray="2 4">
+    <line x1="150" y1="250" x2="930" y2="250"/>
+    <line x1="150" y1="200" x2="930" y2="200"/>
+    <line x1="150" y1="150" x2="930" y2="150"/>
+    <line x1="150" y1="100" x2="930" y2="100"/>
+    <line x1="150" y1="50" x2="930" y2="50"/>
+  </g>
+  <g font-size="11" fill="#8b949c" font-family="ui-monospace,Consolas,monospace" text-anchor="end">
+    <text x="138" y="254">0</text><text x="138" y="204">40</text>
+    <text x="138" y="154">80</text><text x="138" y="104">120</text><text x="138" y="54">160</text>
+  </g>
+  <!-- baseline line at 122.2 tok/s -> y = 250 - 122.2*1.25 = 97.25 -->
+  <line x1="150" y1="97.3" x2="930" y2="97.3" stroke="#a8322a" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="922" y="90" font-size="11.5" fill="#a8322a" text-anchor="end">基线 122.2 tok/s</text>
+
+  <!-- bars: 94.7, 115.7, 136.2 -->
+  <rect x="215" y="131.6" width="120" height="118.4" fill="#c9cdd2"/>
+  <rect x="435" y="105.4" width="120" height="144.6" fill="#7f9298"/>
+  <rect x="655" y="79.8" width="120" height="170.2" fill="#1f5f6b"/>
+
+  <g font-size="12.5" fill="#2a3037" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">
+    <text x="275" y="124">94.7</text><text x="495" y="98">115.7</text><text x="715" y="72">136.2</text>
+  </g>
+  <g font-size="11.5" text-anchor="middle">
+    <text x="275" y="272" fill="#5b646d">本轮之前</text>
+    <text x="495" y="272" fill="#5b646d">+ int6 split-K=3</text>
+    <text x="715" y="272" fill="#1f5f6b" font-weight="600">+ mid1 融合核 · 免回滚</text>
+  </g>
+  <g font-size="12" text-anchor="middle" font-weight="600">
+    <text x="275" y="288" fill="#a8322a">0.85×</text>
+    <text x="495" y="288" fill="#5b646d">1.01×</text>
+    <text x="715" y="288" fill="#1f5f6b">1.12×</text>
+  </g>
+</svg>
+</div>
+
+<h2><span class="n">02</span>一步的钱花在哪（T=4 验证，每步 20.8 ms → 2.84 token）</h2>
+<p class="note">同一进程实测：decode 8.5 ms/token；投机步 = 验证 pass + drafter 链 + 快照/回滚/提交。</p>
+<div class="card">
+<svg viewBox="0 0 980 132" role="img" aria-label="投机步成本分解">
+  <!-- total 20.8 ms -> 780px ; scale 37.5 px/ms -->
+  <g>
+    <rect x="60" y="34" width="612" height="40" fill="#1f5f6b"/>
+    <rect x="672" y="34" width="112.5" height="40" fill="#6f8f96"/>
+    <rect x="784.5" y="34" width="55.5" height="40" fill="#c9cdd2"/>
+    <text x="366" y="59" font-size="13" fill="#fff" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">验证 pass（T=4）16.3 ms · 78%</text>
+    <text x="728" y="59" font-size="12" fill="#fff" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">drafter 3.0</text>
+    <text x="812" y="59" font-size="11.5" fill="#2a3037" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">1.5</text>
+  </g>
+  <text x="60" y="100" font-size="11.5" fill="#8b949c">0</text>
+  <text x="840" y="100" font-size="11.5" fill="#8b949c" text-anchor="end">20.8 ms / 步</text>
+  <text x="60" y="120" font-size="11.5" fill="#5b646d">
+    1.5 ms = 快照 0.1 + 回滚 0～2 + 提交 0～4（全接受时按新规则直接跳过回滚）
+  </text>
+</svg>
+</div>
+
+<h2><span class="n">03</span>验证 pass 的逐段带宽（每层，T=4）</h2>
+<p class="note">decode 单流在同一批权重上跑到 304 GB/s；下面按「搬运量 ÷ 时间」算有效带宽，差距就是可优化空间。</p>
+<table>
+  <thead><tr><th>阶段</th><th class="num">每层耗时</th><th class="num">搬运</th><th class="num">有效带宽</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">shift+rkv_gemm</td><td class="num">0.135 ms</td><td class="num">20.6 MB</td><td class="num">152 GB/s</td><td><span class="tag drop">待优化</span></td></tr>
+    <tr><td class="mono">lowrank+fuse_ka</td><td class="num">0.090 ms</td><td class="num">8.9 MB</td><td class="num">99 GB/s</td><td><span class="tag keep">本轮 60 → 99</span></td></tr>
+    <tr><td class="mono">lowrank+dplr_seq</td><td class="num">0.023 ms</td><td class="num">—</td><td class="num">—</td><td><span class="tag keep">不是瓶颈</span></td></tr>
+    <tr><td class="mono">y_norm+sum+g+output</td><td class="num">0.055 ms</td><td class="num">4.9 MB</td><td class="num">90 GB/s</td><td><span class="tag drop">待优化</span></td></tr>
+    <tr><td class="mono">channel_mix+ffn</td><td class="num">0.231 ms</td><td class="num">39.4 MB</td><td class="num">170 GB/s</td><td><span class="tag drop">最大绝对项</span></td></tr>
+  </tbody>
+</table>
+
+<h2><span class="n">04</span>本轮改动的判定（含被数据否掉的四个假设）</h2>
+<table>
+  <thead><tr><th>改动</th><th class="num">验证 pass</th><th>判定</th></tr></thead>
+  <tbody>
+    <tr><td>int6 小批量 split-K 默认 <span class="mono">I6NM_KSPLIT=3</span></td><td class="num">22.9 → 17.0 ms</td><td><span class="tag keep">保留（1.35×）</span></td></tr>
+    <tr><td>低秩 mid1 四链融合核（uint4 向量化）</td><td class="num">17.2 → 16.3 ms</td><td><span class="tag keep">保留</span></td></tr>
+    <tr><td>全接受时跳过快照恢复 + 重放</td><td class="num">省 0～2 ms/步</td><td><span class="tag keep">保留</span></td></tr>
+    <tr><td>r/k/v 融合核也开 split-K（<span class="mono">I6NM_RKV_SPLIT=1</span>）</td><td class="num">差 0.9%，方向相反</td><td><span class="tag drop">默认关</span></td></tr>
+    <tr><td>vec4（一条 lane 4 列）</td><td class="num">16.3 → 21.9 ms</td><td><span class="tag drop">否掉</span></td></tr>
+    <tr><td>块内 warp 数 8（<span class="mono">I6NM_WARPS=8</span>）</td><td class="num">归一化后更差</td><td><span class="tag drop">否掉</span></td></tr>
+    <tr><td>r/k/v+mid 全融合 + f32 v（<span class="mono">SEQ_STAGE1=2</span>）</td><td class="num">16.5 → 19.7 ms</td><td><span class="tag drop">默认关</span></td></tr>
+  </tbody>
+</table>
+
+<h2><span class="n">05</span>口径与不确定性（必读）</h2>
+<table>
+  <tbody>
+    <tr><td>测量方式</td><td>同一进程内先跑 plain（逐 token decode）再跑 spec（起草→验证→回滚），两者从同一 prompt 出发；三轮独立复测取一致方向。</td></tr>
+    <tr><td>为什么不用单次端到端倍数</td><td>本机没有 <span class="mono">nvidia-smi</span>，锁频/锁屏做不到；同一份代码两次进程曾出现 13.4 与 34.7 tok/s。单次读数出现过 2.02× 与 0.77× 两个荒谬值，已全部作废。</td></tr>
+    <tr><td>正确性自检（全部通过）</td><td>回滚 <span class="mono">max|Δstate| = 0</span>（540 万个数，含二次回滚/图重放）；head 与主模型 argmax 前 3 步一致；T=4 seq vs 解码 argmax 一致；<span class="mono">cargo test --release</span> 96 通过。</td></tr>
+    <tr><td>距 1.5× 还差什么</td><td>按 2.84 token/步，1.5× 需步时间 ≤ 16.2 ms ⇒ 验证 pass 要从 16.3 压到 ~12 ms。剩下的空间全在两处：ffn 段（170 GB/s，占 39%）与 r/k/v 段（152 GB/s）。两者都是「23 个节点各自扫一遍 DRAM」的结构性问题，需要 decode 那种深度融合，不是单点 patch。</td></tr>
+  </tbody>
+</table>
+
+<footer>
+  数据源：<span class="mono">rwkv7-g1l-2.9b-int6n.st</span> + <span class="mono">mtp/mtp.safetensors</span>（sidecar，taps=[9,19]，W=512）·
+  探针 <span class="mono">examples/mtp_probe.rs</span>（MTP_GEN=128、MTP_REPS=16、PREFILL_GRAPH=1）·
+  台账 <span class="mono">参考/2026-11-08-int6量化与MTP-阶段记录.md</span> §3.10
+</footer>
+
+</div>
+</body>
+</html>
