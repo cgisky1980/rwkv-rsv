@@ -55,12 +55,63 @@ impl HeadSrc {
     }
 }
 
-/// 一个 fp16 Linear（`[out, in]` 行主序，`gemv_f16` 的 A 布局）。
+/// 一个 Linear：fp16 或 int6（N-major）量化权重，`[out, in]` 行主序语义。
+///
+/// 为什么要 int6 档：drafter 每步要读 ~1 GB 权重（fp16），实测 3.0 ms 全是带宽
+/// （329 GB/s，已接近本机上限）。权重压到 int6（0.75 B/权重）后字节数减半 ⇒ 这部分
+/// 直接砍到 ~1.6 ms。上游 `docs/mtp.md` §3.1 也是这么做的（"weight-only int6, 0.5 GB → 0.19 GB"），
+/// 草稿只影响接受率、不影响输出分布，所以量化是安全的。
 #[derive(Clone, Copy)]
-struct Linear {
-    w: TensorId,
-    m: usize,
-    k: usize,
+enum Lin {
+    F16(TensorId),
+    I6(Int6Handle),
+}
+
+impl Lin {
+    /// `y = x @ W^T`
+    fn plain(
+        self,
+        be: &mut dyn ComputeBackend,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+    ) -> R<()> {
+        match self {
+            Lin::F16(w) => be.gemv_f16(w, x, y, m, k, 1),
+            Lin::I6(h) => be.w_plain(&Wq::I6(h), x, y, m, k, 1),
+        }
+    }
+
+    /// `y += x @ W^T`
+    fn add(
+        self,
+        be: &mut dyn ComputeBackend,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+    ) -> R<()> {
+        match self {
+            Lin::F16(w) => be.gemv_f16_add(w, x, y, m, k, 1),
+            Lin::I6(h) => be.w_add(&Wq::I6(h), x, y, m, k, 1),
+        }
+    }
+
+    /// `y = relu²(x @ W^T)`
+    fn relu2(
+        self,
+        be: &mut dyn ComputeBackend,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+    ) -> R<()> {
+        match self {
+            Lin::F16(w) => be.gemv_f16_relu2(w, x, y, m, k, 1),
+            Lin::I6(h) => be.w_relu2(&Wq::I6(h), x, y, m, k, 1),
+        }
+    }
 }
 
 /// 一组 LayerNorm 的仿射参数。
@@ -71,15 +122,15 @@ struct Ln {
 }
 
 struct Weights {
-    fproj: Linear,
-    proj: Linear,
-    q: Linear,
-    g: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
-    ffn_key: Linear,
-    ffn_value: Linear,
+    fproj: Lin,
+    proj: Lin,
+    q: Lin,
+    g: Lin,
+    k: Lin,
+    v: Lin,
+    o: Lin,
+    ffn_key: Lin,
+    ffn_value: Lin,
     lh: Ln,
     lf0: Ln,
     lf1: Ln,
@@ -184,9 +235,17 @@ impl MtpDrafter {
                 .get(name)
                 .ok_or_else(|| format!("MTP sidecar 缺张量 {name}").into())
         };
-        let f16t = |be: &mut dyn ComputeBackend, name: &str, m: usize, k: usize| -> R<Linear> {
-            let w = up_f16(be, get(name)?)?;
-            Ok(Linear { w, m, k })
+        let f16t = |be: &mut dyn ComputeBackend, name: &str, m: usize, k: usize| -> R<Lin> {
+            let t = get(name)?;
+            // int6 档**默认关**（`MTP_DRAFTER_I6=1` 才开）：实测本机只从 3.26 → 2.93 ms
+            // （权重减半却只省 10 %，因为 drafter 的矩阵窄、`gemv_int6nm` 在此形状上
+            // 效率远低于 `gemv_f16`），而 int6 的草稿略差、端到端反而 1.13× → 1.11×。
+            // 保留这条路是因为它已经跑通（含 CPU 对拍规则的打包器），等 head 子表
+            // 那一半（378 MB/步）一起做时再评估。
+            if std::env::var("MTP_DRAFTER_I6").is_ok() {
+                return Ok(Lin::I6(up_i6(be, t, m, k)?));
+            }
+            Ok(Lin::F16(up_f16(be, t)?))
         };
         let ln = |be: &mut dyn ComputeBackend, name: &str| -> R<Ln> {
             Ok(Ln {
@@ -434,14 +493,7 @@ impl MtpDrafter {
         be.copy_part(b.cat3, 0, b.h_n, c)?;
         be.copy_part(b.cat3, c, b.m1_n, c)?;
         be.copy_part(b.cat3, 2 * c, b.m2_n, c)?;
-        be.gemv_f16(
-            self.w.fproj.w,
-            b.cat3,
-            b.u,
-            self.w.fproj.m,
-            self.w.fproj.k,
-            1,
-        )?;
+        self.w.fproj.plain(be, b.cat3, b.u, c, 3 * c)?;
         // 深度 1 的 token shift = 最后一个已提交位置的 x2
         be.copy_device(self.st.ffn_x, b.shift)?;
         self.block(be, b.u, tok, p, 0, with_draft)
@@ -466,17 +518,17 @@ impl MtpDrafter {
         be.norm(b.e, self.w.le.w, self.w.le.b, b.e_n, c, 1, self.ln_eps, 1)?;
         be.copy_part(b.cat2, 0, u, c)?;
         be.copy_part(b.cat2, c, b.e_n, c)?;
-        be.gemv_f16(self.w.proj.w, b.cat2, b.x0, self.w.proj.m, self.w.proj.k, 1)?;
+        self.w.proj.plain(be, b.cat2, b.x0, c, 2 * c)?;
         // + dep[k-1]
         let row = dep_row.min(self.w.dep.len() - 1);
         be.elementwise_add(b.x0, self.w.dep[row], b.x0, c)?;
         be.norm(b.x0, self.w.ln0.w, self.w.ln0.b, b.x, c, 1, self.ln_eps, 1)?;
         be.norm(b.x, self.w.ln1.w, self.w.ln1.b, b.xl, c, 1, self.ln_eps, 1)?;
 
-        be.gemv_f16(self.w.q.w, b.xl, b.q, self.w.q.m, self.w.q.k, 1)?;
-        be.gemv_f16(self.w.g.w, b.xl, b.g, self.w.g.m, self.w.g.k, 1)?;
-        be.gemv_f16(self.w.k.w, b.xl, b.kk, self.w.k.m, self.w.k.k, 1)?;
-        be.gemv_f16(self.w.v.w, b.xl, b.vv, self.w.v.m, self.w.v.k, 1)?;
+        self.w.q.plain(be, b.xl, b.q, nh * d, c)?;
+        self.w.g.plain(be, b.xl, b.g, nh * d, c)?;
+        self.w.k.plain(be, b.xl, b.kk, nkv * d, c)?;
+        self.w.v.plain(be, b.xl, b.vv, nkv * d, c)?;
         be.mtp_rms_rope(b.q, self.w.q_norm, nh, d, p, self.rope_dim, self.rope_theta)?;
         be.mtp_rms_rope(
             b.kk,
@@ -514,27 +566,13 @@ impl MtpDrafter {
         // x = x + Wo·(y ⊙ sigmoid(Wg·xl))
         be.elementwise_sigmoid(b.g, b.gs, nh * d, 1)?;
         be.elementwise_mul(b.y, b.gs, b.y, nh * d, 1)?;
-        be.gemv_f16_add(self.w.o.w, b.y, b.x, self.w.o.m, self.w.o.k, 1)?;
+        self.w.o.add(be, b.y, b.x, c, nh * d)?;
 
         // channel-mix
         be.norm(b.x, self.w.ln2.w, self.w.ln2.b, b.x2, c, 1, self.ln_eps, 1)?;
         be.elementwise_lerp(b.x2, b.shift, self.w.x_k, b.kx, c)?;
-        be.gemv_f16_relu2(
-            self.w.ffn_key.w,
-            b.kx,
-            b.hh,
-            self.w.ffn_key.m,
-            self.w.ffn_key.k,
-            1,
-        )?;
-        be.gemv_f16_add(
-            self.w.ffn_value.w,
-            b.hh,
-            b.x,
-            self.w.ffn_value.m,
-            self.w.ffn_value.k,
-            1,
-        )?;
+        self.w.ffn_key.relu2(be, b.kx, b.hh, 4 * c, c)?;
+        self.w.ffn_value.add(be, b.hh, b.x, c, 4 * c)?;
 
         // out → draft（`with_draft=false` 时整段跳过：`accept` 的补提交不需要草稿）
         be.norm(b.x, self.w.lo.w, self.w.lo.b, b.out, c, 1, self.ln_eps, 1)?;
@@ -553,6 +591,83 @@ fn up_f16(be: &mut dyn ComputeBackend, t: &MtpTensor) -> R<TensorId> {
     be.upload(id, &t.data)?;
     be.drop_host(id);
     Ok(id)
+}
+
+/// 把一个 `[m, k]` 行主序 f32 权重就地量化成 **int6 N-major** 平面并上传。
+///
+/// 打包规则必须与 CUDA 内核（`i6nm_dot` / `i6nm_dot_split`）的读法逐字节一致
+/// （`backend_cuda.rs` 的 `int6_nmajor_kernels_match_cpu` 就是对拍门禁）：
+/// · 每 128 个 k 一个对称 scale（`max|w|/32`，fp16 存进 `sz` 低 16 位）；
+/// · `e = round(w/scale) + 32 ∈ [0,63]`（6-bit，`-32` 偏置）；
+/// · **64-k 一个 chunk，chunk 内**：
+///   `lo[32c+j][col]` 低 nibble = e(j)、高 nibble = e(j+32)；
+///   `lo[32c+16+j][col]` 低/高 = e(j+16) / e(j+48)；
+///   `hi[16c+j][col]` 的 4 个 2-bit 域依次 = e(j) / e(j+16) / e(j+32) / e(j+48) 的高 2 位。
+///
+/// 之所以在这里自己量化而不是读文件：sidecar 只有 fp16/bf16，drafter 的 int6 档是**加载期**
+/// 的一次性转换（上游 `MTPDrafter.quantize` 同一做法）。
+fn up_i6(be: &mut dyn ComputeBackend, t: &MtpTensor, m: usize, k: usize) -> R<Int6Handle> {
+    if !k.is_multiple_of(128) || t.data.len() != m * k {
+        return Err(format!(
+            "up_i6: 形状不符（m={m} k={k}，数据 {}，k 需为 128 的倍数）",
+            t.data.len()
+        )
+        .into());
+    }
+    let (kg, lo_rows, hi_rows) = (k / 128, k / 2, k / 4);
+    let mut lo = vec![0u8; lo_rows * m];
+    let mut hi = vec![0u8; hi_rows * m];
+    let mut sz = vec![0u32; kg * m];
+    let mut e = vec![0u8; k];
+    for r in 0..m {
+        let row = &t.data[r * k..(r + 1) * k];
+        for g in 0..kg {
+            let blk = &row[g * 128..(g + 1) * 128];
+            let max = blk.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let scale = if max > 0.0 { max / 32.0 } else { 1.0 };
+            sz[g * m + r] = half::f16::from_f32(scale).to_bits() as u32;
+            for (i, &w) in blk.iter().enumerate() {
+                let q = (w / scale).round() + 32.0;
+                e[g * 128 + i] = q.clamp(0.0, 63.0) as u8;
+            }
+        }
+        for c in 0..k / 64 {
+            let base = c * 64;
+            for j in 0..16 {
+                let (e0, e1) = (e[base + j], e[base + j + 16]);
+                let (e2, e3) = (e[base + j + 32], e[base + j + 48]);
+                lo[(c * 32 + j) * m + r] = (e0 & 15) | ((e2 & 15) << 4);
+                lo[(c * 32 + 16 + j) * m + r] = (e1 & 15) | ((e3 & 15) << 4);
+                hi[(c * 16 + j) * m + r] = ((e0 >> 4) & 3)
+                    | (((e1 >> 4) & 3) << 2)
+                    | (((e2 >> 4) & 3) << 4)
+                    | (((e3 >> 4) & 3) << 6);
+            }
+        }
+    }
+    let as_u32 = |x: &[u8]| -> Vec<u32> {
+        x.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let (lo_w, hi_w) = (as_u32(&lo), as_u32(&hi));
+    let lo_t = be.create_tensor(lo_w.len(), TensorDtype::U32)?;
+    be.upload_u32(lo_t, &lo_w)?;
+    let hi_t = be.create_tensor(hi_w.len(), TensorDtype::U32)?;
+    be.upload_u32(hi_t, &hi_w)?;
+    let sz_t = be.create_tensor(sz.len(), TensorDtype::U32)?;
+    be.upload_u32(sz_t, &sz)?;
+    be.drop_host(lo_t);
+    be.drop_host(hi_t);
+    be.drop_host(sz_t);
+    Ok(Int6Handle {
+        lo: lo_t,
+        hi: hi_t,
+        sz: sz_t,
+        m,
+        k,
+        nmajor: true,
+    })
 }
 
 fn up_f32(be: &mut dyn ComputeBackend, t: &MtpTensor) -> R<TensorId> {
