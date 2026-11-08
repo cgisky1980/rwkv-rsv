@@ -3073,6 +3073,100 @@ extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_batch(
 }
 "#;
 
+/// chain4 的 **f32 变体**：与 `gemv_lowrank_chain4_batch` 同一套 warp-per-row + f32 SIMT
+/// 累加（数值同档），差别只有两处——
+/// ① `v_first` 与四个输出都是 **f32**（不做 f16 舍入）；
+/// ② 四个 mid 输入各带行步长 `sw/sa/sv/sg`（序列路径的 mid 补齐到 64，步长 ≠ 宽度）。
+///
+/// 给谁用：小 T 序列验证路径（`forward_seq_layer` 的 `small_t` 分支）。那条链路的下游
+/// （`dplr_seq`/`sum_rk_rk`/`fuse_ka`）只吃 f32，用 f16 版要先 `to_f16`、再 4 次 `to_f32`，
+/// 5 次转换比这里省下的 13 次 launch 还贵；而 f32 就地出结果 ⇒ 1 次 launch 顶掉
+/// 「4×gemm(_tanh) + 4×to_f16 + 4×gemm_bias + sigmoid/scale_exp + v_first_lerp」共 18 次。
+const GEMV_LOWRANK_CHAIN4_F32_SRC: &str = r#"
+__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_f32(
+    const float* __restrict__ W2,        // [M, KW]（w_mid 已含 tanh）
+    const float* __restrict__ A2,        // [M, KA]
+    const float* __restrict__ V2,        // [M, KV]
+    const float* __restrict__ G2,        // [M, KG]（g_mid 未过 sigmoid，本核内做）
+    const float* __restrict__ xw, const float* __restrict__ xa,
+    const float* __restrict__ xv, const float* __restrict__ xg,
+    const float* __restrict__ w0, const float* __restrict__ a0,
+    const float* __restrict__ v0, const float* __restrict__ scale,
+    const float* __restrict__ v_first,   // [batch, M] f32
+    float* __restrict__ out_w, float* __restrict__ out_a,
+    float* __restrict__ out_v, float* __restrict__ out_g,
+    const int m, const int kw, const int ka, const int kv, const int kg,
+    const int sw, const int sa, const int sv, const int sg, const int batch)
+{
+    constexpr int BGRP = 4;
+    constexpr int WARPS = 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * WARPS + warp;
+    if (row >= m) return;
+    const int b0   = blockIdx.y * BGRP;
+    const int bcnt = min(BGRP, batch - b0);
+    const float sc = scale[0];
+
+    float lw[BGRP], la[BGRP], lv[BGRP], lg[BGRP];
+    #pragma unroll
+    for (int bi = 0; bi < BGRP; bi++) { lw[bi] = 0.f; la[bi] = 0.f; lv[bi] = 0.f; lg[bi] = 0.f; }
+    for (int k = lane; k < kw; k += 32) {
+        const float w = W2[row * kw + k];
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lw[bi] += xw[(b0 + bi) * sw + k] * w;
+        }
+    }
+    for (int k = lane; k < ka; k += 32) {
+        const float w = A2[row * ka + k];
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) la[bi] += xa[(b0 + bi) * sa + k] * w;
+        }
+    }
+    for (int k = lane; k < kv; k += 32) {
+        const float w = V2[row * kv + k];
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lv[bi] += xv[(b0 + bi) * sv + k] * w;
+        }
+    }
+    for (int k = lane; k < kg; k += 32) {
+        const float w = G2[row * kg + k];
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi < bcnt) lg[bi] += sigmoidf_(xg[(b0 + bi) * sg + k]) * w;
+        }
+    }
+    #pragma unroll
+    for (int bi = 0; bi < BGRP; bi++) {
+        if (bi >= bcnt) break;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lw[bi] += __shfl_down_sync(0xffffffffu, lw[bi], off);
+            la[bi] += __shfl_down_sync(0xffffffffu, la[bi], off);
+            lv[bi] += __shfl_down_sync(0xffffffffu, lv[bi], off);
+            lg[bi] += __shfl_down_sync(0xffffffffu, lg[bi], off);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int bi = 0; bi < BGRP; bi++) {
+            if (bi >= bcnt) break;
+            const int mo = (b0 + bi) * m + row;
+            out_w[mo] = expf(sc * sigmoidf_(lw[bi] + w0[row]));
+            out_a[mo] = sigmoidf_(la[bi] + a0[row]);
+            const float vcur = out_v[mo];
+            out_v[mo] = vcur + sigmoidf_(lv[bi] + v0[row]) * (v_first[mo] - vcur);
+            out_g[mo] = lg[bi];
+        }
+    }
+}
+"#;
+
 /// 低秩链**两级 fp16 张量核 GEMM**（`LOWRANK_GEMM=1`，Turing `mma.m16n8k8`）。
 ///
 /// ★ 与既有 `gemv_*` 系列的结构性区别：**权重 tile 进 smem、整 batch 流过**（真 tiled
@@ -8193,6 +8287,23 @@ extern "C" __global__ void rwkv_to_f16(
 }
 "#;
 
+/// to_f32 CUDA kernel：f16 → f32（token 并行）。与 `to_f16` 互为反向量，
+/// 供「f16 输出的融合核 → f32 下游」这条缝使用（见 `ComputeBackend::to_f32`）。
+const TO_F32_SRC: &str = r#"
+extern "C" __global__ void rwkv_to_f32(
+    const __half* __restrict__ x,  // [T, C] f16
+    float* __restrict__ y,         // [T, C] f32
+    const int c,
+    const int t,
+    const int stride)
+{
+    const int token = blockIdx.x;
+    if (token >= t) return;
+    const size_t b = (size_t)token * (size_t)stride;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) y[b + i] = __half2float(x[b + i]);
+}
+"#;
+
 /// to_f16_triple CUDA kernel：一次把 xr/xk/xv 三个 [T,C] f32 转成 [M_PAD,C] f16。
 /// 语义对齐 Vulkan `to_f16_triple.comp`。
 const TO_F16_TRIPLE_SRC: &str = r#"
@@ -8470,6 +8581,43 @@ extern "C" __global__ void rwkv_seq_shift(
         const float prev = (token == 0) ? s[i] : x[xbase - stride_x + i];
         const float tmv  = tm[i];
         y[ybase + i] = cur + tmv * (prev - cur);
+    }
+}
+"#;
+
+/// seq_shift6 CUDA kernel：六路 token shift 融合（`xr/xw/xk/xv/xa/xg` 共用 `x` 与旧状态）。
+///
+/// 小 T 验证路径里这 6 次 shift 只差 `tm`/`y` 两个指针 ⇒ 一次 launch 全出；顺带把
+/// `state_out`（= `tmix_x`）的 `x[t-1]` 行回写也吞掉，等于 7 次 launch → 1。
+/// 语义与逐个 `seq_shift` 逐位一致（同一表达式 `cur + tm*(prev-cur)`）。
+const SEQ_SHIFT6_SRC: &str = r#"
+extern "C" __global__ void rwkv_seq_shift6(
+    const float* __restrict__ x,   // [T, C]
+    const float* __restrict__ s,   // token-shift state [C]
+    const float* __restrict__ tm0, const float* __restrict__ tm1,
+    const float* __restrict__ tm2, const float* __restrict__ tm3,
+    const float* __restrict__ tm4, const float* __restrict__ tm5,
+    float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3,
+    float* __restrict__ y4, float* __restrict__ y5,
+    float* __restrict__ state_out,  // 可空；非空时写 x[t-1] 行
+    const int c, const int t, const int stride_x, const int stride_y)
+{
+    const int token = blockIdx.x;
+    if (token >= t) return;
+    const size_t xbase = (size_t)token * stride_x;
+    const size_t ybase = (size_t)token * stride_y;
+    const float* tms[6] = {tm0, tm1, tm2, tm3, tm4, tm5};
+    float* ys[6] = {y0, y1, y2, y3, y4, y5};
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        const float cur  = x[xbase + i];
+        const float prev = (token == 0) ? s[i] : x[xbase - stride_x + i];
+        const float d    = prev - cur;
+        #pragma unroll
+        for (int k = 0; k < 6; k++) ys[k][ybase + i] = cur + tms[k][i] * d;
+    }
+    if (state_out != nullptr && token == t - 1) {
+        for (int i = threadIdx.x; i < c; i += blockDim.x) state_out[i] = x[xbase + i];
     }
 }
 "#;
@@ -9493,6 +9641,19 @@ impl ComputeBackend for CudaBackend {
         cu_check!(
             (self.drv.cu_graph_launch)(exec, self.stream),
             "cuGraphLaunch(prefill)"
+        );
+        Ok(())
+    }
+
+    fn prefill_graph_replay_keyed(&mut self, t: usize) -> R<()> {
+        let exec = self
+            .prefill_graphs
+            .get(&t)
+            .copied()
+            .ok_or("prefill_graph_replay_keyed: no captured graph for this key")?;
+        cu_check!(
+            (self.drv.cu_graph_launch)(exec, self.stream),
+            "cuGraphLaunch(prefill keyed)"
         );
         Ok(())
     }
@@ -10664,6 +10825,103 @@ impl ComputeBackend for CudaBackend {
             &ka_i as *const i32 as *mut c_void,
             &kv_i as *const i32 as *mut c_void,
             &kg_i as *const i32 as *mut c_void,
+            &batch_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    fn supports_lowrank_chain4_f32(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowrank_chain4_f32(
+        &mut self,
+        w2: TensorId,
+        a2: TensorId,
+        v2: TensorId,
+        g2: TensorId,
+        w_mid: TensorId,
+        a_mid: TensorId,
+        v_mid: TensorId,
+        g_mid: TensorId,
+        w0: TensorId,
+        a0: TensorId,
+        v0: TensorId,
+        scale: TensorId,
+        v_first: TensorId,
+        out_w: TensorId,
+        out_a: TensorId,
+        out_v: TensorId,
+        out_g: TensorId,
+        m: usize,
+        kw: usize,
+        ka: usize,
+        kv: usize,
+        kg: usize,
+        sw: usize,
+        sa: usize,
+        sv: usize,
+        sg: usize,
+        batch: usize,
+    ) -> R<()> {
+        const OP: &str = "gemv_lowrank_chain4_f32";
+        let w2d = self.f32_ptr(w2, OP)?;
+        let a2d = self.f32_ptr(a2, OP)?;
+        let v2d = self.f32_ptr(v2, OP)?;
+        let g2d = self.f32_ptr(g2, OP)?;
+        let wmd = self.f32_ptr(w_mid, OP)?;
+        let amd = self.f32_ptr(a_mid, OP)?;
+        let vmd = self.f32_ptr(v_mid, OP)?;
+        let gmd = self.f32_ptr(g_mid, OP)?;
+        let w0d = self.f32_ptr(w0, OP)?;
+        let a0d = self.f32_ptr(a0, OP)?;
+        let v0d = self.f32_ptr(v0, OP)?;
+        let scaled = self.f32_ptr(scale, OP)?;
+        let vfd = self.f32_ptr(v_first, OP)?;
+        let owd = self.f32_ptr(out_w, OP)?;
+        let oad = self.f32_ptr(out_a, OP)?;
+        let ovd = self.f32_ptr(out_v, OP)?;
+        let ogd = self.f32_ptr(out_g, OP)?;
+        let func = self.kernel(
+            "gemv_lowrank_chain4_f32",
+            GEMV_LOWRANK_CHAIN4_F32_SRC,
+            "gemv_lowrank_chain4_f32",
+        )?;
+        const WARPS: usize = 8;
+        const BGRP: usize = 4;
+        let grid = (m.div_ceil(WARPS) as u32, batch.div_ceil(BGRP) as u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (m_i, kw_i, ka_i, kv_i, kg_i) = (m as i32, kw as i32, ka as i32, kv as i32, kg as i32);
+        let (sw_i, sa_i, sv_i, sg_i) = (sw as i32, sa as i32, sv as i32, sg as i32);
+        let batch_i = batch as i32;
+        let params = [
+            &w2d as *const u64 as *mut c_void,
+            &a2d as *const u64 as *mut c_void,
+            &v2d as *const u64 as *mut c_void,
+            &g2d as *const u64 as *mut c_void,
+            &wmd as *const u64 as *mut c_void,
+            &amd as *const u64 as *mut c_void,
+            &vmd as *const u64 as *mut c_void,
+            &gmd as *const u64 as *mut c_void,
+            &w0d as *const u64 as *mut c_void,
+            &a0d as *const u64 as *mut c_void,
+            &v0d as *const u64 as *mut c_void,
+            &scaled as *const u64 as *mut c_void,
+            &vfd as *const u64 as *mut c_void,
+            &owd as *const u64 as *mut c_void,
+            &oad as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &ogd as *const u64 as *mut c_void,
+            &m_i as *const i32 as *mut c_void,
+            &kw_i as *const i32 as *mut c_void,
+            &ka_i as *const i32 as *mut c_void,
+            &kv_i as *const i32 as *mut c_void,
+            &kg_i as *const i32 as *mut c_void,
+            &sw_i as *const i32 as *mut c_void,
+            &sa_i as *const i32 as *mut c_void,
+            &sv_i as *const i32 as *mut c_void,
+            &sg_i as *const i32 as *mut c_void,
             &batch_i as *const i32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
@@ -12497,6 +12755,27 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    fn supports_to_f32(&self) -> bool {
+        true
+    }
+
+    fn to_f32(&mut self, x: TensorId, y: TensorId, c: usize, t: usize, stride: usize) -> R<()> {
+        let xd = self.f16_ptr(x, "to_f32")?;
+        let yd = self.f32_ptr(y, "to_f32")?;
+        let func = self.kernel("to_f32", TO_F32_SRC, "rwkv_to_f32")?;
+        let grid = (t as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i, s_i) = (c as i32, t as i32, stride as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &yd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &s_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
     fn to_f16_triple(
         &mut self,
         xr: TensorId,
@@ -12701,6 +12980,66 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+
+    fn supports_seq_shift6(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seq_shift6(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        tm: [TensorId; 6],
+        y: [TensorId; 6],
+        state_out: Option<TensorId>,
+        c: usize,
+        t: usize,
+        stride_x: usize,
+        stride_y: usize,
+    ) -> R<()> {
+        const OP: &str = "seq_shift6";
+        let xd = self.f32_ptr(x, OP)?;
+        let sd = self.f32_ptr(state, OP)?;
+        let mut tmd = [0u64; 6];
+        let mut yd = [0u64; 6];
+        for k in 0..6 {
+            tmd[k] = self.f32_ptr(tm[k], OP)?;
+            yd[k] = self.f32_ptr(y[k], OP)?;
+        }
+        // 空指针 = 不写状态（kernel 内判 nullptr）
+        let sod = match state_out {
+            Some(s) => self.f32_ptr(s, OP)?,
+            None => 0u64,
+        };
+        let func = self.kernel("seq_shift6", SEQ_SHIFT6_SRC, "rwkv_seq_shift6")?;
+        let grid = (t as u32, 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let (c_i, t_i, sx, sy) = (c as i32, t as i32, stride_x as i32, stride_y as i32);
+        let params = [
+            &xd as *const u64 as *mut c_void,
+            &sd as *const u64 as *mut c_void,
+            &tmd[0] as *const u64 as *mut c_void,
+            &tmd[1] as *const u64 as *mut c_void,
+            &tmd[2] as *const u64 as *mut c_void,
+            &tmd[3] as *const u64 as *mut c_void,
+            &tmd[4] as *const u64 as *mut c_void,
+            &tmd[5] as *const u64 as *mut c_void,
+            &yd[0] as *const u64 as *mut c_void,
+            &yd[1] as *const u64 as *mut c_void,
+            &yd[2] as *const u64 as *mut c_void,
+            &yd[3] as *const u64 as *mut c_void,
+            &yd[4] as *const u64 as *mut c_void,
+            &yd[5] as *const u64 as *mut c_void,
+            &sod as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &t_i as *const i32 as *mut c_void,
+            &sx as *const i32 as *mut c_void,
+            &sy as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn seq_shift_batch(
         &mut self,

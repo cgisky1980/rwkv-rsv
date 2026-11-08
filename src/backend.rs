@@ -337,6 +337,14 @@ pub trait ComputeBackend {
     fn prefill_graph_replay(&mut self) -> R<()> {
         Ok(())
     }
+    /// 按 **key** 重放 prefill graph（同一进程里有多张图时唯一正确的入口）。
+    ///
+    /// `prefill_graph_replay` 用「最后一次捕获的 key」，一旦调用方交替使用两个形状
+    /// （如 T=3 的 prefill 与 T=4 的验证 pass），`valid(k2)` 命中后会静默重放**另一张图**
+    /// ——算出来的东西是错的但不报错。默认实现退化为无参版（Vulkan 无图，空转）。
+    fn prefill_graph_replay_keyed(&mut self, _t: usize) -> R<()> {
+        self.prefill_graph_replay()
+    }
 
     // —— 解码 self-loop 图（按 key 长期持有：每个形状只捕获一次，此后只重放）——
     // 动机：`begin/end_graph_capture` 是无 key 的单槽 API，形状一变就要重新实例化；
@@ -1285,6 +1293,54 @@ pub trait ComputeBackend {
     ) -> R<()> {
         Err("gemv_lowrank_chain4_batch not supported by this backend".into())
     }
+
+    /// 与 [`Self::gemv_lowrank_chain4_batch`] **同一套 f32 SIMT 语义**，但 `v_first`
+    /// 与四个输出**全为 f32**（不做 f16 舍入），且四个 mid 输入各带行步长。
+    ///
+    /// 存在的理由：小 T 序列验证路径（`forward_seq_layer` 的 `small_t` 分支）下游
+    /// （`dplr_seq`/`sum_rk_rk`/`fuse_ka`）只吃 f32，走 f16 版本要多 5 次往返转换
+    /// （1 次 `to_f16` + 4 次 `to_f32`），比融合省下的 launch 还贵；而 mid 在序列路径
+    /// 里补齐到 64（`*_mid_pad`），步长 ≠ 宽度，所以必须显式给 `*_stride`。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowrank_chain4_f32(
+        &mut self,
+        _w2: TensorId,
+        _a2: TensorId,
+        _v2: TensorId,
+        _g2: TensorId,
+        _w_mid: TensorId,
+        _a_mid: TensorId,
+        _v_mid: TensorId,
+        _g_mid: TensorId,
+        _w0: TensorId,
+        _a0: TensorId,
+        _v0: TensorId,
+        _scale: TensorId,
+        _v_first: TensorId,
+        _out_w: TensorId,
+        _out_a: TensorId,
+        _out_v: TensorId,
+        _out_g: TensorId,
+        _m: usize,
+        _kw: usize,
+        _ka: usize,
+        _kv: usize,
+        _kg: usize,
+        _sw: usize,
+        _sa: usize,
+        _sv: usize,
+        _sg: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_lowrank_chain4_f32 not supported by this backend".into())
+    }
+
+    /// 后端是否实现 [`Self::gemv_lowrank_chain4_f32`]（能力查询，避免每个调用点靠
+    /// 返回值嗅探；错误路径不该出现在热循环里）。
+    fn supports_lowrank_chain4_f32(&self) -> bool {
+        false
+    }
+
     /// 低秩链两级融合 GEMM（fp16 张量核，`LOWRANK_GEMM=1`）：
     /// 一级 `mid = act(x @ W1ᵀ)`（[batch, mid_pad] fp16）、二级按 chain4 语义出
     /// w/a/v/g（[batch, C] fp16）——替代 `gemv_int8_rkv_stage1_batch` 的 mid 段与
@@ -1558,6 +1614,26 @@ pub trait ComputeBackend {
         x_stride: usize,
         y_stride: usize,
     ) -> R<()>;
+    /// f16 → f32 反向转换（token 并行，`[T, C]`，步长只给一个 `stride`）。
+    ///
+    /// 存在理由：融合核（`gemv_int8/int6_rkv_stage1_batch`、`gemv_lowrank_chain4_batch`）
+    /// 的 `out_v` 是 **f16**（批量解码链路里 v 全程 f16），而单序列 seq 链路的下游
+    /// （`dplr_seq`/`sum_rk_rk`/`fuse_ka`）只吃 f32。没有这个反向算子，那几个融合核
+    /// 一个都接不到小 T 的验证路径上（台账 §3.6 / §3.7）。
+    fn to_f32(
+        &mut self,
+        _x: TensorId,
+        _y: TensorId,
+        _c: usize,
+        _t: usize,
+        _stride: usize,
+    ) -> R<()> {
+        Err("to_f32 not supported by this backend".into())
+    }
+    /// 后端是否实现 [`Self::to_f32`]（能力查询）。
+    fn supports_to_f32(&self) -> bool {
+        false
+    }
     /// f32 → f16 三输入融合转换（一次把 xr/xk/xv 转成 fp16）。
     #[allow(clippy::too_many_arguments)]
     fn to_f16_triple(
@@ -1705,7 +1781,36 @@ pub trait ComputeBackend {
         stride_x: usize,
         stride_y: usize,
     ) -> R<()>;
-    /// DPLR 状态更新（sequence-parallel，内部循环 T）。
+    /// 六路 `seq_shift` 融合（time-mix 的 `xr/xw/xk/xv/xa/xg` 共享同一个 `x` 与状态）。
+    ///
+    /// 默认实现退化成 6 次 [`Self::seq_shift`]（语义完全等价）；有融合核的后端覆盖它。
+    /// `state_out` 非空时顺带把 `x` 的第 `t-1` 行写进去（= `copy_token(x, state_out, c, .., t-1)`），
+    /// 把「token shift 状态回写」这第 7 次 launch 也吞掉。
+    #[allow(clippy::too_many_arguments)]
+    fn seq_shift6(
+        &mut self,
+        x: TensorId,
+        state: TensorId,
+        tm: [TensorId; 6],
+        y: [TensorId; 6],
+        state_out: Option<TensorId>,
+        c: usize,
+        t: usize,
+        stride_x: usize,
+        stride_y: usize,
+    ) -> R<()> {
+        for k in 0..6 {
+            self.seq_shift(x, state, tm[k], y[k], c, t, stride_x, stride_y)?;
+        }
+        if let Some(so) = state_out {
+            self.copy_token(x, so, c, stride_x, t - 1)?;
+        }
+        Ok(())
+    }
+    /// 后端是否有 [`Self::seq_shift6`] 的融合核（默认实现等价，不需要开关）。
+    fn supports_seq_shift6(&self) -> bool {
+        false
+    }
     #[allow(clippy::too_many_arguments)]
     fn dplr_seq(
         &mut self,

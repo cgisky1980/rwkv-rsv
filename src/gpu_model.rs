@@ -592,6 +592,9 @@ pub struct SeqBuffers {
     logits_t: Option<TensorId>,
     /// 验证前向的**逐位置回滚输入 + drafter tap**（见 [`VerifySaves`]）。按需分配。
     vsaves: Option<Box<VerifySaves>>,
+    /// 小 T 验证路径的 `v` f16 暂存 `[T, C]`：融合核 `gemv_*_rkv_stage1_batch` 的
+    /// `out_v` 固定 f16（批量解码链路如此），再由 `to_f32` 落回 `sb.v`。
+    v16_t: TensorId,
 }
 
 /// 验证前向（投机解码）要留下的两样东西。
@@ -667,6 +670,7 @@ impl SeqBuffers {
             self.a_mid16,
             self.g_mid16,
             self.w_scratch,
+            self.v16_t,
         ];
         for t in tensors {
             backend.free_tensor(t);
@@ -1138,7 +1142,23 @@ impl GpuModel {
             self.seq_bufs = Some(sb);
             return Err("spec_rollback: 验证存档缺失".into());
         };
+        // 快照恢复放在捕获**之外**：`State::copy_from` 内部自带 begin/end_batch
+        // （Vulkan 语义是「攒一批再提交」），把它圈进捕获里在 CUDA 上会丢节点
+        // （实测：图里只剩逐层 `dplr_seq`，重放后状态被推进两次）。
         state.copy_from(self.backend.as_mut(), snap, c, h, nn)?;
+        let graph_on = self.backend.supports_graph_capture()
+            && std::env::var("MTP_ROLLBACK_GRAPH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let gkey = (1usize << 41) | n;
+        if graph_on && self.backend.prefill_graph_valid(gkey)? {
+            self.seq_bufs = Some(sb);
+            self.backend.prefill_graph_replay_keyed(gkey)?;
+            return Ok(());
+        }
+        if graph_on {
+            self.backend.begin_prefill_capture(gkey)?;
+        }
         self.backend.begin_batch()?;
         for (i, d) in pl.iter().enumerate().take(self.config.n_layer) {
             let s = &state.layers[i];
@@ -1149,6 +1169,12 @@ impl GpuModel {
             self.backend.copy_token(d[7], s.cmix_x, c, c, n - 1)?;
         }
         self.backend.end_batch()?;
+        if graph_on {
+            self.backend.end_prefill_capture()?;
+            // ★ 捕获**不执行** kernel（同 `forward_seq` 的 prefill graph），必须立刻重放
+            // 一次才产生本次的回滚结果。
+            self.backend.prefill_graph_replay_keyed(gkey)?;
+        }
         self.seq_bufs = Some(sb);
         Ok(())
     }
@@ -1176,6 +1202,29 @@ impl GpuModel {
         let _ = self.forward_seq_verify_with_state(state, tokens)?;
         self.spec_rollback(state, &snap, n)?;
         let rolled = self.state_back(state)?;
+        // 回滚是「给定同一快照 + 同一份逐位置输入」的纯函数 ⇒ 再跑一次必须逐位相同。
+        // 这一条专门盯**图捕获/重放**：首次是捕获执行、之后是重放，两者不一致就说明
+        // 图里少了节点或烤进了旧地址（比「回滚 vs 参考」更容易定位）。
+        self.spec_rollback(state, &snap, n)?;
+        let rolled2 = self.state_back(state)?;
+        let mut worst = (0.0f64, 0usize);
+        let mut n_diff = 0usize;
+        for (i, (a, b)) in rolled.iter().zip(&rolled2).enumerate() {
+            let d = (*a as f64 - *b as f64).abs();
+            if d != 0.0 {
+                n_diff += 1;
+            }
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        log::info!(
+            "[回滚自检] 二次回滚（捕获执行 vs 图重放）：max|Δstate| = {:.3e}（idx {} / {}，差异元素 {}）",
+            worst.0,
+            worst.1,
+            rolled.len(),
+            n_diff
+        );
         state.load(&*self.backend, &base, c, h, nn)?;
         let _ = self.forward_seq_verify_with_state(state, &tokens[..n])?;
         let reference = self.state_back(state)?;
@@ -4654,7 +4703,7 @@ impl GpuModel {
         // 保存），必须分开缓存，否则会重放到另一条序列上（静默算错）。
         let gkey = if verify { t | (1usize << 40) } else { t };
         if prefill_graph && self.backend.prefill_graph_valid(gkey)? {
-            self.backend.prefill_graph_replay()?;
+            self.backend.prefill_graph_replay_keyed(gkey)?;
         } else {
             if prefill_graph {
                 self.backend.begin_prefill_capture(gkey)?;
@@ -5195,18 +5244,34 @@ impl GpuModel {
             .norm(sb.x, layer.ln1_w, layer.ln1_b, sb.ln1, c, 1, LN_EPS, t)?;
 
         // token shift + time-mix：xr/xw/xk/xv/xa/xg（t=0 用旧 state，t>0 用前一 token）
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_r, sb.xr, c, t, c, c)?;
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_w, sb.xw, c, t, c, c)?;
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_k, sb.xk, c, t, c, c)?;
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_v, sb.xv, c, t, c, c)?;
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_a, sb.xa, c, t, c, c)?;
-        self.backend
-            .seq_shift(sb.ln1, state.layers[i].tmix_x, layer.x_g, sb.xg, c, t, c, c)?;
+        // 六路一次融合（共享 `x`/旧状态，只差 `tm` 与输出；默认实现退化成 6 次 seq_shift）。
+        // `SEQ_SHIFT6=0` 回退 6 次单路（对拍/诊断；大 T prefill 的形状也走这里）。
+        // ★ `tmix_x` 的回写**不能**并进来：t=0 的块要读旧 state，而写方是 t-1 的块，
+        // 块之间没有顺序保证（t≥2 时是实打实的竞态）⇒ 单独一次 copy_token。
+        let sh6: [TensorId; 6] = [
+            layer.x_r, layer.x_w, layer.x_k, layer.x_v, layer.x_a, layer.x_g,
+        ];
+        let out6: [TensorId; 6] = [sb.xr, sb.xw, sb.xk, sb.xv, sb.xa, sb.xg];
+        if std::env::var("SEQ_SHIFT6")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            self.backend
+                .seq_shift6(sb.ln1, state.layers[i].tmix_x, sh6, out6, None, c, t, c, c)?;
+        } else {
+            for k in 0..6 {
+                self.backend.seq_shift(
+                    sb.ln1,
+                    state.layers[i].tmix_x,
+                    sh6[k],
+                    out6[k],
+                    c,
+                    t,
+                    c,
+                    c,
+                )?;
+            }
+        }
 
         // state[i].tmix_x = ln1[T-1]（须在 seq_shift 之后，避免覆盖 t=0 读取的旧 state）
         self.backend
@@ -5237,109 +5302,243 @@ impl GpuModel {
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv start");
         }
-        // ★ `xr16/xk16/xv16` 在后面的低秩一级 v 链里还要用（`gemm(sb.xv16, v1_16, ...)`），
-        // 所以这一遍转换在小 T 分支里也**不能**省。
-        self.backend.to_f16_triple(
-            sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
-        )?;
-        if small_t {
-            Self::rkv_small(self.backend.as_mut(), layer, c, t, sb)?;
-        } else if let (Some(qr), Some(qk), Some(qv)) = (
-            wq(layer.receptance_i6, layer.receptance_a8),
-            wq(layer.key_i6, layer.key_a8),
-            wq(layer.value_i6, layer.value_a8),
-        ) {
+        // 小 T 的低秩**二级**链路：一条 f32 chain4 融合核（`gemv_lowrank_chain4_f32`）代替
+        // 「4×gemm(_tanh) + to_f16×4 + gemm_bias×4 + sigmoid/scale_exp + v_first_lerp」18 次
+        // launch，且数值与 decode 路径的 f32 SIMT chain4 同档（台账 §3.6b 的接受率根因）。
+        // `SEQ_CHAIN4=0` 回退旧路径（对拍/诊断用）。
+        let chain4 = small_t
+            && self.backend.supports_lowrank_chain4_f32()
+            && std::env::var("SEQ_CHAIN4")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
+        // ★ 小 T 的 r/k/v + 四个一级 mid：整段交给 `gemv_{int8,int6}_rkv_stage1_batch`
+        // （批量 GEMV 直读量化权重，权重只读一遍，7 次 launch → 1 次 + 1 次 `to_f32`）。
+        // 它唯一的 dtype 别扭处是 `out_v` 固定 f16（批量解码链路里 v 全程 f16），而这里
+        // 下游只吃 f32 ⇒ 用 `to_f32` 落回 `sb.v`。
+        //
+        // ⚠️ **默认关**（`SEQ_STAGE1=1` 才开）：实测（int8 2.9B、K=2/3、MTP_GEN=256）
+        // · 验证 pass 只快 0.7 ms（14.7 → 14.0），因为它省的是 launch 而不是带宽；
+        // · 接受草稿数**下降**（K=2：1.31 → 1.04；K=3：1.24 → 1.10）⇒ 端到端反而更慢。
+        // 原因是 `out_v` 的 f16 舍入进了 `dplr_seq`/`sum_rk_rk`，与 decode 路径的 f32
+        // v 拉开了数值差——正是台账 §3.6b 那条「验证/解码必须同一数值档」的反面例证。
+        // 保留这条通路是因为它把 `to_f32` 与 stage1 的接线都跑通了（`f16` 档模型或
+        // 将来 `out_v` 改 f32 时直接可用），并且是「launch 数 vs 数值档」的对照实验。
+        let mut stage1 = false;
+        if small_t
+            && chain4
+            && self.backend.supports_to_f32()
+            && std::env::var("SEQ_STAGE1").is_ok_and(|v| v == "1")
+        {
+            let (qr, qk, qv) = (
+                wq(layer.receptance_i6, layer.receptance_a8),
+                wq(layer.key_i6, layer.key_a8),
+                wq(layer.value_i6, layer.value_a8),
+            );
+            let (vm, wm, am, gm) = (
+                self.config.v_mid,
+                self.config.w_mid,
+                self.config.a_mid,
+                self.config.g_mid,
+            );
+            match (qr, qk, qv) {
+                (Some(Wq::I8(a)), Some(Wq::I8(b)), Some(Wq::I8(d))) => {
+                    self.backend.gemv_int8_rkv_stage1_batch(
+                        &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk, sb.xv,
+                        sb.xr16, sb.xk16, sb.xv16, sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v16_t,
+                        sb.v_mid, sb.w_mid, sb.a_mid, sb.g_mid, c, vm, wm, am, gm, t,
+                    )?;
+                    self.backend.to_f32(sb.v16_t, sb.v, c, t, c)?;
+                    stage1 = true;
+                }
+                (Some(Wq::I6(a)), Some(Wq::I6(b)), Some(Wq::I6(d)))
+                    if a.nmajor && b.nmajor && d.nmajor =>
+                {
+                    self.backend.gemv_int6_rkv_stage1_batch(
+                        &a, &b, &d, layer.v1, layer.w1, layer.a1, layer.g1, sb.xr, sb.xk, sb.xv,
+                        sb.xw, sb.xa, sb.xg, sb.r, sb.k, sb.v16_t, sb.v_mid, sb.w_mid, sb.a_mid,
+                        sb.g_mid, c, vm, wm, am, gm, t,
+                    )?;
+                    self.backend.to_f32(sb.v16_t, sb.v, c, t, c)?;
+                    stage1 = true;
+                }
+                _ => {}
+            }
+        }
+
+        if !stage1 {
+            // ★ `xr16/xk16/xv16` 在后面的低秩一级 v 链里还要用（`gemm(sb.xv16, v1_16, ...)`），
+            // 所以这一遍转换在小 T 分支里也**不能**省。
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
             )?;
-            self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
-        } else {
-            let r16 = layer
-                .receptance_w16
-                .as_ref()
-                .ok_or("receptance_w16 missing")?;
-            let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
-            let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
-            self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
-            self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
-            self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
-        }
-        if std::env::var("GEMM_DIAG").is_ok() {
-            log::info!("[FS] layer {i} gemm rkv done");
-        }
-        pf_phase!("shift+rkv_gemm");
-        Self::dump_tensors(
-            self.backend.as_mut(),
-            "seq",
-            i,
-            &[
-                ("xr", sb.xr),
-                ("xk", sb.xk),
-                ("xv", sb.xv),
-                ("r", sb.r),
-                ("k", sb.k),
-                ("v", sb.v),
-            ],
-        )?;
-        Self::verify_gemm_rkv(self.backend.as_mut(), layer, i, sb, c)?;
+            if small_t {
+                Self::rkv_small(self.backend.as_mut(), layer, c, t, sb)?;
+            } else if let (Some(qr), Some(qk), Some(qv)) = (
+                wq(layer.receptance_i6, layer.receptance_a8),
+                wq(layer.key_i6, layer.key_a8),
+                wq(layer.value_i6, layer.value_a8),
+            ) {
+                self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+            } else {
+                let r16 = layer
+                    .receptance_w16
+                    .as_ref()
+                    .ok_or("receptance_w16 missing")?;
+                let k16 = layer.key_w16.as_ref().ok_or("key_w16 missing")?;
+                let v16 = layer.value_w16.as_ref().ok_or("value_w16 missing")?;
+                self.backend.gemm(sb.xr16, *r16, sb.r, m_pad, c, c)?;
+                self.backend.gemm(sb.xk16, *k16, sb.k, m_pad, c, c)?;
+                self.backend.gemm(sb.xv16, *v16, sb.v, m_pad, c, c)?;
+            }
+            if std::env::var("GEMM_DIAG").is_ok() {
+                log::info!("[FS] layer {i} gemm rkv done");
+            }
+            pf_phase!("shift+rkv_gemm");
+            Self::dump_tensors(
+                self.backend.as_mut(),
+                "seq",
+                i,
+                &[
+                    ("xr", sb.xr),
+                    ("xk", sb.xk),
+                    ("xv", sb.xv),
+                    ("r", sb.r),
+                    ("k", sb.k),
+                    ("v", sb.v),
+                ],
+            )?;
+            Self::verify_gemm_rkv(self.backend.as_mut(), layer, i, sb, c)?;
 
-        // 低秩 w/a/g 第一级投影输入转 fp16（xw/xa/xg → [M_PAD, C]）
-        self.backend.to_f16_triple(
-            sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, t, m_pad, c, c,
-        )?;
+            // 低秩 w/a/g 第一级投影输入转 fp16（xw/xa/xg → [M_PAD, C]）
+            self.backend.to_f16_triple(
+                sb.xw, sb.xa, sb.xg, sb.xw16, sb.xa16, sb.xg16, c, t, m_pad, c, c,
+            )?;
+        }
 
         // v_first 逻辑：layer 0 存 v_first = v；layer>0 交叉混合 v
         if i == 0 {
             self.backend.copy_device(sb.v, sb.v_first)?;
-        } else {
-            // v_mid = tensor-core GEMM(xv @ v1)：[M_PAD, vm_pad]
-            self.backend
-                .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
-            // v_mid → fp16（第二级投影输入）
-            self.backend
-                .to_f16(sb.v_mid, sb.v_mid16, vvp, t, m_pad, vvp, vvp)?;
-            // v_full = gemm_bias(v_mid @ v2 + v0)：[M_PAD, C]
-            self.backend
-                .gemm_bias(sb.v_mid16, layer.v2_16, layer.v0, sb.v_full, m_rows, c, vvp)?;
-            // gate = sigmoid(v_full)
-            self.backend.elementwise_sigmoid(sb.v_full, sb.gate, c, t)?;
-            // v = v + gate*(v_first - v)（原地，含 t=0）
-            self.backend
-                .v_first_lerp(sb.v, sb.gate, sb.v_first, c, t, c)?;
         }
+        if chain4 {
+            // 一级 mid（`stage1` 档已由融合核算完，且写的是**真实宽度步长**）
+            let (sw, sa, sv, sg) = if stage1 {
+                (
+                    self.config.w_mid,
+                    self.config.a_mid,
+                    self.config.v_mid,
+                    self.config.g_mid,
+                )
+            } else {
+                (wwp, aap, vvp, ggp)
+            };
+            if !stage1 {
+                if i > 0 {
+                    self.backend
+                        .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
+                }
+                self.backend
+                    .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
+                self.backend
+                    .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
+                self.backend
+                    .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
+            }
+            // ★ layer 0：`v_first` 与 `out_v` 传同一张（lam = 0 ⇒ v 原样保留，与该层不跑
+            // v 低秩链的语义等价），所以 `v_mid` 不必算（上面已跳过）。
+            let (v_first_src, out_v) = if i == 0 {
+                (sb.v, sb.v)
+            } else {
+                (sb.v_first, sb.v)
+            };
+            self.backend.gemv_lowrank_chain4_f32(
+                layer.w2,
+                layer.a2,
+                layer.v2,
+                layer.g2,
+                sb.w_mid,
+                sb.a_mid,
+                sb.v_mid,
+                sb.g_mid,
+                layer.w0,
+                layer.a0,
+                layer.v0,
+                self.scale_w,
+                v_first_src,
+                sb.w,
+                sb.a,
+                out_v,
+                sb.g,
+                c,
+                self.config.w_mid,
+                self.config.a_mid,
+                self.config.v_mid,
+                self.config.g_mid,
+                sw,
+                sa,
+                sv,
+                sg,
+                t,
+            )?;
+        }
+        if !chain4 {
+            if i > 0 {
+                // v_mid = tensor-core GEMM(xv @ v1)：[M_PAD, vm_pad]
+                self.backend
+                    .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
+                // v_mid → fp16（第二级投影输入）
+                self.backend
+                    .to_f16(sb.v_mid, sb.v_mid16, vvp, t, m_pad, vvp, vvp)?;
+                // v_full = gemm_bias(v_mid @ v2 + v0)：[M_PAD, C]
+                self.backend.gemm_bias(
+                    sb.v_mid16,
+                    layer.v2_16,
+                    layer.v0,
+                    sb.v_full,
+                    m_rows,
+                    c,
+                    vvp,
+                )?;
+                // gate = sigmoid(v_full)
+                self.backend.elementwise_sigmoid(sb.v_full, sb.gate, c, t)?;
+                // v = v + gate*(v_first - v)（原地，含 t=0）
+                self.backend
+                    .v_first_lerp(sb.v, sb.gate, sb.v_first, c, t, c)?;
+            }
 
-        // w = exp(-sigmoid(w0 + tanh(xw@w1)@w2)/sqrt(e))
-        // w_mid = tanh(xw @ w1)：[M_PAD, wm_pad]
-        self.backend
-            .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
-        self.backend
-            .to_f16(sb.w_mid, sb.w_mid16, wwp, t, m_pad, wwp, wwp)?;
-        // w_full = gemm_bias(w_mid @ w2 + w0)：[M_PAD, C]
-        self.backend
-            .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_rows, c, wwp)?;
-        self.backend
-            .elementwise_sigmoid(sb.w_full, sb.w_sig, c, t)?;
-        self.backend
-            .elementwise_scale_exp(sb.w_sig, self.scale_w, sb.w, c, t)?;
+            // w = exp(-sigmoid(w0 + tanh(xw@w1)@w2)/sqrt(e))
+            // w_mid = tanh(xw @ w1)：[M_PAD, wm_pad]
+            self.backend
+                .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
+            self.backend
+                .to_f16(sb.w_mid, sb.w_mid16, wwp, t, m_pad, wwp, wwp)?;
+            // w_full = gemm_bias(w_mid @ w2 + w0)：[M_PAD, C]
+            self.backend
+                .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_rows, c, wwp)?;
+            self.backend
+                .elementwise_sigmoid(sb.w_full, sb.w_sig, c, t)?;
+            self.backend
+                .elementwise_scale_exp(sb.w_sig, self.scale_w, sb.w, c, t)?;
 
-        // a = sigmoid(a0 + xa@a1@a2)
-        // a_mid = xa @ a1：[M_PAD, am_pad]
-        self.backend
-            .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
-        self.backend
-            .to_f16(sb.a_mid, sb.a_mid16, aap, t, m_pad, aap, aap)?;
-        // a_full = gemm_bias(a_mid @ a2 + a0)：[M_PAD, C]
-        self.backend
-            .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_rows, c, aap)?;
-        self.backend.elementwise_sigmoid(sb.a_full, sb.a, c, t)?;
+            // a = sigmoid(a0 + xa@a1@a2)
+            // a_mid = xa @ a1：[M_PAD, am_pad]
+            self.backend
+                .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
+            self.backend
+                .to_f16(sb.a_mid, sb.a_mid16, aap, t, m_pad, aap, aap)?;
+            // a_full = gemm_bias(a_mid @ a2 + a0)：[M_PAD, C]
+            self.backend
+                .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_rows, c, aap)?;
+            self.backend.elementwise_sigmoid(sb.a_full, sb.a, c, t)?;
+        }
 
         // 融合 k/k_a：k_mod、kk_l2、b_vec 一次 launch
         self.backend.fuse_ka(
@@ -5408,16 +5607,19 @@ impl GpuModel {
         )?;
 
         // g = sigmoid(xg@g1)@g2（tensor-core GEMM）
-        // g_mid = xg @ g1：[M_PAD, gm_pad]
-        self.backend
-            .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
-        // sigmoid 原地 + 转 fp16（第二级投影输入）
-        self.backend.elementwise_sigmoid_inplace(sb.g_mid, ggp, t)?;
-        self.backend
-            .to_f16(sb.g_mid, sb.g_mid16, ggp, t, m_pad, ggp, ggp)?;
-        // g = g_mid @ g2：[M_PAD, C]
-        self.backend
-            .gemm(sb.g_mid16, layer.g2_16, sb.g, m_rows, c, ggp)?;
+        // chain4 档已在融合核里算完（`g_mid` 进 kernel 内做 sigmoid），这里跳过。
+        if !chain4 {
+            // g_mid = xg @ g1：[M_PAD, gm_pad]
+            self.backend
+                .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
+            // sigmoid 原地 + 转 fp16（第二级投影输入）
+            self.backend.elementwise_sigmoid_inplace(sb.g_mid, ggp, t)?;
+            self.backend
+                .to_f16(sb.g_mid, sb.g_mid16, ggp, t, m_pad, ggp, ggp)?;
+            // g = g_mid @ g2：[M_PAD, C]
+            self.backend
+                .gemm(sb.g_mid16, layer.g2_16, sb.g, m_rows, c, ggp)?;
+        }
         Self::dump_tensors(
             self.backend.as_mut(),
             "seq",
@@ -7226,6 +7428,12 @@ impl SeqBuffers {
             // 验证前向（MTP）按需分配
             logits_t: None,
             vsaves: None,
+            // 小 T 融合核的 f16 `v` 暂存（`[T, C]`，与 seq 缓冲同寿命）
+            v16_t: {
+                let buf = backend.create_tensor(t * c, TensorDtype::F16)?;
+                backend.upload(buf, &vec![0.0f32; t * c])?;
+                buf
+            },
         })
     }
 }
