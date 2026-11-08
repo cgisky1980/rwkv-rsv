@@ -4892,10 +4892,26 @@ impl GpuModel {
         // 方案A（默认）：int8 权重 dequant 到共享 w_scratch，走 fp16 tensor-core GEMM；
         // 非 int8 模型：直接用常驻 fp16 w16。
         let m_pad = sb.m_pad;
+        // ★ 小 T（≤ `SEQ_SMALL_T`，默认 8）：改走**批量 GEMV 直读量化权重**。
+        // 理由（`参考/2026-11-08-int6量化与MTP-阶段记录.md` §3.4）：prefill 档的 `m_pad` 必须是
+        // TILE_M=256 的倍数，且每层要把 int8 权重 dequant 成 fp16 副本再 GEMM ⇒ T=4 也要 104 ms
+        // （≈10 个 decode 步），而批量 GEMV 只读一遍量化权重（≈1 个 decode 步）。
+        // 这条分支是 MTP 验证前向（T=K+1 的因果 pass）的成本前提；`SEQ_SMALL_T=0` 可关。
+        let small_t = t <= seq_small_t();
+        // 小 T 时把低秩 mid 的 GEMM 行数压到 64（tensor-core 的 M 下限；
+        // 批量档的 `lr_rows` 用的就是 64）。mid ≤ 96 ⇒ 省掉的是 padding 的计算量。
+        let m_rows = if small_t { 64 } else { m_pad };
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv start");
         }
-        if let (Some(qr), Some(qk), Some(qv)) = (
+        // ★ `xr16/xk16/xv16` 在后面的低秩一级 v 链里还要用（`gemm(sb.xv16, v1_16, ...)`），
+        // 所以这一遍转换在小 T 分支里也**不能**省。
+        self.backend.to_f16_triple(
+            sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
+        )?;
+        if small_t {
+            Self::rkv_small(self.backend.as_mut(), layer, c, t, sb)?;
+        } else if let (Some(qr), Some(qk), Some(qv)) = (
             wq(layer.receptance_i6, layer.receptance_a8),
             wq(layer.key_i6, layer.key_a8),
             wq(layer.value_i6, layer.value_a8),
@@ -4913,9 +4929,6 @@ impl GpuModel {
             self.backend
                 .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
         } else {
-            self.backend.to_f16_triple(
-                sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
-            )?;
             let r16 = layer
                 .receptance_w16
                 .as_ref()
@@ -4956,13 +4969,13 @@ impl GpuModel {
         } else {
             // v_mid = tensor-core GEMM(xv @ v1)：[M_PAD, vm_pad]
             self.backend
-                .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_pad, vvp, c)?;
+                .gemm(sb.xv16, layer.v1_16, sb.v_mid, m_rows, vvp, c)?;
             // v_mid → fp16（第二级投影输入）
             self.backend
                 .to_f16(sb.v_mid, sb.v_mid16, vvp, t, m_pad, vvp, vvp)?;
             // v_full = gemm_bias(v_mid @ v2 + v0)：[M_PAD, C]
             self.backend
-                .gemm_bias(sb.v_mid16, layer.v2_16, layer.v0, sb.v_full, m_pad, c, vvp)?;
+                .gemm_bias(sb.v_mid16, layer.v2_16, layer.v0, sb.v_full, m_rows, c, vvp)?;
             // gate = sigmoid(v_full)
             self.backend.elementwise_sigmoid(sb.v_full, sb.gate, c, t)?;
             // v = v + gate*(v_first - v)（原地，含 t=0）
@@ -4973,12 +4986,12 @@ impl GpuModel {
         // w = exp(-sigmoid(w0 + tanh(xw@w1)@w2)/sqrt(e))
         // w_mid = tanh(xw @ w1)：[M_PAD, wm_pad]
         self.backend
-            .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_pad, wwp, c)?;
+            .gemm_tanh(sb.xw16, layer.w1_16, sb.w_mid, m_rows, wwp, c)?;
         self.backend
             .to_f16(sb.w_mid, sb.w_mid16, wwp, t, m_pad, wwp, wwp)?;
         // w_full = gemm_bias(w_mid @ w2 + w0)：[M_PAD, C]
         self.backend
-            .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_pad, c, wwp)?;
+            .gemm_bias(sb.w_mid16, layer.w2_16, layer.w0, sb.w_full, m_rows, c, wwp)?;
         self.backend
             .elementwise_sigmoid(sb.w_full, sb.w_sig, c, t)?;
         self.backend
@@ -4987,12 +5000,12 @@ impl GpuModel {
         // a = sigmoid(a0 + xa@a1@a2)
         // a_mid = xa @ a1：[M_PAD, am_pad]
         self.backend
-            .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_pad, aap, c)?;
+            .gemm(sb.xa16, layer.a1_16, sb.a_mid, m_rows, aap, c)?;
         self.backend
             .to_f16(sb.a_mid, sb.a_mid16, aap, t, m_pad, aap, aap)?;
         // a_full = gemm_bias(a_mid @ a2 + a0)：[M_PAD, C]
         self.backend
-            .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_pad, c, aap)?;
+            .gemm_bias(sb.a_mid16, layer.a2_16, layer.a0, sb.a_full, m_rows, c, aap)?;
         self.backend.elementwise_sigmoid(sb.a_full, sb.a, c, t)?;
 
         // 融合 k/k_a：k_mod、kk_l2、b_vec 一次 launch
@@ -5060,14 +5073,14 @@ impl GpuModel {
         // g = sigmoid(xg@g1)@g2（tensor-core GEMM）
         // g_mid = xg @ g1：[M_PAD, gm_pad]
         self.backend
-            .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_pad, ggp, c)?;
+            .gemm(sb.xg16, layer.g1_16, sb.g_mid, m_rows, ggp, c)?;
         // sigmoid 原地 + 转 fp16（第二级投影输入）
         self.backend.elementwise_sigmoid_inplace(sb.g_mid, ggp, t)?;
         self.backend
             .to_f16(sb.g_mid, sb.g_mid16, ggp, t, m_pad, ggp, ggp)?;
         // g = g_mid @ g2：[M_PAD, C]
         self.backend
-            .gemm(sb.g_mid16, layer.g2_16, sb.g, m_pad, c, ggp)?;
+            .gemm(sb.g_mid16, layer.g2_16, sb.g, m_rows, c, ggp)?;
         Self::dump_tensors(
             self.backend.as_mut(),
             "seq",
@@ -5080,7 +5093,21 @@ impl GpuModel {
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, t)?;
 
         // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8 默认走方案A（dequant→scratch→TC GEMM）
-        if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
+        if small_t {
+            // 小 T：原地累加（x += y_g @ W），因此不交换 x/y_out
+            if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
+                self.backend.w_add(&wqo, sb.y_g, sb.x, c, c, t)?;
+            } else {
+                self.backend.gemv_f16_add(
+                    *layer.output_w16.as_ref().ok_or("output_w16 missing")?,
+                    sb.y_g,
+                    sb.x,
+                    c,
+                    c,
+                    t,
+                )?;
+            }
+        } else if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
             self.backend
@@ -5098,7 +5125,10 @@ impl GpuModel {
             )?;
         }
         // 交换 x 与 y_out：x 现在持有 block 输出残差，y_out 持有旧 x（下轮被覆盖）。
-        std::mem::swap(&mut sb.x, &mut sb.y_out);
+        // 小 T 分支已在 sb.x 上原地累加 ⇒ 不需要交换。
+        if !small_t {
+            std::mem::swap(&mut sb.x, &mut sb.y_out);
+        }
         if std::env::var("GEMM_DIAG").is_ok() {
             // gemv 参考输出（诊断用）
             let output_w = layer
@@ -5144,7 +5174,36 @@ impl GpuModel {
         // §6.13 定稿：同 `forward_seq_layer_batch`（默认档 = fp16 累加器直写 `r2_16`）。
         // 这一条链在**单序列**路径上也开了 ⇒ 门限从 2048 放到 256 才是不留空隙的写法（#68）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
-        if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
+        if small_t {
+            // 小 T：批量 GEMV 直读量化权重，且**原地累加**到 sb.x（不交换 x/v2）
+            if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
+                self.backend.w_relu2(&wqk, sb.xb, sb.r2, fh, c, t)?;
+            } else {
+                self.backend.gemv_f16_relu2(
+                    *layer.ffn_key_w16.as_ref().ok_or("ffn_key_w16 missing")?,
+                    sb.xb,
+                    sb.r2,
+                    fh,
+                    c,
+                    t,
+                )?;
+            }
+            if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
+                self.backend.w_add(&wqv, sb.r2, sb.x, c, fh, t)?;
+            } else {
+                self.backend.gemv_f16_add(
+                    *layer
+                        .ffn_value_w16
+                        .as_ref()
+                        .ok_or("ffn_value_w16 missing")?,
+                    sb.r2,
+                    sb.x,
+                    c,
+                    fh,
+                    t,
+                )?;
+            }
+        } else if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqk, sb.w_scratch, fh, c)?;
             if acc16 {
@@ -5165,7 +5224,9 @@ impl GpuModel {
                     .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
             }
         }
-        if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
+        if small_t {
+            // 已在上面的小 T 分支里原地累加到 sb.x
+        } else if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
             if !acc16 {
                 self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
             }
@@ -5184,13 +5245,68 @@ impl GpuModel {
                 .gemm_add(sb.r2_16, *fv16, sb.x, sb.v2, m_pad, c, fh)?;
         }
         // 交换 x 与 v2：x 现在持有 block 最终输出残差，v2 持有旧 x（下轮被覆盖）。
-        std::mem::swap(&mut sb.x, &mut sb.v2);
+        if !small_t {
+            std::mem::swap(&mut sb.x, &mut sb.v2);
+        }
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} ffn done");
         }
         pf_phase!("channel_mix+ffn");
 
         Ok(())
+    }
+
+    /// 小 T（≤ [`seq_small_t`]）的 r/k/v + 低秩一级 mid：走**批量 GEMV 直读量化权重**。
+    ///
+    /// 与 prefill 档的区别只在「怎么读权重」：不走 `dequant→fp16 scratch + 张量核 GEMM`
+    /// （那是 m_pad=256 行 + 2.6 倍权重量，T=4 也要 104 ms），而是让 `batch = T` 的 GEMV 直接吃
+    /// 量化权重。四个低秩一级 mid（`out_vm/wm/am/gm`）在同一个核里一次算完，随后照旧走二级。
+    fn rkv_small(
+        be: &mut dyn ComputeBackend,
+        l: &GpuLayer,
+        c: usize,
+        t: usize,
+        b: &mut SeqBuffers,
+    ) -> R<()> {
+        // r/k/v：三路「覆盖写」的批量 GEMV（int6/int8 直读量化权重；fp16 用 `gemv_f16` 的 n=batch）。
+        // ★ 刻意**不用**融合核 `gemv_int8_rkv_stage1_batch`：它的 `out_v` 必须是 f16（批量解码链路
+        // 里 v 全程是 f16），而单序列 seq 链路的 v 是 f32（`dplr_seq`/`sum_rk_rk` 都吃 f32），
+        // 硬接要多一次 f16→f32 的反向转换（没有这个算子）。拆成三路只是少一次 launch，
+        // 权重流量完全相同（读一遍）。
+        let rk = [
+            (
+                l.receptance_i6,
+                l.receptance_a8,
+                l.receptance_w16,
+                b.xr,
+                b.r,
+            ),
+            (l.key_i6, l.key_a8, l.key_w16, b.xk, b.k),
+            (l.value_i6, l.value_a8, l.value_w16, b.xv, b.v),
+        ];
+        for (i6, a8, w16, x, y) in rk {
+            if let Some(w) = wq(i6, a8) {
+                be.w_plain(&w, x, y, c, c, t)?;
+            } else {
+                be.gemv_f16(w16.ok_or("r/k/v fp16 权重缺失")?, x, y, c, c, t)?;
+            }
+        }
+        // 低秩一级 mid 仍由调用方用张量核 GEMM 算（mid ≤ 96，m_pad=256 的 padding 代价
+        // 只有 ~0.2 ms/整 pass；而 w 链的 `gemm_tanh` 把 tanh 融在里面，拆开要新算子）
+        Ok(())
+    }
+}
+
+/// 单序列路径「小 T」门限（`SEQ_SMALL_T`，默认 8；`0` 关闭 ⇒ 一律走 prefill 档张量核 GEMM）。
+/// 依据见 `参考/2026-11-08-int6量化与MTP-阶段记录.md` §3.4。
+fn seq_small_t() -> usize {
+    const DEFAULT: usize = 8;
+    match std::env::var("SEQ_SMALL_T") {
+        Ok(v) => v
+            .trim()
+            .parse()
+            .unwrap_or(if v == "0" { 0 } else { DEFAULT }),
+        Err(_) => DEFAULT,
     }
 }
 

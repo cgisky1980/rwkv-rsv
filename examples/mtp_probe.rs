@@ -159,6 +159,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let ms_dec = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
+    // 小 T seq 路径自检：同一段 T 个 token，「逐 token 解码」与「一次因果 seq pass」的
+    // 末行 logits 必须同 argmax（GEMV vs GEMM 累加顺序不同 ⇒ 允许小的数值差）。
+    {
+        let toks: Vec<u32> = (1..=k as u32 + 1).collect();
+        bundle.reset()?;
+        let l_tok = bundle.infer_tokens(&toks)?;
+        bundle.reset()?;
+        let l_seq = bundle.infer_seq(&toks)?;
+        let (mut md, mut mi) = (0.0f32, (0usize, 0usize));
+        for i in 0..l_tok.len() {
+            let d = (l_tok[i] - l_seq[i]).abs();
+            if d > md {
+                md = d;
+                mi = (i, i);
+            }
+        }
+        let am = |v: &[f32]| -> usize {
+            let mut b = 0;
+            for i in 1..v.len() {
+                if v[i] > v[b] {
+                    b = i;
+                }
+            }
+            b
+        };
+        let (a1, a2) = (am(&l_tok), am(&l_seq));
+        log::info!(
+            "[自检] T={} seq vs 解码：argmax {a1} vs {a2} ⇒ {}；max|Δlogit|={md:.4e}（idx {}）",
+            toks.len(),
+            if a1 == a2 { "一致" } else { "❌ 不一致" },
+            mi.0
+        );
+    }
     let t0 = std::time::Instant::now();
     for i in 0..reps {
         let toks = vec![(i % 1000) as u32 + 1; k + 1];
