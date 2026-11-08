@@ -10,6 +10,7 @@ pub mod backend;
 pub mod backend_cuda;
 pub mod gpu_model;
 pub mod model;
+pub mod mtp;
 pub mod runtime;
 pub mod tokenizer;
 pub mod vulkan;
