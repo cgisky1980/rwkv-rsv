@@ -251,6 +251,83 @@ fn dequant_int8(idx: &[u32], sz: &[u32], m: usize, k: usize) -> Vec<f32> {
     w
 }
 
+/// int6 CPU 反量化（对称 per-group=128，与 tools/quantize_any4.py --bits 6 及 GPU 侧一致）：
+/// `w[m,k] = scale[m,k/128] * (e - 32)`，`e = lo4 | (hi2 << 4) ∈ [0,63]`。
+/// - lo: [M*K/2] uint8：字节 j 的低 nibble = e[k=c*64+j]，高 nibble = e[k=c*64+j+32]
+/// - hi: [M*K/4] uint8：字节 j 的 4 个 2-bit 域 = e[j] / e[j+16] / e[j+32] / e[j+48]
+/// - sz: [M*K/128] uint32（scale fp16 低 16 位，高 16 位恒 0）
+///
+/// `nmajor` 选**平面的存放方向**（字节语义完全不变，只是转置）：
+/// - false：`[M, K/2]` 行主序（K 最内），量化器默认产物；
+/// - true ：`[K/2, M]` 列主序（M 最内），量化器 `--int6-layout n` 的产物，
+///   CUDA decode GEMV 用（相邻 lane 读相邻输出列 ⇒ 满 sector）。
+pub(crate) fn dequant_int6(
+    lo: &[u8],
+    hi: &[u8],
+    sz: &[u32],
+    m: usize,
+    k: usize,
+    nmajor: bool,
+) -> Vec<f32> {
+    let kg = k / 128;
+    let (lo_row, hi_row) = (k / 2, k / 4);
+    let mut w = vec![0.0f32; m * k];
+    for r in 0..m {
+        // n-major 时不从 `r*lo_row` 起，而是从第 r 列起、按 m 步进（转置存放）
+        let (lo_r, hi_r) = if nmajor {
+            (&lo[r..], &hi[r..])
+        } else {
+            (&lo[r * lo_row..], &hi[r * hi_row..])
+        };
+        let stride = if nmajor { m } else { 1 };
+        let lob = |j: usize| lo_r[j * stride];
+        let hib = |j: usize| hi_r[j * stride];
+        let row = &mut w[r * k..(r + 1) * k];
+        for (g, chunk) in row.chunks_mut(128).enumerate() {
+            let scale =
+                f16::from_bits((sz[if nmajor { g * m + r } else { r * kg + g }] & 0xFFFF) as u16)
+                    .to_f32();
+            for (j, wv) in chunk.iter_mut().enumerate() {
+                let ki = g * 128 + j;
+                let c = ki / 64; // 打包块号
+                let jj = ki % 64; // 块内行号
+                // 块内 4 个 16 行子块：lo 字节 j∈[0,32) 的低/高 nibble 分别服务子块 0/2，
+                // hi 字节 j∈[0,16) 的 4 个 2-bit 域分别服务子块 0/1/2/3。
+                let e = match jj {
+                    0..=15 => {
+                        let l4 = lob(c * 32 + jj) & 0x0F;
+                        let h2 = hib(c * 16 + jj) & 0x03;
+                        l4 | (h2 << 4)
+                    }
+                    16..=31 => {
+                        let l4 = lob(c * 32 + jj) & 0x0F;
+                        let h2 = (hib(c * 16 + jj - 16) >> 2) & 0x03;
+                        l4 | (h2 << 4)
+                    }
+                    32..=47 => {
+                        let l4 = lob(c * 32 + jj - 32) >> 4;
+                        let h2 = (hib(c * 16 + jj - 32) >> 4) & 0x03;
+                        l4 | (h2 << 4)
+                    }
+                    _ => {
+                        let l4 = lob(c * 32 + jj - 48) >> 4;
+                        let h2 = (hib(c * 16 + jj - 48) >> 6) & 0x03;
+                        l4 | (h2 << 4)
+                    }
+                };
+                *wv = scale * (e as f32 - 32.0);
+            }
+        }
+    }
+    w
+}
+
+/// 模型文件的 int6 平面是否为 N-major（`[K/2, M]`）。量化器 `--int6-layout n` 会写
+/// 标记张量 `int6_nmajor`（u8[1]）；旧文件没有该键 ⇒ 默认 M-major。
+pub(crate) fn int6_nmajor(st: &safetensors::SafeTensors) -> bool {
+    st.tensor("int6_nmajor").is_ok()
+}
+
 /// 读线性权重 [out, in]（行主序 f32）。
 /// 路由：原 fp16/fp32 键 > int8 反量化（与 gpu_model.rs 一致性）。
 fn linear_to_f32(
@@ -261,6 +338,23 @@ fn linear_to_f32(
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     if let Ok(t) = st.tensor(key) {
         return Ok(tensor_to_f32(&t));
+    }
+    if let Ok(lo_t) = st.tensor(&format!("{key}.int6_lo")) {
+        let hi_t = st.tensor(&format!("{key}.int6_hi"))?;
+        let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
+        let sz: &[u32] = bytemuck::cast_slice(sz_t.data());
+        assert_eq!(lo_t.data().len(), m * k / 2, "{key}.int6_lo 形状不符");
+        assert_eq!(hi_t.data().len(), m * k / 4, "{key}.int6_hi 形状不符");
+        assert_eq!(sz.len(), m * k / 128, "{key}.int6_sz 形状不符");
+        log::info!("{key}: 原键缺失，使用 int6 反量化（{m}x{k}）");
+        return Ok(dequant_int6(
+            lo_t.data(),
+            hi_t.data(),
+            sz,
+            m,
+            k,
+            int6_nmajor(st),
+        ));
     }
     let idx_t = st.tensor(&format!("{key}.int8_idx"))?;
     let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
@@ -833,8 +927,69 @@ fn sum_rk_rk(
 /// - **量化精度**：合成高斯权重 → 量化 → 反量化，验证 cos 近无损、rel ≤ 2%。
 #[cfg(test)]
 mod quant_tests {
+    use super::dequant_int6;
     use super::dequant_int8;
     use half::f16;
+
+    /// int6 双平面打包/解包的格式契约：按 Python 量化器的规则**在测试里重新打包**一组
+    /// 已知 `e` 值，再验证 `dequant_int6` 能逐个还原。这条测试的价值在于它不依赖任何
+    /// 模型文件，却能把「lo 哪一半对应哪个子块 / hi 的哪个 2-bit 域对应哪个子块」
+    /// 这类最容易写错的位运算钉死。
+    #[test]
+    fn int6_plane_unpack_and_scale() {
+        let (m, k) = (5usize, 256usize);
+        let mut e = vec![0u8; m * k];
+        for r in 0..m {
+            for j in 0..k {
+                e[r * k + j] = ((r * 7 + j * 3) % 64) as u8;
+            }
+        }
+        let mut lo = vec![0u8; m * k / 2];
+        let mut hi = vec![0u8; m * k / 4];
+        for r in 0..m {
+            for c in 0..k / 64 {
+                for j in 0..32 {
+                    let a = e[r * k + c * 64 + j] & 0x0F;
+                    let b = e[r * k + c * 64 + j + 32] & 0x0F;
+                    lo[r * (k / 2) + c * 32 + j] = a | (b << 4);
+                }
+                for j in 0..16 {
+                    let f = |off: usize| (e[r * k + c * 64 + j + off] >> 4) & 0x03;
+                    hi[r * (k / 4) + c * 16 + j] =
+                        f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                }
+            }
+        }
+        // scale 恒为 1.0（fp16 0x3C00），zero 字段 0
+        let sz = vec![0x3C00u32; m * k / 128];
+        let w = dequant_int6(&lo, &hi, &sz, m, k, false);
+        for r in 0..m {
+            for j in 0..k {
+                let want = e[r * k + j] as f32 - 32.0;
+                assert_eq!(w[r * k + j], want, "m={r} k={j}");
+            }
+        }
+        // N-major：三个平面整体转置（`--int6-layout n` 的产物），解包结果必须逐位相同。
+        let tr_u8 = |src: &[u8], rows: usize, cols: usize| -> Vec<u8> {
+            let mut d = vec![0u8; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    d[c * rows + r] = src[r * cols + c];
+                }
+            }
+            d
+        };
+        let (lo_t, hi_t) = (tr_u8(&lo, m, k / 2), tr_u8(&hi, m, k / 4));
+        let kg = k / 128;
+        let mut sz_t = vec![0u32; kg * m];
+        for r in 0..m {
+            for g in 0..kg {
+                sz_t[g * m + r] = sz[r * kg + g];
+            }
+        }
+        let w_n = dequant_int6(&lo_t, &hi_t, &sz_t, m, k, true);
+        assert_eq!(w, w_n, "N-major 与 M-major 反量化必须一致");
+    }
 
     #[test]
     fn int8_byte_unpack_and_scale_zero() {

@@ -21,9 +21,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| {
         r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st".into()
     });
-    let vocab_path = std::env::var("VOCAB_JSON").unwrap_or_else(|_| {
-        r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json".into()
-    });
+    let vocab_path = std::env::var("VOCAB_JSON")
+        .unwrap_or_else(|_| r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json".into());
     let prompt_files: Vec<String> = std::env::var("PROMPT_FILE")
         .map_err(|_| "需要 PROMPT_FILE")?
         .split(';')

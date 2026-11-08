@@ -300,6 +300,122 @@ def quantize_int8_matrix(W32: np.ndarray, group: int):
     return tensors, stats
 
 
+# ---------------------------------------------------------------------------
+# int6：对称 per-group 6-bit，lo4 + hi2 双平面打包（对齐 llama.cpp Q6_K / FP6-LLM 的 4+2 拆法）
+#
+# 格式（W[M, K] 行主序，K 为收缩维）：
+#   {name}.int6_lo  U8   [M, K/2]  低 4 位平面：字节 j 的低 nibble = e[k=c*64+j]，高 nibble = e[k=c*64+j+32]
+#   {name}.int6_hi  U8   [M, K/4]  高 2 位平面：字节 j 的 4 个 2-bit 域 = e[j] e[j+16] e[j+32] e[j+48]
+#   {name}.int6_sz  U32  [M, K/128] 每元素 = (scale:fp16 低16位 | zero=0 高16位)，与 int8 的 sz 同编码
+# 反量化：e = lo4 | (hi2 << 4) ∈ [0,63]；w = scale[m, k/128] * (e - 32)
+#
+# ★ 布局两态（`--int6-layout`）：
+#   m（默认）：上面写的 [M, K/2] 行主序，K 最内。CPU 反量化 / Vulkan / CUDA 旧内核用。
+#   n        ：三个平面全部转置成 [K/2, M] / [K/4, M] / [K/128, M]，**M（输出列）最内**，
+#              文件另带标记张量 `int6_nmajor` = u8[1]。CUDA decode GEMV 走这个布局：
+#              一个 lane 负责一个输出列、相邻 lane 读相邻字节 ⇒ 一个 warp 一条指令正好
+#              读满 32 B sector（m 布局下 6-bit 双平面在 K 方向必然浪费 sector）。
+#
+# 为什么这么切：6-bit 字段跨字节边界会让载入不对齐、解包带分支。把 K 按 64 行切块、
+# 块内 4 个 16 行子块共享字节后，解包只剩 & 和 >>，且每个子块正好是 16 行 = GEMM 的 K tile。
+# ---------------------------------------------------------------------------
+
+INT6_CHUNK = 64  # 打包块：64 个 K 行 = 4 个子块
+INT6_CLIP_RATIOS = (1.0, 0.97, 0.94, 0.91, 0.88, 0.85)  # 组内 MSE 最小者胜（llama.cpp make_qx_quants）
+
+
+def quantize_int6_matrix(W32: np.ndarray, group: int = 128, clip_search: bool = True):
+    """W32: [M, K] float32 → (lo U8 [M,K/2], hi U8 [M,K/4], sz U32 [M,K/group], 误差统计)。
+
+    scale 不取 absmax/31，而是试几档 clip ratio 取组内平方误差最小者——6 bit 下约再省 10% 权重误差。
+    评估始终用 **fp16 化后的 scale**，即内核真正看到的那个值。
+    """
+    M, K = W32.shape
+    if K % INT6_CHUNK or group % INT6_CHUNK or K % group:
+        raise ValueError(
+            f"int6 要求 K % 64 == 0 且 group % 64 == 0 且 group 整除 K（K={K}, group={group}）"
+        )
+    G = K // group
+    C = K // INT6_CHUNK
+
+    Wr = W32.reshape(M, G, group)
+    amax = np.max(np.abs(Wr), axis=2).clip(min=1e-10)  # [M, G]
+    # 全零 group：scale 直接用 0（fp16 下 1e-10/31.5 会下溢成 0 ⇒ 除零 + NaN）。
+    # 这些组的权重本来就是 0，scale=0 时输出恒为 0，语义正确。
+    dead = amax <= 1e-9
+
+    best_s = np.empty((M, G), dtype=np.float32)
+    best_e = np.full((M, G), np.inf, dtype=np.float32)
+    ratios = INT6_CLIP_RATIOS if clip_search else (1.0,)
+    for r in ratios:
+        s = (amax * r / 31.5).astype(np.float16).astype(np.float32)
+        s = np.where(dead, np.float32(1.0), s)  # 死组给 1.0 避免除零，稍后 scale 置 0
+        # fp16 下极小的 scale 会下溢成 0（病态行）——同样按死组处理，避免 inf/NaN
+        s_safe = np.where(s == 0, np.float32(1.0), s)
+        q = np.clip(np.round(Wr / s_safe[..., None]), -32, 31)
+        err = ((q * s[..., None] - Wr) ** 2).sum(axis=2)
+        take = err < best_e
+        best_s = np.where(take, s, best_s)
+        best_e = np.where(take, err, best_e)
+    best_s = np.where(dead | (best_s < 1e-6), np.float32(0.0), best_s)
+
+    # 编码：死组（scale=0）用 1.0 当除数，其权重恒为 0 ⇒ q 也恒为 0
+    sdiv = np.where(best_s == 0, np.float32(1.0), best_s)
+    q = np.clip(np.round(Wr / sdiv[..., None]), -32, 31).reshape(M, C, INT6_CHUNK)
+    e = (q + 32).astype(np.uint8)  # [M, C, 64]，0..63
+    l4 = e & 15
+    h2 = e >> 4
+
+    lo = (l4[:, :, :32] | (l4[:, :, 32:] << 4)).reshape(M, K // 2)
+    hi = (
+        h2[:, :, 0:16]
+        | (h2[:, :, 16:32] << 2)
+        | (h2[:, :, 32:48] << 4)
+        | (h2[:, :, 48:64] << 6)
+    ).reshape(M, K // 4)
+    # zero 字段恒为 0（对称量化），与 int8 的 sz 编码保持同一布局
+    sz = best_s.astype(np.float16).view(np.uint16).astype(np.uint32)
+
+    # 用实际存储精度（fp16 scale + 打包解包）重建，报告真实部署误差
+    q_stored = dequantize_int6(lo, hi, sz, group)
+    diff = q_stored - W32
+    norm_w = float(np.linalg.norm(W32))
+    rel = float(np.linalg.norm(diff) / max(norm_w, 1e-12))
+    cos = float(
+        np.dot(W32.ravel(), q_stored.ravel())
+        / max(norm_w * float(np.linalg.norm(q_stored)), 1e-12)
+    )
+    tensors = {"lo": lo, "hi": hi, "sz": sz, "group": group}
+    stats = {
+        "mse": float((diff**2).mean()),
+        "max_abs": float(np.abs(diff).max()),
+        "rel": rel,
+        "rel_int4": float("nan"),
+        "cos": cos,
+        "iters": 0.0,
+        "out_rel_before": float("nan"),
+        "out_rel_after": float("nan"),
+        "shape": (M, K),
+        "bytes_per_weight": (K / 2 + K / 4 + K / group * 4) / K,
+    }
+    return tensors, stats
+
+
+def dequantize_int6(lo: np.ndarray, hi: np.ndarray, sz: np.ndarray, group: int) -> np.ndarray:
+    """quantize_int6_matrix 的逆（CPU 参考 / 打包位运算的自检）。"""
+    M, K2 = lo.shape
+    K = K2 * 2
+    C = K // INT6_CHUNK
+    L = lo.reshape(M, C, 32).astype(np.uint16)
+    H = hi.reshape(M, C, 16).astype(np.uint16)
+    l4 = np.concatenate([L & 15, (L >> 4) & 15], axis=2)  # 行 0..31 / 32..63
+    h2 = np.concatenate([H & 3, (H >> 2) & 3, (H >> 4) & 3, (H >> 6) & 3], axis=2)
+    e = (l4 | (h2 << 4)).reshape(M, K)
+    q = e.astype(np.int16) - 32
+    sc = (sz & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)  # [M, K/group]
+    return (q.reshape(M, K // group, group) * sc[..., None]).reshape(M, K)  # type: ignore[no-any-return]
+
+
 def quantize_matrix(
     W32: np.ndarray,
     group: int,
@@ -529,8 +645,17 @@ def main() -> int:
         "--bits",
         type=int,
         default=4,
-        choices=[4, 8],
-        help="量化位宽：4=any4（LUT+k-means，默认）；8=int8 非对称 per-group（无 LUT，近无损）",
+        choices=[4, 6, 8],
+        help="量化位宽：4=any4（LUT+k-means，默认）；6=int6 对称 per-group（lo4+hi2 双平面）；"
+        "8=int8 非对称 per-group（无 LUT，近无损）",
+    )
+    ap.add_argument(
+        "--int6-layout",
+        choices=["m", "n"],
+        default="m",
+        help="int6 权重平面布局：m=[M,K/2] 行主序 K 最内（默认，CPU/Vulkan/旧内核）；"
+        "n=[K/2,M] 列主序 N 最内（CUDA decode GEMV 用，相邻 lane 读相邻输出列 ⇒ 满 sector）。"
+        "n 布局会写 `int6_nmajor` 标记张量，加载端据此选内核",
     )
     ap.add_argument("--layers", type=int, default=None, help="只量化前 N 层（调试用）")
     ap.add_argument(
@@ -586,7 +711,11 @@ def main() -> int:
     print(f"[any4] k-means 设备：{args.device}")
 
     inp = Path(args.inp)
-    suffix = ".int8" if args.bits == 8 else ".any4"
+    suffix = (
+        ".int8"
+        if args.bits == 8
+        else ((".int6n" if args.int6_layout == "n" else ".int6") if args.bits == 6 else ".any4")
+    )
     out = Path(args.out) if args.out else inp.with_name(inp.stem + suffix + ".st")
 
     t_start = time.time()
@@ -647,6 +776,30 @@ def main() -> int:
             assert W.ndim == 2, f"{k}: 期望 2D，得 {W.shape}"
             W32 = W.astype(np.float32)
             del W
+            if args.bits == 6:
+                tensors, stats = quantize_int6_matrix(W32, args.group)
+                del W32
+                if args.int6_layout == "n":
+                    # N-major：平面转置成 [K/2, M] / [K/4, M] / [K/128, M]，字节语义不变。
+                    # 见 参考/2026-11-08-int6量化与MTP-阶段记录.md §int6 N-major。
+                    tensors = {
+                        "lo": np.ascontiguousarray(tensors["lo"].T),
+                        "hi": np.ascontiguousarray(tensors["hi"].T),
+                        "sz": np.ascontiguousarray(tensors["sz"].T),
+                    }
+                    out_tensors["int6_nmajor"] = np.array([1], dtype=np.uint8)
+                out_tensors[f"{k}.int6_lo"] = tensors["lo"]
+                out_tensors[f"{k}.int6_hi"] = tensors["hi"]
+                out_tensors[f"{k}.int6_sz"] = tensors["sz"]
+                report_rows.append((k, stats))
+                print(
+                    f"[int6] ({n}/{len(targets)}) {k} {stats['shape']} "
+                    f"cos={stats['cos']:.6f} rel={stats['rel']:.4%} "
+                    f"max_abs={stats['max_abs']:.4f} "
+                    f"bpw={stats['bytes_per_weight']:.3f} ({time.time() - t0:.1f}s)",
+                    flush=True,
+                )
+                continue
             if args.bits == 8:
                 tensors, stats = quantize_int8_matrix(W32, args.group)
                 del W32
@@ -726,7 +879,7 @@ def main() -> int:
     avg_out_after = float(np.mean([s["out_rel_after"] for s in nnq_rows])) if nnq_rows else None
 
     lines = [
-        f"# {'int8' if args.bits == 8 else 'any4'} 量化权重级误差报告",
+        f"# {'int8' if args.bits == 8 else ('int6' if args.bits == 6 else 'any4')} 量化权重级误差报告",
         "",
         f"- 输入：`{inp}`",
         f"- 输出：`{out}`",
@@ -741,7 +894,11 @@ def main() -> int:
         (
             f"- 平均相对误差：**{avg_rel:.4%}**（目标 ≤ 10.5%，且须优于 int4 基线 **{avg_rel4:.4%}**）"
             if args.bits == 4
-            else f"- 平均相对误差：**{avg_rel:.4%}**（int8 近无损，rel 应 ≪1%）"
+            else (
+                f"- 平均相对误差：**{avg_rel:.4%}**（int6 对称 per-group：理论 ≈2.7%，超 3.3% 即打包有问题）"
+                if args.bits == 6
+                else f"- 平均相对误差：**{avg_rel:.4%}**（int8 近无损，rel 应 ≪1%）"
+            )
         ),
         (
             f"- nnq 输出域相对误差：**{avg_out_before:.5f} → {avg_out_after:.5f}**"
@@ -783,6 +940,11 @@ def main() -> int:
     # 权重级验收：cos ≥ 0.995，rel ≤ 10.5%，且优于 int4 基线（依据见报告注）
     if args.bits == 8:
         ok = avg_cos >= 0.999 and avg_rel <= 0.01
+    elif args.bits == 6:
+        # 6 bit = 64 级，比 int8 的 256 级粗 4×。per-group(128) 的 amax ≈ 2.9σ ⇒
+        # step = amax/31.5、rms 误差 = step/√12 ≈ 2.7%σ；int8 实测 ≈ 0.6% ⇒ 约 4× 关系。
+        # 真正的验收在端到端（ΔCE / teacher-forced Top-1），这里的阈值只挡打包写错。
+        ok = avg_cos >= 0.9994 and avg_rel <= 0.033
     else:
         ok = avg_cos >= 0.995 and avg_rel <= 0.105 and avg_rel < avg_rel4
     print(f"[any4] 权重级验收: {'PASS' if ok else 'FAIL'}")

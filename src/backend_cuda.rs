@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 
 use half::f16;
 
-use crate::backend::{ComputeBackend, Int8Handle, TensorDtype, TensorId};
+use crate::backend::{ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId};
 use crate::runtime::R;
 
 /// 检查 CUDA 调用成功，否则返回错误（`op` 为当前操作名）。
@@ -1474,7 +1474,7 @@ impl CudaBackend {
         // 仅 int8 权重（wtype==2）走此路径——fp16 权重另有通路且不走 batch。
         let use_mb16 =
             batch > 1 && wtype == 2 && std::env::var("GEMV_F16X").map(|v| v != "0").unwrap_or(true);
-        let (func, grid, block) = if batch > 1 {
+        let (func, grid, block) = if batch > 1 && wtype != 3 {
             if use_mb16 {
                 // 几何：block = 128 线程，全体线程按 k 切分（累加深度不变量，见内核注释），
                 // 覆盖 ROWS 行 × **全部 batch 槽**（batch 分块在块内循环，见内核注释）。
@@ -1516,7 +1516,13 @@ impl CudaBackend {
             }
         } else {
             let func = self.kernel("gemv_variant", GEMV_VARIANT_SRC, "gemv_variant")?;
-            (func, ((m / 4) as u32, 1u32, 1u32), (128u32, 1u32, 1u32))
+            // wtype==3（int6）没有 mb/mb16 变体，统一走 `gemv_variant`；
+            // 该内核本身按 blockIdx.y 取 batch 槽，故 grid.y 必须是真实 batch。
+            (
+                func,
+                ((m / 4) as u32, batch as u32, 1u32),
+                (128u32, 1u32, 1u32),
+            )
         };
         let m_i = m as i32;
         // mb16 路径：先把 fp32 激活（必要时乘门控）降位到常驻 fp16 暂存，再跑 GEMM。
@@ -4873,6 +4879,478 @@ extern "C" __global__ void gemv_int8_rkv_stage1(
 }
 "#;
 
+/// gemv_int6_rkv_stage1 CUDA kernel：`gemv_int8_rkv_stage1` 的 int6 版（lo4+hi2 双平面）。
+///
+/// 结构与 int8 版一致：前 `C/ROWS` 个 block 各算 ROWS 行 r/k/v，其余 block 算 4 条 mid 投影。
+/// 差别只在 r/k/v 段：每线程每次迭代处理**一个 64-k 打包块**（一次读 32 B lo + 16 B hi
+/// = 48 B / 64 权重 = 0.75 B/权重），块内 4 个 16 行子块各展开成 16 个 half 再 `__hfma2`。
+/// `out_v` 仍是 fp16（与 int8/fp16 两版契约一致，调用方按 f16 读）。
+const GEMV_INT6_RKV_STAGE1_SRC: &str = r#"
+#ifndef RKV_ROWS
+#define RKV_ROWS 2
+#endif
+__device__ __forceinline__ void unpack_int6_scale(unsigned int sz, float& scale)
+{
+    scale = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
+}
+
+extern "C" __global__ void gemv_int6_rkv_stage1(
+    const unsigned int* __restrict__ R_lo,    // lo 平面 [C, C/2] 字节（uint32 视野）
+    const unsigned int* __restrict__ R_hi,    // hi 平面 [C, C/4] 字节
+    const unsigned int* __restrict__ R_sz,    // scale   [C, C/128]
+    const unsigned int* __restrict__ K_lo,
+    const unsigned int* __restrict__ K_hi,
+    const unsigned int* __restrict__ K_sz,
+    const unsigned int* __restrict__ V_lo,
+    const unsigned int* __restrict__ V_hi,
+    const unsigned int* __restrict__ V_sz,
+    const float*  __restrict__ V1,            // [VM,C] fp32
+    const float*  __restrict__ W1,            // [WM,C]
+    const float*  __restrict__ A1,            // [AM,C]
+    const float*  __restrict__ G1,            // [GM,C]
+    const float*  __restrict__ xr,            // [C]
+    const float*  __restrict__ xk,            // [C]
+    const float*  __restrict__ xv,            // [C]
+    const float*  __restrict__ xw,            // [C]
+    const float*  __restrict__ xa,            // [C]
+    const float*  __restrict__ xg,            // [C]
+    float* __restrict__ out_r,                // [C]
+    float* __restrict__ out_k,                // [C]
+    __half* __restrict__ out_v,               // [C] fp16
+    float* __restrict__ out_vm,               // [VM]
+    float* __restrict__ out_wm,               // [WM]
+    float* __restrict__ out_am,               // [AM]
+    float* __restrict__ out_gm,               // [GM]
+    const int c,
+    const int vm,
+    const int wm,
+    const int am,
+    const int gm)
+{
+    constexpr int ROWS = RKV_ROWS;
+    constexpr int KG_MAX = 32;   // C/128 上限（C ≤ 4096）。C=2560 → KG=20。
+    const int tid  = threadIdx.x;
+    const int flat = blockIdx.x;
+
+    if (flat < c / ROWS) {
+        const int row_base = flat * ROWS;
+        const int nchunk   = c >> 6;   // 每行 64-k 打包块数
+        const int lo_w     = c >> 3;   // 每行 lo 的 uint32 数（C/2 字节）
+        const int hi_w     = c >> 4;   // 每行 hi 的 uint32 数（C/4 字节）
+        const int KG       = c / 128;
+
+        __shared__ float s_scale[3][ROWS][KG_MAX];
+        for (int i = tid; i < 3 * ROWS * KG; i += blockDim.x) {
+            const int mat = i / (ROWS * KG);
+            const int rem = i % (ROWS * KG);
+            const int r   = rem / KG;
+            const int g   = rem % KG;
+            const unsigned int* szp = (mat == 0) ? R_sz : ((mat == 1) ? K_sz : V_sz);
+            float sc;
+            unpack_int6_scale(szp[(row_base + r) * KG + g], sc);
+            s_scale[mat][r][g] = sc;
+        }
+        __syncthreads();
+
+        // ★ 并行度：**按 (row, chunk) 二维展开**。
+        // 只按 K 展开时单元数 = C/64（C=2560 → 40），喂不满 128 线程 ⇒ 实测只有 int8 的
+        // 0.56×（33.4 vs 59.1 tok/s）。把 ROWS 行也摊给线程后单元数 = ROWS·C/64（ROWS=4 →
+        // 160），且 **row-major 映射**（`u = r·nchunk + c8`）保证同 warp 内相邻线程读相邻
+        // chunk ⇒ lo/hi 两平面仍是完全合并的连续段（48 B/线程）。
+        // 每线程只背一个 (row, chunk)：3 个 half2 累加器 + 12 个权重寄存器，寄存器压力远低于
+        // 「一线程吃全部 ROWS 行」的写法。
+        // ★ 并行度与合并度：**一线程一个 16 行子块**。
+        // 反例留档（2026-11-08）：一线程吃整块 64-k 时，相邻线程的 lo 起点相差 32 B，
+        // 每次 `uint4` 载入只用到 32 B sector 的一半 ⇒ 事务数翻倍。实测 int8 rkv 每核
+        // 0.0552 ms（358 GB/s），int6 同样字节量 0.185 ms（83 GB/s），差 4.3×。
+        // 改为 (row, chunk, sub-tile) 三维展开后，**相邻线程读相邻 16 B**：
+        //   lo 16 B 起点 = chunk*32 + (t&1)*16 ⇒ 同 chunk 内 4 线程覆盖 32 B 连续段；
+        //   hi 16 B 同 chunk 内 4 线程读同一段（L1 命中，DRAM 仍只读一次）。
+        // 于是 DRAM 流量仍是 48 B/64 权重 = 0.75 B/权重，但所有载入都满 sector。
+        // ★ 一线程 **半块**（2 个 16 行子块 = t 与 t+2，共享同一段 lo 的低/高 nibble）。
+        // 演进留档：① 一线程整块 → 相邻线程 lo 差 32 B，sector 只用到一半（int8 0.0552 ms
+        // vs int6 0.185 ms）；② 一线程一个子块 → sector 满了但 hi 被 4 个线程各读一遍；
+        // ③ 本版（半块）→ lo 每线程读一次（无重复）、hi 只被 2 个线程读，
+        //    且相邻线程的 lo 起点正好相差 16 B（完全合并）。DRAM 仍 48 B/64 权重。
+        const int units = ROWS * nchunk * 2;
+        float part[3][ROWS];
+        #pragma unroll
+        for (int i = 0; i < 3; i++)
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) part[i][r] = 0.f;
+
+        for (int u = tid; u < units; u += blockDim.x) {
+            const int tt = u & 1;
+            const int ch = u >> 1;
+            const int r  = ch / nchunk;
+            const int c8 = ch - r * nchunk;
+            const int kb = c8 << 6;
+            const int gr = c8 >> 1;   // group=128 ⇒ 2 个 chunk 一组
+            const int row = row_base + r;
+            half2 ar = __half2half2(0.f), ak = __half2half2(0.f), av = __half2half2(0.f);
+            #pragma unroll
+            for (int mat = 0; mat < 3; mat++) {
+                const unsigned int* lop = (mat == 0) ? R_lo : ((mat == 1) ? K_lo : V_lo);
+                const unsigned int* hip = (mat == 0) ? R_hi : ((mat == 1) ? K_hi : V_hi);
+                const float* xp        = (mat == 0) ? xr   : ((mat == 1) ? xk   : xv);
+                const float sc = s_scale[mat][r][gr];
+                const uint4 l4v = *reinterpret_cast<const uint4*>(
+                    lop + row * lo_w + (c8 << 3) + (tt << 2));
+                const uint4 h4v = *reinterpret_cast<const uint4*>(
+                    hip + row * hi_w + (c8 << 2));
+                const unsigned int lou[4] = {l4v.x, l4v.y, l4v.z, l4v.w};
+                const unsigned int hiu[4] = {h4v.x, h4v.y, h4v.z, h4v.w};
+                const __half sch = __float2half(sc);
+                #pragma unroll
+                for (int hs = 0; hs < 2; hs++) {
+                    const int t = tt + hs * 2;   // 子块号；hs=0 取 lo 低 nibble，hs=1 取高 nibble
+                    #pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const int jbase = q * 4;
+                        const float4 xq = *reinterpret_cast<const float4*>(
+                            xp + kb + t * 16 + jbase);
+                        const half2 hx01 = __floats2half2_rn(xq.x, xq.y);
+                        const half2 hx23 = __floats2half2_rn(xq.z, xq.w);
+                        __half wh[4];
+                        #pragma unroll
+                        for (int jj = 0; jj < 4; jj++) {
+                            const int j = jbase + jj;
+                            const unsigned int lbv =
+                                (lou[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+                            const int l4 = (hs == 0) ? (int)(lbv & 0x0Fu) : (int)(lbv >> 4);
+                            const unsigned int hbv =
+                                (hiu[j >> 2] >> ((j & 3) * 8 + t * 2)) & 0x03u;
+                            const int e = l4 | ((int)hbv << 4);
+                            wh[jj] = __hmul(sch, __int2half_rn(e - 32));
+                        }
+                        const half2 w01 = __halves2half2(wh[0], wh[1]);
+                        const half2 w23 = __halves2half2(wh[2], wh[3]);
+                        if (mat == 0) { ar = __hfma2(hx01, w01, ar); ar = __hfma2(hx23, w23, ar); }
+                        else if (mat == 1) { ak = __hfma2(hx01, w01, ak); ak = __hfma2(hx23, w23, ak); }
+                        else { av = __hfma2(hx01, w01, av); av = __hfma2(hx23, w23, av); }
+                    }
+                }
+            }
+            const float2 fr = __half22float2(ar);
+            const float2 fk = __half22float2(ak);
+            const float2 fv = __half22float2(av);
+            part[0][r] += fr.x + fr.y;
+            part[1][r] += fk.x + fk.y;
+            part[2][r] += fv.x + fv.y;
+        }
+
+        // 确定性树形归约（不用 atomicAdd；也不用「少数线程串行累加」——那是依赖链）
+        __shared__ float red[3][ROWS][128];
+        #pragma unroll
+        for (int i = 0; i < 3; i++)
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) red[i][r][tid] = part[i][r];
+        __syncthreads();
+        for (int step = 64; step > 0; step >>= 1) {
+            if (tid < step) {
+                #pragma unroll
+                for (int i = 0; i < 3; i++)
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) red[i][r][tid] += red[i][r][tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid < ROWS) {
+            const int row = row_base + tid;
+            if (row < c) {
+                out_r[row] = red[0][tid][0];
+                out_k[row] = red[1][tid][0];
+                out_v[row] = __float2half(red[2][tid][0]);
+            }
+        }
+        return;
+    }
+
+    // mid 投影分支：与 int8 版逐字相同（warp-per-row，4 行/块）。
+    const int MIDW = 4;
+    const int mid_base = (flat - c / ROWS) * MIDW;
+    {
+        const int lane = tid & 31;
+        const int warp = tid >> 5;
+        const int mrow = mid_base + warp;
+        const int midtot = vm + wm + am + gm;
+        if (mrow < midtot) {
+            const float* __restrict__ wp;
+            const float* __restrict__ xp;
+            int chain = 3;
+            int row = 0;
+            if (mrow < vm) {
+                chain = 0; row = mrow; wp = V1; xp = xv;
+            } else if (mrow < vm + wm) {
+                chain = 1; row = mrow - vm; wp = W1; xp = xw;
+            } else if (mrow < vm + wm + am) {
+                chain = 2; row = mrow - vm - wm; wp = A1; xp = xa;
+            } else {
+                row = mrow - vm - wm - am; wp = G1; xp = xg;
+            }
+            const float* wrow = wp + (long)row * c;
+            float d = 0.f;
+            for (int kk = lane; kk < c; kk += 32) d += wrow[kk] * xp[kk];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffffu, d, off);
+            if (lane == 0) {
+                if (chain == 0) out_vm[row] = d;
+                else if (chain == 1) out_wm[row] = tanhf(d);
+                else if (chain == 2) out_am[row] = d;
+                else out_gm[row] = d;
+            }
+        }
+    }
+}
+"#;
+
+/// N-major int6 GEMV 的块内 warp 数（每 warp 32 个输出列，块内按 k-chunk 轮转切分）。
+/// 默认 16：实测 C=2560（每行 40 个 64-k 块）下 16 warp 块（512 线程）的 decode 最快
+/// （8→80.1、16→84.5、20→79.9、32→78.6 tok/s）。`I6NM_WARPS` 环境变量可覆盖（1..=32）。
+const I6NM_WARPS: usize = 16;
+
+/// 实际使用的 warp 数（环境变量覆盖 + 合法性过滤）。
+fn i6nm_warps() -> usize {
+    std::env::var("I6NM_WARPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|w| (1..=32).contains(w))
+        .unwrap_or(I6NM_WARPS)
+}
+
+/// N-major int6 GEMV（decode）共用的设备函数 + 两个 kernel。
+///
+/// 布局（量化器 `--int6-layout n`）：`lo [K/2][N]`、`hi [K/4][N]`、`sz [K/128][N]` 字节/词，
+/// **N（输出列）最内**。于是「一个 lane 负责一个输出列 n」时，一个 warp 的每条载入指令正好
+/// 读 32 个连续字节 = 1 个 32 B sector（m-major 布局下 6-bit 双平面在 K 方向必然浪费 sector，
+/// 实测只有 int8 的 0.89×）。
+///
+/// 并行度：N/32 个 block 太少（N=2560 → 80 个 block 尚可，但单 warp 只有 1 条 32 B 请求），
+/// 所以**块内再按 k-chunk 切分**：`I6NM_WARPS` 个 warp 各自负责一段连续 k-chunk，
+/// 块内 smem 归约（固定升序 ⇒ 求和顺序确定 ⇒ 贪心 token 流仍逐位可复现，不用 atomicAdd）。
+///
+/// 反量化：块内 4 个 16-k 子块共享 3 字节（lo 两字节的低/高 nibble + hi 一字节的 4 个 2-bit 域），
+/// 每权重只剩 `&`/`>>` + `__int2half_rn` + `__hmul` + `__hfma2`。
+const I6NM_COMMON_SRC: &str = r#"
+#ifndef I6NM_WARPS
+#define I6NM_WARPS 8
+#endif
+__device__ __forceinline__ float relu2f(float x) { return x > 0.f ? x * x : 0.f; }
+__device__ __forceinline__ float i6nm_sc(unsigned int s) {
+    return __half2float(__ushort_as_half((unsigned short)(s & 0xFFFFu)));
+}
+
+// 单列 ncol 的 dot：k-chunk 按 **warp 轮转**分配（`c = w, w+WARPS, …`），
+// 任意 WARPS 下各 warp 的 chunk 数最多差 1（连续切分在 WARPS 不整除 chunk 数时会明显失衡）。
+// GATED 时 x 先乘 fp16 门控 g。
+template <bool GATED>
+__device__ __forceinline__ float i6nm_dot(
+    const unsigned char* __restrict__ lo,
+    const unsigned char* __restrict__ hi,
+    const unsigned int*  __restrict__ sz,
+    const float* __restrict__ x,
+    const __half* __restrict__ g,
+    const int n, const int ncol, const int nchunk, const int w)
+{
+    const size_t col = (size_t)ncol;
+    // 4 个独立累加器：打断 4 连加的依赖链（求和顺序仍固定 ⇒ 可复现）
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int c = w; c < nchunk; c += I6NM_WARPS) {
+        const float sc = i6nm_sc(sz[(size_t)(c >> 1) * n + col]);
+        const size_t lo0 = (size_t)(c << 5) * n + col;   // 行 = c*32 + j
+        const size_t hi0 = (size_t)(c << 4) * n + col;   // 行 = c*16 + j
+        const int kb = c << 6;
+        #pragma unroll
+        for (int jj = 0; jj < 16; ++jj) {
+            const unsigned int lb0 = lo[lo0 + (size_t)jj * n];
+            const unsigned int lb1 = lo[lo0 + (size_t)(16 + jj) * n];
+            const unsigned int hb  = hi[hi0 + (size_t)jj * n];
+            const int e0 = (int)(lb0 & 15u) | (((int)hb & 3) << 4);
+            const int e1 = (int)(lb1 & 15u) | ((((int)hb >> 2) & 3) << 4);
+            const int e2 = (int)(lb0 >> 4)   | ((((int)hb >> 4) & 3) << 4);
+            const int e3 = (int)(lb1 >> 4)   | ((((int)hb >> 6) & 3) << 4);
+            float x0 = x[kb + jj];
+            float x1 = x[kb + 16 + jj];
+            float x2 = x[kb + 32 + jj];
+            float x3 = x[kb + 48 + jj];
+            if (GATED) {
+                x0 *= __half2float(g[kb + jj]);
+                x1 *= __half2float(g[kb + 16 + jj]);
+                x2 *= __half2float(g[kb + 32 + jj]);
+                x3 *= __half2float(g[kb + 48 + jj]);
+            }
+            // ★ 累加在 **fp32** 域：半精度累加（`__hfma2`）虽然快一倍，但 32 个 fp16 加法的
+            // 舍入会吃掉 int6 本就只有 64 级的精度（合成权重测试里相对误差 3.6e-2）。
+            // 本核受带宽约束（实测 ~170 GB/s，单核可达 358），多出的 ALU 不进关键路径。
+            a0 += sc * (float)(e0 - 32) * x0;
+            a1 += sc * (float)(e1 - 32) * x1;
+            a2 += sc * (float)(e2 - 32) * x2;
+            a3 += sc * (float)(e3 - 32) * x3;
+        }
+    }
+    return (a0 + a1) + (a2 + a3);
+}
+"#;
+
+/// 通用（单矩阵）N-major int6 GEMV：`op` 复用 `gemv_variant` 的语义
+/// （0=relu²、1=mul_add（y+=，x 先乘 fp16 门控）、2=add（y+=）、3=覆盖写）。
+/// dispatch `(ceil(M/32), batch, 1)`、block = `I6NM_WARPS*32`。
+const GEMV_INT6NM_SRC: &str = r#"
+extern "C" __global__ void gemv_int6nm(
+    const unsigned int* __restrict__ lo,
+    const unsigned int* __restrict__ hi,
+    const unsigned int* __restrict__ sz,
+    const float* __restrict__ x,      // [K*batch]
+    const __half* __restrict__ g,     // [K*batch]（op==1 用，可为 0）
+    float* __restrict__ y,            // [M*batch]
+    const int m,
+    const int k,
+    const int op)
+{
+    const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
+    const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;
+    const int b    = blockIdx.y;
+    const int ncol = blockIdx.x * 32 + lane;
+    const int nchunk = k >> 6;
+    float acc = 0.f;
+    if (ncol < m) {
+        const float* xb = x + (size_t)b * k;
+        if (op == 1)
+            acc = i6nm_dot<true>(lo8, hi8, sz, xb, g + (size_t)b * k, m, ncol, nchunk, w);
+        else
+            acc = i6nm_dot<false>(lo8, hi8, sz, xb, (const __half*)0, m, ncol, nchunk, w);
+    }
+    __shared__ float red[I6NM_WARPS][32];
+    red[w][lane] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < I6NM_WARPS; ++i) s += red[i][threadIdx.x];
+        const int nc = blockIdx.x * 32 + threadIdx.x;
+        if (nc < m) {
+            const size_t o = (size_t)b * m + nc;
+            if (op == 0) y[o] = relu2f(s);
+            else if (op == 3) y[o] = s;
+            else y[o] += s;
+        }
+    }
+}
+"#;
+
+/// N-major int6 的 `gemv_int6_rkv_stage1` 等价物：一次算 r/k/v 三路 + 低秩 mid 投影。
+/// r/k/v 段：block 覆盖 32 个输出列、块内 `I6NM_WARPS` 个 warp 切 k-chunk；
+/// mid 段（fp32 稠密权重，未量化）：`I6NM_WARPS` 个 warp 各吃一行，warp 内 32 lane 切 k。
+const GEMV_INT6NM_RKV_SRC: &str = r#"
+extern "C" __global__ void gemv_int6nm_rkv(
+    const unsigned int* __restrict__ R_lo,
+    const unsigned int* __restrict__ R_hi,
+    const unsigned int* __restrict__ R_sz,
+    const unsigned int* __restrict__ K_lo,
+    const unsigned int* __restrict__ K_hi,
+    const unsigned int* __restrict__ K_sz,
+    const unsigned int* __restrict__ V_lo,
+    const unsigned int* __restrict__ V_hi,
+    const unsigned int* __restrict__ V_sz,
+    const float* __restrict__ V1,
+    const float* __restrict__ W1,
+    const float* __restrict__ A1,
+    const float* __restrict__ G1,
+    const float* __restrict__ xr,
+    const float* __restrict__ xk,
+    const float* __restrict__ xv,
+    const float* __restrict__ xw,
+    const float* __restrict__ xa,
+    const float* __restrict__ xg,
+    float* __restrict__ out_r,
+    float* __restrict__ out_k,
+    __half* __restrict__ out_v,
+    float* __restrict__ out_vm,
+    float* __restrict__ out_wm,
+    float* __restrict__ out_am,
+    float* __restrict__ out_gm,
+    const int c,
+    const int vm,
+    const int wm,
+    const int am,
+    const int gm)
+{
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;
+    const int nb   = (c + 31) >> 5;
+    const int flat = blockIdx.x;
+
+    if (flat < nb) {
+        const unsigned char* rl = reinterpret_cast<const unsigned char*>(R_lo);
+        const unsigned char* rh = reinterpret_cast<const unsigned char*>(R_hi);
+        const unsigned char* kl = reinterpret_cast<const unsigned char*>(K_lo);
+        const unsigned char* kh = reinterpret_cast<const unsigned char*>(K_hi);
+        const unsigned char* vl = reinterpret_cast<const unsigned char*>(V_lo);
+        const unsigned char* vh = reinterpret_cast<const unsigned char*>(V_hi);
+        const int ncol = (flat << 5) + lane;
+        const int nchunk = c >> 6;
+        float ar = 0.f, ak = 0.f, av = 0.f;
+        if (ncol < c) {
+            ar = i6nm_dot<false>(rl, rh, R_sz, xr, (const __half*)0, c, ncol, nchunk, w);
+            ak = i6nm_dot<false>(kl, kh, K_sz, xk, (const __half*)0, c, ncol, nchunk, w);
+            av = i6nm_dot<false>(vl, vh, V_sz, xv, (const __half*)0, c, ncol, nchunk, w);
+        }
+        __shared__ float red[3][I6NM_WARPS][32];
+        red[0][w][lane] = ar;
+        red[1][w][lane] = ak;
+        red[2][w][lane] = av;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float sr = 0.f, sk = 0.f, sv = 0.f;
+            #pragma unroll
+            for (int i = 0; i < I6NM_WARPS; ++i) {
+                sr += red[0][i][threadIdx.x];
+                sk += red[1][i][threadIdx.x];
+                sv += red[2][i][threadIdx.x];
+            }
+            const int nc = (flat << 5) + threadIdx.x;
+            if (nc < c) {
+                out_r[nc] = sr;
+                out_k[nc] = sk;
+                out_v[nc] = __float2half(sv);
+            }
+        }
+        return;
+    }
+
+    // mid 投影：fp32 稠密权重 [M, C] 行主序，warp-per-row
+    const int midtot = vm + wm + am + gm;
+    const int mrow = (flat - nb) * I6NM_WARPS + w;
+    if (mrow >= midtot) return;
+    const float* wp;
+    const float* xp;
+    int chain = 3;
+    int row = 0;
+    if (mrow < vm) {
+        chain = 0; row = mrow; wp = V1; xp = xv;
+    } else if (mrow < vm + wm) {
+        chain = 1; row = mrow - vm; wp = W1; xp = xw;
+    } else if (mrow < vm + wm + am) {
+        chain = 2; row = mrow - vm - wm; wp = A1; xp = xa;
+    } else {
+        row = mrow - vm - wm - am; wp = G1; xp = xg;
+    }
+    const float* wrow = wp + (long)row * c;
+    float d = 0.f;
+    for (int kk = lane; kk < c; kk += 32) d += wrow[kk] * xp[kk];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffffu, d, off);
+    if (lane == 0) {
+        if (chain == 0) out_vm[row] = d;
+        else if (chain == 1) out_wm[row] = tanhf(d);
+        else if (chain == 2) out_am[row] = d;
+        else out_gm[row] = d;
+    }
+}
+"#;
+
 /// gemv_lowrank_chain4 CUDA kernel：融合 4 条低秩链第二级（w/a/g/v 的 w2/a2/g2/v2），
 /// 一次 dispatch。语义对齐 Vulkan `gemv_lowrank_chain4.comp`：
 ///   w：out = exp(scale[0] * sigmoid(xw @ W2[row] + w0[row]))          [K_W, scale, w0]
@@ -5036,7 +5514,7 @@ extern "C" __global__ void gemv_variant(
                 acc[r] += __half2float(Af16[row * k + kk]) * xv;
             }
         }
-    } else {
+    } else if (wtype == 2) {
         // int8 向量化路径：每线程每次迭代处理 4 行 × 4 个 k（1 uint32 = 4 字节权重），
         // 反量化后拼 half2，与 x 的 half2 用 __hfma2 累加（FP16 FMA 吞吐为 FP32 的 2 倍）。
         // scale/zero 按 group 内循环解一次，字节提取兼内联。
@@ -5079,6 +5557,115 @@ extern "C" __global__ void gemv_variant(
             const float2 f = __half22float2(hacc[r]);
             acc[r] = f.x + f.y;
         }
+    } else {
+        // ---------------------------------------------------------------
+        // int6 对称权重（lo4 + hi2 双平面，见 tools/quantize_any4.py 的 int6 段）。
+        // aidx = lo 平面 [M, K/2]，alut = hi 平面 [M, K/4]，asz = scale [M, K/128]。
+        // 每个线程每次迭代处理 **1 个 64-k 打包块**：一次读 32 B lo + 16 B hi（共 48 B /
+        // 64 权重 = 0.75 B/权重），块内 4 个 16 行子块各自展开成 16 个 half 与 x 做 __hfma2。
+        // 子块映射：t=0/2 用 lo 字节 [0,16) 的低/高 nibble，t=1/3 用 [16,32)；
+        // h2 取 hi 字节 j 的第 t 个 2-bit 域。
+        // ---------------------------------------------------------------
+        half2 hacc[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) hacc[r] = __half2half2(0.f);
+        const int nchunk = k >> 6;   // 每行 64-k 块数
+        const int lo_w   = k >> 3;   // 每行 lo 的 uint32 数（K/2 字节）
+        const int hi_w   = k >> 4;   // 每行 hi 的 uint32 数（K/4 字节）
+        // ⚠️ `alut` 的形参类型是 `const __half*`（其它 wtype 下是 LUT 槽位），
+        // 这里必须**重解释成 uint32 视野**再按词寻址；直接 `alut + row*hi_w`
+        // 会按 2 字节步进 ⇒ 地址错位（表现为 cuLaunchKernel 716 misaligned address）。
+        const unsigned int* hiw = reinterpret_cast<const unsigned int*>(alut);
+        // ★ 与 rkv 融合核同一结论：只按 K 展开时单元数 = K/64（K=2560 → 40），
+        // 喂不满 128 线程（实测只有 int8 的 0.56×）。这里把 4 行也摊给线程：
+        // 单元数 = 4·K/64（K=2560 → 160），row-major 映射 ⇒ 同 warp 内相邻线程读相邻 chunk，
+        // lo/hi 两平面仍是连续段。每线程 1 个 half2 累加器 + 12 个权重寄存器。
+        // ★ 一线程一个 **16 行子块**（同 rkv 融合核的结论）：相邻线程读相邻 16 B，
+        // sector 利用率从 50% 拉满；DRAM 仍是 48 B/64 权重。
+        float part[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) part[r] = 0.f;
+        const int units = 4 * nchunk * 2;
+        for (int u = tid; u < units; u += blockDim.x) {
+            const int tt = u & 1;
+            const int ch = u >> 1;
+            const int r  = ch / nchunk;
+            const int c  = ch - r * nchunk;
+            const int row = row0 + r;
+            if (row >= m) continue;
+            const int gr = c >> 1;   // group=128 ⇒ 2 个 chunk 一组
+            const int kb = c << 6;
+            float sc, dummy;
+            unpack_variant_sz(asz[row * kg + gr], sc, dummy);
+            const uint4 l4v = *reinterpret_cast<const uint4*>(
+                aidx + row * lo_w + (c << 3) + (tt << 2));
+            const uint4 h4v = *reinterpret_cast<const uint4*>(hiw + row * hi_w + (c << 2));
+            const unsigned int lou[4] = {l4v.x, l4v.y, l4v.z, l4v.w};
+            const unsigned int hiu[4] = {h4v.x, h4v.y, h4v.z, h4v.w};
+            // ★ 反量化在 **half 域**做：`w = sc · (e−32)`，e 是小整数 ⇒ `__int2half_rn`
+            // 一条指令，再 `__hmul`（float 域每权重 7 条 ALU）。
+            const __half sch = __float2half(sc);
+            half2 hacc = __half2half2(0.f);
+            #pragma unroll
+            for (int hs = 0; hs < 2; hs++) {
+                const int t = tt + hs * 2;   // 子块号；hs=0 取 lo 低 nibble，hs=1 取高 nibble
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const int jbase = q * 4;
+                    const float4 xv = *reinterpret_cast<const float4*>(
+                        x + k0 + kb + t * 16 + jbase);
+                    float gx = 1.f, gy = 1.f, gz = 1.f, gw = 1.f;
+                    if (op == 1) {
+                        load_half4_f4(g + k0 + kb + t * 16 + jbase, gx, gy, gz, gw);
+                    }
+                    const half2 hx01 = __floats2half2_rn(xv.x * gx, xv.y * gy);
+                    const half2 hx23 = __floats2half2_rn(xv.z * gz, xv.w * gw);
+                    __half wh[4];
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; jj++) {
+                        const int j = jbase + jj;
+                        const unsigned int lbv = (lou[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+                        const int l4 = (hs == 0) ? (int)(lbv & 0x0Fu) : (int)(lbv >> 4);
+                        const unsigned int hbv =
+                            (hiu[j >> 2] >> ((j & 3) * 8 + t * 2)) & 0x03u;
+                        const int e = l4 | ((int)hbv << 4);
+                        wh[jj] = __hmul(sch, __int2half_rn(e - 32));
+                    }
+                    const half2 w01 = __halves2half2(wh[0], wh[1]);
+                    const half2 w23 = __halves2half2(wh[2], wh[3]);
+                    hacc = __hfma2(hx01, w01, hacc);
+                    hacc = __hfma2(hx23, w23, hacc);
+                }
+            }
+            const float2 f = __half22float2(hacc);
+            part[r] += f.x + f.y;
+        }
+        // 确定性归约（不用 atomicAdd：浮点 atomic 求和顺序不确定）
+        __shared__ float red6[4][128];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) red6[r][tid] = part[r];
+        __syncthreads();
+        // ★ 树形归约（7 步、每步 128 线程并行）而不是「4 个线程各串行加 128 项」：
+        // 后者的 128 次 smem 读是**依赖链**，实测占了本核相当一部分时间。
+        // 树序固定 ⇒ 求和顺序确定 ⇒ 贪心 token 流仍逐位可复现。
+        for (int step = 64; step > 0; step >>= 1) {
+            if (tid < step) {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) red6[r][tid] += red6[r][tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid < 4) {
+            const float s = red6[tid][0];
+            const int row = row0 + tid;
+            if (row < m) {
+                // 与下方共用同一份 op 语义（0=relu2、3=覆盖写、其余=累加）
+                if (op == 0) y[m0 + row] = relu2f(s);
+                else if (op == 3) y[m0 + row] = s;
+                else y[m0 + row] += s;
+            }
+        }
+        return;
     }
 
     // warp shuffle 归约（对齐 Albatross row1_linear_exact4_kernel<128,2>）：只有 1 次 __syncthreads。
@@ -7173,6 +7760,109 @@ extern "C" __global__ void rwkv_to_f16_triple(
 }
 "#;
 
+/// dequant_int6_to_f16 CUDA kernel：int6（lo4+hi2 双平面）反量化为 fp16 [M,K]。
+/// 布局与 `tools/quantize_any4.py --bits 6` / `model.rs::dequant_int6` 一致：
+/// lo uint32[M,K/8]（= K/2 字节）、hi uint32[M,K/16]（= K/4 字节）、sz uint32[M,K/128]。
+/// `nmajor != 0` 时三个平面是 `[K/2, M]` 等转置布局（`--int6-layout n`），只是寻址不同，
+/// 输出永远是 `[M, K]` 行主序。
+const DEQUANT_INT6_SRC: &str = r#"
+extern "C" __global__ void rwkv_dequant_int6(
+    const unsigned int* __restrict__ lo,   // [M, K/2] 字节 / N-major 时 [K/2, M]
+    const unsigned int* __restrict__ hi,   // [M, K/4] 字节 / N-major 时 [K/4, M]
+    const unsigned int* __restrict__ sz,   // [M, K/128]  / N-major 时 [K/128, M]
+    __half* __restrict__ w,                // [M, K] f16 输出
+    const int m,
+    const int k,
+    const int nmajor)
+{
+    const int total = m * k;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row = i / k;
+    const int ki  = i - row * k;
+    const int c   = ki >> 6;          // 64-k 打包块
+    const int jj  = ki & 63;
+    const int t   = jj >> 4;          // 子块 0..3
+    const int j16 = jj & 15;
+    const int lb  = ((t & 1) ? 16 : 0) + j16;
+
+    unsigned int lbv, hbv;
+    float sc;
+    if (nmajor) {
+        const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
+        const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
+        lbv = lo8[((size_t)(c << 5) + lb) * m + row];
+        hbv = hi8[((size_t)(c << 4) + j16) * m + row];
+        sc  = __half2float(__ushort_as_half(
+            (unsigned short)(sz[(size_t)(ki >> 7) * m + row] & 0xFFFFu)));
+    } else {
+        const unsigned int* lorow = lo + (size_t)row * (k >> 3) + (c << 3);
+        const unsigned int* hirow = hi + (size_t)row * (k >> 4) + (c << 2);
+        lbv = (lorow[lb >> 2] >> ((lb & 3) * 8)) & 0xFFu;
+        hbv = (hirow[j16 >> 2] >> ((j16 & 3) * 8 + t * 2)) & 0x03u;
+        sc  = __half2float(__ushort_as_half(
+            (unsigned short)(sz[(size_t)row * (k >> 7) + (ki >> 7)] & 0xFFFFu)));
+    }
+    const int l4 = (t < 2) ? (int)(lbv & 0x0Fu) : (int)(lbv >> 4);
+    const int e = l4 | (((int)hbv & 3) << 4);
+    w[i] = __float2half(sc * (float)(e - 32));
+}
+"#;
+
+/// N-major int6 → fp16 [M,K] 的**转置式**反量化（prefill / 批量路径用）。
+///
+/// 为什么不能复用 m-major 内核的 nmajor 分支：那个内核按 `[M, K]` 行主序线性铺线程，
+/// 读 N-major 平面时相邻线程的地址相差 `m` ⇒ 完全散读（实测 prefill 635 → 523 tok/s）。
+/// 这里改成 32×32 tile：读阶段相邻 lane 覆盖连续 32 个 m（合并），写阶段覆盖连续 32 个 ki
+/// （合并），中间经 smem 转置。
+const DEQUANT_INT6_NM_SRC: &str = r#"
+__device__ __forceinline__ float i6nm_elem(
+    const unsigned char* __restrict__ lo,
+    const unsigned char* __restrict__ hi,
+    const unsigned int*  __restrict__ sz,
+    const int m, const int row, const int ki)
+{
+    const int c = ki >> 6, jj = ki & 63, t = jj >> 4, j16 = jj & 15;
+    const int lb = ((t & 1) ? 16 : 0) + j16;
+    const unsigned int lbv = lo[((size_t)(c << 5) + lb) * m + row];
+    const unsigned int hbv = hi[((size_t)(c << 4) + j16) * m + row];
+    const float sc = __half2float(__ushort_as_half(
+        (unsigned short)(sz[(size_t)(ki >> 7) * m + row] & 0xFFFFu)));
+    const int l4 = (t < 2) ? (int)(lbv & 15u) : (int)(lbv >> 4);
+    const int e = l4 | ((((int)hbv >> (t * 2)) & 3) << 4);
+    return sc * (float)(e - 32);
+}
+
+extern "C" __global__ void rwkv_dequant_int6_nm(
+    const unsigned int* __restrict__ lo,
+    const unsigned int* __restrict__ hi,
+    const unsigned int* __restrict__ sz,
+    __half* __restrict__ w,
+    const int m,
+    const int k)
+{
+    __shared__ float tile[32][33];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.x << 5;
+    const int k0 = blockIdx.y << 5;
+    const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
+    const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
+    for (int i = tid; i < 1024; i += blockDim.x) {
+        const int r = i & 31;          // 输出列（m 方向）——相邻 lane 连续 ⇒ 读合并
+        const int c = i >> 5;          // tile 内的 ki
+        const int row = m0 + r;
+        if (row < m) tile[r][c] = i6nm_elem(lo8, hi8, sz, m, row, k0 + c);
+    }
+    __syncthreads();
+    for (int i = tid; i < 1024; i += blockDim.x) {
+        const int r = i >> 5;
+        const int c = i & 31;          // 相邻 lane 连续 ki ⇒ 写合并
+        const int row = m0 + r;
+        if (row < m) w[(size_t)row * k + k0 + c] = __float2half(tile[r][c]);
+    }
+}
+"#;
+
 /// dequant_int8_to_f16 CUDA kernel：int8 [M,K] 反量化为 fp16 [M,K]。
 /// 语义对齐 Vulkan `dequant_int8_f16.comp`：idx uint32[M,K/4]（4 uint8/uint32）、sz uint32[M,K/128]。
 const DEQUANT_INT8_SRC: &str = r#"
@@ -7668,6 +8358,49 @@ extern "C" __global__ void rwkv_gemv_seq(
     if (threadIdx.x == 0) y[(size_t)bidx * y_stride + row] = sdata[0];
 }
 "#;
+
+/// N-major int6 decode 内核（`gemv_int6nm`）的发射器：独立于 trait impl，
+/// 供 `gemv_int6_*` 四个变体在 `Int6Handle::nmajor` 时调用。
+impl CudaBackend {
+    /// `op` 语义同 `gemv_variant`（0=relu²、1=mul_add、2=add、3=覆盖写）；
+    /// `g == 0` 表示无门控；`b` 为 batch（grid.y）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6nm_launch(
+        &mut self,
+        lo: u64,
+        hi: u64,
+        sz: u64,
+        x: u64,
+        g: u64,
+        y: u64,
+        m: usize,
+        k: usize,
+        b: usize,
+        op: i32,
+    ) -> R<()> {
+        if !k.is_multiple_of(64) {
+            return Err(format!("gemv_int6nm: K={k} 必须是 64 的倍数（int6 打包块）").into());
+        }
+        let warps = i6nm_warps();
+        let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_SRC}");
+        let func = self.kernel(&format!("gemv_int6nm_w{warps}"), &src, "gemv_int6nm")?;
+        let grid = ((m as u32).div_ceil(32), b as u32, 1u32);
+        let block = (warps as u32 * 32, 1u32, 1u32);
+        let (m_i, k_i) = (m as i32, k as i32);
+        let params = [
+            &lo as *const u64 as *mut c_void,
+            &hi as *const u64 as *mut c_void,
+            &sz as *const u64 as *mut c_void,
+            &x as *const u64 as *mut c_void,
+            &g as *const u64 as *mut c_void,
+            &y as *const u64 as *mut c_void,
+            &m_i as *const i32 as *mut c_void,
+            &k_i as *const i32 as *mut c_void,
+            &op as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
+}
 
 impl ComputeBackend for CudaBackend {
     fn create_tensor(&mut self, len: usize, dtype: TensorDtype) -> R<TensorId> {
@@ -10112,6 +10845,184 @@ impl ComputeBackend for CudaBackend {
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1(
+        &mut self,
+        r: &Int6Handle,
+        k: &Int6Handle,
+        v: &Int6Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        or: TensorId,
+        ok: TensorId,
+        ov: TensorId,
+        ovm: TensorId,
+        owm: TensorId,
+        oam: TensorId,
+        ogm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+    ) -> R<()> {
+        // int6 句柄：lo/hi/sz 均为 u32；mid 权重与 x 为 f32；out_v 为 f16（同 int8 契约）。
+        let u32p = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::U32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be u32").into()),
+            }
+        };
+        let f16p = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F16 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f16").into()),
+            }
+        };
+        let f32p = |t: TensorId, op: &str| -> R<u64> {
+            match self.get(t, op)? {
+                CudaTensor::F32 { dptr, .. } => Ok(dptr),
+                _ => Err(format!("{op}: tensor {t:?} must be f32").into()),
+            }
+        };
+        const OP: &str = "gemv_int6_rkv_stage1";
+        let (r_lo, r_hi, r_sz) = (u32p(r.lo, OP)?, u32p(r.hi, OP)?, u32p(r.sz, OP)?);
+        let (k_lo, k_hi, k_sz) = (u32p(k.lo, OP)?, u32p(k.hi, OP)?, u32p(k.sz, OP)?);
+        let (v_lo, v_hi, v_sz) = (u32p(v.lo, OP)?, u32p(v.hi, OP)?, u32p(v.sz, OP)?);
+        let v1d = f32p(v1, OP)?;
+        let w1d = f32p(w1, OP)?;
+        let a1d = f32p(a1, OP)?;
+        let g1d = f32p(g1, OP)?;
+        let xrd = f32p(xr, OP)?;
+        let xkd = f32p(xk, OP)?;
+        let xvd = f32p(xv, OP)?;
+        let xwd = f32p(xw, OP)?;
+        let xad = f32p(xa, OP)?;
+        let xgd = f32p(xg, OP)?;
+        let ord = f32p(or, OP)?;
+        let okd = f32p(ok, OP)?;
+        let ovd = f16p(ov, OP)?;
+        let ovmd = f32p(ovm, OP)?;
+        let owmd = f32p(owm, OP)?;
+        let oamd = f32p(oam, OP)?;
+        let ogmd = f32p(ogm, OP)?;
+
+        // N-major：走 dot 形式内核（一个 lane 一个输出列，块内 8 warp 切 k-chunk）。
+        if r.nmajor {
+            let warps = i6nm_warps();
+            let src = format!("#define I6NM_WARPS {warps}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_RKV_SRC}");
+            let func = self.kernel(
+                &format!("gemv_int6nm_rkv_w{warps}"),
+                &src,
+                "gemv_int6nm_rkv",
+            )?;
+            let midtot = vm + wm + am + gm;
+            let grid = (
+                ((c as u32).div_ceil(32)) + (midtot as u32).div_ceil(warps as u32),
+                1u32,
+                1u32,
+            );
+            let block = (warps as u32 * 32, 1u32, 1u32);
+            let (c_i, vm_i, wm_i, am_i, gm_i) =
+                (c as i32, vm as i32, wm as i32, am as i32, gm as i32);
+            let params = [
+                &r_lo as *const u64 as *mut c_void,
+                &r_hi as *const u64 as *mut c_void,
+                &r_sz as *const u64 as *mut c_void,
+                &k_lo as *const u64 as *mut c_void,
+                &k_hi as *const u64 as *mut c_void,
+                &k_sz as *const u64 as *mut c_void,
+                &v_lo as *const u64 as *mut c_void,
+                &v_hi as *const u64 as *mut c_void,
+                &v_sz as *const u64 as *mut c_void,
+                &v1d as *const u64 as *mut c_void,
+                &w1d as *const u64 as *mut c_void,
+                &a1d as *const u64 as *mut c_void,
+                &g1d as *const u64 as *mut c_void,
+                &xrd as *const u64 as *mut c_void,
+                &xkd as *const u64 as *mut c_void,
+                &xvd as *const u64 as *mut c_void,
+                &xwd as *const u64 as *mut c_void,
+                &xad as *const u64 as *mut c_void,
+                &xgd as *const u64 as *mut c_void,
+                &ord as *const u64 as *mut c_void,
+                &okd as *const u64 as *mut c_void,
+                &ovd as *const u64 as *mut c_void,
+                &ovmd as *const u64 as *mut c_void,
+                &owmd as *const u64 as *mut c_void,
+                &oamd as *const u64 as *mut c_void,
+                &ogmd as *const u64 as *mut c_void,
+                &c_i as *const i32 as *mut c_void,
+                &vm_i as *const i32 as *mut c_void,
+                &wm_i as *const i32 as *mut c_void,
+                &am_i as *const i32 as *mut c_void,
+                &gm_i as *const i32 as *mut c_void,
+            ];
+            return self.drv.launch(self.stream, func, grid, block, &params);
+        }
+
+        // int6 的行数档与 int8 **不同**：int6 的 K 单元数是 C/64（C=2560 → 40），
+        // 只有把行也摊给线程才能喂满 128 线程 ⇒ 默认 ROWS=4（单元数 160）。
+        let rows = std::env::var("RKV_ROWS_I6")
+            .or_else(|_| std::env::var("RKV_ROWS"))
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|r| matches!(*r, 1 | 2 | 4 | 8) && c.is_multiple_of(*r))
+            .unwrap_or(4);
+        let key = format!("gemv_int6_rkv_stage1_r{rows}");
+        let src = format!("#define RKV_ROWS {rows}\n{GEMV_INT6_RKV_STAGE1_SRC}");
+        let func = self.kernel(&key, &src, "gemv_int6_rkv_stage1")?;
+        let midtot = (vm + wm + am + gm) as u32;
+        let grid = ((c / rows) as u32 + midtot.div_ceil(4), 1u32, 1u32);
+        let block = (128u32, 1u32, 1u32);
+        let c_i = c as i32;
+        let vm_i = vm as i32;
+        let wm_i = wm as i32;
+        let am_i = am as i32;
+        let gm_i = gm as i32;
+        let params = [
+            &r_lo as *const u64 as *mut c_void,
+            &r_hi as *const u64 as *mut c_void,
+            &r_sz as *const u64 as *mut c_void,
+            &k_lo as *const u64 as *mut c_void,
+            &k_hi as *const u64 as *mut c_void,
+            &k_sz as *const u64 as *mut c_void,
+            &v_lo as *const u64 as *mut c_void,
+            &v_hi as *const u64 as *mut c_void,
+            &v_sz as *const u64 as *mut c_void,
+            &v1d as *const u64 as *mut c_void,
+            &w1d as *const u64 as *mut c_void,
+            &a1d as *const u64 as *mut c_void,
+            &g1d as *const u64 as *mut c_void,
+            &xrd as *const u64 as *mut c_void,
+            &xkd as *const u64 as *mut c_void,
+            &xvd as *const u64 as *mut c_void,
+            &xwd as *const u64 as *mut c_void,
+            &xad as *const u64 as *mut c_void,
+            &xgd as *const u64 as *mut c_void,
+            &ord as *const u64 as *mut c_void,
+            &okd as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &ovmd as *const u64 as *mut c_void,
+            &owmd as *const u64 as *mut c_void,
+            &oamd as *const u64 as *mut c_void,
+            &ogmd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &vm_i as *const i32 as *mut c_void,
+            &wm_i as *const i32 as *mut c_void,
+            &am_i as *const i32 as *mut c_void,
+            &gm_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
+    }
     fn gemv_lowrank_chain4(
         &mut self,
         w2: TensorId,
@@ -10313,6 +11224,135 @@ impl ComputeBackend for CudaBackend {
         let xd = self.f32_ptr(x, "gemv_int8_plain")?;
         let yd = self.f32_ptr(y, "gemv_int8_plain")?;
         self.gemv_variant_dispatch(0, aidx, 0, asz, xd, 0, yd, m, k, b, 2, 3)
+    }
+
+    // —— int6：与 int8 共用同一支 `gemv_variant`（wtype=3），
+    //    lo 平面走 `aidx`、hi 平面走 `alut`（该槽位在其它 wtype 下未使用）。 ——
+
+    fn gemv_int6_relu2(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) -> R<()> {
+        let lo = self.u32_ptr(a.lo, "gemv_int6_relu2")?;
+        let hi = self.u32_ptr(a.hi, "gemv_int6_relu2")?;
+        let sz = self.u32_ptr(a.sz, "gemv_int6_relu2")?;
+        let xd = self.f32_ptr(x, "gemv_int6_relu2")?;
+        let yd = self.f32_ptr(y, "gemv_int6_relu2")?;
+        if a.nmajor {
+            return self.gemv_int6nm_launch(lo, hi, sz, xd, 0, yd, m, k, b, 0);
+        }
+        self.gemv_variant_dispatch(0, lo, hi, sz, xd, 0, yd, m, k, b, 3, 0)
+    }
+
+    fn gemv_int6_mul_add(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        g: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) -> R<()> {
+        let lo = self.u32_ptr(a.lo, "gemv_int6_mul_add")?;
+        let hi = self.u32_ptr(a.hi, "gemv_int6_mul_add")?;
+        let sz = self.u32_ptr(a.sz, "gemv_int6_mul_add")?;
+        let xd = self.f32_ptr(x, "gemv_int6_mul_add")?;
+        let gd = self.f16_ptr(g, "gemv_int6_mul_add")?;
+        let yd = self.f32_ptr(y, "gemv_int6_mul_add")?;
+        if a.nmajor {
+            return self.gemv_int6nm_launch(lo, hi, sz, xd, gd, yd, m, k, b, 1);
+        }
+        self.gemv_variant_dispatch(0, lo, hi, sz, xd, gd, yd, m, k, b, 3, 1)
+    }
+
+    fn gemv_int6_add(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) -> R<()> {
+        let lo = self.u32_ptr(a.lo, "gemv_int6_add")?;
+        let hi = self.u32_ptr(a.hi, "gemv_int6_add")?;
+        let sz = self.u32_ptr(a.sz, "gemv_int6_add")?;
+        let xd = self.f32_ptr(x, "gemv_int6_add")?;
+        let yd = self.f32_ptr(y, "gemv_int6_add")?;
+        if a.nmajor {
+            return self.gemv_int6nm_launch(lo, hi, sz, xd, 0, yd, m, k, b, 2);
+        }
+        self.gemv_variant_dispatch(0, lo, hi, sz, xd, 0, yd, m, k, b, 3, 2)
+    }
+
+    fn gemv_int6_plain(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) -> R<()> {
+        let lo = self.u32_ptr(a.lo, "gemv_int6_plain")?;
+        let hi = self.u32_ptr(a.hi, "gemv_int6_plain")?;
+        let sz = self.u32_ptr(a.sz, "gemv_int6_plain")?;
+        let xd = self.f32_ptr(x, "gemv_int6_plain")?;
+        let yd = self.f32_ptr(y, "gemv_int6_plain")?;
+        if a.nmajor {
+            return self.gemv_int6nm_launch(lo, hi, sz, xd, 0, yd, m, k, b, 3);
+        }
+        self.gemv_variant_dispatch(0, lo, hi, sz, xd, 0, yd, m, k, b, 3, 3)
+    }
+
+    fn dequant_int6_to_f16(&mut self, a: &Int6Handle, out: TensorId, m: usize, k: usize) -> R<()> {
+        let (lo, hi, sz) = (
+            self.u32_ptr(a.lo, "dequant_int6_to_f16")?,
+            self.u32_ptr(a.hi, "dequant_int6_to_f16")?,
+            self.u32_ptr(a.sz, "dequant_int6_to_f16")?,
+        );
+        let w = self.f16_ptr(out, "dequant_int6_to_f16")?;
+        let (m_i, k_i) = (m as i32, k as i32);
+        if a.nmajor {
+            // 转置式（tile 32×32，读写双向合并）；K 需 32 对齐（int6 要求 64 对齐 ⇒ 天然满足）
+            let func = self.kernel(
+                "dequant_int6_nm",
+                DEQUANT_INT6_NM_SRC,
+                "rwkv_dequant_int6_nm",
+            )?;
+            let grid = ((m as u32).div_ceil(32), (k as u32).div_ceil(32), 1u32);
+            let block = (256u32, 1u32, 1u32);
+            let params = [
+                &lo as *const u64 as *mut c_void,
+                &hi as *const u64 as *mut c_void,
+                &sz as *const u64 as *mut c_void,
+                &w as *const u64 as *mut c_void,
+                &m_i as *const i32 as *mut c_void,
+                &k_i as *const i32 as *mut c_void,
+            ];
+            return self.drv.launch(self.stream, func, grid, block, &params);
+        }
+        let func = self.kernel("dequant_int6", DEQUANT_INT6_SRC, "rwkv_dequant_int6")?;
+        let total = m * k;
+        let grid = ((total as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        let nm_i = i32::from(a.nmajor);
+        let params = [
+            &lo as *const u64 as *mut c_void,
+            &hi as *const u64 as *mut c_void,
+            &sz as *const u64 as *mut c_void,
+            &w as *const u64 as *mut c_void,
+            &m_i as *const i32 as *mut c_void,
+            &k_i as *const i32 as *mut c_void,
+            &nm_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)
     }
 
     fn ffn_value_sparse_add(
@@ -13630,6 +14670,143 @@ mod tests {
             .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
         assert!(md < 1e-3, "gemm_tanh mismatch max_diff={md}");
         log::info!("gemm variants (plain/bias/add/relu2/tanh) vs CPU OK");
+    }
+
+    /// int6 **N-major** 布局的两个内核（decode dot 形式 GEMV + 转置式 dequant）对 CPU 参考。
+    ///
+    /// 覆盖三件容易写错的事：① `m` 不是 32 的倍数时尾部 lane 要屏蔽；② `batch > 1`
+    /// （grid.y）时 x/y 的批量步长；③ mul_add 的 fp16 门控路径（模板另一实例）。
+    /// 参考值在 CPU 上按 `w = scale·(e−32)` 直接算，不依赖任何模型文件。
+    #[test]
+    fn int6_nmajor_kernels_match_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping int6 nmajor test");
+            return;
+        }
+        let _gpu = crate::backend::gpu_test_guard();
+        let mut b = CudaBackend::new().expect("create cuda backend");
+
+        // m 非 32 倍数；k = 4 个 64-k 打包块（2 个 scale 组）
+        let (m, k) = (70usize, 256usize);
+        let (lo_row, hi_row, kg) = (k / 2, k / 4, k / 128);
+        let mut e = vec![0u8; m * k];
+        let mut lo_m = vec![0u8; m * lo_row];
+        let mut hi_m = vec![0u8; m * hi_row];
+        let sz_m = vec![0x3C00u32; m * kg]; // scale = 1.0，zero = 0
+        for r in 0..m {
+            for j in 0..k {
+                e[r * k + j] = ((r * 13 + j * 7) % 64) as u8;
+            }
+            for c in 0..k / 64 {
+                for j in 0..32 {
+                    let a = e[r * k + c * 64 + j] & 15;
+                    let bb = e[r * k + c * 64 + j + 32] & 15;
+                    lo_m[r * lo_row + c * 32 + j] = a | (bb << 4);
+                }
+                for j in 0..16 {
+                    let f = |o: usize| (e[r * k + c * 64 + j + o] >> 4) & 3;
+                    hi_m[r * hi_row + c * 16 + j] =
+                        f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                }
+            }
+        }
+        // 转置到 N-major（等价于量化器 `--int6-layout n`）
+        let tr = |src: &[u8], rows: usize, cols: usize| -> Vec<u8> {
+            let mut d = vec![0u8; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    d[c * rows + r] = src[r * cols + c];
+                }
+            }
+            d
+        };
+        let (lo_n, hi_n) = (tr(&lo_m, m, lo_row), tr(&hi_m, m, hi_row));
+        let mut sz_n = vec![0u32; kg * m];
+        for g in 0..kg {
+            for r in 0..m {
+                sz_n[g * m + r] = sz_m[r * kg + g];
+            }
+        }
+        let as_u32 = |x: &[u8]| -> Vec<u32> {
+            x.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let (lo_w, hi_w) = (as_u32(&lo_n), as_u32(&hi_n));
+        let lo_t = mk_tensor(&mut b, lo_w.len(), TensorDtype::U32);
+        b.upload_u32(lo_t, &lo_w).unwrap();
+        let hi_t = mk_tensor(&mut b, hi_w.len(), TensorDtype::U32);
+        b.upload_u32(hi_t, &hi_w).unwrap();
+        let sz_t = mk_tensor(&mut b, sz_n.len(), TensorDtype::U32);
+        b.upload_u32(sz_t, &sz_n).unwrap();
+        let h = Int6Handle {
+            lo: lo_t,
+            hi: hi_t,
+            sz: sz_t,
+            m,
+            k,
+            nmajor: true,
+        };
+
+        // ① dequant：输出 [M,K] fp16 必须逐个等于 e-32（scale=1，整数精确可表示）
+        let dq = mk_tensor(&mut b, m * k, TensorDtype::F16);
+        b.dequant_int6_to_f16(&h, dq, m, k)
+            .expect("dequant_int6 nm");
+        let got = b.download(dq).unwrap();
+        for r in 0..m {
+            for kk in 0..k {
+                let want = e[r * k + kk] as f32 - 32.0;
+                assert_eq!(got[r * k + kk], want, "dequant nm: m={r} k={kk}");
+            }
+        }
+
+        // ② plain GEMV，batch = 2
+        let batch = 2usize;
+        let x: Vec<f32> = (0..batch * k).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let xt = mk_tensor(&mut b, batch * k, TensorDtype::F32);
+        b.upload(xt, &x).unwrap();
+        let yt = mk_tensor(&mut b, batch * m, TensorDtype::F32);
+        b.gemv_int6_plain(&h, xt, yt, m, k, batch)
+            .expect("gemv_int6_plain nm");
+        let got = b.download(yt).unwrap();
+        let mut worst = 0.0f32;
+        for bid in 0..batch {
+            for r in 0..m {
+                let mut want = 0.0f64;
+                for kk in 0..k {
+                    want += (e[r * k + kk] as f64 - 32.0) * x[bid * k + kk] as f64;
+                }
+                let g = got[bid * m + r];
+                let rel = ((g as f64 - want).abs() / (1.0 + want.abs())) as f32;
+                worst = worst.max(rel);
+            }
+        }
+        assert!(worst < 2e-3, "plain nm 相对误差过大: {worst}");
+
+        // ③ mul_add（y += (x·g) @ W），batch = 1
+        let gate_val = 0.5f32;
+        let gt = mk_tensor(&mut b, k, TensorDtype::F16);
+        b.upload(gt, &vec![gate_val; k]).expect("upload gate");
+        let x1 = &x[..k];
+        let xt1 = mk_tensor(&mut b, k, TensorDtype::F32);
+        b.upload(xt1, x1).unwrap();
+        let y0: Vec<f32> = (0..m).map(|i| (i as f32) * 0.01).collect();
+        let y1 = mk_tensor(&mut b, m, TensorDtype::F32);
+        b.upload(y1, &y0).unwrap();
+        b.gemv_int6_mul_add(&h, xt1, gt, y1, m, k, 1)
+            .expect("gemv_int6_mul_add nm");
+        let got = b.download(y1).unwrap();
+        let mut worst = 0.0f32;
+        for r in 0..m {
+            let mut acc = y0[r] as f64;
+            for kk in 0..k {
+                acc += (e[r * k + kk] as f64 - 32.0) * (x1[kk] * gate_val) as f64;
+            }
+            let rel = ((got[r] as f64 - acc).abs() / (1.0 + acc.abs())) as f32;
+            worst = worst.max(rel);
+        }
+        assert!(worst < 2e-3, "mul_add nm 相对误差过大: {worst}");
+        log::info!("int6 N-major（dequant / plain / mul_add）vs CPU OK");
     }
 
     /// copy_device（f32）与 copy_token 与 CPU 参考对比。

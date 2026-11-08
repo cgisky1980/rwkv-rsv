@@ -24,8 +24,7 @@ use std::io::{BufRead, BufWriter, Write};
 
 use rwkv_rsv::gpu_model::{ModelBuilder, SamplerParams};
 
-const DEFAULT_MODEL: &str =
-    r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st";
+const DEFAULT_MODEL: &str = r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\rwkv7-3B-int8.st";
 const DEFAULT_VOCAB: &str = r"C:\work\ai00-x-dev\client\.ai00-x-dev\models\rwkv\vocab.json";
 const DEFAULT_DATA: &str =
     r"C:\work\ai00-x-dev\client\scripts\router_head\data\multiturn\scenarios.jsonl";

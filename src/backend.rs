@@ -46,6 +46,55 @@ pub struct Int8Handle {
     pub k: usize,
 }
 
+/// int6 对称量化权重（平台无关组合句柄）：`w[m,k] = scale[m,k/128] * (e - 32)`，
+/// 其中 `e = lo4 | (hi2 << 4) ∈ [0,63]` 由两张位平面拼出（打包规则见
+/// `tools/quantize_any4.py` 的 int6 段：K 按 64 行切块，块内 4 个 16 行子块共享字节）。
+/// `sz` 与 int8 同编码：低 16 位 = scale(fp16)，高 16 位 = zero（int6 恒为 0）。
+#[derive(Debug, Clone, Copy)]
+pub struct Int6Handle {
+    pub lo: TensorId, // U8 [M, K/2]（上传时重解释为 u32）
+    pub hi: TensorId, // U8 [M, K/4]
+    pub sz: TensorId, // U32 [M, K/128]
+    pub m: usize,
+    pub k: usize,
+    /// 平面是否为 **N-major**（`[K/2, M]` 等，M 最内）。量化器 `--int6-layout n` 的产物；
+    /// 决定后端走哪一支内核（CUDA 的 dot 形式 n-major 内核 / m-major 旧内核、
+    /// 以及 dequant 内核的寻址）。见 `model::int6_nmajor`。
+    pub nmajor: bool,
+}
+
+/// 量化权重的统一句柄。存在的理由：decode/prefill 各有 10+ 处「有量化走量化、否则走 fp16」
+/// 的调用点，若为 int6 再加一层 `if let`，每个点都会长出重复的分支。这里把分派收进
+/// [`ComputeBackend`] 的 `w_*` 默认实现：调用点只认 `Wq`，不认具体位宽。
+#[derive(Debug, Clone, Copy)]
+pub enum Wq {
+    I8(Int8Handle),
+    I6(Int6Handle),
+}
+
+impl Wq {
+    pub fn m(&self) -> usize {
+        match self {
+            Wq::I8(h) => h.m,
+            Wq::I6(h) => h.m,
+        }
+    }
+
+    pub fn k(&self) -> usize {
+        match self {
+            Wq::I8(h) => h.k,
+            Wq::I6(h) => h.k,
+        }
+    }
+
+    pub fn as_i8(&self) -> Option<&Int8Handle> {
+        match self {
+            Wq::I8(h) => Some(h),
+            Wq::I6(_) => None,
+        }
+    }
+}
+
 /// 把 int8 权重索引缓冲从模型文件的**行主序** `[M][K/4]`（uint32 为单位）置换成**组主序**
 /// `[K/128][M][32]`：同一量化组内所有行连续，一次 `BM × 128 B` 的 staging 读的是连续段。
 ///
@@ -758,6 +807,230 @@ pub trait ComputeBackend {
         k: usize,
         batch: usize,
     ) -> R<()>;
+
+    // ------------------------------------------------------------------
+    // int6（对称、lo4+hi2 双平面）。默认全部 unsupported：只有实现了对应内核的
+    // 后端才需要覆盖，未实现时 `w_*` 分派会返回明确的错误串而不是静默算错。
+    // ------------------------------------------------------------------
+
+    /// y = x @ A（int6 权重，覆盖写）——head 用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_plain(
+        &mut self,
+        _a: &Int6Handle,
+        _x: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_plain: backend not supported".into())
+    }
+
+    /// y = relu²(x @ A)（int6 权重）——ffn.key 用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_relu2(
+        &mut self,
+        _a: &Int6Handle,
+        _x: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_relu2: backend not supported".into())
+    }
+
+    /// y += (x .* g) @ A（int6 权重）——att.output 用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_mul_add(
+        &mut self,
+        _a: &Int6Handle,
+        _x: TensorId,
+        _g: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_mul_add: backend not supported".into())
+    }
+
+    /// y += x @ A（int6 权重）——ffn.value 残差用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_add(
+        &mut self,
+        _a: &Int6Handle,
+        _x: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _batch: usize,
+    ) -> R<()> {
+        Err("gemv_int6_add: backend not supported".into())
+    }
+
+    /// 深度融合 gemv（int6 版，r/k/v 三路同量化格式）。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1(
+        &mut self,
+        _r: &Int6Handle,
+        _k: &Int6Handle,
+        _v: &Int6Handle,
+        _v1: TensorId,
+        _w1: TensorId,
+        _a1: TensorId,
+        _g1: TensorId,
+        _xr: TensorId,
+        _xk: TensorId,
+        _xv: TensorId,
+        _xw: TensorId,
+        _xa: TensorId,
+        _xg: TensorId,
+        _out_r: TensorId,
+        _out_k: TensorId,
+        _out_v: TensorId,
+        _out_vm: TensorId,
+        _out_wm: TensorId,
+        _out_am: TensorId,
+        _out_gm: TensorId,
+        _c: usize,
+        _vm: usize,
+        _wm: usize,
+        _am: usize,
+        _gm: usize,
+    ) -> R<()> {
+        Err("gemv_int6_rkv_stage1: backend not supported".into())
+    }
+
+    /// int6 → fp16 反量化（prefill/批量：解到 fp16 scratch 供既有 GEMM 消费）。
+    fn dequant_int6_to_f16(
+        &mut self,
+        _a: &Int6Handle,
+        _out: TensorId,
+        _m: usize,
+        _k: usize,
+    ) -> R<()> {
+        Err("dequant_int6_to_f16: backend not supported".into())
+    }
+
+    // —— 统一分派：调用点只认 `Wq`，位宽细节留在后端 ——
+
+    #[allow(clippy::too_many_arguments)]
+    fn w_plain(
+        &mut self,
+        w: &Wq,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        match w {
+            Wq::I8(h) => self.gemv_int8_plain(h, x, y, m, k, batch),
+            Wq::I6(h) => self.gemv_int6_plain(h, x, y, m, k, batch),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn w_relu2(
+        &mut self,
+        w: &Wq,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        match w {
+            Wq::I8(h) => self.gemv_int8_relu2(h, x, y, m, k, batch),
+            Wq::I6(h) => self.gemv_int6_relu2(h, x, y, m, k, batch),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn w_mul_add(
+        &mut self,
+        w: &Wq,
+        x: TensorId,
+        g: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        match w {
+            Wq::I8(h) => self.gemv_int8_mul_add(h, x, g, y, m, k, batch),
+            Wq::I6(h) => self.gemv_int6_mul_add(h, x, g, y, m, k, batch),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn w_add(
+        &mut self,
+        w: &Wq,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        match w {
+            Wq::I8(h) => self.gemv_int8_add(h, x, y, m, k, batch),
+            Wq::I6(h) => self.gemv_int6_add(h, x, y, m, k, batch),
+        }
+    }
+
+    /// r/k/v 三路融合。int6 只实现了单流档；批量档未实现时返回错误，
+    /// 由调用方（`batch_decode_blocker`）提前拦住，不会运行期炸。
+    #[allow(clippy::too_many_arguments)]
+    fn w_rkv_stage1(
+        &mut self,
+        wr: &Wq,
+        wk: &Wq,
+        wv: &Wq,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+    ) -> R<()> {
+        match (wr, wk, wv) {
+            (Wq::I8(r), Wq::I8(k), Wq::I8(v)) => self.gemv_int8_rkv_stage1(
+                r, k, v, v1, w1, a1, g1, xr, xk, xv, xw, xa, xg, out_r, out_k, out_v, out_vm,
+                out_wm, out_am, out_gm, c, vm, wm, am, gm,
+            ),
+            (Wq::I6(r), Wq::I6(k), Wq::I6(v)) => self.gemv_int6_rkv_stage1(
+                r, k, v, v1, w1, a1, g1, xr, xk, xv, xw, xa, xg, out_r, out_k, out_v, out_vm,
+                out_wm, out_am, out_gm, c, vm, wm, am, gm,
+            ),
+            _ => Err("w_rkv_stage1: r/k/v 必须同为一种量化格式".into()),
+        }
+    }
+
+    fn w_dequant_to_f16(&mut self, w: &Wq, out: TensorId, m: usize, k: usize) -> R<()> {
+        match w {
+            Wq::I8(h) => self.dequant_int8_to_f16(h, out, m, k),
+            Wq::I6(h) => self.dequant_int6_to_f16(h, out, m, k),
+        }
+    }
 
     /// 稀疏 FFN value 投影：x += r2 @ ffn_value（r2=relu² 约 96% 稀疏）。
     /// `value_tiled` 为平铺布局 [fh, C]（对齐 Albatross cmix_sparse_down），CUDA 稀疏内核用；

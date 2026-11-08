@@ -11,8 +11,18 @@
 use half::f16;
 use safetensors::tensor::TensorView;
 
-use crate::backend::{ComputeBackend, Int8Handle, TensorDtype, TensorId};
+use crate::backend::{ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId, Wq};
 use crate::runtime::R;
+
+/// 把「int6 / int8 两个互斥可选句柄」收敛成一个分派用句柄：解码期 int6 优先。
+///
+/// 存在的理由：每个线性层都有 10+ 个调用点要回答「这条路径吃什么权重量化」，
+/// 若在每个点都写两层 `if let`，分支会以乘法增长。统一成 `Option<Wq>` 后，
+/// 调用点只写一次分派，位宽细节留在 `ComputeBackend::w_*` 里。
+#[inline]
+fn wq(i6: Option<Int6Handle>, a8: Option<Int8Handle>) -> Option<Wq> {
+    i6.map(Wq::I6).or_else(|| a8.map(Wq::I8))
+}
 
 /// LayerNorm eps（与 CPU model.rs 一致）
 pub const LN_EPS: f32 = 1.0e-5;
@@ -164,6 +174,7 @@ pub struct GpuModel {
     ln_out_b: TensorId,
     head_w16: Option<TensorId>, // [vocab, C] fp16 变体（head 未 int8 量化时用）
     head_a8: Option<Int8Handle>, // [vocab, C] int8 量化 head（模型含 head.weight.int8_* 时启用，省 4× 带宽）
+    head_i6: Option<Int6Handle>, // [vocab, C] int6 对称量化 head（可选，比 int8 再省 25% 带宽）
     layers: Vec<GpuLayer>,
     // 工作缓冲区（forward 时复用，避免每 token 重新分配）
     bufs: WorkBuffers,
@@ -249,6 +260,14 @@ pub struct GpuLayer {
     receptance_a8: Option<Int8Handle>, // [C, C]
     key_a8: Option<Int8Handle>,        // [C, C]
     value_a8: Option<Int8Handle>,      // [C, C]
+    // int6 对称量化权重（lo4+hi2 双平面）。与 `*_a8` 互斥：同一矩阵只会命中一种文件键。
+    // 解码期优先用 int6（0.75 B/权重 vs int8 的 1.0），宽批/prefill 走 `w_dequant_to_f16`。
+    ffn_key_i6: Option<Int6Handle>,
+    ffn_value_i6: Option<Int6Handle>,
+    att_output_i6: Option<Int6Handle>,
+    receptance_i6: Option<Int6Handle>,
+    key_i6: Option<Int6Handle>,
+    value_i6: Option<Int6Handle>,
     // fp16 低秩权重（tensor-core GEMM 用，已补齐到 [mid_pad, C] / [C, mid_pad]）—— 仅保留 fp16
     w1_16: TensorId, // [wm_pad, C]
     w2_16: TensorId, // [C, wm_pad]
@@ -617,6 +636,8 @@ impl GpuModel {
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
 
         let n_layer = max_layer(&st) + 1;
+        // int6 平面布局（量化器 --int6-layout n ⇒ N-major），一次读出供全模型共用
+        let i6_nmajor = crate::model::int6_nmajor(&st);
         let emb = st.tensor("emb.weight")?;
         let (vocab, n_embd) = (emb.shape()[0], emb.shape()[1]);
         // head_size / n_head 从 r_k 形状 [H, N] 推导（跨模型通用）
@@ -633,10 +654,20 @@ impl GpuModel {
         let a_mid = mid_of(&st.tensor("blocks.0.att.a1")?);
         let v_mid = mid_of(&st.tensor("blocks.0.att.v1")?);
         let g_mid = mid_of(&st.tensor("blocks.0.att.g1")?);
-        // 原 fp16 键可能被 int8 量化键替换，此时从量化张量推导 M（int8_idx [M,K]）
+        // 原 fp16 键可能被 int8 量化键替换，此时从量化张量推导 M（int8_idx [M,K]；
+        // int6 平面在 N-major 下是 [K/2, M]，维度顺序相反）
         let ffn_hidden = match st.tensor("blocks.0.ffn.key.weight") {
             Ok(t) => t.shape()[0],
-            Err(_) => st.tensor("blocks.0.ffn.key.weight.int8_idx")?.shape()[0],
+            Err(_) => match st.tensor("blocks.0.ffn.key.weight.int6_lo") {
+                Ok(t) => {
+                    if i6_nmajor {
+                        t.shape()[1]
+                    } else {
+                        t.shape()[0]
+                    }
+                }
+                Err(_) => st.tensor("blocks.0.ffn.key.weight.int8_idx")?.shape()[0],
+            },
         };
 
         let config = ModelConfig {
@@ -717,7 +748,42 @@ impl GpuModel {
         } else {
             None
         };
-        let head_w16_t = if head_a8.is_none() {
+        // head 的 int6 变体（可选）：量化器默认把 head 留在 int8，这里只做兼容探测。
+        let head_i6 = if st.tensor("head.weight.int6_lo").is_ok() {
+            let lo_t = st.tensor("head.weight.int6_lo")?;
+            let hi_t = st.tensor("head.weight.int6_hi")?;
+            let sz_t = st.tensor("head.weight.int6_sz")?;
+            let lo: &[u8] = lo_t.data();
+            let hi: &[u8] = hi_t.data();
+            let sz: &[u32] = bytemuck::cast_slice(sz_t.data());
+            assert_eq!(lo.len(), vocab * n_embd / 2, "head.int6_lo 形状不符");
+            assert_eq!(hi.len(), vocab * n_embd / 4, "head.int6_hi 形状不符");
+            assert_eq!(sz.len(), vocab * n_embd / 128, "head.int6_sz 形状不符");
+            let as_u32 = |b: &[u8]| -> Vec<u32> {
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let (lo_w, hi_w) = (as_u32(lo), as_u32(hi));
+            let lo_gpu = backend.create_tensor(lo_w.len(), TensorDtype::U32)?;
+            backend.upload_u32(lo_gpu, &lo_w)?;
+            let hi_gpu = backend.create_tensor(hi_w.len(), TensorDtype::U32)?;
+            backend.upload_u32(hi_gpu, &hi_w)?;
+            let sz_gpu = backend.create_tensor(sz.len(), TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, sz)?;
+            log::info!("head 使用 int6 对称量化权重（{vocab}x{n_embd}）");
+            Some(Int6Handle {
+                lo: lo_gpu,
+                hi: hi_gpu,
+                sz: sz_gpu,
+                m: vocab,
+                k: n_embd,
+                nmajor: i6_nmajor,
+            })
+        } else {
+            None
+        };
+        let head_w16_t = if head_a8.is_none() && head_i6.is_none() {
             let head_w = tensor_to_f32(&st.tensor("head.weight")?);
             let t = backend.create_tensor(vocab * n_embd, TensorDtype::F16)?;
             backend.upload(t, &head_w)?;
@@ -761,6 +827,7 @@ impl GpuModel {
             ln_out_b: ln_out_b_t,
             head_w16: head_w16_t,
             head_a8,
+            head_i6,
             layers,
             bufs,
             batch_bufs: None,
@@ -848,6 +915,7 @@ impl GpuModel {
             ln_out_b: self.ln_out_b,
             head_w16: self.head_w16,
             head_a8: self.head_a8,
+            head_i6: self.head_i6,
             layers: self.layers.clone(),
             bufs,
             batch_bufs: None,
@@ -1889,6 +1957,9 @@ impl GpuModel {
                 self.backend
                     .gemv_int8_plain(a8, bb.x_norm, bb.logits, vocab, c, batch)?;
             }
+        } else if let Some(wqh) = wq(self.head_i6, None) {
+            self.backend
+                .w_plain(&wqh, bb.x_norm, bb.logits, vocab, c, batch)?;
         } else {
             let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
             self.backend
@@ -2006,19 +2077,21 @@ impl GpuModel {
             .copy_token_batch(sb.ln1, state.layers[i].tmix_x, lens, c, t_pad, batch)?;
 
         // r/k/v = token 并行 GEMM（M = B*T_pad；int8 → dequant scratch → TC GEMM）
-        if let (Some(ra8), Some(ka8), Some(va8)) =
-            (&layer.receptance_a8, &layer.key_a8, &layer.value_a8)
-        {
+        if let (Some(qr), Some(qk), Some(qv)) = (
+            wq(layer.receptance_i6, layer.receptance_a8),
+            wq(layer.key_i6, layer.key_a8),
+            wq(layer.value_i6, layer.value_a8),
+        ) {
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, bt, m_pad, c, c,
             )?;
-            self.backend.dequant_int8_to_f16(ra8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(ka8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(va8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
         } else {
@@ -2147,9 +2220,9 @@ impl GpuModel {
         // y_g = y_norm * g；y_out = GEMM(output_w, y_g) + x
         self.backend
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, bt)?;
-        if let Some(a8) = &layer.att_output_a8 {
+        if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(a8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
             self.backend
                 .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
         } else {
@@ -2187,10 +2260,9 @@ impl GpuModel {
         // §6.13 定稿：`acc16` 时 ffn key 一条 `gemm_f16_f16_relu2` 直写 `r2_16`，
         // 既省掉累加器宽度、又省掉 `to_f16(r2 → r2_16)` 那一遍；这就是**默认档**（`PREFILL_ACC16=0` 才回退）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
-        if let Some(fka8) = &layer.ffn_key_a8 {
+        if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
             self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
-            self.backend
-                .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
+            self.backend.w_dequant_to_f16(&wqk, sb.w_scratch, fh, c)?;
             if acc16 {
                 self.backend
                     .gemm_f16_acc(sb.xb16, sb.w_scratch, sb.r2_16, m_pad, fh, c, 1)?;
@@ -2209,13 +2281,12 @@ impl GpuModel {
                     .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
             }
         }
-        if let Some(fva8) = &layer.ffn_value_a8 {
+        if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
             if !acc16 {
                 self.backend
                     .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
             }
-            self.backend
-                .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
+            self.backend.w_dequant_to_f16(&wqv, sb.w_scratch, c, fh)?;
             self.backend
                 .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else {
@@ -3719,8 +3790,8 @@ impl GpuModel {
     /// 模型含 int8 量化 head 时走 `gemv_int8_plain`（省 4× 带宽，head 是 decode 单 kernel 读取量最大者），
     /// 否则走 fp16 `gemv_f16`。
     fn head_gemv(&mut self, x_in: TensorId, out: TensorId, vocab: usize, c: usize) -> R<()> {
-        if let Some(a8) = &self.head_a8 {
-            self.backend.gemv_int8_plain(a8, x_in, out, vocab, c, 1)
+        if let Some(wqh) = wq(self.head_i6, self.head_a8) {
+            self.backend.w_plain(&wqh, x_in, out, vocab, c, 1)
         } else {
             let w16 = self.head_w16.expect("head 既无 int8 也无 fp16 权重");
             self.backend.gemv_f16(w16, x_in, out, vocab, c, 1)
@@ -3790,15 +3861,15 @@ impl GpuModel {
         // r/k/v + v_mid/w_mid/a_mid/g_mid = 融合 gemv（一次 dispatch 算 r/k/v 三个 C×C 投影
         // + v1/w1/a1/g1 四个 mid 投影）。量化权重自动路由：int8 → fp16
         // （r/k/v 三者同量化格式才走对应融合版；权重带宽 fp16 2B / int8 1B）。
-        if let (Some(r_a8), Some(k_a8), Some(v_a8)) = (
-            &self.layers[i].receptance_a8,
-            &self.layers[i].key_a8,
-            &self.layers[i].value_a8,
+        if let (Some(qr), Some(qk), Some(qv)) = (
+            wq(self.layers[i].receptance_i6, self.layers[i].receptance_a8),
+            wq(self.layers[i].key_i6, self.layers[i].key_a8),
+            wq(self.layers[i].value_i6, self.layers[i].value_a8),
         ) {
-            self.backend.gemv_int8_rkv_stage1(
-                r_a8,
-                k_a8,
-                v_a8,
+            self.backend.w_rkv_stage1(
+                &qr,
+                &qk,
+                &qv,
                 self.layers[i].v1,
                 self.layers[i].w1,
                 self.layers[i].a1,
@@ -3955,16 +4026,9 @@ impl GpuModel {
 
         // x += (y_norm .* g) @ output_w（mul + 残差累加都折叠进 gemv，省 2 次 dispatch）；
         // 量化权重自动路由：int8 → fp16
-        if let Some(a8) = &self.layers[i].att_output_a8 {
-            self.backend.gemv_int8_mul_add(
-                a8,
-                self.bufs.y_norm,
-                self.bufs.g,
-                self.bufs.x,
-                c,
-                c,
-                1,
-            )?;
+        if let Some(wqo) = wq(self.layers[i].att_output_i6, self.layers[i].att_output_a8) {
+            self.backend
+                .w_mul_add(&wqo, self.bufs.y_norm, self.bufs.g, self.bufs.x, c, c, 1)?;
         } else {
             self.backend.gemv_f16_mul_add(
                 *self.layers[i]
@@ -4003,9 +4067,9 @@ impl GpuModel {
         pf_phase!("cmix_norm_lerp");
 
         // r2 = relu²(xb @ ffn_key.T) — M=ffn_hidden, K=C；量化权重自动路由：int8 → fp16
-        if let Some(a8) = &self.layers[i].ffn_key_a8 {
+        if let Some(wqk) = wq(self.layers[i].ffn_key_i6, self.layers[i].ffn_key_a8) {
             self.backend
-                .gemv_int8_relu2(a8, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
+                .w_relu2(&wqk, self.bufs.xb, self.bufs.r2, fh, c, 1)?;
         } else {
             self.backend.gemv_f16_relu2(
                 *self.layers[i]
@@ -4040,9 +4104,9 @@ impl GpuModel {
                 c,
                 fh,
             )?;
-        } else if let Some(a8) = &self.layers[i].ffn_value_a8 {
+        } else if let Some(wqv) = wq(self.layers[i].ffn_value_i6, self.layers[i].ffn_value_a8) {
             self.backend
-                .gemv_int8_add(a8, self.bufs.r2, self.bufs.x, c, fh, 1)?;
+                .w_add(&wqv, self.bufs.r2, self.bufs.x, c, fh, 1)?;
         } else {
             self.backend.gemv_f16_add(
                 *self.layers[i]
@@ -4644,19 +4708,21 @@ impl GpuModel {
         if std::env::var("GEMM_DIAG").is_ok() {
             log::info!("[FS] layer {i} gemm rkv start");
         }
-        if let (Some(ra8), Some(ka8), Some(va8)) =
-            (&layer.receptance_a8, &layer.key_a8, &layer.value_a8)
-        {
+        if let (Some(qr), Some(qk), Some(qv)) = (
+            wq(layer.receptance_i6, layer.receptance_a8),
+            wq(layer.key_i6, layer.key_a8),
+            wq(layer.value_i6, layer.value_a8),
+        ) {
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, t, m_pad, c, c,
             )?;
-            self.backend.dequant_int8_to_f16(ra8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(ka8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(va8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
             self.backend
                 .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
         } else {
@@ -4827,9 +4893,9 @@ impl GpuModel {
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, t)?;
 
         // y_out = GEMM(output_w, y_g) + x（融合残差相加）；int8 默认走方案A（dequant→scratch→TC GEMM）
-        if let Some(a8) = &layer.att_output_a8 {
+        if let Some(wqo) = wq(layer.att_output_i6, layer.att_output_a8) {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
-            self.backend.dequant_int8_to_f16(a8, sb.w_scratch, c, c)?;
+            self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
             self.backend
                 .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
         } else {
@@ -4891,10 +4957,9 @@ impl GpuModel {
         // §6.13 定稿：同 `forward_seq_layer_batch`（默认档 = fp16 累加器直写 `r2_16`）。
         // 这一条链在**单序列**路径上也开了 ⇒ 门限从 2048 放到 256 才是不留空隙的写法（#68）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
-        if let Some(fka8) = &layer.ffn_key_a8 {
+        if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
-            self.backend
-                .dequant_int8_to_f16(fka8, sb.w_scratch, fh, c)?;
+            self.backend.w_dequant_to_f16(&wqk, sb.w_scratch, fh, c)?;
             if acc16 {
                 self.backend
                     .gemm_f16_acc(sb.xb16, sb.w_scratch, sb.r2_16, m_pad, fh, c, 1)?;
@@ -4913,12 +4978,11 @@ impl GpuModel {
                     .gemm_relu2(sb.xb16, *fk16, sb.r2, m_pad, fh, c)?;
             }
         }
-        if let Some(fva8) = &layer.ffn_value_a8 {
+        if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
             if !acc16 {
                 self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;
             }
-            self.backend
-                .dequant_int8_to_f16(fva8, sb.w_scratch, c, fh)?;
+            self.backend.w_dequant_to_f16(&wqv, sb.w_scratch, c, fh)?;
             self.backend
                 .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else {
@@ -4952,6 +5016,8 @@ impl GpuLayer {
         c: usize,
         cfg: &ModelConfig,
     ) -> R<Self> {
+        // int6 平面布局（见 `model::int6_nmajor`）：决定加载时的维度推导与内核选择
+        let i6_nmajor = crate::model::int6_nmajor(st);
         // 一维参数
         let load1 = |backend: &mut dyn ComputeBackend, name: &str| -> R<TensorId> {
             let key = format!("blocks.{idx}.{name}");
@@ -4990,7 +5056,22 @@ impl GpuLayer {
             // 从任意量化形式取原始 f32 数据（fp16 / int8），返回 (data, shape=[M,K])。
             // int8 张量可能为 2D [M,K] 或 3D（group 打包，如 [M,K/128,128]），
             // 故 M=shape[0]，K 由展平字节按量化比特数反推（与 load_int8 一致）。
-            let (data, shape) = if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
+            let (data, shape) = if let Ok(lo_t) = st.tensor(&format!("{key}.int6_lo")) {
+                let hi_t = st.tensor(&format!("{key}.int6_hi"))?;
+                let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
+                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                // N-major 平面是 [K/2, M]（M 在第二维），M 从对应维度取
+                let m = if i6_nmajor {
+                    lo_t.shape()[1]
+                } else {
+                    lo_t.shape()[0]
+                };
+                let k = lo_t.data().len() * 2 / m;
+                (
+                    crate::model::dequant_int6(lo_t.data(), hi_t.data(), sz_u32, m, k, i6_nmajor),
+                    vec![m, k],
+                )
+            } else if let Ok(idx_t) = st.tensor(&format!("{key}.int8_idx")) {
                 let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
                 let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
                 let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
@@ -5180,25 +5261,75 @@ impl GpuLayer {
                 k,
             }))
         };
-        // 二路量化权重统一加载：优先 int8 → fp16（按模型文件内容自动路由）。
-        // 返回 (int8, fp16)，二者至多一个为 Some。
-        let load_linear = |backend: &mut dyn ComputeBackend,
-                           key: &str,
-                           m: usize,
-                           k: usize|
-         -> R<(Option<Int8Handle>, Option<TensorId>)> {
-            if let Some(a8) = load_int8(backend, key, m, k)? {
-                return Ok((Some(a8), None));
+        // int6（对称、lo4+hi2 双平面）：探测 {key}.int6_lo。
+        // 两个位平面按 uint32 词上传（K%64==0 ⇒ 字节长度天然是 4 的倍数），
+        // 内核侧按 plain uint32 视野读，不做任何重排（布局即文件布局）。
+        let load_int6 = |backend: &mut dyn ComputeBackend,
+                         key: &str,
+                         m: usize,
+                         k: usize|
+         -> R<Option<Int6Handle>> {
+            if st.tensor(&format!("{key}.int6_lo")).is_err() {
+                return Ok(None);
             }
-            Ok((None, Some(load_linear_f16(backend, key.to_string())?)))
+            let lo_t = st.tensor(&format!("{key}.int6_lo"))?;
+            let hi_t = st.tensor(&format!("{key}.int6_hi"))?;
+            let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
+            let lo: &[u8] = lo_t.data();
+            let hi: &[u8] = hi_t.data();
+            let sz: &[u32] = bytemuck::cast_slice(sz_t.data());
+            assert_eq!(lo.len(), m * k / 2, "{key}.int6_lo 形状不符");
+            assert_eq!(hi.len(), m * k / 4, "{key}.int6_hi 形状不符");
+            assert_eq!(sz.len(), m * k / 128, "{key}.int6_sz 形状不符");
+            let as_u32 = |b: &[u8]| -> Vec<u32> {
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let lo_w = as_u32(lo);
+            let hi_w = as_u32(hi);
+            let lo_gpu = backend.create_tensor(lo_w.len(), TensorDtype::U32)?;
+            backend.upload_u32(lo_gpu, &lo_w)?;
+            let hi_gpu = backend.create_tensor(hi_w.len(), TensorDtype::U32)?;
+            backend.upload_u32(hi_gpu, &hi_w)?;
+            let sz_gpu = backend.create_tensor(sz.len(), TensorDtype::U32)?;
+            backend.upload_u32(sz_gpu, sz)?;
+            log::info!(
+                "layer {idx}: {key} 使用 int6 对称量化权重（{m}x{k}，0.75 B/权重，{}）",
+                if i6_nmajor { "N-major" } else { "M-major" }
+            );
+            Ok(Some(Int6Handle {
+                lo: lo_gpu,
+                hi: hi_gpu,
+                sz: sz_gpu,
+                m,
+                k,
+                nmajor: i6_nmajor,
+            }))
         };
-        let (ffn_key_a8, ffn_key_w16) = load_linear(
+        // 量化权重统一加载：int6 → int8 → fp16（按模型文件内容自动路由）。
+        // 返回 (int6, int8, fp16)，至多一个为 Some。
+        let load_linear =
+            |backend: &mut dyn ComputeBackend,
+             key: &str,
+             m: usize,
+             k: usize|
+             -> R<(Option<Int6Handle>, Option<Int8Handle>, Option<TensorId>)> {
+                if let Some(i6) = load_int6(backend, key, m, k)? {
+                    return Ok((Some(i6), None, None));
+                }
+                if let Some(a8) = load_int8(backend, key, m, k)? {
+                    return Ok((None, Some(a8), None));
+                }
+                Ok((None, None, Some(load_linear_f16(backend, key.to_string())?)))
+            };
+        let (ffn_key_i6, ffn_key_a8, ffn_key_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.key.weight"),
             cfg.ffn_hidden,
             c,
         )?;
-        let (ffn_value_a8, ffn_value_w16) = load_linear(
+        let (ffn_value_i6, ffn_value_a8, ffn_value_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.value.weight"),
             c,
@@ -5212,53 +5343,49 @@ impl GpuLayer {
             c,
             cfg.ffn_hidden,
         )?;
-        let (receptance_a8, receptance_w16) = load_linear(
+        let (receptance_i6, receptance_a8, receptance_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.att.receptance.weight"),
             c,
             c,
         )?;
-        let (key_a8, key_w16) =
+        let (key_i6, key_a8, key_w16) =
             load_linear(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?;
-        let (value_a8, value_w16) =
+        let (value_i6, value_a8, value_w16) =
             load_linear(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?;
-        // att.output：int8 时走对应 GEMM（零 fp16 副本）；
+        // att.output：量化时走对应 GEMM（零 fp16 副本）；
         // fp32 诊断副本仅 GEMM_DIAG 时用反量化权重创建（正式推理不创建，省 ~26MB/层）
         let want_diag = std::env::var("GEMM_DIAG").is_ok();
-        let (att_output_a8, output_w16, output_w) = if let Some(a8) =
-            load_int8(backend, &format!("blocks.{idx}.att.output.weight"), c, c)?
-        {
-            let ow = if want_diag {
-                let key = format!("blocks.{idx}.att.output.weight");
-                let idx_t = st.tensor(&format!("{key}.int8_idx"))?;
-                let sz_t = st.tensor(&format!("{key}.int8_sz"))?;
-                let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
-                let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
-                let w32 = dequant_int8(idx_u32, sz_u32, c, c);
-                let t32 = backend.create_tensor(w32.len(), TensorDtype::F32)?;
-                backend.upload(t32, &w32)?;
-                Some(t32)
-            } else {
-                None
-            };
-            (Some(a8), None, ow)
-        } else {
-            (
-                None,
-                Some(load_linear_f16(
-                    backend,
-                    format!("blocks.{idx}.att.output.weight"),
-                )?),
-                if want_diag {
-                    Some(load_linear_diag(
-                        backend,
-                        format!("blocks.{idx}.att.output.weight"),
-                    )?)
+        let out_key = format!("blocks.{idx}.att.output.weight");
+        let (att_output_i6, att_output_a8, output_w16, output_w) =
+            if let Some(i6) = load_int6(backend, &out_key, c, c)? {
+                (Some(i6), None, None, None)
+            } else if let Some(a8) = load_int8(backend, &out_key, c, c)? {
+                let ow = if want_diag {
+                    let idx_t = st.tensor(&format!("{out_key}.int8_idx"))?;
+                    let sz_t = st.tensor(&format!("{out_key}.int8_sz"))?;
+                    let idx_u32: &[u32] = bytemuck::cast_slice(idx_t.data());
+                    let sz_u32: &[u32] = bytemuck::cast_slice(sz_t.data());
+                    let w32 = dequant_int8(idx_u32, sz_u32, c, c);
+                    let t32 = backend.create_tensor(w32.len(), TensorDtype::F32)?;
+                    backend.upload(t32, &w32)?;
+                    Some(t32)
                 } else {
                     None
-                },
-            )
-        };
+                };
+                (None, Some(a8), None, ow)
+            } else {
+                (
+                    None,
+                    None,
+                    Some(load_linear_f16(backend, out_key.clone())?),
+                    if want_diag {
+                        Some(load_linear_diag(backend, out_key)?)
+                    } else {
+                        None
+                    },
+                )
+            };
 
         let mut layer = Self {
             ln1_w: load1(backend, "ln1.weight")?,
@@ -5306,6 +5433,12 @@ impl GpuLayer {
             receptance_a8,
             key_a8,
             value_a8,
+            ffn_key_i6,
+            ffn_value_i6,
+            att_output_i6,
+            receptance_i6,
+            key_i6,
+            value_i6,
             // fp16 低秩权重（补齐到 mid_pad）
             w1_16: load_lowrank_f16(backend, "w1", wm, c, wwp, c)?, // [wm_pad, C]
             w2_16: load_lowrank_f16(backend, "w2", c, wm, c, wwp)?, // [C, wm_pad]
