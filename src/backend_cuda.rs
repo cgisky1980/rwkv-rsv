@@ -5243,12 +5243,20 @@ fn i6nm_ksplit() -> usize {
         .unwrap_or(3)
 }
 
-/// int6 张量核档的**最小 batch**（`I6NM_MMA_MINB`，默认 4；实验可降到 2）。
+/// int6 张量核档的**最小 batch**（`I6NM_MMA_MINB`，默认 5；>16 表示永不启用，即强制 SIMT）。
 ///
-/// 分档点来自**同进程轮转交替**的对拍（`mtp_probe` 的 `MTP_AB_INT6=1`）：T=4（M=4 补到 16）
-/// 时 mma 的 verify/decode = **1.49–1.58**，SIMT 档同轮是 **1.80–1.92** ⇒ T=4 起换 mma。
-/// 此前「mma 在 T=4 更慢（17.9 vs 15.9）」的结论来自**跨进程**读数，被热节流污染（同一份
-/// 代码两次进程曾差 1.6×），本轮用轮转交替 + 逐轮比值复核后翻案。
+/// 分档点由**同进程轮转交替**对拍钉死（`mtp_probe` 的 `MTP_AB_INT6=1`，须配 `PREFILL_GRAPH=0`，
+/// 8 轮取逐轮比值 min，空闲态 decode 7.7–7.9 ms）：
+///
+/// | T | SIMT | mma（w4/512） |
+/// |---|---|---|
+/// | 4 | **16.66 ms (1.99×)** | 18.50 ms (2.21×) |
+/// | 6 | 23.81 ms (2.89×) | **19.80 ms (2.39×)** |
+///
+/// ⇒ T=4 上 mma 的 16 行只填 4 行、解包摊不薄，**SIMT 更优**；T≥5 换 mma。这条曾被两次读错：
+/// 一次是跨进程读数被热节流污染（mma 看着快 9 %），一次是 `I6NM_MMA_MINB=99` 被下面的
+/// 过滤条件吃掉后**回落成默认 5→4**，于是「SIMT 臂」其实跑的 mma（表现为「verify 从 17 变成
+/// 19.5 = 变慢了」的假象）。所以现在 env 值不再过滤，>16 就是明确的不启用。
 fn i6nm_mma_min_b() -> usize {
     let o = I6NM_MMA_MIN_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if o != 0 {
@@ -5257,8 +5265,8 @@ fn i6nm_mma_min_b() -> usize {
     std::env::var("I6NM_MMA_MINB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|b| (2..=16).contains(b))
-        .unwrap_or(4)
+        .filter(|b| *b >= 2)
+        .unwrap_or(5)
 }
 
 /// 运行期覆盖 [`i6nm_mma_min_b`]（`None` = 撤销覆盖）。
@@ -5273,11 +5281,11 @@ pub fn set_i6nm_mma_min_b(v: Option<usize>) {
 static I6NM_MMA_MIN_B_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// int6 张量核档每个 block 的 warp 数（`I6NM_MMA_WARPS`，默认 2）。
+/// int6 张量核档每个 block 的 warp 数（`I6NM_MMA_WARPS`，默认 4）。
 ///
-/// 一个 warp 覆盖 32 个输出列 ⇒ block 覆盖 `MMA_WARPS × 32` 列。默认 2 的 block 只有
-/// 64 线程，**占用率极低**（m=2560 时只有 `80/2 × ksplit` 个块）；这是张量核档在 T=4/5
-/// 上跑不过 SIMT 的嫌疑之一，故留成可扫的旋钮。
+/// 一个 warp 覆盖 32 个输出列 ⇒ block 覆盖 `MMA_WARPS × 32` 列。默认 2 时 block 只有 64 线程；
+/// 空闲态 T=5/6 的轮转 A/B：`w4/512` 19.23/19.80、`w2/512` 19.61/20.64、`w2/256` 19.52/20.17
+/// ⇒ 取 4（比 2 稳定快 2 %）。
 fn i6nm_mma_warps() -> usize {
     let o = I6NM_MMA_WARPS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if o != 0 {
@@ -5287,7 +5295,7 @@ fn i6nm_mma_warps() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|w| (1..=8).contains(w))
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 /// 运行期覆盖 [`i6nm_mma_warps`]（`None` = 撤销覆盖）。
