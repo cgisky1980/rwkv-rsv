@@ -3200,32 +3200,147 @@ extern "C" __global__ void __launch_bounds__(256, 2) gemv_lowrank_chain4_f32_f16
     float lw[BGRP], la[BGRP], lv[BGRP], lg[BGRP];
     #pragma unroll
     for (int bi = 0; bi < BGRP; bi++) { lw[bi] = 0.f; la[bi] = 0.f; lv[bi] = 0.f; lg[bi] = 0.f; }
-    for (int k = lane; k < kw; k += 32) {
-        const float w = __half2float(W2[row * pw + k]);
-        #pragma unroll
-        for (int bi = 0; bi < BGRP; bi++) {
-            if (bi < bcnt) lw[bi] += xw[(b0 + bi) * sw + k] * w;
+    // ★ 向量化：一条 lane 每次搬 **8 个 half（16 B）** 的权重 + 2 个 float4 的激活。
+    // 旧写法是 2 B/lane（warp 64 B/迭代 = 半个 sector）⇒ 实测只有 ~40 GB/s，
+    // 而这段的流量下限是 47 MB/pass ≈ 0.17 ms（消融给出 1.16 ms，全花在延迟上）。
+    // 累加顺序随之变成「lane 内 8 个连续 k 相加、再 warp 归约」——解码核同步改成同一顺序，
+    // 保证两档数值一致（不一致会吃投机接受率，见 `SEQ_STAGE1` 那条旧账）。
+    const bool vec = (((kw | ka | kv | kg) & 7) == 0);
+    if (vec) {
+        {
+            const uint4* wq = reinterpret_cast<const uint4*>(W2 + (size_t)row * pw);
+            const int nq = kw >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = wq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                #pragma unroll
+                for (int bi = 0; bi < BGRP; bi++) {
+                    if (bi >= bcnt) break;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xw + (size_t)(b0 + bi) * sw);
+                    const float4 x0 = xq[2 * i];
+                    const float4 x1 = xq[2 * i + 1];
+                    lw[bi] += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                            + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+                }
+            }
         }
-    }
-    for (int k = lane; k < ka; k += 32) {
-        const float w = __half2float(A2[row * pa + k]);
-        #pragma unroll
-        for (int bi = 0; bi < BGRP; bi++) {
-            if (bi < bcnt) la[bi] += xa[(b0 + bi) * sa + k] * w;
+        {
+            const uint4* aq = reinterpret_cast<const uint4*>(A2 + (size_t)row * pa);
+            const int nq = ka >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = aq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                #pragma unroll
+                for (int bi = 0; bi < BGRP; bi++) {
+                    if (bi >= bcnt) break;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xa + (size_t)(b0 + bi) * sa);
+                    const float4 x0 = xq[2 * i];
+                    const float4 x1 = xq[2 * i + 1];
+                    la[bi] += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                            + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+                }
+            }
         }
-    }
-    for (int k = lane; k < kv; k += 32) {
-        const float w = __half2float(V2[row * pv + k]);
-        #pragma unroll
-        for (int bi = 0; bi < BGRP; bi++) {
-            if (bi < bcnt) lv[bi] += xv[(b0 + bi) * sv + k] * w;
+        {
+            const uint4* vq = reinterpret_cast<const uint4*>(V2 + (size_t)row * pv);
+            const int nq = kv >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = vq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                #pragma unroll
+                for (int bi = 0; bi < BGRP; bi++) {
+                    if (bi >= bcnt) break;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xv + (size_t)(b0 + bi) * sv);
+                    const float4 x0 = xq[2 * i];
+                    const float4 x1 = xq[2 * i + 1];
+                    lv[bi] += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                            + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+                }
+            }
         }
-    }
-    for (int k = lane; k < kg; k += 32) {
-        const float w = __half2float(G2[row * pg + k]);
-        #pragma unroll
-        for (int bi = 0; bi < BGRP; bi++) {
-            if (bi < bcnt) lg[bi] += sigmoidf_(xg[(b0 + bi) * sg + k]) * w;
+        {
+            const uint4* gq = reinterpret_cast<const uint4*>(G2 + (size_t)row * pg);
+            const int nq = kg >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = gq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                #pragma unroll
+                for (int bi = 0; bi < BGRP; bi++) {
+                    if (bi >= bcnt) break;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xg + (size_t)(b0 + bi) * sg);
+                    const float4 x0 = xq[2 * i];
+                    const float4 x1 = xq[2 * i + 1];
+                    lg[bi] += sigmoidf_(x0.x) * wv[0] + sigmoidf_(x0.y) * wv[1]
+                            + sigmoidf_(x0.z) * wv[2] + sigmoidf_(x0.w) * wv[3]
+                            + sigmoidf_(x1.x) * wv[4] + sigmoidf_(x1.y) * wv[5]
+                            + sigmoidf_(x1.z) * wv[6] + sigmoidf_(x1.w) * wv[7];
+                }
+            }
+        }
+    } else {
+        for (int k = lane; k < kw; k += 32) {
+            const float w = __half2float(W2[row * pw + k]);
+            #pragma unroll
+            for (int bi = 0; bi < BGRP; bi++) {
+                if (bi < bcnt) lw[bi] += xw[(b0 + bi) * sw + k] * w;
+            }
+        }
+        for (int k = lane; k < ka; k += 32) {
+            const float w = __half2float(A2[row * pa + k]);
+            #pragma unroll
+            for (int bi = 0; bi < BGRP; bi++) {
+                if (bi < bcnt) la[bi] += xa[(b0 + bi) * sa + k] * w;
+            }
+        }
+        for (int k = lane; k < kv; k += 32) {
+            const float w = __half2float(V2[row * pv + k]);
+            #pragma unroll
+            for (int bi = 0; bi < BGRP; bi++) {
+                if (bi < bcnt) lv[bi] += xv[(b0 + bi) * sv + k] * w;
+            }
+        }
+        for (int k = lane; k < kg; k += 32) {
+            const float w = __half2float(G2[row * pg + k]);
+            #pragma unroll
+            for (int bi = 0; bi < BGRP; bi++) {
+                if (bi < bcnt) lg[bi] += sigmoidf_(xg[(b0 + bi) * sg + k]) * w;
+            }
         }
     }
     #pragma unroll
@@ -6456,6 +6571,10 @@ const LOWRANK_MID1_SRC: &str = r#"
 #ifndef MID1_WARPS
 #define MID1_WARPS 4
 #endif
+// 每个 warp 同时在飞的 batch 槽数（权重行只读一遍、累加器按槽分开）。
+#ifndef MID1_MAXB
+#define MID1_MAXB 8
+#endif
 
 extern "C" __global__ void lowrank_mid1(
     const __half* __restrict__ V1,   // [vmp, C] fp16
@@ -6496,40 +6615,61 @@ extern "C" __global__ void lowrank_mid1(
         wp = G1; xp = xg; op = out_g; row = gid - vm - wm - am; stride = sg;
     }
     const __half* wrow = wp + (size_t)row * c;
-    for (int b = 0; b < t; ++b) {
-        const __half* xb = xp + (size_t)b * xs;
-        float d = 0.f;
-        if ((c & 7) == 0) {
-            // 向量化：一条 lane 每次 8 个 half（`uint4` = 16 B）⇒ 每 warp 一条 512 B 事务。
-            // 标量版是 2 B/lane（64 B/warp = 半个 sector），实测把这一段的收益吃掉三分之二
-            // （融合后整段 90 µs，按 3 MB 流量算只有 ~35 GB/s）。
+    // ★ 权重行**只读一遍**：旧写法是「外层 b、内层 i」，T=4 时同一权重行被读 4 次
+    // （权重流量 ×T ⇒ 实测 0.84 ms 里约 3/4 是重复读）。改成「外层 i 载权重、内层 b 累加」，
+    // 每条 lane 每次迭代仍是 16 B 向量载入，累加器按 batch 槽分开（≤ MID1_MAXB）。
+    const bool vec = (c & 7) == 0;
+    for (int b0 = 0; b0 < t; b0 += MID1_MAXB) {
+        const int mb = (t - b0) < MID1_MAXB ? (t - b0) : MID1_MAXB;
+        float d[MID1_MAXB];
+        #pragma unroll
+        for (int bi = 0; bi < MID1_MAXB; ++bi) d[bi] = 0.f;
+        if (vec) {
             const int nq = c >> 3;
             const uint4* wq = reinterpret_cast<const uint4*>(wrow);
-            const uint4* xq = reinterpret_cast<const uint4*>(xb);
             #pragma unroll 4
             for (int i = lane; i < nq; i += 32) {
                 const uint4 a = wq[i];
-                const uint4 b4 = xq[i];
                 const __half2* ah = reinterpret_cast<const __half2*>(&a);
-                const __half2* bh = reinterpret_cast<const __half2*>(&b4);
+                float2 fa[4];
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    // ★ 先转 f32 再乘（不是 `__hmul2`）：保持「fp16 权重 × fp16 激活、f32 累加」
-                    // 这个既有数值档，否则乘积多一次 fp16 舍入会改掉 mid 的末位。
-                    const float2 fa = __half22float2(ah[j]);
-                    const float2 fb = __half22float2(bh[j]);
-                    d += fa.x * fb.x + fa.y * fb.y;
+                for (int j = 0; j < 4; ++j) fa[j] = __half22float2(ah[j]);
+                #pragma unroll
+                for (int bi = 0; bi < MID1_MAXB; ++bi) {
+                    if (bi >= mb) break;
+                    const uint4* xq = reinterpret_cast<const uint4*>(
+                        xp + (size_t)(b0 + bi) * xs);
+                    const uint4 b4 = xq[i];
+                    const __half2* bh = reinterpret_cast<const __half2*>(&b4);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        // ★ 先转 f32 再乘（不是 `__hmul2`）：保持「fp16 权重 × fp16 激活、
+                        // f32 累加」这个既有数值档，否则乘积多一次 fp16 舍入会改掉 mid 的末位。
+                        const float2 fb = __half22float2(bh[j]);
+                        d[bi] += fa[j].x * fb.x + fa[j].y * fb.y;
+                    }
                 }
             }
         } else {
-            for (int kk = lane; kk < c; kk += 32)
-                d += __half2float(wrow[kk]) * __half2float(xb[kk]);
+            for (int kk = lane; kk < c; kk += 32) {
+                const float w = __half2float(wrow[kk]);
+                #pragma unroll
+                for (int bi = 0; bi < MID1_MAXB; ++bi) {
+                    if (bi >= mb) break;
+                    d[bi] += w * __half2float(xp[(size_t)(b0 + bi) * xs + kk]);
+                }
+            }
         }
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            d += __shfl_down_sync(0xffffffffu, d, off);
-        if (lane == 0)
-            op[(size_t)b * stride + row] = do_tanh ? tanhf(d) : d;
+        for (int bi = 0; bi < MID1_MAXB; ++bi) {
+            if (bi >= mb) break;
+            float v = d[bi];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, off);
+            if (lane == 0)
+                op[(size_t)(b0 + bi) * stride + row] = do_tanh ? tanhf(v) : v;
+        }
     }
 }
 "#;
@@ -6830,14 +6970,106 @@ extern "C" __global__ void gemv_lowrank_chain4_f16w(
     const __half* grow = G2 + row * pg;
 
     float lw = 0.f, la = 0.f, lv = 0.f, lg = 0.f;
-    #pragma unroll 4
-    for (int k = lane; k < kw; k += 32) lw += xw[k] * __half2float(wrow[k]);
-    #pragma unroll 4
-    for (int k = lane; k < ka; k += 32) la += xa[k] * __half2float(arow[k]);
-    #pragma unroll 4
-    for (int k = lane; k < kv; k += 32) lv += xv[k] * __half2float(vrow[k]);
-    #pragma unroll 4
-    for (int k = lane; k < kg; k += 32) lg += sigmoidf(xg[k]) * __half2float(grow[k]);
+    // 与 seq 版（`gemv_lowrank_chain4_f32_f16w` 的 slot 0）用**同一**累加顺序：
+    // 一条 lane 8 个连续 k、再 warp 归约。顺序一致是解码/验证同档的前提。
+    const bool vec = (((kw | ka | kv | kg) & 7) == 0);
+    if (vec) {
+        {
+            const uint4* wq = reinterpret_cast<const uint4*>(wrow);
+            const float4* xq = reinterpret_cast<const float4*>(xw);
+            const int nq = kw >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = wq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                const float4 x0 = xq[2 * i];
+                const float4 x1 = xq[2 * i + 1];
+                lw += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                    + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+            }
+        }
+        {
+            const uint4* aq = reinterpret_cast<const uint4*>(arow);
+            const float4* xq = reinterpret_cast<const float4*>(xa);
+            const int nq = ka >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = aq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                const float4 x0 = xq[2 * i];
+                const float4 x1 = xq[2 * i + 1];
+                la += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                    + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+            }
+        }
+        {
+            const uint4* vq = reinterpret_cast<const uint4*>(vrow);
+            const float4* xq = reinterpret_cast<const float4*>(xv);
+            const int nq = kv >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = vq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                const float4 x0 = xq[2 * i];
+                const float4 x1 = xq[2 * i + 1];
+                lv += x0.x * wv[0] + x0.y * wv[1] + x0.z * wv[2] + x0.w * wv[3]
+                    + x1.x * wv[4] + x1.y * wv[5] + x1.z * wv[6] + x1.w * wv[7];
+            }
+        }
+        {
+            const uint4* gq = reinterpret_cast<const uint4*>(grow);
+            const float4* xq = reinterpret_cast<const float4*>(xg);
+            const int nq = kg >> 3;
+            #pragma unroll 2
+            for (int i = lane; i < nq; i += 32) {
+                const uint4 a = gq[i];
+                const __half2* ah = reinterpret_cast<const __half2*>(&a);
+                float wv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __half22float2(ah[j]);
+                    wv[2 * j] = f.x;
+                    wv[2 * j + 1] = f.y;
+                }
+                const float4 x0 = xq[2 * i];
+                const float4 x1 = xq[2 * i + 1];
+                lg += sigmoidf(x0.x) * wv[0] + sigmoidf(x0.y) * wv[1]
+                    + sigmoidf(x0.z) * wv[2] + sigmoidf(x0.w) * wv[3]
+                    + sigmoidf(x1.x) * wv[4] + sigmoidf(x1.y) * wv[5]
+                    + sigmoidf(x1.z) * wv[6] + sigmoidf(x1.w) * wv[7];
+            }
+        }
+    } else {
+        #pragma unroll 4
+        for (int k = lane; k < kw; k += 32) lw += xw[k] * __half2float(wrow[k]);
+        #pragma unroll 4
+        for (int k = lane; k < ka; k += 32) la += xa[k] * __half2float(arow[k]);
+        #pragma unroll 4
+        for (int k = lane; k < kv; k += 32) lv += xv[k] * __half2float(vrow[k]);
+        #pragma unroll 4
+        for (int k = lane; k < kg; k += 32) lg += sigmoidf(xg[k]) * __half2float(grow[k]);
+    }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         lw += __shfl_down_sync(0xffffffffu, lw, off);
