@@ -5226,6 +5226,29 @@ fn i6nm_vec() -> usize {
         .unwrap_or(1)
 }
 
+/// 小批量 split-K 段数（`I6NM_KSPLIT`，1 = 关闭）。仅用于 2..=8 槽的 vec1 路径。
+/// 每个块处理全部 slot 的一段 K，权重只反量化一次；部分和由既有固定顺序归约核合并。
+///
+/// **默认 3**（`I6NM_KSPLIT=1` 可回退）。依据（int6n 2.9B、C=2560、W=16、同进程交替）：
+/// · T=4 验证 pass 22.9 → **17.0 ms**（1.35×，两轮配对方向一致）；
+/// · 批量解码（96/256 槽）同向、不翻号（无图 0.90 → 0.99×，带图 1.16×）。
+/// 为什么 `>` 1 才开：`C/64 = 40` 个 k-chunk 被 16 个 warp 轮转 ⇒ 每 warp 只 2~3 个 chunk，
+/// 块内串行深度不足、块数（`C/32 = 80`）又填不满 68 个 SM，split 是唯一加块手段。
+/// batch=1 不进这条路：decode 单流本来就饱和，部分和往返只会多付一次归约。
+fn i6nm_ksplit() -> usize {
+    std::env::var("I6NM_KSPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|s| (1..=8).contains(s))
+        .unwrap_or(3)
+}
+
+/// 融合 r/k/v+mid 核是否也走 split-K（`I6NM_RKV_SPLIT=1` 开；**默认关**，实测无收益，
+/// 理由见 `GEMV_INT6NM_RKV_SPLIT_SRC` 的注释）。
+fn i6nm_rkv_split_enabled() -> bool {
+    std::env::var("I6NM_RKV_SPLIT").is_ok_and(|v| v == "1")
+}
+
 /// N-major int6 GEMV（decode）共用的设备函数 + 两个 kernel。
 ///
 /// 布局（量化器 `--int6-layout n`）：`lo [K/2][N]`、`hi [K/4][N]`、`sz [K/128][N]` 字节/词，
@@ -5747,7 +5770,9 @@ extern "C" __global__ void mtp_attn(
 
 /// 通用（单矩阵）N-major int6 GEMV：`op` 复用 `gemv_variant` 的语义
 /// （0=relu²、1=mul_add（y+=，x 先乘 fp16 门控）、2=add（y+=）、3=覆盖写）。
-/// dispatch `(ceil(M/32), batch, 1)`、block = `I6NM_WARPS*32`。
+/// dispatch `(batch, ceil(M/32), 1)`、block = `I6NM_WARPS*32`。
+/// batch 放在最快的 block 维：同一列块的各 slot 相邻常驻，直接由 L2 复用同一份权重，
+/// 不减少 block 数，也不增加每线程的累加器/寄存器。batch=1 的线性 block 顺序不变。
 const GEMV_INT6NM_SRC: &str = r#"
 extern "C" __global__ void gemv_int6nm(
     const unsigned int* __restrict__ lo,
@@ -5764,8 +5789,8 @@ extern "C" __global__ void gemv_int6nm(
     const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
     const int lane = threadIdx.x & 31;
     const int w    = threadIdx.x >> 5;
-    const int b    = blockIdx.y;
-    const int ncol = blockIdx.x * 32 + lane;
+    const int b    = blockIdx.x;
+    const int ncol = blockIdx.y * 32 + lane;
     const int nchunk = k >> 6;
     float acc = 0.f;
     if (ncol < m) {
@@ -5782,13 +5807,114 @@ extern "C" __global__ void gemv_int6nm(
         float s = 0.f;
         #pragma unroll
         for (int i = 0; i < I6NM_WARPS; ++i) s += red[i][threadIdx.x];
-        const int nc = blockIdx.x * 32 + threadIdx.x;
+        const int nc = blockIdx.y * 32 + threadIdx.x;
         if (nc < m) {
             const size_t o = (size_t)b * m + nc;
             if (op == 0) y[o] = relu2f(s);
             else if (op == 3) y[o] = s;
             else y[o] += s;
         }
+    }
+}
+"#;
+
+/// 小批量 int6 split-K 实验臂：`grid=(ceil(M/32), ksplit, 1)`，每块计算全部 slot
+/// 的一段 K。与已删除的 BGRP 不同，块数不因 slot 合并而下降；每份权重只载入、
+/// 反量化一次，slot 间只重读激活。部分和布局 `[ksplit][batch][M]`，op 留给二次归约。
+const GEMV_INT6NM_SPLIT_SRC: &str = r#"
+template <bool GATED>
+__device__ __forceinline__ void i6nm_dot_split(
+    const unsigned char* __restrict__ lo,
+    const unsigned char* __restrict__ hi,
+    const unsigned int*  __restrict__ sz,
+    const float* __restrict__ x,
+    const __half* __restrict__ g,
+    const int n, const int k, const int ncol,
+    const int c0, const int c1, const int w,
+    float (&acc)[I6NM_BATCH][4])
+{
+    const size_t col = (size_t)ncol;
+    for (int c = c0 + w; c < c1; c += I6NM_WARPS) {
+        const float sc = i6nm_sc(sz[(size_t)(c >> 1) * n + col]);
+        const size_t lo0 = (size_t)(c << 5) * n + col;
+        const size_t hi0 = (size_t)(c << 4) * n + col;
+        const int kb = c << 6;
+        #pragma unroll
+        for (int jj = 0; jj < 16; ++jj) {
+            const unsigned int lb0 = lo[lo0 + (size_t)jj * n];
+            const unsigned int lb1 = lo[lo0 + (size_t)(16 + jj) * n];
+            const unsigned int hb  = hi[hi0 + (size_t)jj * n];
+            const int e0 = (int)(lb0 & 15u) | (((int)hb & 3) << 4);
+            const int e1 = (int)(lb1 & 15u) | ((((int)hb >> 2) & 3) << 4);
+            const int e2 = (int)(lb0 >> 4)   | ((((int)hb >> 4) & 3) << 4);
+            const int e3 = (int)(lb1 >> 4)   | ((((int)hb >> 6) & 3) << 4);
+            const float w0 = sc * (float)(e0 - 32);
+            const float w1 = sc * (float)(e1 - 32);
+            const float w2 = sc * (float)(e2 - 32);
+            const float w3 = sc * (float)(e3 - 32);
+            #pragma unroll
+            for (int b = 0; b < I6NM_BATCH; ++b) {
+                const size_t xb = (size_t)b * k + kb;
+                float x0 = x[xb + jj];
+                float x1 = x[xb + 16 + jj];
+                float x2 = x[xb + 32 + jj];
+                float x3 = x[xb + 48 + jj];
+                if (GATED) {
+                    x0 *= __half2float(g[xb + jj]);
+                    x1 *= __half2float(g[xb + 16 + jj]);
+                    x2 *= __half2float(g[xb + 32 + jj]);
+                    x3 *= __half2float(g[xb + 48 + jj]);
+                }
+                acc[b][0] += w0 * x0;
+                acc[b][1] += w1 * x1;
+                acc[b][2] += w2 * x2;
+                acc[b][3] += w3 * x3;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void gemv_int6nm_split(
+    const unsigned int* __restrict__ lo,
+    const unsigned int* __restrict__ hi,
+    const unsigned int* __restrict__ sz,
+    const float* __restrict__ x,
+    const __half* __restrict__ g,
+    float* __restrict__ partial,
+    const int m,
+    const int k,
+    const int op)
+{
+    const unsigned char* lo8 = reinterpret_cast<const unsigned char*>(lo);
+    const unsigned char* hi8 = reinterpret_cast<const unsigned char*>(hi);
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;
+    const int ncol = blockIdx.x * 32 + lane;
+    const int nchunk = k >> 6;
+    const int split = blockIdx.y;
+    const int c0 = nchunk * split / I6NM_KSPLIT;
+    const int c1 = nchunk * (split + 1) / I6NM_KSPLIT;
+    float acc[I6NM_BATCH][4] = {};
+    if (ncol < m) {
+        if (op == 1)
+            i6nm_dot_split<true>(lo8, hi8, sz, x, g, m, k, ncol, c0, c1, w, acc);
+        else
+            i6nm_dot_split<false>(lo8, hi8, sz, x, (const __half*)0, m, k, ncol, c0, c1, w, acc);
+    }
+    __shared__ float red[I6NM_BATCH][I6NM_WARPS][32];
+    #pragma unroll
+    for (int b = 0; b < I6NM_BATCH; ++b)
+        red[b][w][lane] = (acc[b][0] + acc[b][1]) + (acc[b][2] + acc[b][3]);
+    __syncthreads();
+    if (threadIdx.x < I6NM_BATCH * 32) {
+        const int b = threadIdx.x >> 5;
+        const int lane32 = threadIdx.x & 31;
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < I6NM_WARPS; ++i) s += red[b][i][lane32];
+        const int nc = blockIdx.x * 32 + lane32;
+        if (nc < m)
+            partial[((size_t)split * I6NM_BATCH + b) * m + nc] = s;
     }
 }
 "#;
@@ -5909,6 +6035,174 @@ extern "C" __global__ void gemv_int6nm_rkv(
         else if (chain == 2) out_am[row] = d;
         else out_gm[row] = d;
     }
+}
+"#;
+
+/// 小批量 RKV split-K（`I6NM_KSPLIT` 段）：前 `I6NM_KSPLIT` 行块计算三路量化投影的一段 K，
+/// 最后一行块计算四条 mid 投影。每块覆盖全部 slot，同一份权重只反量化/载入一次。
+/// 部分和布局 `[chain][split][batch][C]`，由单个归约核写 r/k（f32）与 v（f16）。
+///
+/// ★ **默认关（`I6NM_RKV_SPLIT=1` 才开）**：实测无收益，只留作对照。
+/// 依据（int6n 2.9B、C=2560、`PREFILL_GRAPH=1`、两轮交替）：T=4 验证 pass
+/// 开 18.51 / 16.96 ms vs 关 18.07 / 17.10 ms —— 差 0.15 ms（0.9 %），在两轮方向相反。
+/// 原因：融合核本来就把**一份权重喂全部 slot**（权重流量 = 1×），split-K 只增加并发块数、
+/// 不减一个字节；而 80 个列块 × 16 warp 早已填满 68 个 SM ⇒ 没有可拿的带宽/占用率缺口。
+/// 与通用 GEMV 的 split-K（真收益：T=4 22.9 → 17.0 ms）不是同一回事，后者是**单投影**、
+/// 块内 k-chunk 数少（C=2560 只有 40 个），块数才是瓶颈。
+const GEMV_INT6NM_RKV_SPLIT_SRC: &str = r#"
+__device__ __forceinline__ void i6nm_rkv_split_chain(
+    const unsigned char* __restrict__ lo,
+    const unsigned char* __restrict__ hi,
+    const unsigned int*  __restrict__ sz,
+    const float* __restrict__ x,
+    float* __restrict__ partial,
+    const int c, const int ncol, const int c0, const int c1,
+    const int split, const int chain,
+    float (&red)[I6NM_BATCH][I6NM_WARPS][32])
+{
+    const int lane = threadIdx.x & 31;
+    const int w = threadIdx.x >> 5;
+    float acc[I6NM_BATCH][4] = {};
+    if (ncol < c)
+        i6nm_dot_split<false>(lo, hi, sz, x, (const __half*)0,
+                              c, c, ncol, c0, c1, w, acc);
+    #pragma unroll
+    for (int b = 0; b < I6NM_BATCH; ++b)
+        red[b][w][lane] = (acc[b][0] + acc[b][1]) + (acc[b][2] + acc[b][3]);
+    __syncthreads();
+    if (threadIdx.x < I6NM_BATCH * 32) {
+        const int b = threadIdx.x >> 5;
+        const int lane32 = threadIdx.x & 31;
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < I6NM_WARPS; ++i) s += red[b][i][lane32];
+        const int nc = blockIdx.x * 32 + lane32;
+        if (nc < c)
+            partial[(((size_t)chain * I6NM_KSPLIT + split) * I6NM_BATCH + b) * c + nc] = s;
+    }
+    // 下一条链复用同一块 shared reduction，必须等所有消费者读完。
+    __syncthreads();
+}
+
+extern "C" __global__ void gemv_int6nm_rkv_split(
+    const unsigned int* __restrict__ R_lo,
+    const unsigned int* __restrict__ R_hi,
+    const unsigned int* __restrict__ R_sz,
+    const unsigned int* __restrict__ K_lo,
+    const unsigned int* __restrict__ K_hi,
+    const unsigned int* __restrict__ K_sz,
+    const unsigned int* __restrict__ V_lo,
+    const unsigned int* __restrict__ V_hi,
+    const unsigned int* __restrict__ V_sz,
+    const float* __restrict__ V1,
+    const float* __restrict__ W1,
+    const float* __restrict__ A1,
+    const float* __restrict__ G1,
+    const float* __restrict__ xr,
+    const float* __restrict__ xk,
+    const float* __restrict__ xv,
+    const float* __restrict__ xw,
+    const float* __restrict__ xa,
+    const float* __restrict__ xg,
+    float* __restrict__ partial,
+    float* __restrict__ out_vm,
+    float* __restrict__ out_wm,
+    float* __restrict__ out_am,
+    float* __restrict__ out_gm,
+    const int c,
+    const int vm,
+    const int wm,
+    const int am,
+    const int gm)
+{
+    const int lane = threadIdx.x & 31;
+    const int w = threadIdx.x >> 5;
+    const int flat = blockIdx.x;
+    const int split = blockIdx.y;
+    if (split < I6NM_KSPLIT) {
+        const int nb = (c + 31) >> 5;
+        if (flat >= nb) return;
+        const int nchunk = c >> 6;
+        const int c0 = nchunk * split / I6NM_KSPLIT;
+        const int c1 = nchunk * (split + 1) / I6NM_KSPLIT;
+        const int ncol = flat * 32 + lane;
+        __shared__ float red[I6NM_BATCH][I6NM_WARPS][32];
+        i6nm_rkv_split_chain(
+            reinterpret_cast<const unsigned char*>(R_lo),
+            reinterpret_cast<const unsigned char*>(R_hi), R_sz, xr,
+            partial, c, ncol, c0, c1, split, 0, red);
+        i6nm_rkv_split_chain(
+            reinterpret_cast<const unsigned char*>(K_lo),
+            reinterpret_cast<const unsigned char*>(K_hi), K_sz, xk,
+            partial, c, ncol, c0, c1, split, 1, red);
+        i6nm_rkv_split_chain(
+            reinterpret_cast<const unsigned char*>(V_lo),
+            reinterpret_cast<const unsigned char*>(V_hi), V_sz, xv,
+            partial, c, ncol, c0, c1, split, 2, red);
+        return;
+    }
+
+    // mid 只由 blockIdx.y == I6NM_KSPLIT 的额外行块计算。
+    const int midtot = vm + wm + am + gm;
+    const int mrow = flat * I6NM_WARPS + w;
+    if (mrow >= midtot) return;
+    const float* wp;
+    const float* xp;
+    int chain = 3;
+    int row = 0;
+    if (mrow < vm) {
+        chain = 0; row = mrow; wp = V1; xp = xv;
+    } else if (mrow < vm + wm) {
+        chain = 1; row = mrow - vm; wp = W1; xp = xw;
+    } else if (mrow < vm + wm + am) {
+        chain = 2; row = mrow - vm - wm; wp = A1; xp = xa;
+    } else {
+        row = mrow - vm - wm - am; wp = G1; xp = xg;
+    }
+    const float* wrow = wp + (size_t)row * c;
+    float d[I6NM_BATCH] = {};
+    for (int kk = lane; kk < c; kk += 32) {
+        const float weight = wrow[kk];
+        #pragma unroll
+        for (int b = 0; b < I6NM_BATCH; ++b)
+            d[b] += weight * xp[(size_t)b * c + kk];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int b = 0; b < I6NM_BATCH; ++b)
+            d[b] += __shfl_down_sync(0xffffffffu, d[b], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int b = 0; b < I6NM_BATCH; ++b) {
+            if (chain == 0) out_vm[(size_t)b * vm + row] = d[b];
+            else if (chain == 1) out_wm[(size_t)b * wm + row] = tanhf(d[b]);
+            else if (chain == 2) out_am[(size_t)b * am + row] = d[b];
+            else out_gm[(size_t)b * gm + row] = d[b];
+        }
+    }
+}
+
+extern "C" __global__ void gemv_int6nm_rkv_reduce(
+    const float* __restrict__ partial,
+    float* __restrict__ out_r,
+    float* __restrict__ out_k,
+    __half* __restrict__ out_v,
+    const int c)
+{
+    const int total = I6NM_BATCH * c;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 3 * total) return;
+    const int chain = i / total;
+    const int j = i - chain * total;
+    const float* p = partial + (size_t)chain * I6NM_KSPLIT * total + j;
+    float acc = p[0];
+    #pragma unroll
+    for (int s = 1; s < I6NM_KSPLIT; ++s) acc += p[(size_t)s * total];
+    if (chain == 0) out_r[j] = acc;
+    else if (chain == 1) out_k[j] = acc;
+    else out_v[j] = __float2half(acc);
 }
 "#;
 
@@ -9128,7 +9422,7 @@ extern "C" __global__ void rwkv_gemv_seq(
 /// 供 `gemv_int6_*` 四个变体在 `Int6Handle::nmajor` 时调用。
 impl CudaBackend {
     /// `op` 语义同 `gemv_variant`（0=relu²、1=mul_add、2=add、3=覆盖写）；
-    /// `g == 0` 表示无门控；`b` 为 batch（grid.y）。
+    /// `g == 0` 表示无门控；`b` 为 batch（vec1 时为 grid.x）。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int6nm_launch(
         &mut self,
@@ -9150,6 +9444,14 @@ impl CudaBackend {
         // ⚠️ vec4 用 uint4 载入：要求平面行宽 M 是 4 的倍数（否则行首不对齐 16 B ⇒ 716）。
         // 真模型 M ∈ {2560, 10240, 65536, vocab} 都满足；测试里的小 M 会走 vec1。
         let vec = if m.is_multiple_of(4) { i6nm_vec() } else { 1 };
+        let ksplit = if vec == 1 && (2..=8).contains(&b) {
+            i6nm_ksplit().min(k / 64)
+        } else {
+            1
+        };
+        if ksplit > 1 {
+            return self.gemv_int6nm_split_launch(lo, hi, sz, x, g, y, m, k, b, op, ksplit);
+        }
         let (key, src, cols, name) = if vec == 4 {
             (
                 format!("gemv_int6nm4_w{warps}"),
@@ -9166,7 +9468,12 @@ impl CudaBackend {
             )
         };
         let func = self.kernel(&key, &src, name)?;
-        let grid = ((m as u32).div_ceil(cols as u32), b as u32, 1u32);
+        let mblocks = (m as u32).div_ceil(cols as u32);
+        let grid = if vec == 1 {
+            (b as u32, mblocks, 1u32)
+        } else {
+            (mblocks, b as u32, 1u32)
+        };
         let block = (warps as u32 * 32, 1u32, 1u32);
         let (m_i, k_i) = (m as i32, k as i32);
         let params = [
@@ -9181,6 +9488,51 @@ impl CudaBackend {
             &op as *const i32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    /// split-K 实验臂的发射器。`partial` 复用 IMMA 的暂存池与确定性归约核；
+    /// 同一 stream 上「写部分和 → 归约 → 下一个投影」串行，故不同投影可复用同一缓冲。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6nm_split_launch(
+        &mut self,
+        lo: u64,
+        hi: u64,
+        sz: u64,
+        x: u64,
+        g: u64,
+        y: u64,
+        m: usize,
+        k: usize,
+        b: usize,
+        op: i32,
+        ksplit: usize,
+    ) -> R<()> {
+        debug_assert!((2..=8).contains(&b) && ksplit > 1 && ksplit <= k / 64);
+        let warps = i6nm_warps();
+        let part = self.ipart_scratch(ksplit * b * m)?;
+        let partial = self.f32_ptr(part, "gemv_int6nm_split")?;
+        let src = format!(
+            "#define I6NM_WARPS {warps}\n#define I6NM_BATCH {b}\n\
+             #define I6NM_KSPLIT {ksplit}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_SPLIT_SRC}"
+        );
+        let key = format!("gemv_int6nm_sk_w{warps}_b{b}_s{ksplit}");
+        let func = self.kernel(&key, &src, "gemv_int6nm_split")?;
+        let grid = ((m as u32).div_ceil(32), ksplit as u32, 1u32);
+        let block = (warps as u32 * 32, 1u32, 1u32);
+        let (m_i, k_i) = (m as i32, k as i32);
+        let params = [
+            &lo as *const u64 as *mut c_void,
+            &hi as *const u64 as *mut c_void,
+            &sz as *const u64 as *mut c_void,
+            &x as *const u64 as *mut c_void,
+            &g as *const u64 as *mut c_void,
+            &partial as *const u64 as *mut c_void,
+            &m_i as *const i32 as *mut c_void,
+            &k_i as *const i32 as *mut c_void,
+            &op as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)?;
+        self.imma_gemm_reduce(partial, y, ksplit, b, m, op)
     }
 
     /// N-major int6 r/k/v 融合核的编译入口：按 `I6NM_VEC` 选 1 列/lane（32 列/块）或
@@ -9291,6 +9643,112 @@ impl CudaBackend {
             &gm_i as *const i32 as *mut c_void,
         ];
         self.drv.launch(self.stream, func, grid, block, &params)
+    }
+
+    /// RKV split-K 发射器：主核只写三路部分和与 mid，第二个核一次归约 r/k/v。
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int6nm_rkv_split(
+        &mut self,
+        r_lo: u64,
+        r_hi: u64,
+        r_sz: u64,
+        k_lo: u64,
+        k_hi: u64,
+        k_sz: u64,
+        v_lo: u64,
+        v_hi: u64,
+        v_sz: u64,
+        v1d: u64,
+        w1d: u64,
+        a1d: u64,
+        g1d: u64,
+        xrd: u64,
+        xkd: u64,
+        xvd: u64,
+        xwd: u64,
+        xad: u64,
+        xgd: u64,
+        ord: u64,
+        okd: u64,
+        ovd: u64,
+        ovmd: u64,
+        owmd: u64,
+        oamd: u64,
+        ogmd: u64,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+        batch: usize,
+        ksplit: usize,
+    ) -> R<()> {
+        debug_assert!((2..=8).contains(&batch) && ksplit > 1 && ksplit <= c / 64);
+        let warps = i6nm_warps();
+        let part = self.ipart_scratch(3 * ksplit * batch * c)?;
+        let partial = self.f32_ptr(part, "gemv_int6nm_rkv_split")?;
+        let src = format!(
+            "#define I6NM_WARPS {warps}\n#define I6NM_BATCH {batch}\n\
+             #define I6NM_KSPLIT {ksplit}\n{I6NM_COMMON_SRC}{GEMV_INT6NM_SPLIT_SRC}{GEMV_INT6NM_RKV_SPLIT_SRC}"
+        );
+        let key = format!("gemv_int6nm_rkv_sk_w{warps}_b{batch}_s{ksplit}");
+        let func = self.kernel(&key, &src, "gemv_int6nm_rkv_split")?;
+        let reduce = self.kernel(&format!("{key}_reduce"), &src, "gemv_int6nm_rkv_reduce")?;
+        let midtot = vm + wm + am + gm;
+        let grid = (
+            c.div_ceil(32).max(midtot.div_ceil(warps)) as u32,
+            (ksplit + 1) as u32,
+            1u32,
+        );
+        let block = (warps as u32 * 32, 1u32, 1u32);
+        let (c_i, vm_i, wm_i, am_i, gm_i) = (c as i32, vm as i32, wm as i32, am as i32, gm as i32);
+        let params = [
+            &r_lo as *const u64 as *mut c_void,
+            &r_hi as *const u64 as *mut c_void,
+            &r_sz as *const u64 as *mut c_void,
+            &k_lo as *const u64 as *mut c_void,
+            &k_hi as *const u64 as *mut c_void,
+            &k_sz as *const u64 as *mut c_void,
+            &v_lo as *const u64 as *mut c_void,
+            &v_hi as *const u64 as *mut c_void,
+            &v_sz as *const u64 as *mut c_void,
+            &v1d as *const u64 as *mut c_void,
+            &w1d as *const u64 as *mut c_void,
+            &a1d as *const u64 as *mut c_void,
+            &g1d as *const u64 as *mut c_void,
+            &xrd as *const u64 as *mut c_void,
+            &xkd as *const u64 as *mut c_void,
+            &xvd as *const u64 as *mut c_void,
+            &xwd as *const u64 as *mut c_void,
+            &xad as *const u64 as *mut c_void,
+            &xgd as *const u64 as *mut c_void,
+            &partial as *const u64 as *mut c_void,
+            &ovmd as *const u64 as *mut c_void,
+            &owmd as *const u64 as *mut c_void,
+            &oamd as *const u64 as *mut c_void,
+            &ogmd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+            &vm_i as *const i32 as *mut c_void,
+            &wm_i as *const i32 as *mut c_void,
+            &am_i as *const i32 as *mut c_void,
+            &gm_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(self.stream, func, grid, block, &params)?;
+        let total = 3 * batch * c;
+        let reduce_params = [
+            &partial as *const u64 as *mut c_void,
+            &ord as *const u64 as *mut c_void,
+            &okd as *const u64 as *mut c_void,
+            &ovd as *const u64 as *mut c_void,
+            &c_i as *const i32 as *mut c_void,
+        ];
+        self.drv.launch(
+            self.stream,
+            reduce,
+            ((total as u32).div_ceil(256), 1u32, 1u32),
+            (256u32, 1u32, 1u32),
+            &reduce_params,
+        )
     }
 }
 
@@ -12319,43 +12777,48 @@ impl ComputeBackend for CudaBackend {
             self.u32_ptr(v.hi, OP)?,
             self.u32_ptr(v.sz, OP)?,
         );
-        let (func, warps, cols) = self.int6nm_rkv_kernel(c)?;
-        self.launch_int6nm_rkv(
-            func,
-            warps,
-            cols,
-            r_lo,
-            r_hi,
-            r_sz,
-            k_lo,
-            k_hi,
-            k_sz,
-            v_lo,
-            v_hi,
-            v_sz,
+        let (v1d, w1d, a1d, g1d) = (
             self.f32_ptr(v1, OP)?,
             self.f32_ptr(w1, OP)?,
             self.f32_ptr(a1, OP)?,
             self.f32_ptr(g1, OP)?,
+        );
+        let (xrd, xkd, xvd, xwd, xad, xgd) = (
             self.f32_ptr(xr, OP)?,
             self.f32_ptr(xk, OP)?,
             self.f32_ptr(xv, OP)?,
             self.f32_ptr(xw, OP)?,
             self.f32_ptr(xa, OP)?,
             self.f32_ptr(xg, OP)?,
+        );
+        let (ord, okd, ovd) = (
             self.f32_ptr(out_r, OP)?,
             self.f32_ptr(out_k, OP)?,
             self.f16_ptr(out_v, OP)?,
+        );
+        let (ovmd, owmd, oamd, ogmd) = (
             self.f32_ptr(out_vm, OP)?,
             self.f32_ptr(out_wm, OP)?,
             self.f32_ptr(out_am, OP)?,
             self.f32_ptr(out_gm, OP)?,
-            c,
-            vm,
-            wm,
-            am,
-            gm,
-            batch,
+        );
+        let ksplit = if i6nm_vec() == 1 && (2..=8).contains(&batch) && i6nm_rkv_split_enabled() {
+            i6nm_ksplit().min(c / 64)
+        } else {
+            1
+        };
+        if ksplit > 1 {
+            return self.launch_int6nm_rkv_split(
+                r_lo, r_hi, r_sz, k_lo, k_hi, k_sz, v_lo, v_hi, v_sz, v1d, w1d, a1d, g1d, xrd, xkd,
+                xvd, xwd, xad, xgd, ord, okd, ovd, ovmd, owmd, oamd, ogmd, c, vm, wm, am, gm,
+                batch, ksplit,
+            );
+        }
+        let (func, warps, cols) = self.int6nm_rkv_kernel(c)?;
+        self.launch_int6nm_rkv(
+            func, warps, cols, r_lo, r_hi, r_sz, k_lo, k_hi, k_sz, v_lo, v_hi, v_sz, v1d, w1d, a1d,
+            g1d, xrd, xkd, xvd, xwd, xad, xgd, ord, okd, ovd, ovmd, owmd, oamd, ogmd, c, vm, wm,
+            am, gm, batch,
         )
     }
 
@@ -16210,53 +16673,293 @@ mod tests {
             }
         }
 
-        // ② plain GEMV，batch = 2
-        let batch = 2usize;
+        // ② 四种 GEMV，batch=5：覆盖 slot 主序 block 调度与跨槽输入/输出步长。
+        let batch = 5usize;
         let x: Vec<f32> = (0..batch * k).map(|i| ((i as f32) * 0.017).sin()).collect();
         let xt = mk_tensor(&mut b, batch * k, TensorDtype::F32);
         b.upload(xt, &x).unwrap();
-        let yt = mk_tensor(&mut b, batch * m, TensorDtype::F32);
-        b.gemv_int6_plain(&h, xt, yt, m, k, batch)
-            .expect("gemv_int6_plain nm");
-        let got = b.download(yt).unwrap();
-        let mut worst = 0.0f32;
-        for bid in 0..batch {
-            for r in 0..m {
-                let mut want = 0.0f64;
-                for kk in 0..k {
-                    want += (e[r * k + kk] as f64 - 32.0) * x[bid * k + kk] as f64;
-                }
-                let g = got[bid * m + r];
-                let rel = ((g as f64 - want).abs() / (1.0 + want.abs())) as f32;
-                worst = worst.max(rel);
-            }
-        }
-        assert!(worst < 2e-3, "plain nm 相对误差过大: {worst}");
-
-        // ③ mul_add（y += (x·g) @ W），batch = 1
         let gate_val = 0.5f32;
-        let gt = mk_tensor(&mut b, k, TensorDtype::F16);
-        b.upload(gt, &vec![gate_val; k]).expect("upload gate");
-        let x1 = &x[..k];
+        let gt = mk_tensor(&mut b, batch * k, TensorDtype::F16);
+        b.upload(gt, &vec![gate_val; batch * k])
+            .expect("upload gate");
+        let yt = mk_tensor(&mut b, batch * m, TensorDtype::F32);
+        let y0: Vec<f32> = (0..batch * m).map(|i| (i as f32) * 0.001).collect();
+        let check = |got: &[f32], op: i32| {
+            let mut worst = 0.0f32;
+            for bid in 0..batch {
+                for r in 0..m {
+                    let mut dot = 0.0f64;
+                    for kk in 0..k {
+                        let gate = if op == 1 { gate_val as f64 } else { 1.0 };
+                        dot += (e[r * k + kk] as f64 - 32.0) * (x[bid * k + kk] as f64 * gate);
+                    }
+                    let want = match op {
+                        0 => {
+                            if dot > 0.0 {
+                                dot * dot
+                            } else {
+                                0.0
+                            }
+                        }
+                        1 | 2 => y0[bid * m + r] as f64 + dot,
+                        _ => dot,
+                    };
+                    let rel = ((got[bid * m + r] as f64 - want).abs() / (1.0 + want.abs())) as f32;
+                    worst = worst.max(rel);
+                }
+            }
+            worst
+        };
+
+        b.gemv_int6_plain(&h, xt, yt, m, k, batch)
+            .expect("gemv_int6_plain nm batch");
+        let worst = check(&b.download(yt).unwrap(), 3);
+        assert!(worst < 2e-3, "plain nm batch 相对误差过大: {worst}");
+
+        b.gemv_int6_relu2(&h, xt, yt, m, k, batch)
+            .expect("gemv_int6_relu2 nm batch");
+        let worst = check(&b.download(yt).unwrap(), 0);
+        assert!(worst < 2e-3, "relu2 nm batch 相对误差过大: {worst}");
+
+        b.upload(yt, &y0).unwrap();
+        b.gemv_int6_add(&h, xt, yt, m, k, batch)
+            .expect("gemv_int6_add nm batch");
+        let worst = check(&b.download(yt).unwrap(), 2);
+        assert!(worst < 2e-3, "add nm batch 相对误差过大: {worst}");
+
+        b.upload(yt, &y0).unwrap();
+        b.gemv_int6_mul_add(&h, xt, gt, yt, m, k, batch)
+            .expect("gemv_int6_mul_add nm batch");
+        let worst = check(&b.download(yt).unwrap(), 1);
+        assert!(worst < 2e-3, "mul_add nm batch 相对误差过大: {worst}");
+
+        // ③ split=3：K=256 只有 4 个 chunk，分段为 1/1/2，覆盖非均分尾段；
+        // batch=5 与 m=132 同时钉住部分和的 slot 步长和尾列。四 op 共用既有归约核。
+        let (lo_d, hi_d, sz_d) = (
+            b.u32_ptr(lo_t, "test split lo").unwrap(),
+            b.u32_ptr(hi_t, "test split hi").unwrap(),
+            b.u32_ptr(sz_t, "test split sz").unwrap(),
+        );
+        let (xd, gd, yd) = (
+            b.f32_ptr(xt, "test split x").unwrap(),
+            b.f16_ptr(gt, "test split gate").unwrap(),
+            b.f32_ptr(yt, "test split y").unwrap(),
+        );
+        for op in [3, 0, 2, 1] {
+            b.upload(yt, &y0).unwrap();
+            b.gemv_int6nm_split_launch(
+                lo_d,
+                hi_d,
+                sz_d,
+                xd,
+                if op == 1 { gd } else { 0 },
+                yd,
+                m,
+                k,
+                batch,
+                op,
+                3,
+            )
+            .unwrap_or_else(|e| panic!("gemv_int6nm_split op={op}: {e}"));
+            let worst = check(&b.download(yt).unwrap(), op);
+            assert!(worst < 2e-3, "split-K nm op={op} 相对误差过大: {worst}");
+        }
+
+        // ④ batch=1 仍走原单流内核。
         let xt1 = mk_tensor(&mut b, k, TensorDtype::F32);
-        b.upload(xt1, x1).unwrap();
-        let y0: Vec<f32> = (0..m).map(|i| (i as f32) * 0.01).collect();
+        b.upload(xt1, &x[..k]).unwrap();
+        let gt1 = mk_tensor(&mut b, k, TensorDtype::F16);
+        b.upload(gt1, &vec![gate_val; k]).expect("upload gate");
         let y1 = mk_tensor(&mut b, m, TensorDtype::F32);
-        b.upload(y1, &y0).unwrap();
-        b.gemv_int6_mul_add(&h, xt1, gt, y1, m, k, 1)
-            .expect("gemv_int6_mul_add nm");
+        b.upload(y1, &y0[..m]).unwrap();
+        b.gemv_int6_mul_add(&h, xt1, gt1, y1, m, k, 1)
+            .expect("gemv_int6_mul_add nm single");
         let got = b.download(y1).unwrap();
         let mut worst = 0.0f32;
         for r in 0..m {
             let mut acc = y0[r] as f64;
             for kk in 0..k {
-                acc += (e[r * k + kk] as f64 - 32.0) * (x1[kk] * gate_val) as f64;
+                acc += (e[r * k + kk] as f64 - 32.0) * (x[kk] * gate_val) as f64;
             }
             let rel = ((got[r] as f64 - acc).abs() / (1.0 + acc.abs())) as f32;
             worst = worst.max(rel);
         }
-        assert!(worst < 2e-3, "mul_add nm 相对误差过大: {worst}");
-        log::info!("int6 N-major（dequant / plain / mul_add）vs CPU OK");
+        assert!(worst < 2e-3, "mul_add nm single 相对误差过大: {worst}");
+        log::info!("int6 N-major（dequant / 四变体 batch / 单流）vs CPU OK");
+    }
+
+    /// RKV split-K 对 CPU：五槽、非均分 K 段、三路部分和与四个 mid 输出。
+    #[test]
+    fn int6_nmajor_rkv_split_matches_cpu() {
+        if !cuda_available() {
+            log::info!("CUDA unavailable, skipping int6 nmajor rkv split test");
+            return;
+        }
+        let _gpu = crate::backend::gpu_test_guard();
+        let mut b = CudaBackend::new().expect("create cuda backend");
+        let (c, batch) = (256usize, 5usize);
+        let (vm, wm, am, gm) = (3usize, 5usize, 2usize, 4usize);
+
+        let mut e = vec![0u8; c * c];
+        let mut lo_n = vec![0u8; c * c / 2];
+        let mut hi_n = vec![0u8; c * c / 4];
+        let sz_n = vec![0x3C00u32; c * c / 128];
+        for r in 0..c {
+            for j in 0..c {
+                e[r * c + j] = ((r * 13 + j * 7) % 64) as u8;
+            }
+            for chunk in 0..c / 64 {
+                for j in 0..32 {
+                    let a = e[r * c + chunk * 64 + j] & 15;
+                    let bb = e[r * c + chunk * 64 + j + 32] & 15;
+                    lo_n[(chunk * 32 + j) * c + r] = a | (bb << 4);
+                }
+                for j in 0..16 {
+                    let f = |o: usize| (e[r * c + chunk * 64 + j + o] >> 4) & 3;
+                    hi_n[(chunk * 16 + j) * c + r] =
+                        f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                }
+            }
+        }
+        let as_u32 = |x: &[u8]| -> Vec<u32> {
+            x.chunks_exact(4)
+                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                .collect()
+        };
+        let (lo_w, hi_w) = (as_u32(&lo_n), as_u32(&hi_n));
+        let lo_t = mk_tensor(&mut b, lo_w.len(), TensorDtype::U32);
+        let hi_t = mk_tensor(&mut b, hi_w.len(), TensorDtype::U32);
+        let sz_t = mk_tensor(&mut b, sz_n.len(), TensorDtype::U32);
+        b.upload_u32(lo_t, &lo_w).unwrap();
+        b.upload_u32(hi_t, &hi_w).unwrap();
+        b.upload_u32(sz_t, &sz_n).unwrap();
+
+        let xs: Vec<Vec<f32>> = (0..6)
+            .map(|chain| {
+                (0..batch * c)
+                    .map(|i| ((i as f32) * (0.011 + chain as f32 * 0.002) + chain as f32).sin())
+                    .collect()
+            })
+            .collect();
+        let dims = [vm, wm, am, gm];
+        let mids: Vec<Vec<f32>> = dims
+            .iter()
+            .enumerate()
+            .map(|(chain, &rows)| {
+                (0..rows * c)
+                    .map(|i| 0.05 * ((i as f32) * 0.019 + chain as f32).cos())
+                    .collect()
+            })
+            .collect();
+        let mut xt = Vec::new();
+        let mut mt = Vec::new();
+        let mut omt = Vec::new();
+        for x in &xs {
+            let t = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+            b.upload(t, x).unwrap();
+            xt.push(t);
+        }
+        for (&rows, mid) in dims.iter().zip(&mids) {
+            let t = mk_tensor(&mut b, rows * c, TensorDtype::F32);
+            let o = mk_tensor(&mut b, rows * batch, TensorDtype::F32);
+            b.upload(t, mid).unwrap();
+            mt.push(t);
+            omt.push(o);
+        }
+        let ort = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let okt = mk_tensor(&mut b, batch * c, TensorDtype::F32);
+        let ovt = mk_tensor(&mut b, batch * c, TensorDtype::F16);
+
+        let qptr = |b: &CudaBackend, t: TensorId| b.u32_ptr(t, "test rkv split q").unwrap();
+        let fptr = |b: &CudaBackend, t: TensorId| b.f32_ptr(t, "test rkv split f").unwrap();
+        let (lod, hid, szd) = (qptr(&b, lo_t), qptr(&b, hi_t), qptr(&b, sz_t));
+        let md = [
+            fptr(&b, mt[0]),
+            fptr(&b, mt[1]),
+            fptr(&b, mt[2]),
+            fptr(&b, mt[3]),
+        ];
+        let xd = [
+            fptr(&b, xt[0]),
+            fptr(&b, xt[1]),
+            fptr(&b, xt[2]),
+            fptr(&b, xt[3]),
+            fptr(&b, xt[4]),
+            fptr(&b, xt[5]),
+        ];
+        let omd = [
+            fptr(&b, omt[0]),
+            fptr(&b, omt[1]),
+            fptr(&b, omt[2]),
+            fptr(&b, omt[3]),
+        ];
+        let (ord, okd) = (fptr(&b, ort), fptr(&b, okt));
+        let ovd = b.f16_ptr(ovt, "test rkv split v").unwrap();
+        b.launch_int6nm_rkv_split(
+            lod, hid, szd, lod, hid, szd, lod, hid, szd, md[0], md[1], md[2], md[3], xd[0], xd[1],
+            xd[2], xd[3], xd[4], xd[5], ord, okd, ovd, omd[0], omd[1], omd[2], omd[3], c, vm, wm,
+            am, gm, batch, 3,
+        )
+        .expect("gemv_int6nm_rkv_split");
+
+        let quant_ref = |x: &[f32]| -> Vec<f32> {
+            let mut y = vec![0.0f32; batch * c];
+            for bid in 0..batch {
+                for r in 0..c {
+                    let mut dot = 0.0f64;
+                    for kk in 0..c {
+                        dot += (e[r * c + kk] as f64 - 32.0) * x[bid * c + kk] as f64;
+                    }
+                    y[bid * c + r] = dot as f32;
+                }
+            }
+            y
+        };
+        let expected_q = [quant_ref(&xs[0]), quant_ref(&xs[1]), quant_ref(&xs[2])];
+        let got_q = [
+            b.download(ort).unwrap(),
+            b.download(okt).unwrap(),
+            b.download(ovt).unwrap(),
+        ];
+        let worst_rel = |got: &[f32], want: &[f32]| {
+            got.iter().zip(want).fold(0.0f32, |worst, (&g, &w)| {
+                worst.max((g - w).abs() / (1.0 + w.abs()))
+            })
+        };
+        for chain in 0..3 {
+            let expected = if chain == 2 {
+                expected_q[chain]
+                    .iter()
+                    .map(|&v| f16::from_f32(v).to_f32())
+                    .collect::<Vec<_>>()
+            } else {
+                expected_q[chain].clone()
+            };
+            let worst = worst_rel(&got_q[chain], &expected);
+            assert!(
+                worst < 2e-3,
+                "rkv split chain={chain} 相对误差过大: {worst}"
+            );
+        }
+        for chain in 0..4 {
+            let rows = dims[chain];
+            let mut expected = vec![0.0f32; batch * rows];
+            for bid in 0..batch {
+                for r in 0..rows {
+                    let x = &xs[[2, 3, 4, 5][chain]];
+                    let mut dot = 0.0f64;
+                    for kk in 0..c {
+                        dot += mids[chain][r * c + kk] as f64 * x[bid * c + kk] as f64;
+                    }
+                    let v = dot as f32;
+                    expected[bid * rows + r] = if chain == 1 { v.tanh() } else { v };
+                }
+            }
+            let got = b.download(omt[chain]).unwrap();
+            let worst = worst_rel(&got, &expected);
+            assert!(worst < 2e-3, "rkv split mid={chain} 相对误差过大: {worst}");
+        }
+        log::info!("int6 N-major RKV split-K（batch=5, split=3）vs CPU OK");
     }
 
     /// MTP drafter 的三个专用核（`mtp_rms_rope` / `mtp_kv_write` / `mtp_attn`）对 CPU 参考。

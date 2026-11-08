@@ -1120,8 +1120,11 @@ impl GpuModel {
                 j
             );
         }
-        // 5) 回滚到「已处理 j+1 个 token」的状态（按验证时存下的逐位置输入重放）
-        self.spec_rollback(state, &snap, j + 1)?;
+        // 5) 回滚到「已处理 j+1 个 token」的状态（按验证时存下的逐位置输入重放）。
+        // 全部草稿命中时 n == k+1 == T，验证后的状态恰好就是目标状态，无需恢复快照再重放。
+        if j < k {
+            self.spec_rollback(state, &snap, j + 1)?;
+        }
         pp!("rollback");
         // 6) drafter 补提交被接受的 j 个草稿，并把下一步的 H 指向 taps[j]
         let taps: Vec<[TensorId; 3]> = self
