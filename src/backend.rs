@@ -4013,6 +4013,122 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
+    fn elementwise_add(&mut self, a: TensorId, b: TensorId, y: TensorId, n: usize) -> R<()> {
+        const OP: &str = "elementwise_add";
+        let mut y_o = self.take_f32(y, OP)?;
+        let a_g = self.get_f32(a, OP)?;
+        let b_g = self.get_f32(b, OP)?;
+        let res = self.rt.elementwise_add(&a_g, &b_g, &mut y_o, n);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn elementwise_lerp(
+        &mut self,
+        a: TensorId,
+        b: TensorId,
+        k: TensorId,
+        y: TensorId,
+        n: usize,
+    ) -> R<()> {
+        const OP: &str = "elementwise_lerp";
+        let mut y_o = self.take_f32(y, OP)?;
+        let a_g = self.get_f32(a, OP)?;
+        let b_g = self.get_f32(b, OP)?;
+        let k_g = self.get_f32(k, OP)?;
+        let res = self.rt.elementwise_lerp(&a_g, &b_g, &k_g, &mut y_o, n);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn copy_part(&mut self, dst: TensorId, dst_off: usize, src: TensorId, n: usize) -> R<()> {
+        const OP: &str = "copy_part";
+        let mut y_o = self.take_f32(dst, OP)?;
+        let s_g = self.get_f32(src, OP)?;
+        let res = self.rt.copy_range(&s_g, 0, &mut y_o, dst_off, n);
+        self.put_f32(dst, y_o);
+        res
+    }
+
+    // —— MTP drafter 专用原语（Vulkan 侧；CUDA 见 `backend_cuda.rs` 的 MTP_*_SRC）——
+    // ⚠️ 与解码主干不同，这三个核**必须逐位可复现**（draft 的接受率靠它），所以 shader 内的
+    // 归约一律用固定顺序的 shared 树，不用原子加。
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_rms_rope(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n_head: usize,
+        d: usize,
+        pos: u32,
+        rope_dim: usize,
+        theta: f32,
+    ) -> R<()> {
+        const OP: &str = "mtp_rms_rope";
+        let mut x_o = self.take_f32(x, OP)?;
+        let w_g = self.get_f32(w, OP)?;
+        let res = self
+            .rt
+            .mtp_rms_rope(&mut x_o, &w_g, n_head, d, pos, rope_dim, theta);
+        self.put_f32(x, x_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_kv_write(
+        &mut self,
+        kc: TensorId,
+        vc: TensorId,
+        ring_pos: TensorId,
+        k_new: TensorId,
+        v_new: TensorId,
+        pos: u32,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        const OP: &str = "mtp_kv_write";
+        let mut kc_o = self.take_f32(kc, OP)?;
+        let mut vc_o = self.take_f32(vc, OP)?;
+        let rp = self.get_u32(ring_pos, OP)?;
+        let kn = self.get_f32(k_new, OP)?;
+        let vn = self.get_f32(v_new, OP)?;
+        let res = self
+            .rt
+            .mtp_kv_write(&mut kc_o, &mut vc_o, &rp, &kn, &vn, pos, n_kv, d, s_ring);
+        self.put_f32(kc, kc_o);
+        self.put_f32(vc, vc_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_attn(
+        &mut self,
+        q: TensorId,
+        kc: TensorId,
+        vc: TensorId,
+        ring_pos: TensorId,
+        y: TensorId,
+        pos: u32,
+        window: usize,
+        n_head: usize,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        const OP: &str = "mtp_attn";
+        let mut y_o = self.take_f32(y, OP)?;
+        let q_g = self.get_f32(q, OP)?;
+        let kc_g = self.get_f32(kc, OP)?;
+        let vc_g = self.get_f32(vc, OP)?;
+        let rp = self.get_u32(ring_pos, OP)?;
+        let res = self.rt.mtp_attn(
+            &q_g, &kc_g, &vc_g, &rp, &mut y_o, pos, window, n_head, n_kv, d, s_ring,
+        );
+        self.put_f32(y, y_o);
+        res
+    }
+
     fn gemv_seq(
         &mut self,
         a: TensorId,

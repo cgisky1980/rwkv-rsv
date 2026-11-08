@@ -1,0 +1,123 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+
+// MTP drafter：GQA 注意力（一个 workgroup = 一个 query head）。
+//
+// `y[h*D + t] = Σ_j softmax(q·k_j / √D) · v_j[t]`，j 遍历可见的 ring 槽：
+//   `0 ≤ sp ≤ pos && pos − sp < WINDOW`（`sp` 是该槽记录的绝对位置，`u32::MAX` 视为空）。
+//
+// 三段式与 CUDA 版一致，且**归约顺序固定**（shared 树 / 顺序加），保证 draft 可复现：
+//   ① 每个线程算「自己的那些槽」的整槽 dot（D ≤ 128 ⇒ 核内串行，无需跨线程归约）
+//   ② 求 max → exp → 求和
+//   ③ 加权和（线程 t 负责输出第 t 维）
+// `pos` 每 token 变 ⇒ 走 params 的 `sc.x`；其余形状参数都是 spec 常量。
+
+layout(constant_id = 0) const uint D = 128;
+layout(constant_id = 1) const uint S_RING = 8;
+layout(constant_id = 2) const uint KV_D = 128;        // n_kv * D
+layout(constant_id = 3) const uint HEAD_PER_KV = 8;   // n_head / n_kv
+layout(constant_id = 4) const uint WINDOW = 8;
+
+const uint BLOCK = 128;
+
+layout(buffer_reference) buffer Qv { float data[]; } qv;
+layout(buffer_reference) buffer Kc { float data[]; } kc;
+layout(buffer_reference) buffer Vc { float data[]; } vc;
+layout(buffer_reference) buffer RingPos { uint data[]; } ring_pos;
+layout(buffer_reference) buffer Yv { float data[]; } yv;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Qv      qv;
+    Kc      kc;
+    Vc      vc;
+    RingPos ring_pos;
+    Yv      yv;
+    uvec2   sc;   // x = pos
+} params;
+
+shared float s_q[BLOCK];
+// ★ 权重表的长度 = `s_ring`（= window + max_k + 1）。真实 sidecar 的 window 可以到 512
+// ⇒ 这里按**上界** 1024 分配（4 KiB shared），host 侧再卡 `s_ring ≤ 1024`。
+// （第一版按默认值写成 64，窗口 512 的模型直接越界写 shared → Vulkan 0xC0000005。）
+shared float s_w[1024];
+shared float s_red[BLOCK];
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint t = gl_LocalInvocationID.x;
+    const uint kvh = h / HEAD_PER_KV;
+    const uint pos = params.sc.x;
+    const float scale = 1.0 / sqrt(float(D));
+
+    Qv q = params.qv;
+    Kc k = params.kc;
+    Vc v = params.vc;
+    RingPos rp = params.ring_pos;
+    Yv y = params.yv;
+
+    if (t < D) {
+        s_q[t] = q.data[h * D + t];
+    }
+    s_red[t] = 0.0;
+    barrier();
+
+    // ① 分数（-1e30 表示不可见；exp(-1e30 - mx) 自然为 0）
+    float lmax = -1e30;
+    for (uint j = t; j < S_RING; j += BLOCK) {
+        const uint sp = rp.data[j];
+        float sc = -1e30;
+        if (sp != 0xFFFFFFFFu && sp <= pos && (pos - sp) < WINDOW) {
+            float acc = 0.0;
+            for (uint u = 0; u < D; ++u) {
+                acc += s_q[u] * k.data[j * KV_D + kvh * D + u];
+            }
+            sc = acc * scale;
+        }
+        s_w[j] = sc;
+        lmax = max(lmax, sc);
+    }
+    // ② max（shared 树，固定顺序）
+    s_red[t] = lmax;
+    barrier();
+    for (uint step = BLOCK >> 1u; step > 0u; step >>= 1u) {
+        if (t < step) {
+            s_red[t] = max(s_red[t], s_red[t + step]);
+        }
+        barrier();
+    }
+    const float mx = s_red[0];
+    barrier();
+
+    float lsum = 0.0;
+    for (uint j = t; j < S_RING; j += BLOCK) {
+        const float e = exp(s_w[j] - mx);
+        s_w[j] = e;
+        lsum += e;
+    }
+    s_red[t] = lsum;
+    barrier();
+    for (uint step = BLOCK >> 1u; step > 0u; step >>= 1u) {
+        if (t < step) {
+            s_red[t] += s_red[t + step];
+        }
+        barrier();
+    }
+    const float tot = s_red[0];
+    const float inv = (tot > 0.0) ? (1.0 / tot) : 0.0;
+    barrier();
+
+    // ③ 加权和
+    if (t < D) {
+        float acc = 0.0;
+        for (uint j = 0; j < S_RING; ++j) {
+            const float wj = s_w[j];
+            if (wj > 0.0) {
+                acc += wj * v.data[j * KV_D + kvh * D + t];
+            }
+        }
+        y.data[h * D + t] = acc * inv;
+    }
+}

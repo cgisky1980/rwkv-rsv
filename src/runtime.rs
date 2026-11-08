@@ -4537,6 +4537,164 @@ impl Runtime {
         Ok(())
     }
 
+    /// `y = a + b`（逐元素 f32，长度 n）——drafter 的 `+ dep[k-1]` 与残差。
+    pub fn elementwise_add(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        y: &mut GpuTensor,
+        n: usize,
+    ) -> R<()> {
+        self.elementwise_binary("shaders/spv/elementwise_f32_f32_add.spv", a, b, y, n, 1)
+    }
+
+    /// `y = a + (b − a) · k`（逐元素 f32，长度 n）——drafter 的 channel-mix token shift。
+    pub fn elementwise_lerp(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        k: &GpuTensor,
+        y: &mut GpuTensor,
+        n: usize,
+    ) -> R<()> {
+        let spec = elementwise_spec(n);
+        let params = [
+            a.device.address,
+            b.device.address,
+            k.device.address,
+            y.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/elementwise_f32_f32_lerp.spv",
+            &spec,
+            &params,
+            (1, 1, 1),
+            &[a.device.buffer, b.device.buffer, k.device.buffer],
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// per-head RMSNorm + rotate-half RoPE（`mtp_rms_rope.comp`）。一个 workgroup = 一个 head。
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_rms_rope(
+        &mut self,
+        x: &mut GpuTensor,
+        w: &GpuTensor,
+        n_head: usize,
+        d: usize,
+        pos: u32,
+        rope_dim: usize,
+        theta: f32,
+    ) -> R<()> {
+        let spec = [d as u32, rope_dim as u32];
+        // 标量走 params 的 `uvec2 sc`：低 32 位 = pos，高 32 位 = theta 的位模式
+        let packed = (pos as u64) | ((theta.to_bits() as u64) << 32);
+        let params = [x.device.address, w.device.address, packed];
+        self.record_kernel(
+            "shaders/spv/mtp_rms_rope.spv",
+            &spec,
+            &params,
+            (n_head as u32, 1, 1),
+            &[x.device.buffer, w.device.buffer],
+            &[x.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// 把 `(k, v)` 写进 KV ring 的第 `pos % s_ring` 槽，并记录该槽的绝对位置。
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_kv_write(
+        &mut self,
+        kc: &mut GpuTensor,
+        vc: &mut GpuTensor,
+        ring_pos: &GpuTensorU32,
+        k_new: &GpuTensor,
+        v_new: &GpuTensor,
+        pos: u32,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        let spec = [(n_kv * d) as u32, s_ring as u32];
+        let packed = pos as u64;
+        let params = [
+            kc.device.address,
+            vc.device.address,
+            ring_pos.device.address,
+            k_new.device.address,
+            v_new.device.address,
+            packed,
+        ];
+        self.record_kernel(
+            "shaders/spv/mtp_kv_write.spv",
+            &spec,
+            &params,
+            (((n_kv * d) as u32).div_ceil(256), 1, 1),
+            &[
+                k_new.device.buffer,
+                v_new.device.buffer,
+                ring_pos.device.buffer,
+            ],
+            &[kc.device.buffer, vc.device.buffer, ring_pos.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// GQA 注意力（`mtp_attn.comp`）。一个 workgroup = 一个 query head。
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_attn(
+        &mut self,
+        q: &GpuTensor,
+        kc: &GpuTensor,
+        vc: &GpuTensor,
+        ring_pos: &GpuTensorU32,
+        y: &mut GpuTensor,
+        pos: u32,
+        window: usize,
+        n_head: usize,
+        n_kv: usize,
+        d: usize,
+        s_ring: usize,
+    ) -> R<()> {
+        // shader 里 `s_w` 的 shared 上界（见 mtp_attn.comp 的注释）
+        if s_ring > 1024 || d > 128 {
+            return Err(format!(
+                "mtp_attn: 形状超上界（s_ring={s_ring}≤1024、d={d}≤128 由 shader 的 shared/线程数决定）"
+            )
+            .into());
+        }
+        let spec = [
+            d as u32,
+            s_ring as u32,
+            (n_kv * d) as u32,
+            (n_head / n_kv.max(1)) as u32,
+            window as u32,
+        ];
+        let params = [
+            q.device.address,
+            kc.device.address,
+            vc.device.address,
+            ring_pos.device.address,
+            y.device.address,
+            pos as u64,
+        ];
+        self.record_kernel(
+            "shaders/spv/mtp_attn.spv",
+            &spec,
+            &params,
+            (n_head as u32, 1, 1),
+            &[
+                q.device.buffer,
+                kc.device.buffer,
+                vc.device.buffer,
+                ring_pos.device.buffer,
+            ],
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
     /// 拷贝一个 token 行到 [C] 状态缓冲（状态更新用）
     /// dispatch: (1, 1, 1)
     pub fn copy_token(

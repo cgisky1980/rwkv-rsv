@@ -1,0 +1,85 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+
+// MTP drafter：per-head RMSNorm（eps 1e-6，共享 `[D]` 权重）+ rotate-half RoPE
+// （每个 head 的**前 `ROPE` 维**，角度 `pos · theta^(-2i/ROPE)`，全程 fp32）。
+//
+// 语义与 CUDA `mtp_rms_rope` 一一对应：先归一化写回，再做 RoPE。
+// 归一化后的值经 shared 中转（`s_x`），既省一次 global 回读，也避免「同一 head 内跨 lane
+// 读写 global」的可见性假设。
+//
+// 一个 workgroup = 一个 head；`local_size_x = 128`（D ≤ 128，head_size 恒为 64）。
+// 标量 `pos`/`theta` 走 params 块里的 `uvec2`：**不能**用 spec 常量——pos 每 token 都变，
+// 会让 pipeline 缓存按 token 数膨胀。
+
+layout(constant_id = 0) const uint D = 128;
+layout(constant_id = 1) const uint ROPE = 64;
+
+const uint BLOCK = 128;
+
+layout(buffer_reference) buffer Vec { float data[]; } vec_x;
+layout(buffer_reference) buffer Wgt { float data[]; } rms_w;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Vec vec_x;
+    Wgt rms_w;
+    uvec2 sc;   // x = pos, y = floatBitsToUint(theta)
+} params;
+
+shared float s_part[BLOCK];
+shared float s_x[BLOCK];
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint t = gl_LocalInvocationID.x;
+    const uint base = h * D;
+
+    Vec x = params.vec_x;
+    Wgt w = params.rms_w;
+
+    const float v = (t < D) ? x.data[base + t] : 0.0;
+
+    // 块内平方和（固定顺序的 shared 树）
+    s_part[t] = v * v;
+    barrier();
+    for (uint step = BLOCK >> 1u; step > 0u; step >>= 1u) {
+        if (t < step) {
+            s_part[t] += s_part[t + step];
+        }
+        barrier();
+    }
+    const float inv = 1.0 / sqrt(s_part[0] / float(D) + 1e-6);
+
+    if (t < D) {
+        s_x[t] = v * inv * w.data[t];
+    }
+    barrier();
+
+    // rotate-half RoPE：只动前 ROPE 维，成对 (i, i + ROPE/2)
+    if (t < D) {
+        float out_v = s_x[t];
+        if (t < (ROPE >> 1u)) {
+            const uint j = t + (ROPE >> 1u);
+            const float theta = uintBitsToFloat(params.sc.y);
+            const float ang = float(params.sc.x) * pow(theta, -2.0 * float(t) / float(ROPE));
+            const float c = cos(ang);
+            const float s = sin(ang);
+            const float a = s_x[t];
+            const float b = s_x[j];
+            out_v = a * c - b * s;
+        } else if (t < ROPE) {
+            const uint i = t - (ROPE >> 1u);
+            const float theta = uintBitsToFloat(params.sc.y);
+            const float ang = float(params.sc.x) * pow(theta, -2.0 * float(i) / float(ROPE));
+            const float c = cos(ang);
+            const float s = sin(ang);
+            const float a = s_x[i];
+            const float b = s_x[t];
+            out_v = a * s + b * c;
+        }
+        x.data[base + t] = out_v;
+    }
+}

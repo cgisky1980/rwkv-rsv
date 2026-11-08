@@ -1,0 +1,49 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+
+// MTP drafter：把新的 `(k, v)` 写进 KV ring 的第 `pos % S_RING` 槽，并记录该槽的绝对位置。
+// 语义与 CUDA `mtp_kv_write` 一致；`slot`/`pos` 在核内从 params 的 `sc.x` 取
+// （pos 每 token 变，不能走 spec 常量）。
+
+layout(constant_id = 0) const uint NKV_D = 128;   // n_kv * D
+layout(constant_id = 1) const uint S_RING = 8;
+
+const uint BLOCK = 256;
+
+layout(buffer_reference) buffer Kc { float data[]; } kc;
+layout(buffer_reference) buffer Vc { float data[]; } vc;
+layout(buffer_reference) buffer RingPos { uint data[]; } ring_pos;
+layout(buffer_reference) buffer Kn { float data[]; } k_new;
+layout(buffer_reference) buffer Vn { float data[]; } v_new;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Kc      kc;
+    Vc      vc;
+    RingPos ring_pos;
+    Kn      k_new;
+    Vn      v_new;
+    uvec2   sc;   // x = pos
+} params;
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint pos = params.sc.x;
+    const uint slot = pos % S_RING;
+
+    Kc kc_b = params.kc;
+    Vc vc_b = params.vc;
+    RingPos rp = params.ring_pos;
+    Kn kn = params.k_new;
+    Vn vn = params.v_new;
+
+    if (i == 0u) {
+        rp.data[slot] = pos;
+    }
+    if (i < NKV_D) {
+        kc_b.data[slot * NKV_D + i] = kn.data[i];
+        vc_b.data[slot * NKV_D + i] = vn.data[i];
+    }
+}

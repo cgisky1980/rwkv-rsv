@@ -360,6 +360,16 @@ fn main() {
         "to_f16" => "src/to_f16.comp" => {
             TYPE => [none("")],
         },
+        // —— MTP drafter 专用原语（CUDA 侧对应 backend_cuda.rs 的 MTP_*_SRC）——
+        "mtp_rms_rope" => "src/mtp_rms_rope.comp" => {
+            TYPE => [none("")],
+        },
+        "mtp_kv_write" => "src/mtp_kv_write.comp" => {
+            TYPE => [none("")],
+        },
+        "mtp_attn" => "src/mtp_attn.comp" => {
+            TYPE => [none("")],
+        },
         "to_f16_triple" => "src/to_f16_triple.comp" => {
             TYPE => [none("")],
         },
