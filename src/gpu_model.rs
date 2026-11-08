@@ -6625,6 +6625,54 @@ impl GpuLayer {
                 .chunks_exact(4)
                 .map(|c4| u32::from_le_bytes([c4[0], c4[1], c4[2], c4[3]]))
                 .collect();
+            if idx == 0 && std::env::var("I6_R8_STATS").is_ok() {
+                let (mut smin, mut smax) = (f32::MAX, f32::MIN);
+                let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+                let mut hist = [0usize; 4];
+                for v in &sz8 {
+                    smin = smin.min(f16::from_bits((v & 0xFFFF) as u16).to_f32());
+                    smax = smax.max(f16::from_bits((v & 0xFFFF) as u16).to_f32());
+                    zmin = zmin.min(f16::from_bits((v >> 16) as u16).to_f32());
+                    zmax = zmax.max(f16::from_bits((v >> 16) as u16).to_f32());
+                }
+                for &b in &q8 {
+                    hist[(b / 64) as usize] += 1;
+                }
+                log::info!(
+                    "[R8STATS] {key}: scale=[{smin:.5},{smax:.5}] zero=[{zmin:.5},{zmax:.5}] \
+                     bytes 四分位直方图={hist:?}"
+                );
+                // 与官方 int8 文件同名张量对拍（`I6_OUT_FROM=<int8 模型>`）。用闭包 + `?`
+                // 收掉嵌套（clippy 的 collapsible_if）。基线读数见台账 §3.15.5：
+                // 六颗矩阵都约 47 % 满量程 / 76 % 元素 >1 %（两次独立量化的正常噪声）。
+                let cmp_official = || -> Option<()> {
+                    let p = std::env::var("I6_OUT_FROM").ok()?;
+                    let f = std::fs::File::open(&p).ok()?;
+                    let mm = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+                    let st8 = safetensors::SafeTensors::deserialize(&mm).ok()?;
+                    let it = st8.tensor(&format!("{key}.int8_idx")).ok()?;
+                    let zt = st8.tensor(&format!("{key}.int8_sz")).ok()?;
+                    let (oi, oz): (&[u8], &[u32]) = (it.data(), bytemuck::cast_slice(zt.data()));
+                    let (mut md, mut mw) = (0.0f32, 0.0f32);
+                    for r in 0..m {
+                        for i in 0..k {
+                            let g = i / 128;
+                            let sv = sz8[r * kg + g];
+                            let a = f16::from_bits((sv & 0xFFFF) as u16).to_f32()
+                                * q8[r * k + i] as f32
+                                + f16::from_bits((sv >> 16) as u16).to_f32();
+                            let b = f16::from_bits((oz[r * kg + g] & 0xFFFF) as u16).to_f32()
+                                * oi[r * k + i] as f32
+                                + f16::from_bits((oz[r * kg + g] >> 16) as u16).to_f32();
+                            md = md.max((a - b).abs());
+                            mw = mw.max(b.abs());
+                        }
+                    }
+                    log::info!("[R8STATS] {key} vs 官方: max|Δ|={md:.4} max|w|={mw:.4}");
+                    Some(())
+                };
+                let _ = cmp_official();
+            }
             let idx_grouped = if backend.int8_idx_group_major() {
                 Some(crate::backend::int8_idx_to_group_major(&idx_row, m, k))
             } else {
@@ -6745,8 +6793,42 @@ impl GpuLayer {
                 // 已排除的原因：宿主侧重量化正确（max|Δ|=1.6e-3）、r/k/v 与 ffn 用**同一套**
                 // 重量化 + `gemm_imma` 都健康、有符号/对称两种零点方案都试过无效 ⇒ 问题在
                 // 这条 `gemm_imma` 的 **op=1 累加 + 门控** 组合本身，待单独查。
-                let a8 = if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
-                    requant(backend, &out_key, c, c, true)?
+                let a8 = if let Ok(p) = std::env::var("I6_OUT_FROM") {
+                    // 诊断（`I6_OUT_FROM=<官方 int8 模型路径>`）：把**另一份文件**的同名 int8
+                    // 张量塞进这个位置，其余一切不变 —— 用来判定「是我的张量有问题」还是
+                    // 「带门控的消费路径有问题」。
+                    // 顺带跑一次本地重量化（`I6_R8_STATS=1` 时打印与官方张量的逐元素差）。
+                    if std::env::var("I6_R8_STATS").is_ok() {
+                        let _ = requant(backend, &out_key, c, c, false)?;
+                    }
+                    let f = std::fs::File::open(&p)?;
+                    let mm = unsafe { memmap2::Mmap::map(&f)? };
+                    let st8 = safetensors::SafeTensors::deserialize(&mm)?;
+                    let it = st8.tensor(&format!("{out_key}.int8_idx"))?;
+                    let zt = st8.tensor(&format!("{out_key}.int8_sz"))?;
+                    let idx_u32: &[u32] = bytemuck::cast_slice(it.data());
+                    let sz_u32: &[u32] = bytemuck::cast_slice(zt.data());
+                    assert_eq!(idx_u32.len(), c * c / 4, "{out_key}.int8_idx 形状不符");
+                    assert_eq!(sz_u32.len(), c * c / 128, "{out_key}.int8_sz 形状不符");
+                    let ig = backend.create_tensor(c * c / 4, TensorDtype::U32)?;
+                    backend.upload_u32(ig, idx_u32)?;
+                    let zg = backend.create_tensor(c * c / 128, TensorDtype::U32)?;
+                    backend.upload_u32(zg, sz_u32)?;
+                    log::info!("layer {idx}: {out_key} 用 I6_OUT_FROM 的官方 int8 张量（诊断）");
+                    Some(Int8Handle {
+                        idx: ig,
+                        sz: zg,
+                        m: c,
+                        k: c,
+                    })
+                } else if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
+                    let h = requant(backend, &out_key, c, c, false)?;
+                    // 诊断：`I6_OUT_BUILD_ONLY=1` 只建不用（区分「分配副作用」与「真被消费」）。
+                    if std::env::var("I6_OUT_BUILD_ONLY").is_ok_and(|v| v != "0") {
+                        None
+                    } else {
+                        h
+                    }
                 } else {
                     None
                 };
