@@ -6571,7 +6571,8 @@ impl GpuLayer {
         let requant_i6_to_i8 = |backend: &mut dyn ComputeBackend,
                                 key: &str,
                                 m: usize,
-                                k: usize|
+                                k: usize,
+                                sym: bool|
          -> R<Option<Int8Handle>> {
             if st.tensor(&format!("{key}.int6_lo")).is_err() {
                 return Ok(None);
@@ -6581,7 +6582,9 @@ impl GpuLayer {
             let sz_t = st.tensor(&format!("{key}.int6_sz"))?;
             let sz6: &[u32] = bytemuck::cast_slice(sz_t.data());
             let w = crate::model::dequant_int6(lo_t.data(), hi_t.data(), sz6, m, k, i6_nmajor);
-            // 分组 min-max 非对称量化：反量化式 `idx * scale + zero`（与 `unpack_int8_sz` 一致）。
+            // 分组 min-max **无符号**量化（`idx ∈ [0,255]`、`w = idx*scale + zero`）：
+            // 磁盘约定就是无符号（见 `QUANT_X_I8_SRC` 的注释：IMMA 内核自己做 `byte ^ 0x80`
+            // 并在激活侧补偿 `128·sx·Σxq`）；宿主侧 `dequant_int8_row` 也按无符号读。
             let kg = k / 128;
             let mut q8 = vec![0u8; m * k];
             let mut sz8 = vec![0u32; m * kg];
@@ -6594,12 +6597,25 @@ impl GpuLayer {
                         mn = mn.min(v);
                         mx = mx.max(v);
                     }
-                    let scale = ((mx - mn) / 255.0).max(1.0e-8);
-                    let zero = mn;
+                    // `sym=true`（门控矩阵专用）：对称量化 `zero=0`、`b = q + 128`，让 IMMA
+                    // 的零点修正项 `zm·Σx` 恒为 0 —— 带门控的 `att.output` 把门乘进 x，
+                    // 而 aux 的 `Σx` 与乘门后的 x 不一致，非零零点会把该矩阵算错
+                    // （实测：B≥8 输出退化成周期性两 token）。
+                    let (scale, zero) = if sym {
+                        ((mx.max(-mn) / 127.0).max(1.0e-8), 0.0f32)
+                    } else {
+                        (((mx - mn) / 255.0).max(1.0e-8), mn)
+                    };
                     let inv = 1.0 / scale;
                     for (j, &v) in chunk.iter().enumerate() {
-                        q8[r * k + g * 128 + j] =
-                            ((v - zero) * inv).round().clamp(0.0, 255.0) as u8;
+                        let b = if sym {
+                            // 对称：`b = q + 128`（q ∈ [-127,127]）⇒ IMMA 侧 `b ^ 0x80` 得回 q。
+                            ((v * inv).round() + 128.0).clamp(1.0, 255.0)
+                        } else {
+                            // 非对称：磁盘字节就是无符号 `q ∈ [0,255]`，零点另存。
+                            ((v - zero) * inv).round().clamp(0.0, 255.0)
+                        };
+                        q8[r * k + g * 128 + j] = b as u8;
                     }
                     sz8[r * kg + g] = (f16::from_f32(scale).to_bits() as u32)
                         | ((f16::from_f32(zero).to_bits() as u32) << 16);
@@ -6628,9 +6644,10 @@ impl GpuLayer {
         };
         let gate_on = |name: &str| !std::env::var(name).is_ok_and(|v| v == "0");
         // 只有「有 int6、没有原生 int8」的矩阵才补副本（真 int8 模型不受影响）。
-        let requant = |backend: &mut dyn ComputeBackend, key: &str, m: usize, k: usize| {
-            requant_i6_to_i8(backend, key, m, k)
-        };
+        let requant =
+            |backend: &mut dyn ComputeBackend, key: &str, m: usize, k: usize, sym: bool| {
+                requant_i6_to_i8(backend, key, m, k, sym)
+            };
         let (ffn_key_i6, ffn_key_a8, ffn_key_w16) = load_linear(
             backend,
             &format!("blocks.{idx}.ffn.key.weight"),
@@ -6651,6 +6668,7 @@ impl GpuLayer {
                 &format!("blocks.{idx}.ffn.key.weight"),
                 cfg.ffn_hidden,
                 c,
+                false,
             )?,
             None => None,
         };
@@ -6661,6 +6679,7 @@ impl GpuLayer {
                 &format!("blocks.{idx}.ffn.value.weight"),
                 c,
                 cfg.ffn_hidden,
+                false,
             )?,
             None => None,
         };
@@ -6690,21 +6709,30 @@ impl GpuLayer {
                 &format!("blocks.{idx}.att.receptance.weight"),
                 c,
                 c,
+                false,
             )?,
             None => None,
         };
         let key_a8 = match key_a8 {
             Some(a) => Some(a),
-            None if key_i6.is_some() && gate_on("I6_RKV_I8") => {
-                requant(backend, &format!("blocks.{idx}.att.key.weight"), c, c)?
-            }
+            None if key_i6.is_some() && gate_on("I6_RKV_I8") => requant(
+                backend,
+                &format!("blocks.{idx}.att.key.weight"),
+                c,
+                c,
+                false,
+            )?,
             None => None,
         };
         let value_a8 = match value_a8 {
             Some(a) => Some(a),
-            None if value_i6.is_some() && gate_on("I6_RKV_I8") => {
-                requant(backend, &format!("blocks.{idx}.att.value.weight"), c, c)?
-            }
+            None if value_i6.is_some() && gate_on("I6_RKV_I8") => requant(
+                backend,
+                &format!("blocks.{idx}.att.value.weight"),
+                c,
+                c,
+                false,
+            )?,
             None => None,
         };
         // att.output：量化时走对应 GEMM（零 fp16 副本）；
@@ -6713,9 +6741,12 @@ impl GpuLayer {
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                // att.output 的 int8 副本（批量档 W8A8 用，见 `requant_i6_to_i8`）。
-                let a8 = if gate_on("I6_FFN_I8") {
-                    requant(backend, &out_key, c, c)?
+                // ⚠️ **默认不建**（`I6_OUT_I8=1` 才建）：B≥8 时输出会退化成周期性单/双 token。
+                // 已排除的原因：宿主侧重量化正确（max|Δ|=1.6e-3）、r/k/v 与 ffn 用**同一套**
+                // 重量化 + `gemm_imma` 都健康、有符号/对称两种零点方案都试过无效 ⇒ 问题在
+                // 这条 `gemm_imma` 的 **op=1 累加 + 门控** 组合本身，待单独查。
+                let a8 = if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
+                    requant(backend, &out_key, c, c, true)?
                 } else {
                     None
                 };
