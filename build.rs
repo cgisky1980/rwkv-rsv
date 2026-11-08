@@ -284,6 +284,13 @@ fn main() {
         "gemv_int8_rkv_stage1" => "src/gemv_int8_rkv_stage1.comp" => {
             TYPE => [none("")],
         },
+        "gemv_int6_rkv_stage1" => "src/gemv_int6_rkv_stage1.comp" => {
+            TYPE => [none("")],
+        },
+        "gemv_int6" => "src/gemv_int6.comp" => {
+            ACTIVATION => [none(""), def(1, "relu2")],
+            MODE => [def(0, ""), def(1, "add"), def(2, "mul")],
+        },
         "dequant_int8_f16" => "src/dequant_int8_f16.comp" => {
             TYPE => [none("")],
         },

@@ -1820,6 +1820,243 @@ impl Runtime {
         Ok(())
     }
 
+    /// int6（N-major）单矩阵 gemv 的公共发射器：`spv` 选变体
+    /// （`gemv_int6.spv` / `_relu2` / `_add` / `_mul`），`g` 仅 mul 变体使用。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_impl(
+        &mut self,
+        spv: &str,
+        a: &GpuTensorInt6,
+        x: &GpuTensor,
+        g: Option<&GpuTensor16>,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        debug_assert_eq!(a.m, m);
+        debug_assert_eq!(a.k, k);
+        // [M, K, x 的 batch 步长, y 的 batch 步长, BGRP, BATCH]
+        let bgrp = gemv_bgrp_for(batch);
+        let spec = [
+            m as u32,
+            k as u32,
+            k as u32,
+            m as u32,
+            bgrp as u32,
+            batch as u32,
+        ];
+        // 不用门控时传 x 的地址（该缓冲已绑定，着色器不会读它）
+        let g_addr = g.map(|t| t.device.address).unwrap_or(x.device.address);
+        let params = [
+            a.lo.device.address,
+            a.hi.device.address,
+            a.sz.device.address,
+            x.device.address,
+            g_addr,
+            y.device.address,
+        ];
+        let mut reads = vec![
+            a.lo.device.buffer,
+            a.hi.device.buffer,
+            a.sz.device.buffer,
+            x.device.buffer,
+            y.device.buffer, // add/mul 变体会读旧值
+        ];
+        if let Some(t) = g {
+            reads.push(t.device.buffer);
+        }
+        self.record_kernel(
+            spv,
+            &spec,
+            &params,
+            (
+                (m as u32).div_ceil(128),
+                (batch as u32).div_ceil(bgrp as u32),
+                1,
+            ),
+            &reads,
+            &[y.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// y = x @ A（int6 N-major，覆盖写）
+    pub fn gemv_int6_plain(
+        &mut self,
+        a: &GpuTensorInt6,
+        x: &GpuTensor,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        self.gemv_int6_impl("shaders/spv/gemv_int6.spv", a, x, None, y, m, k, batch)
+    }
+
+    /// y = relu²(x @ A)（int6 N-major）
+    pub fn gemv_int6_relu2(
+        &mut self,
+        a: &GpuTensorInt6,
+        x: &GpuTensor,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        self.gemv_int6_impl(
+            "shaders/spv/gemv_int6_relu2.spv",
+            a,
+            x,
+            None,
+            y,
+            m,
+            k,
+            batch,
+        )
+    }
+
+    /// y = y + x @ A（int6 N-major）
+    pub fn gemv_int6_add(
+        &mut self,
+        a: &GpuTensorInt6,
+        x: &GpuTensor,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        self.gemv_int6_impl("shaders/spv/gemv_int6_add.spv", a, x, None, y, m, k, batch)
+    }
+
+    /// y = y + (x .* g) @ A（int6 N-major，g 为 fp16 门控）
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_int6_mul_add(
+        &mut self,
+        a: &GpuTensorInt6,
+        x: &GpuTensor,
+        g: &GpuTensor16,
+        y: &mut GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        self.gemv_int6_impl(
+            "shaders/spv/gemv_int6_mul.spv",
+            a,
+            x,
+            Some(g),
+            y,
+            m,
+            k,
+            batch,
+        )
+    }
+
+    /// int6（N-major）r/k/v + mid 融合氛围（decode 单流）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_int6_rkv_stage1(
+        &mut self,
+        r: &GpuTensorInt6,
+        k: &GpuTensorInt6,
+        v: &GpuTensorInt6,
+        v1: &GpuTensor,
+        w1: &GpuTensor,
+        a1: &GpuTensor,
+        g1: &GpuTensor,
+        xr: &GpuTensor,
+        xk: &GpuTensor,
+        xv: &GpuTensor,
+        xw: &GpuTensor,
+        xa: &GpuTensor,
+        xg: &GpuTensor,
+        out_r: &mut GpuTensor,
+        out_k: &mut GpuTensor,
+        out_v: &mut GpuTensor16,
+        out_vm: &mut GpuTensor,
+        out_wm: &mut GpuTensor,
+        out_am: &mut GpuTensor,
+        out_gm: &mut GpuTensor,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+    ) -> R<()> {
+        debug_assert_eq!((r.m, r.k), (c, c));
+        debug_assert_eq!((k.m, k.k), (c, c));
+        debug_assert_eq!((v.m, v.k), (c, c));
+        let spec = [c as u32, vm as u32, wm as u32, am as u32, gm as u32];
+        let params = [
+            r.lo.device.address,
+            r.hi.device.address,
+            r.sz.device.address,
+            k.lo.device.address,
+            k.hi.device.address,
+            k.sz.device.address,
+            v.lo.device.address,
+            v.hi.device.address,
+            v.sz.device.address,
+            v1.device.address,
+            w1.device.address,
+            a1.device.address,
+            g1.device.address,
+            xr.device.address,
+            xk.device.address,
+            xv.device.address,
+            xw.device.address,
+            xa.device.address,
+            xg.device.address,
+            out_r.device.address,
+            out_k.device.address,
+            out_v.device.address,
+            out_vm.device.address,
+            out_wm.device.address,
+            out_am.device.address,
+            out_gm.device.address,
+        ];
+        let reads = vec![
+            r.lo.device.buffer,
+            r.hi.device.buffer,
+            r.sz.device.buffer,
+            k.lo.device.buffer,
+            k.hi.device.buffer,
+            k.sz.device.buffer,
+            v.lo.device.buffer,
+            v.hi.device.buffer,
+            v.sz.device.buffer,
+            v1.device.buffer,
+            w1.device.buffer,
+            a1.device.buffer,
+            g1.device.buffer,
+            xr.device.buffer,
+            xk.device.buffer,
+            xv.device.buffer,
+            xw.device.buffer,
+            xa.device.buffer,
+            xg.device.buffer,
+        ];
+        let writes = vec![
+            out_r.device.buffer,
+            out_k.device.buffer,
+            out_v.device.buffer,
+            out_vm.device.buffer,
+            out_wm.device.buffer,
+            out_am.device.buffer,
+            out_gm.device.buffer,
+        ];
+        let threads = (c + vm + wm + am + gm) as u32;
+        self.record_kernel(
+            "shaders/spv/gemv_int6_rkv_stage1.spv",
+            &spec,
+            &params,
+            (threads.div_ceil(128), 1, 1),
+            &reads,
+            &writes,
+        )?;
+        Ok(())
+    }
+
     /// y = relu²(x @ A)（int8 量化权重，f32 输入/输出）
     /// 与 gemv_f16_relu2 同构，权重带宽降到 fp16 的一半（1 byte/权重）。
     pub fn gemv_int8_relu2(

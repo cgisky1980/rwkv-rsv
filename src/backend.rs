@@ -3028,6 +3028,147 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
+    // —— int6（N-major）decode 内核：四个单矩阵变体 + r/k/v 融合 ——
+
+    fn gemv_int6_plain(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut y_o = self.take_f32(y, "gemv_int6_plain")?;
+        let a6 = self.int6_ref(a, "gemv_int6_plain")?;
+        let x_g = self.get_f32(x, "gemv_int6_plain")?;
+        let res = self.rt.gemv_int6_plain(&a6, &x_g, &mut y_o, m, k, batch);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn gemv_int6_relu2(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut y_o = self.take_f32(y, "gemv_int6_relu2")?;
+        let a6 = self.int6_ref(a, "gemv_int6_relu2")?;
+        let x_g = self.get_f32(x, "gemv_int6_relu2")?;
+        let res = self.rt.gemv_int6_relu2(&a6, &x_g, &mut y_o, m, k, batch);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn gemv_int6_add(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut y_o = self.take_f32(y, "gemv_int6_add")?;
+        let a6 = self.int6_ref(a, "gemv_int6_add")?;
+        let x_g = self.get_f32(x, "gemv_int6_add")?;
+        let res = self.rt.gemv_int6_add(&a6, &x_g, &mut y_o, m, k, batch);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    fn gemv_int6_mul_add(
+        &mut self,
+        a: &Int6Handle,
+        x: TensorId,
+        g: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> R<()> {
+        let mut y_o = self.take_f32(y, "gemv_int6_mul_add")?;
+        let a6 = self.int6_ref(a, "gemv_int6_mul_add")?;
+        let x_g = self.get_f32(x, "gemv_int6_mul_add")?;
+        let g_g = self.get_f16(g, "gemv_int6_mul_add")?;
+        let res = self
+            .rt
+            .gemv_int6_mul_add(&a6, &x_g, &g_g, &mut y_o, m, k, batch);
+        self.put_f32(y, y_o);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_int6_rkv_stage1(
+        &mut self,
+        r: &Int6Handle,
+        k: &Int6Handle,
+        v: &Int6Handle,
+        v1: TensorId,
+        w1: TensorId,
+        a1: TensorId,
+        g1: TensorId,
+        xr: TensorId,
+        xk: TensorId,
+        xv: TensorId,
+        xw: TensorId,
+        xa: TensorId,
+        xg: TensorId,
+        out_r: TensorId,
+        out_k: TensorId,
+        out_v: TensorId,
+        out_vm: TensorId,
+        out_wm: TensorId,
+        out_am: TensorId,
+        out_gm: TensorId,
+        c: usize,
+        vm: usize,
+        wm: usize,
+        am: usize,
+        gm: usize,
+    ) -> R<()> {
+        const OP: &str = "gemv_int6_rkv_stage1";
+        let mut or_o = self.take_f32(out_r, OP)?;
+        let mut ok_o = self.take_f32(out_k, OP)?;
+        let mut ov_o = self.take_f16(out_v, OP)?;
+        let mut ovm_o = self.take_f32(out_vm, OP)?;
+        let mut owm_o = self.take_f32(out_wm, OP)?;
+        let mut oam_o = self.take_f32(out_am, OP)?;
+        let mut ogm_o = self.take_f32(out_gm, OP)?;
+        let res = {
+            let r6 = self.int6_ref(r, OP)?;
+            let k6 = self.int6_ref(k, OP)?;
+            let v6 = self.int6_ref(v, OP)?;
+            let v1_g = self.get_f32(v1, OP)?;
+            let w1_g = self.get_f32(w1, OP)?;
+            let a1_g = self.get_f32(a1, OP)?;
+            let g1_g = self.get_f32(g1, OP)?;
+            let xr_g = self.get_f32(xr, OP)?;
+            let xk_g = self.get_f32(xk, OP)?;
+            let xv_g = self.get_f32(xv, OP)?;
+            let xw_g = self.get_f32(xw, OP)?;
+            let xa_g = self.get_f32(xa, OP)?;
+            let xg_g = self.get_f32(xg, OP)?;
+            self.rt.gemv_int6_rkv_stage1(
+                &r6, &k6, &v6, &v1_g, &w1_g, &a1_g, &g1_g, &xr_g, &xk_g, &xv_g, &xw_g, &xa_g,
+                &xg_g, &mut or_o, &mut ok_o, &mut ov_o, &mut ovm_o, &mut owm_o, &mut oam_o,
+                &mut ogm_o, c, vm, wm, am, gm,
+            )
+        };
+        self.put_f32(out_r, or_o);
+        self.put_f32(out_k, ok_o);
+        self.put_f16(out_v, ov_o);
+        self.put_f32(out_vm, ovm_o);
+        self.put_f32(out_wm, owm_o);
+        self.put_f32(out_am, oam_o);
+        self.put_f32(out_gm, ogm_o);
+        res
+    }
+
     fn argmax(&mut self, logits: TensorId, token: TensorId, n: usize) -> R<()> {
         let mut tok_o = self.take_f32(token, "argmax")?;
         let logits_g = self.get_f32(logits, "argmax")?;
@@ -4351,6 +4492,330 @@ mod tests {
             }
         }
         log::info!("backend dequant_int6 N-major vs CPU OK");
+    }
+
+    /// int6 **N-major** 的四个单矩阵 gemv 变体（plain / relu2 / add / mul_add）对 CPU 参考。
+    ///
+    /// 与 dequant 那条互补：dequant 走 tile 转置路径，这四条走「一个 invocation 一个输出列」
+    /// 的 decode 路径（含 `batch=2` 的 grid.y 与 fp16 门控）。
+    #[test]
+    fn backend_gemv_int6_nmajor_matches_cpu() {
+        let _gpu = gpu_test_guard();
+        let mut b = VulkanBackend::new().expect("create vulkan backend");
+        // batch=10：BGRP=min(8,10)=8 ⇒ grid.y=2，第二组只有 2 个槽（**尾块守卫**）
+        let (m, k, batch) = (70usize, 256usize, 10usize);
+        let (lo_row, hi_row, kg) = (k / 2, k / 4, k / 128);
+
+        let mut e = vec![0u8; m * k];
+        let mut lo_m = vec![0u8; m * lo_row];
+        let mut hi_m = vec![0u8; m * hi_row];
+        for r in 0..m {
+            for j in 0..k {
+                e[r * k + j] = ((r * 13 + j * 7) % 64) as u8;
+            }
+            for c in 0..k / 64 {
+                for j in 0..32 {
+                    let a = e[r * k + c * 64 + j] & 15;
+                    let bb = e[r * k + c * 64 + j + 32] & 15;
+                    lo_m[r * lo_row + c * 32 + j] = a | (bb << 4);
+                }
+                for j in 0..16 {
+                    let f = |o: usize| (e[r * k + c * 64 + j + o] >> 4) & 3;
+                    hi_m[r * hi_row + c * 16 + j] =
+                        f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                }
+            }
+        }
+        let tr = |src: &[u8], rows: usize, cols: usize| -> Vec<u8> {
+            let mut d = vec![0u8; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    d[c * rows + r] = src[r * cols + c];
+                }
+            }
+            d
+        };
+        let (lo_n, hi_n) = (tr(&lo_m, m, lo_row), tr(&hi_m, m, hi_row));
+        let sz: Vec<u32> = vec![0x3C00u32; kg * m];
+        let as_u32 = |x: &[u8]| -> Vec<u32> {
+            x.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let (lo_w, hi_w) = (as_u32(&lo_n), as_u32(&hi_n));
+        let lo = b.create_tensor(lo_w.len(), TensorDtype::U32).unwrap();
+        let hi = b.create_tensor(hi_w.len(), TensorDtype::U32).unwrap();
+        let szt = b.create_tensor(sz.len(), TensorDtype::U32).unwrap();
+        b.upload_u32(lo, &lo_w).unwrap();
+        b.upload_u32(hi, &hi_w).unwrap();
+        b.upload_u32(szt, &sz).unwrap();
+        let h = Int6Handle {
+            lo,
+            hi,
+            sz: szt,
+            m,
+            k,
+            nmajor: true,
+        };
+
+        let x: Vec<f32> = (0..batch * k).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let xt = b.create_tensor(batch * k, TensorDtype::F32).unwrap();
+        b.upload(xt, &x).unwrap();
+        let gate = 0.5f32;
+        let g16 = b.create_tensor(batch * k, TensorDtype::F16).unwrap();
+        b.upload(g16, &vec![gate; batch * k]).unwrap();
+
+        // CPU 参考：y[b][r] = Σ_k (e-32) · x[b][k]（relu2/门控/累加在后处理）
+        let dot = |bid: usize, r: usize, gated: bool| -> f64 {
+            let mut acc = 0.0f64;
+            for kk in 0..k {
+                let g = if gated { gate as f64 } else { 1.0 };
+                acc += (e[r * k + kk] as f64 - 32.0) * x[bid * k + kk] as f64 * g;
+            }
+            acc
+        };
+        let rel = |got: f64, want: f64| -> f32 { ((got - want).abs() / (1.0 + want.abs())) as f32 };
+
+        // ① plain
+        let yp = b.create_tensor(batch * m, TensorDtype::F32).unwrap();
+        b.begin_batch().unwrap();
+        b.gemv_int6_plain(&h, xt, yp, m, k, batch).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(yp).unwrap();
+        let mut worst = 0.0f32;
+        for bid in 0..batch {
+            for r in 0..m {
+                worst = worst.max(rel(got[bid * m + r] as f64, dot(bid, r, false)));
+            }
+        }
+        assert!(worst < 2e-3, "int6 plain rel_err={worst}");
+
+        // ② relu2
+        let yr = b.create_tensor(batch * m, TensorDtype::F32).unwrap();
+        b.begin_batch().unwrap();
+        b.gemv_int6_relu2(&h, xt, yr, m, k, batch).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(yr).unwrap();
+        let mut worst = 0.0f32;
+        for bid in 0..batch {
+            for r in 0..m {
+                let d = dot(bid, r, false);
+                let want = if d > 0.0 { d * d } else { 0.0 };
+                worst = worst.max(rel(got[bid * m + r] as f64, want));
+            }
+        }
+        assert!(worst < 2e-3, "int6 relu2 rel_err={worst}");
+
+        // ③ add（y 初值 + dot）
+        let y0: Vec<f32> = (0..batch * m).map(|i| (i as f32) * 0.01).collect();
+        let ya = b.create_tensor(batch * m, TensorDtype::F32).unwrap();
+        b.upload(ya, &y0).unwrap();
+        b.begin_batch().unwrap();
+        b.gemv_int6_add(&h, xt, ya, m, k, batch).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(ya).unwrap();
+        let mut worst = 0.0f32;
+        for bid in 0..batch {
+            for r in 0..m {
+                let want = y0[bid * m + r] as f64 + dot(bid, r, false);
+                worst = worst.max(rel(got[bid * m + r] as f64, want));
+            }
+        }
+        assert!(worst < 2e-3, "int6 add rel_err={worst}");
+
+        // ④ mul_add（y += (x·g) @ W）
+        let ym = b.create_tensor(batch * m, TensorDtype::F32).unwrap();
+        b.upload(ym, &y0).unwrap();
+        b.begin_batch().unwrap();
+        b.gemv_int6_mul_add(&h, xt, g16, ym, m, k, batch).unwrap();
+        b.end_batch().unwrap();
+        let got = b.download(ym).unwrap();
+        let mut worst = 0.0f32;
+        for bid in 0..batch {
+            for r in 0..m {
+                let want = y0[bid * m + r] as f64 + dot(bid, r, true);
+                worst = worst.max(rel(got[bid * m + r] as f64, want));
+            }
+        }
+        assert!(worst < 2e-3, "int6 mul_add rel_err={worst}");
+        log::info!("backend gemv_int6 N-major（plain/relu2/add/mul）vs CPU OK");
+    }
+
+    /// int6 **N-major** 的 r/k/v + mid 融合核（decode 主路径）对 CPU 参考。
+    ///
+    /// 这是唯一一条「一个 invocation 算 r/k/v 三份 + 另一批 invocation 算 mid」的内核，
+    /// 三类输出（f32 r/k、f16 v、四条 mid）的写出下标各不相同，必须逐条对拍。
+    #[test]
+    fn backend_gemv_int6_rkv_matches_cpu() {
+        let _gpu = gpu_test_guard();
+        let mut b = VulkanBackend::new().expect("create vulkan backend");
+        let (c, vm, wm, am, gm) = (128usize, 4usize, 4usize, 4usize, 4usize);
+        let (lo_row, hi_row, kg) = (c / 2, c / 4, c / 128);
+
+        let build = |b: &mut VulkanBackend, salt: usize| -> (Int6Handle, Vec<u8>) {
+            let mut e = vec![0u8; c * c];
+            let mut lo_m = vec![0u8; c * lo_row];
+            let mut hi_m = vec![0u8; c * hi_row];
+            for r in 0..c {
+                for j in 0..c {
+                    e[r * c + j] = ((r * 13 + j * 7 + salt * 29) % 64) as u8;
+                }
+                for ch in 0..c / 64 {
+                    for j in 0..32 {
+                        let a = e[r * c + ch * 64 + j] & 15;
+                        let bb = e[r * c + ch * 64 + j + 32] & 15;
+                        lo_m[r * lo_row + ch * 32 + j] = a | (bb << 4);
+                    }
+                    for j in 0..16 {
+                        let f = |o: usize| (e[r * c + ch * 64 + j + o] >> 4) & 3;
+                        hi_m[r * hi_row + ch * 16 + j] =
+                            f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                    }
+                }
+            }
+            let tr = |src: &[u8]| -> Vec<u8> {
+                let mut d = vec![0u8; src.len()];
+                for r in 0..c {
+                    for col in 0..src.len() / c {
+                        d[col * c + r] = src[r * (src.len() / c) + col];
+                    }
+                }
+                d
+            };
+            let as_u32 = |x: &[u8]| -> Vec<u32> {
+                x.chunks_exact(4)
+                    .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                    .collect()
+            };
+            let (lo_n, hi_n) = (tr(&lo_m), tr(&hi_m));
+            let (lo_w, hi_w) = (as_u32(&lo_n), as_u32(&hi_n));
+            let lo = b.create_tensor(lo_w.len(), TensorDtype::U32).unwrap();
+            let hi = b.create_tensor(hi_w.len(), TensorDtype::U32).unwrap();
+            b.upload_u32(lo, &lo_w).unwrap();
+            b.upload_u32(hi, &hi_w).unwrap();
+            let sz = b.create_tensor(kg * c, TensorDtype::U32).unwrap();
+            b.upload_u32(sz, &vec![0x3C00u32; kg * c]).unwrap();
+            (
+                Int6Handle {
+                    lo,
+                    hi,
+                    sz,
+                    m: c,
+                    k: c,
+                    nmajor: true,
+                },
+                e,
+            )
+        };
+
+        let (hr, er) = build(&mut b, 0);
+        let (hk, ek) = build(&mut b, 1);
+        let (hv, ev) = build(&mut b, 2);
+
+        let xs = |salt: f32| -> Vec<f32> {
+            (0..c)
+                .map(|i| ((i as f32) * 0.05 + salt).sin() * 0.5)
+                .collect()
+        };
+        let (xr, xk, xv, xw, xa, xg) = (xs(0.0), xs(0.3), xs(0.6), xs(0.9), xs(1.2), xs(1.5));
+        let mkx = |b: &mut VulkanBackend, v: &[f32]| -> TensorId {
+            let t = b.create_tensor(v.len(), TensorDtype::F32).unwrap();
+            b.upload(t, v).unwrap();
+            t
+        };
+        let (txr, txk, txv, txw, txa, txg) = (
+            mkx(&mut b, &xr),
+            mkx(&mut b, &xk),
+            mkx(&mut b, &xv),
+            mkx(&mut b, &xw),
+            mkx(&mut b, &xa),
+            mkx(&mut b, &xg),
+        );
+        // mid 权重（fp32）
+        let mkm = |b: &mut VulkanBackend, rows: usize, salt: f32| -> (TensorId, Vec<f32>) {
+            let v: Vec<f32> = (0..rows * c)
+                .map(|i| ((i as f32) * 0.011 + salt).cos() * 0.05)
+                .collect();
+            let t = b.create_tensor(v.len(), TensorDtype::F32).unwrap();
+            b.upload(t, &v).unwrap();
+            (t, v)
+        };
+        let (tv1, mv1) = mkm(&mut b, vm, 0.0);
+        let (tw1, mw1) = mkm(&mut b, wm, 0.4);
+        let (ta1, ma1) = mkm(&mut b, am, 0.8);
+        let (tg1, mg1) = mkm(&mut b, gm, 1.2);
+
+        let tor = b.create_tensor(c, TensorDtype::F32).unwrap();
+        let tok = b.create_tensor(c, TensorDtype::F32).unwrap();
+        let tov = b.create_tensor(c, TensorDtype::F16).unwrap();
+        let tovm = b.create_tensor(vm, TensorDtype::F32).unwrap();
+        let towm = b.create_tensor(wm, TensorDtype::F32).unwrap();
+        let toam = b.create_tensor(am, TensorDtype::F32).unwrap();
+        let togm = b.create_tensor(gm, TensorDtype::F32).unwrap();
+
+        b.begin_batch().unwrap();
+        b.gemv_int6_rkv_stage1(
+            &hr, &hk, &hv, tv1, tw1, ta1, tg1, txr, txk, txv, txw, txa, txg, tor, tok, tov, tovm,
+            towm, toam, togm, c, vm, wm, am, gm,
+        )
+        .unwrap();
+        b.end_batch().unwrap();
+
+        let dotq = |e: &[u8], x: &[f32], row: usize| -> f64 {
+            let mut acc = 0.0f64;
+            for k in 0..c {
+                acc += (e[row * c + k] as f64 - 32.0) * x[k] as f64;
+            }
+            acc
+        };
+        let dotm = |w: &[f32], x: &[f32], row: usize| -> f64 {
+            let mut acc = 0.0f64;
+            for k in 0..c {
+                acc += w[row * c + k] as f64 * x[k] as f64;
+            }
+            acc
+        };
+        let rel = |got: f64, want: f64| -> f32 { ((got - want).abs() / (1.0 + want.abs())) as f32 };
+
+        let (got_r, got_k, got_v) = (
+            b.download(tor).unwrap(),
+            b.download(tok).unwrap(),
+            b.download(tov).unwrap(),
+        );
+        let mut worst = 0.0f32;
+        for (r, ((&gr, &gk), &gv)) in got_r.iter().zip(got_k.iter()).zip(got_v.iter()).enumerate() {
+            worst = worst.max(rel(gr as f64, dotq(&er, &xr, r)));
+            worst = worst.max(rel(gk as f64, dotq(&ek, &xk, r)));
+            // out_v 是 fp16 输出，单独放宽
+            let want = dotq(&ev, &xv, r);
+            assert!(
+                rel(gv as f64, want) < 5e-3,
+                "rkv out_v r={r}: got {gv} want {want}"
+            );
+        }
+        assert!(worst < 2e-3, "rkv r/k rel_err={worst}");
+
+        let got_vm = b.download(tovm).unwrap();
+        let got_wm = b.download(towm).unwrap();
+        let got_am = b.download(toam).unwrap();
+        let got_gm = b.download(togm).unwrap();
+        for (r, &got) in got_vm.iter().enumerate().take(vm) {
+            let w = rel(got as f64, dotm(&mv1, &xv, r));
+            assert!(w < 2e-3, "rkv v_mid r={r} rel={w}");
+        }
+        for (r, &got) in got_wm.iter().enumerate().take(wm) {
+            let w = rel(got as f64, dotm(&mw1, &xw, r).tanh());
+            assert!(w < 2e-3, "rkv w_mid r={r} rel={w}");
+        }
+        for (r, &got) in got_am.iter().enumerate().take(am) {
+            let w = rel(got as f64, dotm(&ma1, &xa, r));
+            assert!(w < 2e-3, "rkv a_mid r={r} rel={w}");
+        }
+        for (r, &got) in got_gm.iter().enumerate().take(gm) {
+            let w = rel(got as f64, dotm(&mg1, &xg, r));
+            assert!(w < 2e-3, "rkv g_mid r={r} rel={w}");
+        }
+        log::info!("backend gemv_int6 rkv（r/k/v + 四条 mid）vs CPU OK");
     }
 
     /// 验证抽象层 norm 算子正确性：y = (x-mean)/std * gamma + beta。

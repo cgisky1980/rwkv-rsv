@@ -1,0 +1,182 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// int6 gemv（**N-major** 双平面，单 token decode）：y = (x·[g]) @ W。
+//
+// 布局（量化器 `--int6-layout n`，文件带 `int6_nmajor` 标记）：
+//   lo: uint8  [K/2, M]    行 = c*32 + j；字节 j 的低 nibble = e[k=c*64+j]，高 nibble = e[k=c*64+j+32]
+//   hi: uint8  [K/4, M]    行 = c*16 + j；4 个 2-bit 域 = e[j]/e[j+16]/e[j+32]/e[j+48]
+//   sz: uint32 [K/128, M]  scale(fp16 低 16 位)
+//   e = lo4 | (hi2 << 4) ∈ [0,63]；w = scale · (e − 32)
+//
+// ★ 并行映射：**一个 invocation 负责一个输出列（row）**，相邻 invocation 覆盖相邻 row
+//   ⇒ 每条字节载入在同一 warp 内是连续地址（4 个 row 共享 1 个 uint32 字），天然合并。
+//   反过来（invocation 沿 k 展开，像 int8 版那样）在 N-major 下相邻 invocation 相差 32·M 字节，
+//   全散读。副作用：每个 invocation 自带完整点积 ⇒ **不需要任何跨线程归约**，求和顺序固定。
+//
+// 特化常量：M / K / STRIDE_X_Y（x 的 batch 步长，单位 f32）/ STRIDE_Y_Y（y 的 batch 步长）
+// / BGRP（一个 invocation 同时算的槽数）/ BATCH（实际批量，用于尾块守卫）。
+// dispatch = (ceil(M/128), ceil(batch/BGRP), 1)。
+//
+// ★ BGRP 的意义（与 int8 版同）：权重跨槽共享，BGRP=1 时批量路径会把同一份权重按槽各读一遍
+//   ⇒ 权重读取量 × batch。BGRP>1 时每个 k 位置只读一次字节、解一次，在寄存器里复用给
+//   BGRP 个槽（实测 Vulkan 采样自循环 B=8 时相差一个数量级）。
+//
+// 编译期开关：
+//   ACTIVATION=1  → y = relu²(dot)
+//   MODE=1        → y += dot
+//   MODE=2        → y += (x·g) @ W（g 为 fp16 逐元素门控）
+
+layout(constant_id = 0) const uint M = 4096;
+layout(constant_id = 1) const uint K = 4096;
+layout(constant_id = 2) const uint STRIDE_X_Y = 4096;
+layout(constant_id = 3) const uint STRIDE_Y_Y = 4096;
+layout(constant_id = 4) const uint BGRP = 1;
+layout(constant_id = 5) const uint BATCH = 1;
+
+const uint BLOCK_SIZE = 128;
+const uint NCHUNK     = K / 64;   // 每行 64-k 打包块数
+
+layout(buffer_reference) buffer InputLo { uint data[]; }        input_lo;  // uint8 平面（uint32 视野）
+layout(buffer_reference) buffer InputHi { uint data[]; }        input_hi;
+layout(buffer_reference) buffer InputSZ { uint data[]; }        input_sz;
+layout(buffer_reference) buffer InputX  { float data[]; }       input_x;
+layout(buffer_reference) buffer InputG  { float16_t data[]; }   input_g;
+layout(buffer_reference) buffer OutputY { float data[]; }       output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputLo input_lo;
+    InputHi input_hi;
+    InputSZ input_sz;
+    InputX  input_x;
+    InputG  input_g;
+    OutputY output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+uint byte_at(InputLo p, uint byte_index) {
+    return (p.data[byte_index >> 2] >> ((byte_index & 3u) * 8u)) & 0xFFu;
+}
+
+// 单个输出的写回（含 MODE / ACTIVATION 的编译期变体）
+void store(uint idx, float v) {
+#if MODE == 1 || MODE == 2
+    v += params.output_y.data[idx];
+#endif
+#if defined(ACTIVATION) && ACTIVATION == 1
+    v = max(v, 0.0);
+    v = v * v;
+#endif
+    params.output_y.data[idx] = v;
+}
+
+void main() {
+    const uint row  = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationIndex;
+    const uint slot0 = gl_WorkGroupID.y * BGRP;
+    const uint slot_cnt = min(BGRP, BATCH - slot0); // 尾块守卫
+    if (row >= M) return;
+
+    InputLo lo = params.input_lo;
+    InputHi hi = params.input_hi;
+
+    // ★ 单流（BGRP == 1）与批量分成两份代码：`a0[BGRP]` 这类**特化常量长度的数组**在
+    //   BGRP=1 时实测慢一倍（驱动把它留在 Private 存储 ⇒ 每次累加都变成私有内存往返）。
+    //   BGRP 是特化常量，所以这里用**运行期 uniform 分支**（驱动在建管线时折叠）。
+    if (BGRP == 1) {
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0; // 4 路独立累加器（顺序固定 ⇒ 可复现）
+        const uint xb = slot0 * STRIDE_X_Y;
+        const uint gb = slot0 * K;
+        for (uint c = 0; c < NCHUNK; ++c) {
+            const float sc = unpackHalf2x16(params.input_sz.data[(c >> 1) * M + row]).x;
+            const uint lo0 = c * 32u;
+            const uint hi0 = c * 16u;
+            const uint kb  = c * 64u;
+            [[unroll]]
+            for (uint j = 0; j < 16u; ++j) {
+                const uint lb0 = byte_at(lo, (lo0 + j) * M + row);
+                const uint lb1 = byte_at(lo, (lo0 + 16u + j) * M + row);
+                const uint hb  = byte_at(hi, (hi0 + j) * M + row);
+                const int e0 = int(lb0 & 15u) | (int(hb & 3u) << 4);
+                const int e1 = int(lb1 & 15u) | (int((hb >> 2) & 3u) << 4);
+                const int e2 = int(lb0 >> 4) | (int((hb >> 4) & 3u) << 4);
+                const int e3 = int(lb1 >> 4) | (int((hb >> 6) & 3u) << 4);
+                float x0 = params.input_x.data[xb + kb + j];
+                float x1 = params.input_x.data[xb + kb + 16u + j];
+                float x2 = params.input_x.data[xb + kb + 32u + j];
+                float x3 = params.input_x.data[xb + kb + 48u + j];
+#if MODE == 2
+                x0 *= float(params.input_g.data[gb + kb + j]);
+                x1 *= float(params.input_g.data[gb + kb + 16u + j]);
+                x2 *= float(params.input_g.data[gb + kb + 32u + j]);
+                x3 *= float(params.input_g.data[gb + kb + 48u + j]);
+#endif
+                a0 += sc * float(e0 - 32) * x0;
+                a1 += sc * float(e1 - 32) * x1;
+                a2 += sc * float(e2 - 32) * x2;
+                a3 += sc * float(e3 - 32) * x3;
+            }
+        }
+        store(slot0 * STRIDE_Y_Y + row, (a0 + a1) + (a2 + a3));
+        return;
+    }
+
+    // 批量路径：权重每 (c, j) 只读一次、解一次，在寄存器里复用给 BGRP 个槽
+    float a0[BGRP], a1[BGRP], a2[BGRP], a3[BGRP];
+    [[unroll]]
+    for (uint s = 0; s < BGRP; ++s) {
+        a0[s] = 0.0; a1[s] = 0.0; a2[s] = 0.0; a3[s] = 0.0;
+    }
+    for (uint c = 0; c < NCHUNK; ++c) {
+        const float sc = unpackHalf2x16(params.input_sz.data[(c >> 1) * M + row]).x;
+        const uint lo0 = c * 32u;
+        const uint hi0 = c * 16u;
+        const uint kb  = c * 64u;
+        [[unroll]]
+        for (uint j = 0; j < 16u; ++j) {
+            const uint lb0 = byte_at(lo, (lo0 + j) * M + row);
+            const uint lb1 = byte_at(lo, (lo0 + 16u + j) * M + row);
+            const uint hb  = byte_at(hi, (hi0 + j) * M + row);
+            const int e0 = int(lb0 & 15u) | (int(hb & 3u) << 4);
+            const int e1 = int(lb1 & 15u) | (int((hb >> 2) & 3u) << 4);
+            const int e2 = int(lb0 >> 4) | (int((hb >> 4) & 3u) << 4);
+            const int e3 = int(lb1 >> 4) | (int((hb >> 6) & 3u) << 4);
+            const float w0 = sc * float(e0 - 32);
+            const float w1 = sc * float(e1 - 32);
+            const float w2 = sc * float(e2 - 32);
+            const float w3 = sc * float(e3 - 32);
+            [[unroll]]
+            for (uint s = 0; s < BGRP; ++s) {
+                if (s < slot_cnt) {
+                    const uint xb = (slot0 + s) * STRIDE_X_Y + kb;
+                    float x0 = params.input_x.data[xb + j];
+                    float x1 = params.input_x.data[xb + 16u + j];
+                    float x2 = params.input_x.data[xb + 32u + j];
+                    float x3 = params.input_x.data[xb + 48u + j];
+#if MODE == 2
+                    const uint gb = (slot0 + s) * K + kb;
+                    x0 *= float(params.input_g.data[gb + j]);
+                    x1 *= float(params.input_g.data[gb + 16u + j]);
+                    x2 *= float(params.input_g.data[gb + 32u + j]);
+                    x3 *= float(params.input_g.data[gb + 48u + j]);
+#endif
+                    a0[s] += w0 * x0;
+                    a1[s] += w1 * x1;
+                    a2[s] += w2 * x2;
+                    a3[s] += w3 * x3;
+                }
+            }
+        }
+    }
+
+    [[unroll]]
+    for (uint s = 0; s < BGRP; ++s) {
+        if (s < slot_cnt) {
+            store((slot0 + s) * STRIDE_Y_Y + row, (a0[s] + a1[s]) + (a2[s] + a3[s]));
+        }
+    }
+}
