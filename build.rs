@@ -287,6 +287,9 @@ fn main() {
         "dequant_int8_f16" => "src/dequant_int8_f16.comp" => {
             TYPE => [none("")],
         },
+        "dequant_int6_f16" => "src/dequant_int6_f16.comp" => {
+            TYPE => [none("")],
+        },
         "norm_lerp6" => "src/norm_lerp6.comp" => {
             TYPE => [none("")],
         },

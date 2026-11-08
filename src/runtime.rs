@@ -165,6 +165,21 @@ pub struct GpuTensorInt8 {
     pub k: usize,
 }
 
+/// int6 对称 per-group 量化权重（lo4+hi2 双平面）：`w[m,k] = scale[m,k/128] · (e − 32)`，
+/// `e = lo4 | (hi2 << 4) ∈ [0,63]`。打包规则与 `tools/quantize_any4.py --bits 6` 一致。
+///
+/// Vulkan 侧**只支持 N-major 平面**（`[K/2, M]` / `[K/4, M]` / `[K/128, M]`，M 最内）：
+/// decode/prefill 的寻址都按 N-major 写死，M-major 文件会在 `dequant` / gemv 入口报明确错误
+/// （M-major 是 CUDA 早期版本的布局，CUDA 侧仍支持）。
+#[derive(Debug)]
+pub struct GpuTensorInt6 {
+    pub lo: GpuTensorU32,
+    pub hi: GpuTensorU32,
+    pub sz: GpuTensorU32,
+    pub m: usize,
+    pub k: usize,
+}
+
 /// Vulkan 推理 runtime
 #[derive(Debug)]
 pub struct Runtime {
@@ -1767,6 +1782,39 @@ impl Runtime {
             &params,
             (threads.div_ceil(256), 1, 1),
             &[a.idx.device.buffer, a.sz.device.buffer],
+            &[out.device.buffer],
+        )?;
+        Ok(())
+    }
+
+    /// int6（N-major 双平面）→ fp16 反量化（prefill 方案A：解到共享 scratch 后走 tensor-core GEMM）。
+    /// dispatch: (ceil(M/32), ceil(K/32), 1)，每个 workgroup 一个 32×32 tile。
+    pub fn dequant_int6_to_f16(
+        &mut self,
+        a: &GpuTensorInt6,
+        out: &GpuTensor16,
+        m: usize,
+        k: usize,
+    ) -> R<()> {
+        debug_assert_eq!(a.m, m);
+        debug_assert_eq!(a.k, k);
+        debug_assert!(out.len >= m * k);
+        if !k.is_multiple_of(64) {
+            return Err(format!("dequant_int6: K={k} 必须是 64 的倍数（int6 打包块）").into());
+        }
+        let spec = [m as u32, k as u32];
+        let params = [
+            a.lo.device.address,
+            a.hi.device.address,
+            a.sz.device.address,
+            out.device.address,
+        ];
+        self.record_kernel(
+            "shaders/spv/dequant_int6_f16.spv",
+            &spec,
+            &params,
+            ((m as u32).div_ceil(32), (k as u32).div_ceil(32), 1),
+            &[a.lo.device.buffer, a.hi.device.buffer, a.sz.device.buffer],
             &[out.device.buffer],
         )?;
         Ok(())

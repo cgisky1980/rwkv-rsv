@@ -1,0 +1,92 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// int6 → fp16 反量化（prefill 方案A：大矩阵反量化到共享 scratch 后走 tensor-core GEMM）。
+//
+// 输入是 **N-major** int6 平面（量化器 `--int6-layout n`，文件带 `int6_nmajor` 标记）：
+//   lo: uint8 [K/2, M]   低 4 位平面；行 = c*32 + j，字节 j 的低 nibble = e[k=c*64+j]，
+//                        高 nibble = e[k=c*64+j+32]
+//   hi: uint8 [K/4, M]   高 2 位平面；行 = c*16 + j，字节 j 的 4 个 2-bit 域 = e[j]/e[j+16]/e[j+32]/e[j+48]
+//   sz: uint32 [K/128, M]  低 16 位 = scale(fp16)，高 16 位恒 0
+//   e = lo4 | (hi2 << 4) ∈ [0,63]；w = scale · (e − 32)
+// 输出 fp16 [M, K] 行主序（= gemm 的 B 操作数，与 load_linear_f16 上传布局一致）。
+//
+// ★ 为什么用 32×32 tile + shared 转置（与 CUDA `rwkv_dequant_int6_nm` 同构）：
+//   N-major 平面「M 最内」，若按输出 `[M,K]` 线性铺线程，相邻线程读平面要跨 M 步长 ⇒ 全散读
+//   （CUDA 实测 prefill 从 635 掉到 523 tok/s）。这里读阶段让 lane 覆盖连续 32 个 m（合并），
+//   写阶段覆盖连续 32 个 ki（合并），中间经 shared 转置。
+//
+// 每个 workgroup 处理一个 32(m)×32(k) tile；dispatch = (ceil(M/32), ceil(K/32), 1)。
+// 要求 K % 64 == 0（int6 打包块）且 K % 32 == 0（tile）。
+
+layout(constant_id = 0) const uint M = 4096;   // 输出行数
+layout(constant_id = 1) const uint K = 4096;   // 收缩维
+
+const uint BLOCK = 256;
+const uint TILE = 32;
+
+shared float tile[TILE][TILE + 1];
+
+layout(buffer_reference) buffer InputLo { uint data[]; }   input_lo;   // uint8 平面按 uint32 视野
+layout(buffer_reference) buffer InputHi { uint data[]; }   input_hi;
+layout(buffer_reference) buffer InputSZ { uint data[]; }   input_sz;
+layout(buffer_reference) buffer OutputW { uint data[]; }   output_w;  // fp16 两两打包
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputLo input_lo;
+    InputHi input_hi;
+    InputSZ input_sz;
+    OutputW output_w;
+} params;
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+// 取一个输出元素 w[row, ki]（N-major 寻址）
+float elem(uint row, uint ki) {
+    const uint c   = ki >> 6;
+    const uint jj  = ki & 63u;
+    const uint t   = jj >> 4;          // 子块 0..3
+    const uint j16 = jj & 15u;
+    const uint lb  = ((t & 1u) != 0u ? 16u : 0u) + j16;
+
+    const uint lb_byte = (c * 32u + lb) * M + row;
+    const uint hb_byte = (c * 16u + j16) * M + row;
+    const uint lbv = (params.input_lo.data[lb_byte >> 2] >> ((lb_byte & 3u) * 8u)) & 0xFFu;
+    const uint hbv = (params.input_hi.data[hb_byte >> 2] >> ((hb_byte & 3u) * 8u)) & 0xFFu;
+
+    const uint l4 = (t < 2u) ? (lbv & 15u) : (lbv >> 4);
+    const uint e  = l4 | (((hbv >> (t * 2u)) & 3u) << 4);
+    const float sc = unpackHalf2x16(params.input_sz.data[(ki >> 7) * M + row]).x;
+    return sc * float(int(e) - 32);
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint m0  = gl_WorkGroupID.x * TILE;
+    const uint k0  = gl_WorkGroupID.y * TILE;
+
+    // 读阶段：lane 覆盖连续 m（同一平面行内相邻字节）⇒ 合并
+    for (uint i = lid; i < TILE * TILE; i += BLOCK) {
+        const uint r = i & (TILE - 1u);   // m 方向
+        const uint c = i >> 5;            // ki 方向
+        const uint row = m0 + r;
+        tile[r][c] = (row < M) ? elem(row, k0 + c) : 0.0;
+    }
+    barrier();
+
+    // 写阶段：每线程打包 2 个相邻 ki 到 1 个 uint32（相邻 lane 连续 ⇒ 合并，且不产生写竞争）
+    for (uint i = lid; i < TILE * (TILE / 2u); i += BLOCK) {
+        const uint r  = i >> 4;           // m 方向
+        const uint cp = (i & 15u) * 2u;   // ki 方向（偶数）
+        const uint row = m0 + r;
+        const uint ki = k0 + cp;
+        if (row < M && ki < K) {
+            params.output_w.data[(row * K + ki) >> 1] =
+                packHalf2x16(vec2(tile[r][cp], tile[r][cp + 1u]));
+        }
+    }
+}

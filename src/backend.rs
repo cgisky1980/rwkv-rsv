@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 
 use crate::runtime::{
-    FillTarget, GpuTensor, GpuTensor16, GpuTensorInt8, GpuTensorU32, IoPart, IoTensor, IoWrite, R,
-    Runtime, SAMPLER_ROW_F32, StateTensor,
+    FillTarget, GpuTensor, GpuTensor16, GpuTensorInt6, GpuTensorInt8, GpuTensorU32, IoPart,
+    IoTensor, IoWrite, R, Runtime, SAMPLER_ROW_F32, StateTensor,
 };
 
 /// 平台无关张量句柄（由后端分配，内部映射到设备内存）。
@@ -1992,6 +1992,24 @@ impl VulkanBackend {
         })
     }
 
+    /// 从平台无关 `Int6Handle` 组装出 Runtime 所需的 `GpuTensorInt6`。
+    /// Vulkan 侧只支持 N-major 平面（见 `GpuTensorInt6` 文档），M-major 直接报错。
+    fn int6_ref(&self, a: &Int6Handle, op: &str) -> R<GpuTensorInt6> {
+        if !a.nmajor {
+            return Err(format!(
+                "{op}: Vulkan 只支持 N-major int6 平面（用 quantize_any4.py --int6-layout n 重出模型）"
+            )
+            .into());
+        }
+        Ok(GpuTensorInt6 {
+            lo: self.get_u32(a.lo, op)?,
+            hi: self.get_u32(a.hi, op)?,
+            sz: self.get_u32(a.sz, op)?,
+            m: a.m,
+            k: a.k,
+        })
+    }
+
     /// `TensorId` → 「设备缓冲 + 它自己的 host 镜像」的统一视图（批量 I/O 专用）。
     /// u32 张量不参与状态搬运（状态只有 f32/f16 两档，见 `wkv_state_dtype`）。
     fn io_tensor(&self, t: TensorId, ctx: &str) -> R<IoTensor<'_>> {
@@ -3228,6 +3246,14 @@ impl ComputeBackend for VulkanBackend {
         res
     }
 
+    fn dequant_int6_to_f16(&mut self, a: &Int6Handle, out: TensorId, m: usize, k: usize) -> R<()> {
+        let out_o = self.take_f16(out, "dequant_int6_to_f16")?;
+        let a6 = self.int6_ref(a, "dequant_int6_to_f16")?;
+        let res = self.rt.dequant_int6_to_f16(&a6, &out_o, m, k);
+        self.put_f16(out, out_o);
+        res
+    }
+
     fn elementwise_sigmoid(&mut self, a: TensorId, y: TensorId, c: usize, batch: usize) -> R<()> {
         let mut y_o = self.take_f32(y, "elementwise_sigmoid")?;
         let a_g = self.get_f32(a, "elementwise_sigmoid")?;
@@ -4245,6 +4271,86 @@ mod tests {
         }
         log::info!("backend gemv_f16 ones K=32 max_abs_diff: {max_diff:.6}");
         assert!(max_diff < 1e-2, "ones mismatch, max_abs_diff={max_diff}");
+    }
+
+    /// int6 **N-major** 反量化（Vulkan `dequant_int6_f16.comp`）对 CPU 参考。
+    ///
+    /// 钉住三件事：① `lo` 的低/高 nibble 分别服务子块 0/2 与 1/3；② `hi` 字节的 2-bit 域
+    /// 按子块号 `t` 移位取（`>> 2t`，写错只会让输出变差、不崩）；③ N-major 的
+    /// 「行 = 打包索引、列 = 输出列」寻址 + 32×32 tile 转置的边界（M 不是 32 的倍数）。
+    #[test]
+    fn backend_dequant_int6_nmajor_matches_cpu() {
+        let _gpu = gpu_test_guard();
+        let mut b = VulkanBackend::new().expect("create vulkan backend");
+        let (m, k) = (70usize, 256usize); // m 非 32 倍数；k = 4 个 64-k 打包块
+        let (lo_row, hi_row, kg) = (k / 2, k / 4, k / 128);
+
+        let mut e = vec![0u8; m * k];
+        let mut lo_m = vec![0u8; m * lo_row];
+        let mut hi_m = vec![0u8; m * hi_row];
+        for r in 0..m {
+            for j in 0..k {
+                e[r * k + j] = ((r * 13 + j * 7) % 64) as u8;
+            }
+            for c in 0..k / 64 {
+                for j in 0..32 {
+                    let a = e[r * k + c * 64 + j] & 15;
+                    let bb = e[r * k + c * 64 + j + 32] & 15;
+                    lo_m[r * lo_row + c * 32 + j] = a | (bb << 4);
+                }
+                for j in 0..16 {
+                    let f = |o: usize| (e[r * k + c * 64 + j + o] >> 4) & 3;
+                    hi_m[r * hi_row + c * 16 + j] =
+                        f(0) | (f(16) << 2) | (f(32) << 4) | (f(48) << 6);
+                }
+            }
+        }
+        // N-major 转置（= 量化器 --int6-layout n）+ scale 恒 1.0
+        let tr = |src: &[u8], rows: usize, cols: usize| -> Vec<u8> {
+            let mut d = vec![0u8; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    d[c * rows + r] = src[r * cols + c];
+                }
+            }
+            d
+        };
+        let (lo_n, hi_n) = (tr(&lo_m, m, lo_row), tr(&hi_m, m, hi_row));
+        let sz: Vec<u32> = vec![0x3C00u32; kg * m];
+        let as_u32 = |x: &[u8]| -> Vec<u32> {
+            x.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+
+        let (lo_w, hi_w) = (as_u32(&lo_n), as_u32(&hi_n));
+        let lo = b.create_tensor(lo_w.len(), TensorDtype::U32).unwrap();
+        let hi = b.create_tensor(hi_w.len(), TensorDtype::U32).unwrap();
+        let szt = b.create_tensor(sz.len(), TensorDtype::U32).unwrap();
+        b.upload_u32(lo, &lo_w).unwrap();
+        b.upload_u32(hi, &hi_w).unwrap();
+        b.upload_u32(szt, &sz).unwrap();
+        let h = Int6Handle {
+            lo,
+            hi,
+            sz: szt,
+            m,
+            k,
+            nmajor: true,
+        };
+        let out = b.create_tensor(m * k, TensorDtype::F16).unwrap();
+        b.begin_batch().unwrap();
+        b.dequant_int6_to_f16(&h, out, m, k)
+            .expect("dequant_int6 nm");
+        b.end_batch().unwrap();
+        let got = b.download(out).unwrap();
+        for r in 0..m {
+            for kk in 0..k {
+                let want = e[r * k + kk] as f32 - 32.0;
+                assert_eq!(got[r * k + kk], want, "dequant nm: m={r} k={kk}");
+            }
+        }
+        log::info!("backend dequant_int6 N-major vs CPU OK");
     }
 
     /// 验证抽象层 norm 算子正确性：y = (x-mean)/std * gamma + beta。
