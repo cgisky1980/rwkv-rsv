@@ -39,7 +39,8 @@ So: **one stream and small batches are won; long prompts are won; wide-batch dec
 7. [Layout](#7-layout)
 8. [Relationship with Albatross and cryscan/rosalia](#8-relationship-with-albatross-and-cryscanrosalia)
 9. [Known Limitations & Future Work](#9-known-limitations--future-work)
-10. [License](#10-license)
+10. [Int6 quantization & MTP speculative decoding](#10-int6-quantization--mtp-speculative-decoding)
+11. [License](#11-license)
 
 ## 1. What It Does
 
@@ -345,6 +346,59 @@ Inspired by both, this repository has since evolved independently, adding capabi
 - **`dplr_seq` occupancy is low** (40 workgroups × 64 threads + 2 barriers per token, ~10 ms in steady prefill): could adopt the CUDA structure (parallel-row blocks + shuffle reduction).
 - **Measurement environment ceiling**: the card drives the display, SM clocks step in ~7 % increments (1695 – 1830 MHz) and temperatures run 46 → 82 ℃, so end-to-end resolution is ~2 – 3 % and any single-cell claim below that is not evidence. See §6.5.
 
-## 10. License
+## 10. Int6 quantization & MTP speculative decoding
+
+Two features shipped after the numbers in §6 were taken; both are **opt-in at the model/flag level**
+and leave the fp16 / int8 paths bit-identical when unused. Deep engineering notes, all measurements
+and the reverse-lessons are in `参考/2026-11-08-int6量化与MTP-阶段记录.md` (Chinese).
+
+### 10.1 int6 weights (6-bit, symmetric, N-major)
+
+`tools/quantize_any4.py --bits 6 --int6-layout n` produces three extra tensors per matrix
+(`*.int6_lo` / `*.int6_hi` / `*.int6_sz`); the loader picks them up automatically and
+`Wq::I6` / `Wq::I8` dispatch keeps every call site width-agnostic. Layout is **N-major**
+so the decode dot product reads one contiguous 2-bit plane per 16-value sub-block.
+
+| Arm (RTX 2080 Ti, locked 1845 MHz, 300 W) | size | decode | argmax self-loop |
+|---|---:|---:|---:|
+| fp16 | 5.89 GB | 72.1 tok/s | 74.1 |
+| int8 | 3.30 GB | 94.8 | 98.6 |
+| **int6-N** | **2.48 GB** | **108.5** | **112.3** |
+
+So int6 is the **fastest decode arm on CUDA** (1.14× int8, 1.50× fp16) while being 24 % smaller;
+prefill is the opposite (int6 dequantizes to fp16 before the GEMM, so it trails fp16 by ~15 %).
+Vulkan has the same kernels but its decode is still parallelism-limited (see §9).
+
+### 10.2 MTP speculative decoding
+
+A sidecar drafter (`mtp/mtp.safetensors`, found automatically next to the model, or `RWKV_MTP_PATH`)
+proposes `k` tokens from two fuse-layer taps of the main model; one causal pass over `t = k+1` rows
+verifies them. `MTP`/`SEQ_SMALL_T`/`SEQ_CHAIN4`/`PREFILL_GRAPH` are the relevant switches;
+`GpuModel::spec_step(state, tok, k)` is the single-stream entry point.
+
+```powershell
+$env:MODEL_PATH="...\rwkv7-g1l-2.9b-int8.st"; $env:MTP_K=2; $env:MTP_GEN=256
+$env:PREFILL_GRAPH=1                       # 必须：验证 pass 是 ~22 个节点/层的小内核
+cargo run --release --example mtp_probe    # 接受长度 + 投机步 A/B + 成本三件套 + 回滚自检
+```
+
+Measured on int8 2.9B / CUDA (`MTP_GEN=256`, plain = 97–98 tok/s):
+
+| k | verify pass | snapshot+rollback | accepted drafts/step | vs plain |
+|---:|---:|---:|---:|---:|
+| 2 | 13.6 ms | 0.65 ms | 1.31 | **1.20–1.26×** |
+| 3 | 14.3 ms | 0.65 ms | 1.24 | 1.05–1.08× |
+
+**Correctness evidence** (all in `examples/mtp_probe`): rollback is bit-exact against a direct
+`t = n` pass (`max|Δstate| = 0` over 5.4 M values); a *second* rollback from the same snapshot
+replays bit-identically (this is the invariant that catches CUDA-graph capture mistakes — capture
+does **not** execute kernels); the verify pass and per-token decode agree on argmax.
+
+**What is not done yet**: verification is greedy-only (sampling verification needs a per-row sampler
+on the verify pass); the three MTP-specific primitives are CUDA-only, so Vulkan runs the drafter
+through the default (unsupported) path; and `k=2` is the sweet spot because acceptance per extra
+depth (~0.4) does not pay for the drafter's 1.25 ms/depth.
+
+## 11. License
 
 Apache-2.0.

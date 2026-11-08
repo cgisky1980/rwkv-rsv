@@ -39,7 +39,8 @@
 7. [目录结构](#7-目录结构)
 8. [与信天翁 Albatross、cryscan/rosalia 的关系](#8-与信天翁-albatrosscryscanrosalia-的关系)
 9. [已知限制与后续方向](#9-已知限制与后续方向)
-10. [License](#10-license)
+10. [int6 量化与 MTP 投机解码](#10-int6-量化与-mtp-投机解码)
+11. [License](#11-license)
 
 ## 1. 作用
 
@@ -349,6 +350,55 @@ examples/       自包含示例程序（见 §4.1）
 - **`dplr_seq` 占用率偏低**（40 workgroup × 64 线程 + 每 token 2 次 barrier，稳态 prefill 中 ~10 ms）：可对齐 CUDA 版结构（block 并行行 + shuffle 归约）。
 - **测量环境的天花板**：这张卡同时驱动显示器，SM 时钟按 ~7 % 一级跳（1695 – 1830 MHz），温度从 46 走到 82 ℃ ⇒ 端到端分辨率 ≈ 2 – 3 %，任何小于它的单格读数都不是证据。见 §6.5。
 
-## 10. License
+## 10. int6 量化与 MTP 投机解码
+
+§6 的读数之后新增的两个特性，都是**模型/开关级的 opt-in**：不用时 fp16 / int8 路径逐位不变。
+完整的工程记录、全部读数与「反向经验」见 `参考/2026-11-08-int6量化与MTP-阶段记录.md`。
+
+### 10.1 int6 权重（6 bit 对称量化，N-major 布局）
+
+`tools/quantize_any4.py --bits 6 --int6-layout n` 为每个矩阵额外产出
+`*.int6_lo` / `*.int6_hi` / `*.int6_sz` 三张平面；加载器自动识别，`Wq::I6` / `Wq::I8`
+两个句柄让所有调用点与位宽解耦。布局是 **N-major**：解码的 dot 积在每个 16 值子块上
+读一段连续的 2-bit 平面。
+
+| 档（RTX 2080 Ti，锁频 1845 MHz、300 W） | 体积 | decode | argmax 自循环 |
+|---|---:|---:|---:|
+| fp16 | 5.89 GB | 72.1 tok/s | 74.1 |
+| int8 | 3.30 GB | 94.8 | 98.6 |
+| **int6-N** | **2.48 GB** | **108.5** | **112.3** |
+
+⇒ CUDA 上 int6 是**最快的解码档**（1.14× int8、1.50× fp16），体积再小 24 %；
+prefill 相反（int6 要先反量化成 fp16 再 GEMM，比 fp16 慢 ~15 %）。
+Vulkan 侧内核齐备，但解码仍受并行度限制（见 §9）。
+
+### 10.2 MTP 投机解码
+
+sidecar drafter（`mtp/mtp.safetensors`，自动在模型同目录发现，或 `RWKV_MTP_PATH`）用主模型
+两个 fuse 层的 tap 起草 `k` 个 token，再用一次 `t = k+1` 行的因果 pass 验证。
+单流入口是 `GpuModel::spec_step(state, tok, k)`。
+
+```powershell
+$env:MODEL_PATH="...\rwkv7-g1l-2.9b-int8.st"; $env:MTP_K=2; $env:MTP_GEN=256
+$env:PREFILL_GRAPH=1                       # 必须：验证 pass 是 ~22 个节点/层的小内核
+cargo run --release --example mtp_probe    # 接受长度 + 投机步 A/B + 成本三件套 + 回滚自检
+```
+
+实测（int8 2.9B / CUDA，`MTP_GEN=256`，plain = 97–98 tok/s）：
+
+| k | 验证 pass | 快照+回滚 | 平均接受草稿/步 | 对 plain |
+|---:|---:|---:|---:|---:|
+| 2 | 13.6 ms | 0.65 ms | 1.31 | **1.20–1.26×** |
+| 3 | 14.3 ms | 0.65 ms | 1.24 | 1.05–1.08× |
+
+**正确性证据**（都在 `examples/mtp_probe` 里）：回滚对「直接跑 `t = n` 的 pass」逐位一致
+（540 万个数 `max|Δstate| = 0`）；**同一快照连跑两次回滚**必须逐位相同——这条不变量专门抓
+CUDA graph 捕获的坑（捕获**不执行** kernel）；验证 pass 与逐 token 解码的 argmax 一致。
+
+**还没做**：验证只支持贪心（采样档要逐位置采样核）；三个 MTP 专用原语只有 CUDA 实现
+（Vulkan 走默认的「不支持」路径）；`k=2` 是甜点，因为每多一层的接受增量（~0.4）抵不上
+drafter 每深度 1.25 ms 的成本。
+
+## 11. License
 
 Apache-2.0。
