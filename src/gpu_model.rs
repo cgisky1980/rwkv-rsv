@@ -5999,6 +5999,11 @@ impl GpuModel {
             (l.key_i6, l.key_a8, l.key_w16, b.xk, b.k),
             (l.value_i6, l.value_a8, l.value_w16, b.xv, b.v),
         ];
+        // ★ 三路合并（r/k/v 一个 dispatch、`grid.z=3` 分链）试过并**否决**：即使 split-K 在，
+        // T=4 验证 pass 也是 17.7~18.2 ms（默认三路独立是 16.0~16.2），且实际算错
+        // （`max|Δlogit|≈2.0e1`、`seq vs 解码` argmax 2 vs 47）——把 mid 维度传 0 借道
+        // 融合核会踩到未预期的路径，不值得在错数基础上再谈性能。结论：r/k/v 保持三次独立
+        // `w_plain`，mid 交给 `lowrank_mid1`。
         for (i6, a8, w16, x, y) in rk {
             if let Some(w) = wq(i6, a8) {
                 be.w_plain(&w, x, y, c, c, t)?;

@@ -1300,6 +1300,11 @@ pub trait ComputeBackend {
         Err("gemv_int6_rkv_stage1_batch_f32v not supported by this backend".into())
     }
 
+    /// 后端是否实现 [`Self::gemv_int6_rkv_stage1_batch_f32v`]（能力查询）。
+    fn supports_int6_rkv_f32v(&self) -> bool {
+        false
+    }
+
     /// batch 版 gemv_lowrank_chain4：mid 输入与 v_first/输出为 [batch, ...]；权重共享。
     #[allow(clippy::too_many_arguments)]
     fn gemv_lowrank_chain4_batch(

@@ -11793,6 +11793,10 @@ impl ComputeBackend for CudaBackend {
         true
     }
 
+    fn supports_int6_rkv_f32v(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lowrank_mid1(
         &mut self,
