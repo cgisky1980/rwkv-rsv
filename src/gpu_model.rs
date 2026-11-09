@@ -7184,14 +7184,14 @@ impl GpuLayer {
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                // **默认开**（`I6_OUT_I8=0` 才不建）。2026-11-09 定案（台账 §3.15.7）：
-                // att.output 在 B=32 占整步 **42 %**（消融 `gemv_int6nm_w16`：1048.6 → 1795.1），
-                // 换 int8 副本后 **1772 tok/s（上限的 98.7 %）**，是 int6n 与原生 int8 的全部差距。
-                // 副本本身已验证正确（逐层 GPU 增量 vs 宿主复算 fit_k≈1.000，比 int6 核更准）；
-                // 唯一的代价是**批量贪心解码的 token 轨迹会变**（量化模型的周期性吸引子，
-                // B=4 实测 4 槽中 2 槽受影响）——这是质量口径，不是正确性，故按性能口径默认开。
-                // teacher-forced 质量基线（ΔCE / top-1 一致率）仍待补，见台账 §3.15.7 的待办。
-                let a8 = if !std::env::var("I6_OUT_I8").is_ok_and(|v| v == "0") {
+                // **默认关**（`I6_OUT_I8=1` 才建）。2026-11-09 用 teacher-forced 判据
+                // （`examples/teacher_forced_eval.rs`，CE/top-1，确定性）量出来的读数是
+                // **负面**的：把 att.output 从 int6 GEMV 换成 int8 副本，CE 4.230 → 5.655
+                // （+1.42 nats）、top-1 27.8 % → 17.7 %。且 `GEMV_IMMA=0`（int8 权重 + fp16
+                // 激活，不走 W8A8）仍是 5.628 ⇒ **不是激活量化造成的**，是 int8 解码路径本身
+                // 与 int6 内核的数值差在 32 层残差流上被放大。⇒ 先保持关；要开必须先查清这条差
+                // （见台账 §3.15.9）。
+                let a8 = if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
                     requant(backend, &out_key, c, c, false)?
                 } else {
                     None
