@@ -234,6 +234,19 @@ fn i6_rkv_i8_min_batch() -> usize {
         .unwrap_or(8)
 }
 
+/// `att.output` 的 int8 副本在**批量路径**上生效的最小批宽（`OUT_I8_MINB`，默认 8）。
+///
+/// 与 `RKV_I8_MINB` 同口径的理由：副本只在宽批上换到 W8A8 核才划算（B=32 实测
+/// `gemv_int6nm_w16` 占整步 42 %，换核后 1048.6 → 1772 tok/s）。B<8 没有收益，
+/// 保持 int6 的数值与行为不变，避免低并发路径白白换一次舍入（见台账 §3.15.7）。
+#[inline]
+fn i6_out_i8_min_batch() -> usize {
+    std::env::var("OUT_I8_MINB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
@@ -3758,7 +3771,12 @@ impl GpuModel {
             std::fs::write(format!("target/i6l{i}_gate.bin"), bytes).ok();
             log::info!("[I6DUMP] layer {i}: x_in/y_norm/gate 落盘");
         }
-        if let Some(a8) = &self.layers[i].att_output_a8 {
+        // 副本只在宽批上换核（`OUT_I8_MINB`，默认 8）：B<8 没有收益，保持 int6 的数值。
+        let out_a8 = self.layers[i]
+            .att_output_a8
+            .as_ref()
+            .filter(|_| batch >= i6_out_i8_min_batch());
+        if let Some(a8) = out_a8 {
             // ★ W8A8 张量核：门控 `·g` 由 `quant_x_i8`（HAS_G）顺手乘掉，GEMM 走累加 op。
             if Self::imma_op_on("out") && self.imma_ok(c, c, batch) {
                 self.backend
@@ -7166,13 +7184,14 @@ impl GpuLayer {
         let out_key = format!("blocks.{idx}.att.output.weight");
         let (att_output_i6, att_output_a8, output_w16, output_w) =
             if let Some(i6) = load_int6(backend, &out_key, c, c)? {
-                // **默认关**（`I6_OUT_I8=1` 才建）。2026-11-09 复查（见台账 §3.15.7）：
-                // 副本本身**没有 bug** —— 逐层 GPU 增量与宿主 `w = scale·b + zero` 复算
-                // 对得上（fit_k = 1.000±0.001，比 int6 内核更准），单流生成也通顺；但**批量**
-                // 贪心解码会从第 8~11 个 token 起落进 2-周期（B=4 时 4 槽里 2 槽不受影响）。
-                // 这是「残差流换了一种（更好的）舍入 ⇒ 贪心轨迹换道 ⇒ 周期性吸引子」的质量
-                // 余量问题，与数据/上传/内核都无关；要开它得先有 teacher-forced 的质量判据。
-                let a8 = if std::env::var("I6_OUT_I8").is_ok_and(|v| v != "0") {
+                // **默认开**（`I6_OUT_I8=0` 才不建）。2026-11-09 定案（台账 §3.15.7）：
+                // att.output 在 B=32 占整步 **42 %**（消融 `gemv_int6nm_w16`：1048.6 → 1795.1），
+                // 换 int8 副本后 **1772 tok/s（上限的 98.7 %）**，是 int6n 与原生 int8 的全部差距。
+                // 副本本身已验证正确（逐层 GPU 增量 vs 宿主复算 fit_k≈1.000，比 int6 核更准）；
+                // 唯一的代价是**批量贪心解码的 token 轨迹会变**（量化模型的周期性吸引子，
+                // B=4 实测 4 槽中 2 槽受影响）——这是质量口径，不是正确性，故按性能口径默认开。
+                // teacher-forced 质量基线（ΔCE / top-1 一致率）仍待补，见台账 §3.15.7 的待办。
+                let a8 = if !std::env::var("I6_OUT_I8").is_ok_and(|v| v == "0") {
                     requant(backend, &out_key, c, c, false)?
                 } else {
                     None
