@@ -611,6 +611,248 @@ impl Model {
     }
 }
 
+// ===== 深度循环（recurrent depth）实验支持 =====
+//
+// 研究计划：`rwkv_recurrent_depth_plan.md` §3。这里只做**推理时 post-hoc 循环**——把一个
+// 已训练好的 RWKV-7 的连续 N_loop 层当作共享权重的循环块，对同一 token 执行 L 次。
+// 权重不复制 ⇒ state 与显存都不随 L 增长；这与「重新训练一个 looped 模型」是两件事。
+
+/// 时间 state 提交策略（计划 §3.2 / H4 的核心变量）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateCommit {
+    /// S1 naive：每轮都更新 WKV state（反面基线，会污染时间递归）。
+    Naive,
+    /// S2 first-commit：仅第 1 轮更新，后续轮使用循环开始前的只读快照。
+    First,
+    /// S3 last-commit（默认）：前 L−1 轮用只读快照，最后一轮才写回 state。
+    Last,
+}
+
+impl std::str::FromStr for StateCommit {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "s1" | "naive" => Ok(Self::Naive),
+            "s2" | "first" => Ok(Self::First),
+            "s3" | "last" => Ok(Self::Last),
+            _ => Err(format!("unknown commit strategy: {s}")),
+        }
+    }
+}
+
+/// 三段式深度循环配置：N_in / (N_loop × L) / N_out。
+#[derive(Debug, Clone, Copy)]
+pub struct DepthConfig {
+    pub n_in: usize,
+    pub n_loop: usize,
+    pub n_out: usize,
+    pub l: usize,
+    pub commit: StateCommit,
+    /// h_i = F_shared(h_{i-1}) + h_0（计划 §3.3）。
+    pub reinject: bool,
+}
+
+impl DepthConfig {
+    /// 恒等配置：L=1、无循环块，等价于原 `Model::forward`。
+    pub fn passthrough(n_layer: usize) -> Self {
+        Self {
+            n_in: n_layer,
+            n_loop: 0,
+            n_out: 0,
+            l: 1,
+            commit: StateCommit::Last,
+            reinject: false,
+        }
+    }
+
+    pub fn validate(&self, n_layer: usize) -> Result<(), String> {
+        if self.l == 0 {
+            return Err("L must be >= 1".into());
+        }
+        if self.n_in + self.n_loop + self.n_out != n_layer {
+            return Err(format!(
+                "n_in+n_loop+n_out={} != model n_layer={n_layer}",
+                self.n_in + self.n_loop + self.n_out
+            ));
+        }
+        Ok(())
+    }
+
+    /// 有效深度（仅用于报告，不增加参数量）。
+    pub fn effective_depth(&self) -> usize {
+        self.n_in + self.l * self.n_loop + self.n_out
+    }
+}
+
+impl Model {
+    /// 单层前向（RWKV-7 DPLR）：从原 `forward` 的层体逐字抽出，数值口径保持一致。
+    /// `commit` 由调用方通过传入的 state 是否是真实 state 来保证，这里不做特判。
+    #[allow(clippy::too_many_arguments)]
+    fn layer_step(
+        &self,
+        idx: usize,
+        mut x: Vec<f32>,
+        st: &mut LayerState,
+        v_first: &mut Option<Vec<f32>>,
+    ) -> Vec<f32> {
+        let c = self.config.n_embd;
+        let h = self.config.n_head;
+        let n = self.config.head_size;
+        let (wm, am, vm, gm, fh) = (
+            self.config.w_mid,
+            self.config.a_mid,
+            self.config.v_mid,
+            self.config.g_mid,
+            self.config.ffn_hidden,
+        );
+        let layer = &self.layers[idx];
+
+        // ===== Time Mixing =====
+        let ln1 = layer_norm(&x, &layer.ln1_w, &layer.ln1_b, LN_EPS);
+        let prev = st.tmix_x.clone();
+        st.tmix_x = ln1.clone();
+
+        let xr = lerp(&ln1, &prev, &layer.x_r);
+        let xw = lerp(&ln1, &prev, &layer.x_w);
+        let xk = lerp(&ln1, &prev, &layer.x_k);
+        let xv = lerp(&ln1, &prev, &layer.x_v);
+        let xa = lerp(&ln1, &prev, &layer.x_a);
+        let xg = lerp(&ln1, &prev, &layer.x_g);
+
+        let r = matvec(&xr, &layer.receptance_w, c, c);
+        let k = matvec(&xk, &layer.key_w, c, c);
+        let v = matvec(&xv, &layer.value_w, c, c);
+
+        let v = match &*v_first {
+            None => {
+                *v_first = Some(v.clone());
+                v
+            }
+            Some(vf) => {
+                let mid = matvec(&xv, &layer.v1, c, vm);
+                let full = matvec(&mid, &layer.v2, vm, c);
+                let gate = sigmoid(&add_bias(&full, &layer.v0));
+                lerp(&v, vf, &gate)
+            }
+        };
+
+        let w_mid = matvec(&xw, &layer.w1, c, wm);
+        let w_tanh = tanh_vec(&w_mid);
+        let w_full = matvec(&w_tanh, &layer.w2, wm, c);
+        let w_sig = sigmoid(&add_bias(&w_full, &layer.w0));
+        let w = exp_vec(&scale_vec(&w_sig, -1.0f32 / std::f32::consts::E.sqrt()));
+
+        let a_mid = matvec(&xa, &layer.a1, c, am);
+        let a_full = matvec(&a_mid, &layer.a2, am, c);
+        let a = sigmoid(&add_bias(&a_full, &layer.a0));
+
+        let kk = mul_vec(&k, &layer.k_k);
+        let k_a_vec = mul_vec(&k, &a);
+        let k_mod = lerp(&k, &k_a_vec, &layer.k_a);
+        let kk_l2 = l2_norm_groups(&kk, h, n);
+        let b_vec = mul_vec(&kk_l2, &neg_vec(&a));
+
+        dplr_update(&mut st.tmix_rnn, &k_mod, &v, &w, &kk_l2, &b_vec, h, n);
+        let y = dplr_matvec(&st.tmix_rnn, &r, h, n);
+        let y = group_norm(&y, &layer.ln_x_w, &layer.ln_x_b, h, n, GN_EPS);
+        let extra = sum_rk_rk(&r, &k_mod, &layer.r_k, &v, h, n, c);
+        let y = add_vec(&y, &extra);
+
+        let g_mid = matvec(&xg, &layer.g1, c, gm);
+        let g_sig = sigmoid(&g_mid);
+        let g = matvec(&g_sig, &layer.g2, gm, c);
+        let y_g = mul_vec(&y, &g);
+        let y_out = matvec(&y_g, &layer.output_w, c, c);
+        x = add_vec(&x, &y_out);
+
+        // ===== Channel Mixing =====
+        let ln2 = layer_norm(&x, &layer.ln2_w, &layer.ln2_b, LN_EPS);
+        let prev_c = st.cmix_x.clone();
+        st.cmix_x = ln2.clone();
+        let xb = lerp(&ln2, &prev_c, &layer.ffn_x_k);
+        let r2 = relu_sq(&matvec(&xb, &layer.ffn_key_w, c, fh));
+        let v2 = matvec(&r2, &layer.ffn_value_w, fh, c);
+        add_vec(&x, &v2)
+    }
+
+    /// 带深度循环的前向，返回最后一个 token 的 logits。
+    ///
+    /// `states` 长度必须 = n_layer（与 `init_state` 一致）。循环块使用
+    /// `states[n_in .. n_in+n_loop]`，非 commit 轮使用临时快照 ⇒ 不写回时间 state。
+    pub fn forward_recurrent(
+        &self,
+        tokens: &[u32],
+        states: &mut [LayerState],
+        cfg: &DepthConfig,
+    ) -> Result<Vec<f32>, String> {
+        cfg.validate(self.config.n_layer)?;
+        let c = self.config.n_embd;
+        let emb_ln = layer_norm_rows(
+            &self.emb_weight,
+            &self.ln0_w,
+            &self.ln0_b,
+            c,
+            self.config.vocab,
+            LN_EPS,
+        );
+        let n_out_start = self.config.n_layer - cfg.n_out;
+        let mut logits = vec![0.0f32; self.config.vocab];
+
+        for &token in tokens {
+            let mut x = emb_ln[token as usize * c..(token as usize + 1) * c].to_vec();
+            let mut v_first: Option<Vec<f32>> = None;
+
+            // InputBlock
+            for (i, st) in states.iter_mut().enumerate().take(cfg.n_in) {
+                x = self.layer_step(i, x, st, &mut v_first);
+            }
+
+            if cfg.n_loop > 0 {
+                // 循环开始前冻结快照：S2/S3 的非 commit 轮都读它（与计划附录 B 一致）。
+                let frozen: Vec<LayerState> = if cfg.commit == StateCommit::Naive {
+                    Vec::new()
+                } else {
+                    states[cfg.n_in..cfg.n_in + cfg.n_loop].to_vec()
+                };
+                let h0 = if cfg.reinject { Some(x.clone()) } else { None };
+
+                for round in 1..=cfg.l {
+                    let commit_this = match cfg.commit {
+                        StateCommit::Naive => true,
+                        StateCommit::First => round == 1,
+                        StateCommit::Last => round == cfg.l,
+                    };
+                    let loop_states = &mut states[cfg.n_in..cfg.n_in + cfg.n_loop];
+                    for (j, st) in loop_states.iter_mut().enumerate() {
+                        let idx = cfg.n_in + j;
+                        if commit_this {
+                            x = self.layer_step(idx, x, st, &mut v_first);
+                        } else {
+                            // 每轮独立快照：读同一个冻结 state，丢弃本轮写入。
+                            // Naive 策略下 frozen 为空，但 commit_this 恒 true，不会走这里。
+                            let mut tmp = frozen.get(j).cloned().unwrap_or_else(|| st.clone());
+                            x = self.layer_step(idx, x, &mut tmp, &mut v_first);
+                        }
+                    }
+                    if let Some(ref h) = h0 {
+                        x = add_vec(&x, h);
+                    }
+                }
+            }
+
+            // OutputBlock
+            for i in 0..cfg.n_out {
+                let idx = n_out_start + i;
+                x = self.layer_step(idx, x, &mut states[idx], &mut v_first);
+            }
+
+            let x_norm = layer_norm(&x, &self.ln_out_w, &self.ln_out_b, LN_EPS);
+            logits = matvec(&x_norm, &self.head_weight, c, self.config.vocab);
+        }
+        Ok(logits)
+    }
+}
+
 fn max_layer(st: &safetensors::SafeTensors) -> usize {
     st.names()
         .iter()

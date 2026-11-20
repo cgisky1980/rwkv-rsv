@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(&corpus_path)?;
     let toks = tok.encode(text.as_bytes())?;
     assert!(
-        toks.len() >= slots * (prompt + tail) + 1,
+        toks.len() > slots * (prompt + tail),
         "语料太短：{} tok，需要 {}（TF_SLOTS×(TF_PROMPT+TF_TAIL)+1）",
         toks.len(),
         slots * (prompt + tail) + 1
