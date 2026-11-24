@@ -247,6 +247,17 @@ fn i6_out_i8_min_batch() -> usize {
         .unwrap_or(8)
 }
 
+/// 序列缓冲的归属（三块互斥池，见 `GpuModel` 字段注释）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqBufSlot {
+    /// 单序列 prefill / 分类 / MTP 等共用。
+    Shared,
+    /// 批量单步（`batch_step_sample`）。
+    BatchStep,
+    /// 分块批量 prefill（`forward_seq_batch_chunk`）。
+    BatchPrefill,
+}
+
 /// RWKV-7 GPU 模型：权重上传一次，forward 时复用工作缓冲与状态
 pub struct GpuModel {
     backend: Box<dyn ComputeBackend>,
@@ -271,6 +282,11 @@ pub struct GpuModel {
     // 批量单步（batch_step_sample）专用序列缓冲：与 seq_bufs 隔离，避免与单序列
     // prefill / 分类路径的 T 不同反复 clear_cache + 重建。
     batch_seq_bufs: Option<SeqBuffers>,
+    // 分块批量 prefill（`forward_seq_batch_chunk`）专用序列缓冲：bt = 批宽 × 块长，
+    // 与 seq_bufs（单序列 prefill）和 batch_seq_bufs（批量 decode）都不同；三者若共用
+    // 一块缓冲，客户端「批量 prefill 与单序列 prefill 交替」时每次调用都会
+    // clear_cache + 重建 ~45 个缓冲。
+    batch_prefill_bufs: Option<SeqBuffers>,
     // 分块 prefill 用的小状态（宽度 = `prefill_chunk_slots()`）。
     // 动机：解码并发可以到 256，但 prefill 工作区不该跟着涨（见 forward_seq_batch_padded）。
     prefill_state: Option<(usize, State)>,
@@ -1055,6 +1071,7 @@ impl GpuModel {
             batch_lens: None,
             seq_bufs: None,
             batch_seq_bufs: None,
+            batch_prefill_bufs: None,
             prefill_state: None,
             batch_step_tmp: None,
             selfloop_bufs: Vec::new(),
@@ -1514,6 +1531,7 @@ impl GpuModel {
             batch_lens: None,
             seq_bufs: None,
             batch_seq_bufs: None,
+            batch_prefill_bufs: None,
             prefill_state: None,
             batch_step_tmp: None,
             selfloop_bufs: Vec::new(),
@@ -2038,25 +2056,15 @@ impl GpuModel {
         )
     }
 
-    /// batch prefill 公共核心：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，
-    /// 直接更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的
-    /// M 维 = B*T_pad，权重读一份算全部行。
-    /// `pad_to`：Some(n) 强制 T_pad = n（调用方保证 n >= 各 prompt 长度）——固定 bt
-    /// 让 seq 缓冲只建一次；None 取批内最大长度。lens 恒按**原始长度**计算
-    ///（pad 行不进 state、不计入 segmean 均值）。
-    /// 返回 (seeds, seq_bufs[已 take，调用方归还], lens_t, t_pad, batch, tok[调用方释放])。
-    /// CUDA / Vulkan 均可用（`seq_shift_batch`/`dplr_seq_batch`/`copy_token_batch` 两后端
-    /// 都已实现）。状态重置由调用方负责。
-    /// 取（并在 T 变化时重建）序列缓冲：`dedicated=true` 走 `batch_seq_bufs`
-    /// （批量单步路径专用，避免与单序列 prefill 的 T 抖动互相 clear_cache），
-    /// false 走共享的 `seq_bufs`。返回的缓冲已被 take，调用方负责归还。
-    fn take_seq_bufs(&mut self, bt: usize, dedicated: bool) -> R<SeqBuffers> {
+    /// 取（并在 T 变化时重建）序列缓冲：三种用途各用独立池子（见 [`SeqBufSlot`]），
+    /// 避免不同 bt 交替时反复 clear_cache + 重建。
+    fn take_seq_bufs(&mut self, bt: usize, slot: SeqBufSlot) -> R<SeqBuffers> {
         let c = self.config.n_embd;
         let vocab = self.config.vocab;
-        let mut cur = if dedicated {
-            self.batch_seq_bufs.take()
-        } else {
-            self.seq_bufs.take()
+        let mut cur = match slot {
+            SeqBufSlot::Shared => self.seq_bufs.take(),
+            SeqBufSlot::BatchStep => self.batch_seq_bufs.take(),
+            SeqBufSlot::BatchPrefill => self.batch_prefill_bufs.take(),
         };
         if cur.as_ref().is_none_or(|sb| sb.t != bt) {
             self.backend.clear_cache();
@@ -2074,12 +2082,31 @@ impl GpuModel {
         Ok(cur.expect("seq_bufs 已重建"))
     }
 
+    /// 归还序列缓冲到对应池子。
+    fn put_seq_bufs(&mut self, bufs: SeqBuffers, slot: SeqBufSlot) {
+        match slot {
+            SeqBufSlot::Shared => self.seq_bufs = Some(bufs),
+            SeqBufSlot::BatchStep => self.batch_seq_bufs = Some(bufs),
+            SeqBufSlot::BatchPrefill => self.batch_prefill_bufs = Some(bufs),
+        }
+    }
+
+    /// batch prefill 公共核心：B 个 prompt（可变长，pad 到 T_pad）一次贯穿全部层，
+    /// 直接更新 batch State（[batch, ...] 布局）——信天翁 B×T rows 模型：GEMM 的
+    /// M 维 = B*T_pad，权重读一份算全部行。
+    /// `pad_to`：Some(n) 强制 T_pad = n（调用方保证 n >= 各 prompt 长度）——固定 bt
+    /// 让 seq 缓冲只建一次；None 取批内最大长度。lens 恒按**原始长度**计算
+    ///（pad 行不进 state、不计入 segmean 均值）。
+    /// `buf_slot`：本次使用哪块序列缓冲（见 [`SeqBufSlot`]）。
+    /// 返回 (seeds, seq_bufs[已 take，调用方归还], lens_t, t_pad, batch, tok[调用方释放])。
+    /// CUDA / Vulkan 均可用（`seq_shift_batch`/`dplr_seq_batch`/`copy_token_batch` 两后端
+    /// 都已实现）。状态重置由调用方负责。
     fn forward_seq_batch_core(
         &mut self,
         state: &mut State,
         tokens_batch: &[Vec<u32>],
         pad_to: Option<usize>,
-        dedicated_bufs: bool,
+        buf_slot: SeqBufSlot,
     ) -> R<(Vec<u32>, SeqBuffers, TensorId, usize, usize, TensorId)> {
         let batch = tokens_batch.len();
         if batch == 0 {
@@ -2133,7 +2160,7 @@ impl GpuModel {
         self.backend.upload_u32(tok, &flat)?;
 
         // 序列缓冲按 bt 重建（t 维换 B*T_pad，布局完全兼容）。
-        let mut seq_bufs = self.take_seq_bufs(bt, dedicated_bufs)?;
+        let mut seq_bufs = self.take_seq_bufs(bt, buf_slot)?;
 
         self.backend.begin_batch()?;
         self.backend
@@ -2155,9 +2182,9 @@ impl GpuModel {
         tokens_batch: &[Vec<u32>],
     ) -> R<Vec<u32>> {
         let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
-            self.forward_seq_batch_core(state, tokens_batch, None, false)?;
+            self.forward_seq_batch_core(state, tokens_batch, None, SeqBufSlot::Shared)?;
         self.backend.free_tensor(tok);
-        self.seq_bufs = Some(seq_bufs);
+        self.put_seq_bufs(seq_bufs, SeqBufSlot::Shared);
         Ok(seeds)
     }
 
@@ -2175,9 +2202,9 @@ impl GpuModel {
         let limit = prefill_chunk_slots();
         if limit == 0 || tokens_batch.len() <= limit {
             let (seeds, seq_bufs, _lens_t, _t_pad, _batch, tok) =
-                self.forward_seq_batch_core(state, tokens_batch, Some(pad_to), false)?;
+                self.forward_seq_batch_core(state, tokens_batch, Some(pad_to), SeqBufSlot::Shared)?;
             self.backend.free_tensor(tok);
-            self.seq_bufs = Some(seq_bufs);
+            self.put_seq_bufs(seq_bufs, SeqBufSlot::Shared);
             return Ok(seeds);
         }
         // —— 分块 prefill：把 **prefill 宽度** 与 **解码宽度** 解耦 ——
@@ -2217,9 +2244,9 @@ impl GpuModel {
             self.reset_state_of(&sub)?;
             let c1 = std::time::Instant::now();
             let (s, seq_bufs, _l, _t, _b, tok) =
-                self.forward_seq_batch_core(&mut sub, &padded, Some(pad_to), false)?;
+                self.forward_seq_batch_core(&mut sub, &padded, Some(pad_to), SeqBufSlot::Shared)?;
             self.backend.free_tensor(tok);
-            self.seq_bufs = Some(seq_bufs); // 下块同 bt 直接复用
+            self.put_seq_bufs(seq_bufs, SeqBufSlot::Shared); // 下块同 bt 直接复用
             seeds.extend(s.into_iter().take(chunk.len()));
             let c2 = std::time::Instant::now();
             // 整块一次设备内回灌：源是 sub 的前 chunk.len() 行（连续），目标是
@@ -2255,6 +2282,50 @@ impl GpuModel {
             );
         }
         self.prefill_state = Some((w, sub));
+        Ok(seeds)
+    }
+
+    /// **分块批量 prefill**（桌面会话池的并发 prefill 路径）：B 个任务各喂入
+    /// 长度 ≤ `pad_to` 的**当前块**，跨调用在原 batch State 上累积（行 = 任务）。
+    ///
+    /// 与 [`Self::forward_seq_batch_padded`] 的区别：
+    /// · 不按 `prefill_chunk_slots()` 拆宽、不建临时小状态回灌 —— 调用方保证
+    ///   `tokens_batch.len()` 不超限，且 State 的行与任务一一对应（分块推进期间
+    ///   state 必须原样续用，所以「按宽度分块 + 状态回灌」在这里不适用）；
+    /// · 序列缓冲走**独立池**（`batch_prefill_bufs`）：与单序列 prefill（`seq_bufs`）
+    ///   和批量 decode（`batch_seq_bufs`）交替调用时不会互相 clear_cache + 重建；
+    /// · 各轮可变长：不同行每轮可以喂不同长度；喂完的行由调用方自行停喂
+    ///   （本函数要求每行非空，空行请传 1 个占位 token 并在调用方另行暂存真状态）。
+    ///
+    /// 返回各槽本块末 token（即 `tokens_batch` 各行的 `last()`），不是下一 token 预测。
+    pub fn forward_seq_batch_chunk(
+        &mut self,
+        state: &mut State,
+        tokens_batch: &[Vec<u32>],
+        pad_to: usize,
+    ) -> R<Vec<u32>> {
+        if tokens_batch.is_empty() {
+            return Err("forward_seq_batch_chunk: 空 batch".into());
+        }
+        if tokens_batch.iter().any(|v| v.is_empty()) {
+            return Err("forward_seq_batch_chunk: 存在空行（喂完的行须由调用方停喂）".into());
+        }
+        let limit = prefill_chunk_slots().max(1);
+        if tokens_batch.len() > limit {
+            return Err(format!(
+                "forward_seq_batch_chunk: 批宽 {} 超限（PREFILL_SLOTS={limit}）",
+                tokens_batch.len()
+            )
+            .into());
+        }
+        let (seeds, seq_bufs, _l, _t, _b, tok) = self.forward_seq_batch_core(
+            state,
+            tokens_batch,
+            Some(pad_to),
+            SeqBufSlot::BatchPrefill,
+        )?;
+        self.backend.free_tensor(tok);
+        self.put_seq_bufs(seq_bufs, SeqBufSlot::BatchPrefill);
         Ok(seeds)
     }
 
@@ -2314,7 +2385,7 @@ impl GpuModel {
     ) -> R<Vec<Vec<f32>>> {
         self.reset_state_of(state)?;
         let (_seeds, seq_bufs, lens_t, t_pad, batch, tok) =
-            self.forward_seq_batch_core(state, tokens_batch, pad_to, false)?;
+            self.forward_seq_batch_core(state, tokens_batch, pad_to, SeqBufSlot::Shared)?;
         let c = self.config.n_embd;
         let out = self.backend.create_tensor(batch * c, TensorDtype::F32)?;
         self.backend
@@ -2322,7 +2393,7 @@ impl GpuModel {
         let flat = self.backend.download(out)?;
         self.backend.free_tensor(out);
         self.backend.free_tensor(tok);
-        self.seq_bufs = Some(seq_bufs);
+        self.put_seq_bufs(seq_bufs, SeqBufSlot::Shared);
         Ok(flat.chunks(c).map(<[f32]>::to_vec).collect())
     }
 
@@ -2516,12 +2587,12 @@ impl GpuModel {
         } else {
             // 变长 seq 路径：用专用 batch_seq_bufs（与单序列 prefill 的 T 抖动隔离）。
             let (_seeds, seq_bufs, lens_t, t_pad, _b, tok) =
-                self.forward_seq_batch_core(state, tokens, None, true)?;
+                self.forward_seq_batch_core(state, tokens, None, SeqBufSlot::BatchStep)?;
             // 各 slot 末 token 的残差 → bb.x（batch 布局），后续 norm/head/采样共用。
             self.backend
                 .copy_token_batch(seq_bufs.x, bb.x, lens_t, c, t_pad, batch)?;
             self.backend.free_tensor(tok);
-            self.batch_seq_bufs = Some(seq_bufs);
+            self.put_seq_bufs(seq_bufs, SeqBufSlot::BatchStep);
         }
 
         self.backend.norm(
