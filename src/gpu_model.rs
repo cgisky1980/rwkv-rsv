@@ -2771,15 +2771,21 @@ impl GpuModel {
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, bt, m_pad, c, c,
             )?;
-            self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+            if self.seq_imma_on(c, c, bt) {
+                self.backend.gemm_imma_seq(&qr, sb.xr, sb.r, c, c, bt, 3)?;
+                self.backend.gemm_imma_seq(&qk, sb.xk, sb.k, c, c, bt, 3)?;
+                self.backend.gemm_imma_seq(&qv, sb.xv, sb.v, c, c, bt, 3)?;
+            } else {
+                self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+            }
         } else {
             self.backend.to_f16_triple(
                 sb.xr, sb.xk, sb.xv, sb.xr16, sb.xk16, sb.xv16, c, bt, m_pad, c, c,
@@ -2927,10 +2933,17 @@ impl GpuModel {
         self.backend
             .elementwise_mul(sb.y_norm, sb.g, sb.y_g, c, bt)?;
         if let Some(wqo) = wq_out(layer.att_output_i6, layer.att_output_a8) {
-            self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
+            if self.seq_imma_on(c, c, bt) {
+                // y_out = x + y_g @ W^T：先把残差拷进去，再由 int8 GEMM 累加（op=1）。
+                self.backend.copy_range(sb.x, 0, sb.y_out, 0, bt * c)?;
+                self.backend
+                    .gemm_imma_seq(&wqo, sb.y_g, sb.y_out, c, c, bt, 1)?;
+            } else {
+                self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
+            }
         } else {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, bt, m_pad, c, c)?;
             self.backend.gemm_add(
@@ -2966,7 +2979,17 @@ impl GpuModel {
         // §6.13 定稿：`acc16` 时 ffn key 一条 `gemm_f16_f16_relu2` 直写 `r2_16`，
         // 既省掉累加器宽度、又省掉 `to_f16(r2 → r2_16)` 那一遍；这就是**默认档**（`PREFILL_ACC16=0` 才回退）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
-        if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
+        // seq 的 W8A8 档：ffn key 直写 `r2`（f32，relu²），ffn value 从 `r2` 量化后累加。
+        // key/value 都有 int8 权重时才整体换档（只换一半会多一次 r2→r2_16 转换）。
+        let ffn_imma = self.seq_imma_on(fh, c, bt)
+            && wq(layer.ffn_key_i6, layer.ffn_key_a8).is_some()
+            && wq(layer.ffn_value_i6, layer.ffn_value_a8).is_some();
+        if ffn_imma {
+            let wqk = wq(layer.ffn_key_i6, layer.ffn_key_a8).expect("已判存在");
+            // relu² 直写 f32 `r2`（ffn value 的 int8 量化入口也吃 f32）。
+            self.backend
+                .gemm_imma_seq(&wqk, sb.xb, sb.r2, fh, c, bt, 0)?;
+        } else if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
             self.backend.to_f16(sb.xb, sb.xb16, c, bt, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqk, sb.w_scratch, fh, c)?;
             if acc16 {
@@ -2988,13 +3011,20 @@ impl GpuModel {
             }
         }
         if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
-            if !acc16 {
+            if ffn_imma {
+                // v2 = x + r2 @ W^T：残差先拷进 v2，再由 int8 GEMM 累加（op=1）。
+                self.backend.copy_range(sb.x, 0, sb.v2, 0, bt * c)?;
                 self.backend
-                    .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+                    .gemm_imma_seq(&wqv, sb.r2, sb.v2, c, fh, bt, 1)?;
+            } else {
+                if !acc16 {
+                    self.backend
+                        .to_f16(sb.r2, sb.r2_16, fh, bt, m_pad, fh, fh)?;
+                }
+                self.backend.w_dequant_to_f16(&wqv, sb.w_scratch, c, fh)?;
+                self.backend
+                    .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
             }
-            self.backend.w_dequant_to_f16(&wqv, sb.w_scratch, c, fh)?;
-            self.backend
-                .gemm_add(sb.r2_16, sb.w_scratch, sb.x, sb.v2, m_pad, c, fh)?;
         } else {
             if !acc16 {
                 self.backend
@@ -3267,6 +3297,32 @@ impl GpuModel {
             // 复现旧口径用 `VK_IMMA_OPS=key,out,val,head`（显式白名单即关闭 rkv）。
             Err(_) => true,
         }
+    }
+
+    /// seq/prefill 的 W8A8 int8 张量核门（CUDA 实现；`PREFILL_IMMA=0` 关闭）。
+    ///
+    /// 行数下限 64：尾巴小块、MTP 验证（T≤8）与分类/mean-hidden 的小形状都留在
+    /// fp16 路径，数值与既有小 T 路径一致；768/整块 prefill 才换档。
+    /// 形状约束与解码档同源：`m % 64 == 0`（mma 行块）、`k % 128 == 0`（量化组宽）。
+    fn seq_imma_on(&self, m: usize, k: usize, rows: usize) -> bool {
+        let on = std::env::var("PREFILL_IMMA")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+            && self.backend.supports_imma_seq()
+            && rows >= 64
+            && m.is_multiple_of(64)
+            && k.is_multiple_of(128)
+            // 纯 int8 权重模型才换档：int6 模型的 int8 副本是加载期补的，
+            // prefill 保持原 fp16 反量化路径（数值与既有档一致）。
+            && self
+                .layers
+                .first()
+                .is_none_or(|l| l.receptance_i6.is_none());
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if on && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("[PREFILL_IMMA] seq/prefill 走 W8A8 int8 张量核（PREFILL_IMMA=0 关）");
+        }
+        on
     }
 
     /// batch 版单层前向：全部 kernel 走 batch 变体（B slot 共享权重一次读）。
@@ -5072,7 +5128,7 @@ impl GpuModel {
                 if std::env::var("GEMM_DIAG").is_ok() {
                     log::info!("[FS] layer {i} start");
                 }
-                self.forward_seq_layer(i, t, c, n, sb, state)?;
+                self.forward_seq_layer(i, t, c, n, sb, state, true)?;
                 if std::env::var("GEMM_DIAG").is_ok() {
                     log::info!("[FS] layer {i} done");
                 }
@@ -5235,7 +5291,7 @@ impl GpuModel {
         // 单批处理全部层：prefill 后 sb.x 即最后一层 FFN 输出（残差后）
         self.backend.begin_batch()?;
         for i in 0..self.config.n_layer {
-            self.forward_seq_layer(i, t, c, n, sb, state)?;
+            self.forward_seq_layer(i, t, c, n, sb, state, false)?;
         }
         self.backend.end_batch()?;
 
@@ -5294,7 +5350,7 @@ impl GpuModel {
         let mut state = self.state.take().unwrap();
         for i in 0..self.config.n_layer {
             self.backend.begin_batch()?;
-            self.forward_seq_layer(i, t, c, n, sb, &mut state)?;
+            self.forward_seq_layer(i, t, c, n, sb, &mut state, false)?;
             self.backend.end_batch()?;
             let xd = self.backend.download(sb.x)?;
             snaps.push(xd[..d].to_vec());
@@ -5452,7 +5508,7 @@ impl GpuModel {
         let mut state = self.state.take().unwrap();
         for i in 0..up_to_layer {
             self.backend.begin_batch()?;
-            self.forward_seq_layer(i, t, c, n_head, sb, &mut state)?;
+            self.forward_seq_layer(i, t, c, n_head, sb, &mut state, false)?;
             self.backend.end_batch()?;
         }
         self.state = Some(state);
@@ -5569,6 +5625,7 @@ impl GpuModel {
         n: usize,
         sb: &mut SeqBuffers,
         state: &mut State,
+        imma: bool,
     ) -> R<()> {
         let fh = self.config.ffn_hidden;
         let (wwp, aap, vvp, ggp) = (
@@ -5814,15 +5871,21 @@ impl GpuModel {
                     wq(layer.key_i6, layer.key_a8),
                     wq(layer.value_i6, layer.value_a8),
                 ) {
-                    self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
-                    self.backend
-                        .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
-                    self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
-                    self.backend
-                        .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
-                    self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
-                    self.backend
-                        .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+                    if imma && self.seq_imma_on(c, c, t) {
+                        self.backend.gemm_imma_seq(&qr, sb.xr, sb.r, c, c, t, 3)?;
+                        self.backend.gemm_imma_seq(&qk, sb.xk, sb.k, c, c, t, 3)?;
+                        self.backend.gemm_imma_seq(&qv, sb.xv, sb.v, c, c, t, 3)?;
+                    } else {
+                        self.backend.w_dequant_to_f16(&qr, sb.w_scratch, c, c)?;
+                        self.backend
+                            .gemm(sb.xr16, sb.w_scratch, sb.r, m_pad, c, c)?;
+                        self.backend.w_dequant_to_f16(&qk, sb.w_scratch, c, c)?;
+                        self.backend
+                            .gemm(sb.xk16, sb.w_scratch, sb.k, m_pad, c, c)?;
+                        self.backend.w_dequant_to_f16(&qv, sb.w_scratch, c, c)?;
+                        self.backend
+                            .gemm(sb.xv16, sb.w_scratch, sb.v, m_pad, c, c)?;
+                    }
                 } else {
                     let r16 = layer
                         .receptance_w16
@@ -6141,10 +6204,17 @@ impl GpuModel {
                 )?;
             }
         } else if let Some(wqo) = wq_out(layer.att_output_i6, layer.att_output_a8) {
-            self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
-            self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
-            self.backend
-                .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
+            if imma && self.seq_imma_on(c, c, t) {
+                // y_out = x + y_g @ W^T：残差先拷进去，再由 int8 GEMM 累加（op=1）。
+                self.backend.copy_range(sb.x, 0, sb.y_out, 0, t * c)?;
+                self.backend
+                    .gemm_imma_seq(&wqo, sb.y_g, sb.y_out, c, c, t, 1)?;
+            } else {
+                self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
+                self.backend.w_dequant_to_f16(&wqo, sb.w_scratch, c, c)?;
+                self.backend
+                    .gemm_add(sb.y_g16, sb.w_scratch, sb.x, sb.y_out, m_pad, c, c)?;
+            }
         } else {
             self.backend.to_f16(sb.y_g, sb.y_g16, c, t, m_pad, c, c)?;
             self.backend.gemm_add(
@@ -6249,6 +6319,13 @@ impl GpuModel {
         // §6.13 定稿：同 `forward_seq_layer_batch`（默认档 = fp16 累加器直写 `r2_16`）。
         // 这一条链在**单序列**路径上也开了 ⇒ 门限从 2048 放到 256 才是不留空隙的写法（#68）。
         let acc16 = self.backend.supports_gemm_f16_acc() && prefill_acc16(m_pad);
+        // seq 的 W8A8 档（见 `forward_seq_layer_batch` 同名逻辑）：key 直写 f32 `r2`，
+        // value 从 `r2` 量化后累加；key/value 都有 int8 权重时才整体换档。
+        let ffn_imma = !small_t
+            && imma
+            && self.seq_imma_on(fh, c, t)
+            && wq(layer.ffn_key_i6, layer.ffn_key_a8).is_some()
+            && wq(layer.ffn_value_i6, layer.ffn_value_a8).is_some();
         if small_t {
             // 小 T：批量 GEMV 直读量化权重，且**原地累加**到 sb.x（不交换 x/v2）
             if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
@@ -6278,6 +6355,11 @@ impl GpuModel {
                     t,
                 )?;
             }
+        } else if ffn_imma {
+            let wqk = wq(layer.ffn_key_i6, layer.ffn_key_a8).expect("已判存在");
+            // relu² 直写 f32 `r2`（ffn value 的 int8 量化入口也吃 f32）。
+            self.backend
+                .gemm_imma_seq(&wqk, sb.xb, sb.r2, fh, c, t, 0)?;
         } else if let Some(wqk) = wq(layer.ffn_key_i6, layer.ffn_key_a8) {
             self.backend.to_f16(sb.xb, sb.xb16, c, t, m_pad, c, c)?;
             self.backend.w_dequant_to_f16(&wqk, sb.w_scratch, fh, c)?;
@@ -6301,6 +6383,12 @@ impl GpuModel {
         }
         if small_t {
             // 已在上面的小 T 分支里原地累加到 sb.x
+        } else if ffn_imma {
+            let wqv = wq(layer.ffn_value_i6, layer.ffn_value_a8).expect("已判存在");
+            // v2 = x + r2 @ W^T：残差先拷进 v2，再由 int8 GEMM 累加（op=1）。
+            self.backend.copy_range(sb.x, 0, sb.v2, 0, t * c)?;
+            self.backend
+                .gemm_imma_seq(&wqv, sb.r2, sb.v2, c, fh, t, 1)?;
         } else if let Some(wqv) = wq(layer.ffn_value_i6, layer.ffn_value_a8) {
             if !acc16 {
                 self.backend.to_f16(sb.r2, sb.r2_16, fh, t, m_pad, fh, fh)?;

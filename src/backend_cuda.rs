@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 
 use half::f16;
 
-use crate::backend::{ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId};
+use crate::backend::{ComputeBackend, Int6Handle, Int8Handle, TensorDtype, TensorId, Wq};
 use crate::runtime::R;
 
 /// 检查 CUDA 调用成功，否则返回错误（`op` 为当前操作名）。
@@ -8103,10 +8103,10 @@ extern "C" __global__ void __launch_bounds__(256, IM_LB2) imma_gemm_batch(
             if (r0 < m) yp[sb * m + r0] = v0;
             if (r0 + 1 < m) yp[sb * m + r0 + 1] = v1;
 #else
-            if (op == 0) { v0 = im_relu2(v0); v1 = im_relu2(v1); }
-            if (op == 4) {
+            if (op == 0 || op == 5) { v0 = im_relu2(v0); v1 = im_relu2(v1); }
+            if (op == 4 || op == 5) {
                 // 覆盖写、但落 fp16（rkv_stage1 的 out_v 是 fp16 语义，舍入与
-                // `__float2half` 一致——SIMT 路径当年就这么写的）
+                // `__float2half` 一致——SIMT 路径当年就这么写的）；op==5 先 relu²。
                 __half* yh = reinterpret_cast<__half*>(y);
                 if (r0 < m) yh[sb * m + r0] = __float2half(v0);
                 if (r0 + 1 < m) yh[sb * m + r0 + 1] = __float2half(v1);
@@ -8138,10 +8138,10 @@ extern "C" __global__ void imma_gemm_reduce(
         const float* p = partial + i;
         float acc = p[0];
         for (int s = 1; s < ksplit; s++) acc += p[(long long)s * total];
-        if (op == 0) {
+        if (op == 4 || op == 5) {
+            reinterpret_cast<__half*>(y)[i] = __float2half(op == 5 ? im_relu2_r(acc) : acc);
+        } else if (op == 0) {
             y[i] = im_relu2_r(acc);
-        } else if (op == 4) {
-            reinterpret_cast<__half*>(y)[i] = __float2half(acc);
         } else if (op == 3) {
             y[i] = acc;
         } else {
@@ -14488,6 +14488,44 @@ impl ComputeBackend for CudaBackend {
             && fh.is_multiple_of(QUANT_X_I8_GROUP)
             && c.is_multiple_of(8)
             && env_on("FFN_VALUE_IMMA")
+    }
+
+    fn supports_imma_seq(&self) -> bool {
+        true
+    }
+
+    /// 一步式 W8A8 张量核线性层（seq/prefill）：A 侧由核内 `quant_x_i8` 量化。
+    /// `op`：0 = relu² 覆盖 f32、1 = 累加、3 = 覆盖 f32、4 = 覆盖 f16、5 = relu² 覆盖 f16。
+    fn gemm_imma_seq(
+        &mut self,
+        a: &Wq,
+        x: TensorId,
+        y: TensorId,
+        m: usize,
+        k: usize,
+        rows: usize,
+        op: u32,
+    ) -> R<()> {
+        let Wq::I8(a) = a else {
+            return Err("gemm_imma_seq: 仅支持 int8 权重".into());
+        };
+        assert!(
+            k.is_multiple_of(QUANT_X_I8_GROUP),
+            "gemm_imma_seq: k={k} 必须是 {QUANT_X_I8_GROUP} 的倍数"
+        );
+        let aidx = self.u32_ptr(a.idx, "gemm_imma_seq")?;
+        let asz = self.u32_ptr(a.sz, "gemm_imma_seq")?;
+        let xd = self.f32_ptr(x, "gemm_imma_seq")?;
+        let yd = if op == 4 || op == 5 {
+            self.f16_ptr(y, "gemm_imma_seq")?
+        } else {
+            self.f32_ptr(y, "gemm_imma_seq")?
+        };
+        // seq 的行数（bt）远大于解码批宽，块数一般已过 split-K 目标（400）⇒ ks 自动为 1；
+        // 尾巴块等小形状由 `imma_ksplit` 自己补 split-K。
+        let bm = env_tile("IMMA_BM", IMMA_BM_DEFAULT);
+        let bn = env_tile("IMMA_BN", IMMA_BN_DEFAULT);
+        self.imma_gemm_tiled(aidx, asz, xd, 0, yd, m, k, rows, op as i32, bm, bn)
     }
 
     fn argmax(&mut self, logits: TensorId, token: TensorId, n: usize) -> R<()> {

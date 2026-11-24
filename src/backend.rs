@@ -731,6 +731,32 @@ pub trait ComputeBackend {
         Err("gemm_imma_f16: backend not supported".into())
     }
 
+    /// 一步式 W8A8 int8 张量核线性层（**seq/prefill** 用）：`y = op(x @ W^T)`，
+    /// `x` 为 `[rows, k]` f32（A 侧由后端内部量化），`y` 为 `[rows, m]`。
+    /// `op`：0 = relu² 覆盖写 f32、1 = 累加到 y、3 = 覆盖写 f32、4 = 覆盖写 f16、
+    /// 5 = relu² 覆盖写 f16。
+    ///
+    /// 与 [`Self::gemm_imma`] 的区别只有 A 侧入口（这里吃 f32 `TensorId`、内部自行
+    /// 量化），供 seq 路径替换「`w_dequant_to_f16` + fp16 GEMM」。默认不支持
+    /// （CUDA 实现；Vulkan 的 seq 路径保持 fp16 coopmat）。
+    fn supports_imma_seq(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_imma_seq(
+        &mut self,
+        _a: &Wq,
+        _x: TensorId,
+        _y: TensorId,
+        _m: usize,
+        _k: usize,
+        _rows: usize,
+        _op: u32,
+    ) -> R<()> {
+        Err("gemm_imma_seq: backend not supported".into())
+    }
+
     /// 只跑 rkv_stage1 的 mid 投影臂（r/k/v 走 `gemm_imma` 后，这里只剩 v1/w1/a1/g1）。
     #[allow(clippy::too_many_arguments)]
     fn gemv_int8_rkv_mid_batch(
