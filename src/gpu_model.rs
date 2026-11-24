@@ -1994,6 +1994,26 @@ impl GpuModel {
         )
     }
 
+    /// 单 slot 状态回灌的**全程设备内**版本：单序列状态 → batch 状态第 `slot` 行。
+    ///
+    /// 等价于 `state_back` + `state_slot_load`，但不过 PCIe（实测省 ~35ms/次，
+    /// 桌面池每次请求入组都走这里）。
+    pub fn state_slot_from_state(
+        &mut self,
+        batch_state: &State,
+        slot: usize,
+        single: &State,
+    ) -> R<()> {
+        batch_state.slot_load_from(
+            self.backend.as_mut(),
+            single,
+            slot,
+            self.config.n_embd,
+            self.config.n_head,
+            self.config.head_size,
+        )
+    }
+
     /// 单 slot 状态下载（batch State）。
     pub fn state_slot_back(&self, batch_state: &State, slot: usize) -> R<Vec<f32>> {
         batch_state.slot_back(
@@ -8015,6 +8035,44 @@ impl State {
         }
         items.push((self.v_first, slot * c, &data[pos..pos + c]));
         backend.upload_parts(&items)
+    }
+
+    /// 设备内把**单序列状态**灌进批量状态的 slot 行（prefill → 解码入组）。
+    ///
+    /// 与 `slot_back` + `slot_load` 的宿主往返等价：后两者要搬 2×21.6MB 过 PCIe
+    /// 并各等一次队列；这里全程设备内 `copy_ranges`（一次提交）。桌面池每次请求
+    /// 入组都走这条路，实测省 ~35ms/请求（`app_path_probe`，3B int8/CUDA）。
+    pub fn slot_load_from(
+        &self,
+        backend: &mut dyn ComputeBackend,
+        from: &State,
+        slot: usize,
+        c: usize,
+        h: usize,
+        n: usize,
+    ) -> R<()> {
+        if slot >= self.batch {
+            return Err(format!("slot_load_from: slot {slot} >= batch {}", self.batch).into());
+        }
+        if from.batch != 1 || from.layers.len() != self.layers.len() {
+            return Err(format!(
+                "slot_load_from: 源状态布局不符（batch={} layers={} vs 期望 1/{}）",
+                from.batch,
+                from.layers.len(),
+                self.layers.len()
+            )
+            .into());
+        }
+        let rnn = h * n * n;
+        let mut items: Vec<(TensorId, usize, TensorId, usize, usize)> =
+            Vec::with_capacity(self.layers.len() * 3 + 1);
+        for (dst, src) in self.layers.iter().zip(from.layers.iter()) {
+            items.push((src.tmix_x, 0, dst.tmix_x, slot * c, c));
+            items.push((src.tmix_rnn, 0, dst.tmix_rnn, slot * rnn, rnn));
+            items.push((src.cmix_x, 0, dst.cmix_x, slot * c, c));
+        }
+        items.push((from.v_first, 0, self.v_first, slot * c, c));
+        backend.copy_ranges(&items)
     }
 
     /// 清零全部状态（含 v_first 缓冲）：**一次批量设备内清零**，不是 97 次 `upload`。
